@@ -221,7 +221,7 @@ The first script invocation in a loop receives **no input**. Stdin is empty and 
 
 ### 6.2 Error Handling
 
-- **Non-zero exit code from a script:** The loop **continues**. The script's stdout is still parsed for structured output as normal. If no valid output was produced, the iteration is treated as `{ result: undefined }` and the loop continues from the starting script.
+- **Non-zero exit code from a script:** The loop **stops**. loopx prints the script's stderr (already passed through to the terminal) and exits with code 1. Any stdout produced by the script before it failed is not parsed as structured output.
 - **Invalid `goto` target:** If `goto` references a script name that does not exist in `.loopx/`, loopx prints an error message and exits with code 1.
 - **Missing `.loopx/` directory:** When running a named or default script, if `.loopx/` does not exist, loopx exits with an error instructing the user to create it.
 
@@ -361,7 +361,7 @@ loopx install <url>
 | 0 | Clean exit: loop ended via `stop: true`, `-n` limit reached, or successful subcommand execution. |
 | 1 | Error: validation failure (name collision, reserved name, invalid `goto`, missing script, `LOOPX_INPUT` violation, etc.). |
 
-Note: Non-zero exit codes from individual scripts do **not** cause loopx itself to exit with a non-zero code. The loop continues and loopx exits 0 when the loop ends normally.
+Note: A non-zero exit code from any script causes loopx to exit with code 1. Scripts that need error resilience should handle errors internally and exit 0.
 
 ---
 
