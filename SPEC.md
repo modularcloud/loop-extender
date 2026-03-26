@@ -6,7 +6,7 @@ loopx is a CLI tool that automates repeated execution ("loops") of scripts, prim
 
 **Package name:** `loopx`
 **Implementation language:** TypeScript
-**Target runtime:** Node.js
+**Target runtimes:** Node.js (default), Bun
 
 ---
 
@@ -22,7 +22,7 @@ A script is a single executable unit located in the `.loopx/` directory relative
 
 A script is identified by its **base name** (filename without extension). For example, `.loopx/myscript.ts` is identified as `myscript`.
 
-Only top-level files in `.loopx/` are considered. Subdirectories are ignored during script discovery.
+Only top-level files in `.loopx/` are considered scripts. Nested directories within `.loopx/` are ignored by the script discovery mechanism (but may exist for other purposes such as shared utilities).
 
 ### 2.2 Loop
 
@@ -40,7 +40,7 @@ interface Output {
 }
 ```
 
-If a script's output does not conform to this schema (i.e., is not valid JSON or does not contain at least one of these fields), the entire stdout is treated as the `result` field, with `goto` and `stop` unset.
+If a script's output does not conform to this schema (i.e., is not valid JSON with at least one of these fields), the entire output is treated as the `result` field, with `goto` and `stop` unset.
 
 ---
 
@@ -54,31 +54,26 @@ loopx [options] [script-name]
 
 - If `script-name` is provided, loopx looks for a script with that base name in `.loopx/`.
 - If `script-name` is omitted, loopx looks for a script named `default` in `.loopx/`.
-- If no `default` script exists and no script name is given, loopx exits with an error message instructing the user to create a script in `.loopx/`.
+- If no `default` script exists and no script name is given, loopx exits with an error message instructing the user to create a script (e.g., "No default script found. Create `.loopx/default.ts` or specify a script name.").
 
 ### 3.2 Ad-hoc Command Mode
 
-loopx can wrap an arbitrary shell command in a loop:
+loopx can also wrap an arbitrary shell command in a loop:
 
 ```
 loopx [options] <command...>
 ```
 
-**Disambiguation:** loopx first checks whether the first positional argument matches a script in `.loopx/`. If a matching script exists, it runs that script. Otherwise, the arguments are treated as a shell command to execute in a loop.
+**Disambiguation:** When arguments are provided, loopx first checks if the first argument matches a script name in `.loopx/`. If a match is found, it runs that script. Otherwise, the entire argument string is treated as a shell command to execute in a loop.
 
-Example:
-```bash
-loopx cat PROMPT.md | claude --dangerously-skip-permissions -p
-```
-
-In ad-hoc mode, the command's stdout is captured and parsed as structured output using the same rules as scripts. If parsing fails, the raw output becomes the `result`.
+In ad-hoc mode, the command's stdout is captured and parsed using the same structured output rules as scripts — including `goto`, `stop`, and `result`. If an ad-hoc command outputs valid structured JSON with a `goto` field, loopx honors it and jumps to the named script in `.loopx/`. A simple command that doesn't output structured JSON will have its output treated as `result`, the loop will restart with no input, and continue indefinitely (or until `-n` is reached).
 
 ### 3.3 Options
 
 | Flag | Description |
 |------|-------------|
-| `-n <count>` | Maximum number of loop iterations. After this many iterations, exit cleanly (exit code 0). |
-| `-e <path>` | Path to a local `.env` file. Variables are merged with global env vars; local values take precedence on conflict. The file must not contain `LOOPX_INPUT` — if it does, loopx exits with a fatal error. |
+| `-n <count>` | Maximum number of loop iterations. After this many iterations, exit cleanly. |
+| `-e <path>` | Path to a local env file (standard `.env` format). Variables are merged with global env vars; local values take precedence on conflict. The file must not contain a `LOOPX_INPUT` key — if it does, loopx exits with a fatal error. |
 | `-h`, `--help` | Print usage information. Dynamically lists all available scripts discovered in `.loopx/`. |
 
 ### 3.4 Subcommands
@@ -95,11 +90,18 @@ A helper for bash scripts to emit structured output:
 loopx output [--result <value>] [--goto <script-name>] [--stop]
 ```
 
-Prints the corresponding JSON to stdout. The bash script should call this as the last stdout-producing command and then exit. loopx captures the script's full stdout and parses it, so the `loopx output` JSON should be the only thing written to stdout (or at least the complete stdout should parse as valid structured output).
+Prints the corresponding JSON to stdout. The bash script should capture or relay this output and then exit. Example usage in a bash script:
+
+```bash
+#!/bin/bash
+# do work...
+loopx output --result "done" --goto "next-step"
+exit 0
+```
 
 #### `loopx env set <name> <value>`
 
-Sets a global environment variable. The name `LOOPX_INPUT` is reserved — attempting to set it produces a fatal error.
+Sets a global environment variable stored in the loopx global config directory. Setting `LOOPX_INPUT` is a fatal error — this variable is reserved by loopx.
 
 #### `loopx env remove <name>`
 
@@ -113,9 +115,10 @@ Lists all currently set global environment variables and their values.
 
 Downloads a remote script file into the `.loopx/` directory.
 
-- The filename is derived from the URL's path.
+- The filename is derived from the URL (last path segment).
 - The file must have a supported extension (`.sh`, `.js`, `.jsx`, `.ts`, `.tsx`); otherwise an error is displayed.
-- If a file with the same base name already exists in `.loopx/`, loopx displays an error and does not overwrite it.
+- If a file with the same name already exists in `.loopx/`, loopx displays an error and does not overwrite.
+- Creates the `.loopx/` directory if it does not exist.
 
 ---
 
@@ -123,7 +126,7 @@ Downloads a remote script file into the `.loopx/` directory.
 
 ### 4.1 Discovery
 
-Scripts are discovered by scanning the `.loopx/` directory in the current working directory. Only **top-level files** with supported extensions (`.sh`, `.js`, `.jsx`, `.ts`, `.tsx`) are considered. Subdirectories and files with unsupported extensions are ignored.
+Scripts are discovered by scanning the `.loopx/` directory in the current working directory. Only top-level files with supported extensions (`.sh`, `.js`, `.jsx`, `.ts`, `.tsx`) are considered. Nested directories and files within them are ignored.
 
 ### 4.2 Name Collision
 
@@ -142,7 +145,8 @@ If any script in `.loopx/` uses a reserved name, loopx refuses to start and disp
 
 ### 4.4 Name Restrictions
 
-Script names must not begin with `-`.
+- Script names must not begin with `-`.
+- Script names must match the pattern `[a-zA-Z0-9_][a-zA-Z0-9_-]*` (start with alphanumeric or underscore, followed by alphanumerics, underscores, or hyphens).
 
 ---
 
@@ -150,92 +154,76 @@ Script names must not begin with `-`.
 
 ### 5.1 Bash Scripts
 
-Bash scripts (`.sh`) are executed as child processes via the system shell. Stdout is captured and parsed as structured output. Stderr is passed through to the user's terminal.
+Bash scripts (`.sh`) are executed as child processes via the system shell (`/bin/bash`). The script's stdout is captured as its structured output. Stderr is passed through to the user's terminal.
 
 ### 5.2 JS/TS Scripts
 
-JavaScript and TypeScript scripts are executed as child processes using `tsx`, which handles `.js`, `.jsx`, `.ts`, and `.tsx` files uniformly. `tsx` must be available in the environment (either installed globally or as a project dependency). Stdout is captured and parsed as structured output. Stderr is passed through to the user's terminal.
+JavaScript and TypeScript scripts are executed as child processes using `tsx`, which handles `.js`, `.jsx`, `.ts`, and `.tsx` files uniformly. `tsx` is a dependency of loopx and does not need to be installed separately by the user.
+
+- Stdout is captured as structured output.
+- Stderr is passed through to the user's terminal.
+
+When running under Bun, loopx uses Bun's native TypeScript/JSX support instead of `tsx`.
 
 ### 5.3 TypeScript/JavaScript `output()` Function
 
-When imported from `loopx`, the `output()` function writes the structured JSON to stdout and immediately terminates the process via `process.exit(0)`. Since it exits, any code after an `output()` call is unreachable — calling `output()` twice is not possible.
+When imported from `loopx`, the `output()` function writes structured JSON to stdout and immediately terminates the process (`process.exit(0)`).
 
 ```typescript
 import { output } from "loopx";
 import type { Output } from "loopx";
 
-// Writes JSON to stdout and exits the process
 output({ result: "hello", goto: "next-step" });
-// unreachable
+// process exits here — no code after this line runs
 ```
 
-If a script does not call `output()`, its raw stdout is captured and parsed using the standard rules (valid structured JSON or treated as `result`).
+Since `output()` calls `process.exit()`, calling it multiple times is not possible — only the first call takes effect.
 
-### 5.4 Input Delivery
+If `output()` is called with a value that does not conform to the `Output` interface (e.g., a plain string), the value is serialized as `{ result: String(value) }`.
+
+### 5.4 Input Piping
 
 When a previous script's output includes both `result` and `goto`, the `result` value is delivered to the next script via **two mechanisms simultaneously**:
 
 1. **stdin** — the `result` string is written to the next script's stdin.
 2. **`LOOPX_INPUT` environment variable** — the `result` string is set as the `LOOPX_INPUT` env var in the next script's execution environment.
 
-This dual delivery allows scripts to consume input in whichever way is most convenient for their use case.
+This dual delivery allows scripts to consume input via whichever mechanism is most convenient (e.g., bash scripts can read stdin, while JS/TS scripts may prefer `process.env.LOOPX_INPUT`).
 
-#### `LOOPX_INPUT` Protection
-
-`LOOPX_INPUT` is a reserved environment variable managed exclusively by loopx. It cannot be set by users:
-
-- `loopx env set LOOPX_INPUT ...` produces a fatal error.
-- If a file provided via `-e` contains `LOOPX_INPUT`, loopx exits with a fatal error before running any scripts.
+**`LOOPX_INPUT` is a reserved variable.** It cannot be set via `loopx env set` (fatal error) or included in a `-e` env file (fatal error). loopx owns this variable exclusively.
 
 ### 5.5 Initial Input
 
-The first script invocation in a loop receives **no input** — stdin is empty and `LOOPX_INPUT` is not set.
-
-### 5.6 Script Failure
-
-If a script exits with a non-zero exit code, the loop **continues**. The script's stdout is still captured and parsed using the standard rules. This allows scripts to signal partial failure through exit codes while still participating in the loop via structured output.
+The first script invocation in a loop receives **no input**. Stdin is empty and `LOOPX_INPUT` is not set.
 
 ---
 
 ## 6. Loop Execution Flow
 
-### 6.1 Algorithm
+### 6.1 Basic Loop
 
-```
-1. Validate .loopx/ directory (check for name collisions, reserved names, name restrictions).
-2. Determine the starting script S (named argument, or "default").
-3. Set iteration_count = 0.
-4. Set input = <empty> (no input for first iteration).
+1. Validate the `.loopx/` directory (check for name collisions, reserved names, name restrictions).
+2. Determine the starting script (named argument, ad-hoc command, or `default`).
+3. Execute the script with no input (first iteration) or with piped input (subsequent iterations via `goto`).
+4. Capture stdout. Parse it as structured JSON. If parsing fails, treat the entire output as `{ result: <raw output> }`.
+5. Increment the iteration counter.
+6. If `stop` is `true`: print `result` (if present) and exit with code 0.
+7. If `-n` was specified and the iteration count has been reached: print `result` (if present) and exit with code 0.
+8. If `goto` is present:
+   a. Validate that the named script exists. If not, print an error and exit with code 1.
+   b. Print `result` to the loopx process's own stdout (if present).
+   c. Execute the `goto` script with `result` piped as input (stdin + `LOOPX_INPUT`).
+   d. Return to step 4 with the new script's output.
+9. If `goto` is absent:
+   a. Print `result` to the loopx process's own stdout (if present).
+   b. Re-run the starting script with no input.
+   c. Return to step 4.
 
-LOOP:
-5. Execute S with input delivered via stdin and LOOPX_INPUT (if input is non-empty).
-6. Capture stdout. Stderr passes through to the terminal.
-7. Increment iteration_count.
-8. Parse stdout as structured JSON.
-   - If valid JSON with at least one of {result, goto, stop}: use as Output.
-   - Otherwise: Output = { result: <raw stdout> }.
-9. Print result to the terminal (if result is present).
-10. If stop is true → exit with code 0.
-11. If -n was specified and iteration_count >= n → exit with code 0.
-12. If goto is present:
-    a. If the named script does not exist → exit with code 1 and print an error.
-    b. Set S = the goto script.
-    c. Set input = result (if present), otherwise input = <empty>.
-    d. Go to LOOP.
-13. If goto is absent:
-    a. Set S = the original starting script.
-    b. Set input = <empty>.
-    c. Go to LOOP.
-```
+### 6.2 Error Handling
 
-### 6.2 Error Conditions
-
-| Condition | Behavior |
-|-----------|----------|
-| Script exits with non-zero code | Loop continues; stdout is parsed normally |
-| `goto` names a non-existent script | Fatal error; loop exits with code 1 and an error message |
-| `.loopx/` directory missing | Error message; exit code 1 |
-| No matching script and no ad-hoc command | Error message; exit code 1 |
+- **Non-zero exit code from a script:** The loop **continues**. The script's stdout is still parsed for structured output as normal. If no valid output was produced, the iteration is treated as `{ result: undefined }` and the loop continues from the starting script.
+- **Invalid `goto` target:** If `goto` references a script name that does not exist in `.loopx/`, loopx prints an error message and exits with code 1.
+- **Missing `.loopx/` directory:** When running a named or default script, if `.loopx/` does not exist, loopx exits with an error instructing the user to create it.
 
 ---
 
@@ -243,25 +231,32 @@ LOOP:
 
 ### 7.1 Global Storage
 
-Global environment variables are stored in `~/.loopx/env` as a standard `.env` file (one `KEY=VALUE` per line).
+Global environment variables are stored in the loopx configuration directory at:
 
-The `~/.loopx/` directory is created automatically if it does not exist when `loopx env set` is first used.
+```
+~/.config/loopx/env
+```
+
+The file uses standard `.env` format (`KEY=VALUE`, one per line, `#` comments, blank lines ignored).
+
+If the directory or file does not exist, loopx treats it as having no global variables. The directory is created on first `loopx env set`.
 
 ### 7.2 Local Override (`-e`)
 
-When `-e <path>` is specified, the file at `<path>` is parsed as a standard `.env` file and merged with global env vars. Local values take precedence on conflict. If the file contains `LOOPX_INPUT`, loopx exits with a fatal error.
+When `-e <path>` is specified, the file at `<path>` is read (standard `.env` format) and its variables are merged with global env vars. Local values take precedence on conflict.
 
-### 7.3 Resolution Order
+**Validation:** If the local env file contains a `LOOPX_INPUT` key, loopx exits with a fatal error.
 
-Environment variables are resolved in this order (later overrides earlier):
+### 7.3 Reserved Variables
 
-1. Global env vars (`~/.loopx/env`)
-2. Local env vars (from `-e` file)
-3. `LOOPX_INPUT` (set by loopx when piping result between scripts)
+`LOOPX_INPUT` is reserved by loopx for piping `result` between scripts. It cannot be set in:
+
+- Global env vars (`loopx env set LOOPX_INPUT ...` is a fatal error)
+- Local env files (`-e` file containing `LOOPX_INPUT` is a fatal error)
 
 ### 7.4 Injection
 
-All resolved environment variables are injected into each script's execution environment alongside the inherited system environment.
+All resolved environment variables (global + local overrides + `LOOPX_INPUT` when applicable) are injected into the script's execution environment alongside the inherited system environment. loopx env vars take precedence over inherited system env vars of the same name.
 
 ---
 
@@ -271,21 +266,31 @@ loopx can be imported and used from TypeScript/JavaScript:
 
 ### 8.1 `run(scriptName?: string)`
 
-Returns an `AsyncGenerator<Output>` that yields each iteration's output.
+```typescript
+import { run } from "loopx";
+
+const loop = run("myscript");
+
+for await (const output of loop) {
+  console.log(output.result);
+  // each yielded value is an Output from one iteration
+}
+// loop has ended (stop: true or natural completion)
+```
+
+Returns an `AsyncGenerator<Output>` that yields the `Output` from each loop iteration. The generator completes when the loop ends (via `stop: true`).
+
+Options (such as `-n` and `-e` equivalents) can be passed as a second argument:
 
 ```typescript
 import { run } from "loopx";
 
-for await (const result of run("myscript")) {
-  console.log(result.result);
+for await (const output of run("myscript", { maxIterations: 10, envFile: ".env" })) {
+  // ...
 }
 ```
 
-If `scriptName` is omitted, runs the `default` script.
-
 ### 8.2 `runPromise(scriptName?: string)`
-
-Returns a `Promise<Output[]>` that resolves when the loop ends (via `stop: true` or `-n` limit), with an array of all outputs from every iteration.
 
 ```typescript
 import { runPromise } from "loopx";
@@ -293,44 +298,80 @@ import { runPromise } from "loopx";
 const outputs: Output[] = await runPromise("myscript");
 ```
 
-### 8.3 `output(value: Partial<Output> | string)`
+Returns a `Promise<Output[]>` that resolves with an array of all `Output` values when the loop ends (via `stop: true` or max iterations reached). Accepts the same options object as `run()`.
 
-Used inside scripts to emit structured output. Writes JSON to stdout and calls `process.exit(0)`.
-
-If called with a string, it is treated as `{ result: value }`.
+### 8.3 `output(value)`
 
 ```typescript
 import { output } from "loopx";
 
 output({ result: "data", goto: "next" });
-// process exits here
+// process.exit(0) is called — execution stops here
 ```
+
+Used inside scripts to emit structured output. Writes JSON to stdout and exits the process.
 
 ### 8.4 Types
 
 ```typescript
-export interface Output {
+import type { Output, RunOptions } from "loopx";
+
+interface Output {
   result?: string;
   goto?: string;
   stop?: boolean;
+}
+
+interface RunOptions {
+  maxIterations?: number;
+  envFile?: string;
 }
 ```
 
 ---
 
-## 9. Help
+## 9. `loopx install`
+
+```
+loopx install <url>
+```
+
+- Downloads the file at `<url>` into the `.loopx/` directory, creating it if necessary.
+- The filename is derived from the last path segment of the URL.
+- The file must have a supported extension (`.sh`, `.js`, `.jsx`, `.ts`, `.tsx`); otherwise an error is shown.
+- If a file with the same base name already exists in `.loopx/`, loopx displays an error and does not overwrite. The user must manually remove the existing script first.
+- The downloaded script is validated against reserved name and name restriction rules before being saved.
+
+---
+
+## 10. Help
 
 `loopx -h` / `loopx --help` prints usage information including:
 
 - General usage syntax
 - Available options and subcommands
-- A dynamically generated list of scripts discovered in the current `.loopx/` directory
+- A dynamically generated list of scripts discovered in the current `.loopx/` directory (name and file type)
 
 ---
 
-## 10. Exit Codes
+## 11. Exit Codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | Clean exit: `stop: true`, `-n` limit reached, or `version`/`help` commands |
-| 1 | Error: invalid `goto` target, validation failure, missing script, missing `.loopx/` directory, reserved name conflict, `LOOPX_INPUT` violation |
+| 0 | Clean exit: loop ended via `stop: true`, `-n` limit reached, or successful subcommand execution. |
+| 1 | Error: validation failure (name collision, reserved name, invalid `goto`, missing script, `LOOPX_INPUT` violation, etc.). |
+
+Note: Non-zero exit codes from individual scripts do **not** cause loopx itself to exit with a non-zero code. The loop continues and loopx exits 0 when the loop ends normally.
+
+---
+
+## 12. Summary of Reserved and Special Values
+
+| Name | Context | Purpose |
+|------|---------|---------|
+| `output` | Script name | Reserved for `loopx output` subcommand |
+| `env` | Script name | Reserved for `loopx env` subcommand |
+| `install` | Script name | Reserved for `loopx install` subcommand |
+| `version` | Script name | Reserved for `loopx version` subcommand |
+| `default` | Script name | The script run when no name is provided |
+| `LOOPX_INPUT` | Env variable | Reserved for inter-script result piping |
