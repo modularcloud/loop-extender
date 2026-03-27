@@ -6,8 +6,11 @@ loopx is a CLI tool that automates repeated execution ("loops") of scripts, prim
 
 **Package name:** `loopx`
 **Implementation language:** TypeScript
-**Target runtimes:** Node.js ≥ 18, Bun ≥ 1.0
+**Module format:** ESM-only
+**Target runtimes:** Node.js ≥ 20.6, Bun ≥ 1.0
 **Platform support:** POSIX-only (macOS, Linux) for v1. Windows is not supported.
+
+> **Note:** The Node.js minimum was raised from 18 to 20.6 to support `module.register()`, which is required for the custom module loader used to resolve `import from "loopx"` in scripts (see section 3.3).
 
 ---
 
@@ -24,6 +27,8 @@ A single file with a supported extension:
 - Bash (`.sh`)
 - JavaScript (`.js` / `.jsx`)
 - TypeScript (`.ts` / `.tsx`)
+
+`.mjs` and `.cjs` extensions are intentionally unsupported. All JS/TS scripts must be ESM (see section 6.3).
 
 A file script is identified by its **base name** (filename without extension). For example, `.loopx/myscript.ts` is identified as `myscript`.
 
@@ -44,29 +49,31 @@ Directory scripts allow scripts to have their own dependencies managed via stand
 
 A directory in `.loopx/` is only recognized as a script if it contains a `package.json` with a `main` field. Directories without this are ignored (and may exist for other purposes such as shared utilities).
 
+**Important:** Directory scripts must not list `loopx` as their own dependency. The loopx helpers (`output`, `input`) are provided automatically by the running CLI via a custom module loader (see section 3.3). Installing a separate version of loopx inside a directory script may cause version mismatches.
+
 ### 2.2 Loop
 
-A loop is a repeated execution cycle modeled as a **state machine**. Each iteration runs a script, examines its structured output, and transitions:
+A loop is a repeated execution cycle modeled as a **state machine**. Each iteration runs a **target script**, examines its structured output, and transitions:
 
 - **`goto` another script:** transition to that script for the next iteration.
-- **No `goto`:** the cycle ends and the loop restarts from the **starting script** (the script originally specified or `default`).
+- **No `goto`:** the cycle ends and the loop restarts from the **starting target**.
 - **`stop`:** the machine halts.
 
-The `goto` mechanism is a **state transition, not a permanent reassignment.** When a target script finishes without its own `goto`, execution returns to the starting script — not the script that issued the `goto`. The loop always resets to its initial state after a transition chain completes.
+The **starting target** is the original script specified when loopx was invoked — either a named script or the `default` script. The `goto` mechanism is a **state transition, not a permanent reassignment.** When a target finishes without its own `goto`, execution returns to the starting target. The loop always resets to its initial state after a transition chain completes.
 
 **Example:**
 ```
-Starting script: A
+Starting target: A (script)
 
 Iteration 1: A runs → outputs goto:"B"
 Iteration 2: B runs → outputs goto:"C"
 Iteration 3: C runs → outputs (no goto)
-Iteration 4: A runs → (back to starting script)
+Iteration 4: A runs → (back to starting target)
 ```
 
 ### 2.3 Structured Output
 
-Every script iteration produces an output conforming to:
+Every iteration produces an output conforming to:
 
 ```typescript
 interface Output {
@@ -80,51 +87,70 @@ interface Output {
 
 **Parsing rules:**
 
-- If stdout is valid JSON containing at least one known field (`result`, `goto`, `stop`), it is parsed as structured output.
-- If stdout is not valid JSON, or is valid JSON but contains none of the known fields, the entire stdout content is treated as `{ result: <raw output> }`.
+- Only a **top-level JSON object** can be treated as structured output. Arrays, primitives (strings, numbers, booleans), and `null` fall back to raw result treatment.
+- If stdout is a valid JSON object containing at least one known field (`result`, `goto`, `stop`), it is parsed as structured output.
+- If stdout is not valid JSON, is not an object, or is a valid JSON object but contains none of the known fields, the entire stdout content is treated as `{ result: <raw output> }`.
 - Extra JSON fields beyond `result`, `goto`, and `stop` are silently ignored.
 - If `result` is present but not a string, it is coerced via `String(value)`.
 - If `goto` is present but not a string, it is treated as absent.
-- If `stop` is present, any truthy value is treated as `true`.
+- `stop` must be exactly `true` (boolean). Any other value (including truthy strings like `"true"`, numbers, etc.) is treated as absent. This prevents surprises like `{"stop": "false"}` halting the loop.
 
 **Field precedence:**
 
 - `stop: true` takes priority over `goto`. If both are set, the loop halts.
 - `goto` with no `result` is valid: the target script receives empty stdin.
+- **`result` is only piped to the next script when `goto` is present.** When the loop resets to the starting target (no `goto`), the starting target receives empty stdin regardless of whether the previous iteration produced a `result`.
 
 ---
 
 ## 3. Installation & Module Resolution
 
-### 3.1 Primary Install Mode
+### 3.1 Global Install
 
-loopx is installed **globally**:
+loopx is installed **globally** to provide the `loopx` CLI command:
 
 ```
 npm install -g loopx
 ```
 
+A global install is sufficient for all loopx functionality, including JS/TS scripts that `import { output, input } from "loopx"`. loopx uses a custom module loader to make its exports available to scripts regardless of install location (see section 3.3).
+
 ### 3.2 Local Version Pinning
 
-A project may optionally pin a specific loopx version by installing it as a local dependency:
+A project may pin a specific loopx version by installing it as a local dependency:
 
 ```
 npm install --save-dev loopx
 ```
 
-When the globally installed `loopx` binary starts, it checks whether the current working directory (or an ancestor) has a local `node_modules/.bin/loopx`. If a local installation is found, the global instance delegates execution to the local version's binary. This ensures project-level version consistency when needed.
+A local install provides two guarantees:
+
+1. **CLI delegation:** When the globally installed `loopx` binary starts, it checks whether the current working directory (or an ancestor) has a local `node_modules/.bin/loopx`. If found, the global instance delegates execution to the local version's binary **before any command handling**. This ensures the entire session — CLI behavior, script helpers, and all — uses the pinned version.
+
+2. **Importable library:** Application code can `import { run, runPromise } from "loopx"` when loopx is a local dependency. This is standard Node.js module resolution — no special mechanism required.
+
+**Delegation rules:**
+
+- **Nearest ancestor wins.** loopx searches from the current working directory upward and delegates to the first `node_modules/.bin/loopx` found.
+- **Recursion guard.** The delegated process is spawned with `LOOPX_DELEGATED=1` in its environment. If this variable is set when loopx starts, delegation is skipped. This prevents infinite delegation loops.
+- After delegation, `LOOPX_BIN` contains the **resolved realpath** of the effective binary (the local version), not the original global launcher or any intermediate symlinks.
 
 ### 3.3 Module Resolution for Scripts
 
-A globally installed npm package is on PATH but its modules are **not** automatically importable from arbitrary scripts. To make `import { output } from "loopx"` work regardless of install location, loopx sets the `NODE_PATH` environment variable to include its own package directory when spawning JS/TS scripts.
+Scripts spawned by loopx (in `.loopx/`) need access to the `output` and `input` helpers via `import { output, input } from "loopx"`.
+
+**For Node.js / tsx:** loopx uses Node's `--import` flag to preload a registration module that installs a custom module resolve hook via `module.register()`. This hook intercepts bare specifier imports of `"loopx"` and resolves them to the running CLI's package exports. This approach works correctly with Node's ESM resolver, which does not support `NODE_PATH`.
+
+**For Bun:** Bun's module resolver supports `NODE_PATH` for both CJS and ESM. loopx sets `NODE_PATH` to include its own package directory when running under Bun.
+
+In both cases, the resolution **always points to the post-delegation version.** If a local install triggered delegation, the helpers resolve to the local version's package. This ensures script helpers match the running CLI version.
 
 ### 3.4 Bash Script Binary Access
 
-loopx injects a `LOOPX_BIN` environment variable into every script's execution environment. This variable contains the absolute path to the loopx binary, allowing bash scripts to call loopx subcommands reliably regardless of PATH:
+loopx injects a `LOOPX_BIN` environment variable into every script's execution environment. This variable contains the **resolved realpath** of the effective loopx binary (post-delegation), allowing bash scripts to call loopx subcommands reliably:
 
 ```bash
 #!/bin/bash
-# Always works, regardless of PATH configuration
 $LOOPX_BIN output --result "done" --goto "next-step"
 ```
 
@@ -143,29 +169,15 @@ loopx [options] [script-name]
 - If no `default` script exists and no script name is given, loopx exits with an error message instructing the user to create a script (e.g., "No default script found. Create `.loopx/default.ts` or specify a script name.").
 - If `script-name` does not match any script in `.loopx/`, loopx exits with an error.
 
-### 4.2 Ad-hoc Command Mode
-
-loopx can wrap an arbitrary command in a loop using the `--` separator:
-
-```
-loopx [options] -- <command> [args...]
-```
-
-The `--` separator is **required** for ad-hoc mode. Everything after `--` is treated as a command and its arguments. The command is executed via direct process spawn (`spawn(command, args)`), not shell evaluation. Shell features (pipes, redirects, globbing) are not available directly — use `bash -c "..."` as the command if shell evaluation is needed.
-
-Structured output rules apply identically to ad-hoc commands. If the command outputs valid structured JSON with a `goto` field, loopx honors it and jumps to the named script in `.loopx/`.
-
-The `.loopx/` directory does not need to exist for ad-hoc mode, unless a `goto` in the command's output references a script.
-
-### 4.3 Options
+### 4.2 Options
 
 | Flag | Description |
 |------|-------------|
-| `-n <count>` | Maximum number of loop iterations. After this many iterations, exit cleanly. `-n 0` means zero iterations (exit immediately with code 0). |
-| `-e <path>` | Path to a local env file (standard `.env` format). Variables are merged with global env vars; local values take precedence on conflict. |
-| `-h`, `--help` | Print usage information. Dynamically lists available scripts discovered in `.loopx/`. If `.loopx/` is missing or contains invalid scripts, help is still displayed with warnings appended. |
+| `-n <count>` | Maximum number of loop iterations (see section 7.1 for counting semantics). Must be a non-negative integer; negative values or non-integers are usage errors. `-n 0` validates the starting target (script discovery, name resolution, env file loading) but executes zero iterations, then exits with code 0. |
+| `-e <path>` | Path to a local env file (`.env` format). The file must exist; a missing file is an error. Variables are merged with global env vars; local values take precedence on conflict. |
+| `-h`, `--help` | Print usage information. Dynamically lists available scripts discovered in `.loopx/`. Performs non-fatal discovery and validation — if `.loopx/` is missing or contains invalid scripts, help is still displayed with warnings appended. |
 
-### 4.4 Subcommands
+### 4.3 Subcommands
 
 #### `loopx version`
 
@@ -179,7 +191,9 @@ A helper for bash scripts to emit structured output:
 loopx output [--result <value>] [--goto <script-name>] [--stop]
 ```
 
-Prints the corresponding JSON to stdout. Example usage in a bash script:
+Prints the corresponding JSON to stdout. **At least one flag must be provided;** calling `loopx output` with no flags is an error.
+
+Example usage in a bash script:
 
 ```bash
 #!/bin/bash
@@ -196,20 +210,20 @@ Sets a global environment variable stored in the loopx global config directory.
 
 #### `loopx env remove <name>`
 
-Removes a global environment variable.
+Removes a global environment variable. If the variable does not exist, this is a silent no-op (exits with code 0).
 
 #### `loopx env list`
 
-Lists all currently set global environment variables and their values.
+Lists all currently set global environment variables. Output format is one `KEY=VALUE` pair per line, sorted lexicographically by key name. If no variables are set, produces no output.
 
 #### `loopx install <source>`
 
 Installs a script into the `.loopx/` directory. See section 10 for full details. Supports:
 
-- **File URL** — downloads a single script file.
+- **`org/repo` shorthand** — expands to `https://github.com/org/repo` and clones as a directory script.
 - **Git URL** — clones a repository as a directory script.
 - **Tarball URL** — extracts an archive as a directory script.
-- **`org/repo` shorthand** — expands to `https://github.com/org/repo` and clones as a directory script.
+- **Single-file URL** — downloads a single script file.
 
 Creates the `.loopx/` directory if it does not exist.
 
@@ -219,14 +233,22 @@ Creates the `.loopx/` directory if it does not exist.
 
 ### 5.1 Discovery
 
-Scripts are discovered by scanning the `.loopx/` directory in the current working directory:
+Scripts are discovered by scanning the `.loopx/` directory in the current working directory. The `.loopx/` directory is only searched in the current working directory — ancestor directories are not searched.
 
 - **File scripts:** Top-level files with supported extensions (`.sh`, `.js`, `.jsx`, `.ts`, `.tsx`). The script name is the base name (filename without extension).
-- **Directory scripts:** Top-level directories containing a `package.json` with a `main` field pointing to a file with a supported extension. The script name is the directory name. The `main` field must point to a file within the directory with a supported extension; otherwise the directory is ignored with a warning.
+- **Directory scripts:** Top-level directories containing a `package.json` with a `main` field pointing to a file with a supported extension. The script name is the directory name. The `main` field must point to a file **within the script's own directory** — paths containing `../` or otherwise escaping the directory are rejected. If `main` points to a file without a supported extension or escapes the directory, the directory is ignored and a warning is printed to stderr.
 
 Nested directories that do not contain a valid `package.json` with `main` are ignored.
 
-**Discovery is performed once at loop start and the result is cached for the duration of the loop.** Scripts added, removed, or modified during loop execution are not detected until the next invocation of loopx.
+**Symlink policy:** Symlinks within `.loopx/` are followed during discovery. A symlinked file or directory is treated identically to its target. However, the `main` field in a directory script's `package.json` must still resolve to a path within the script's directory after symlink resolution — it must not escape the directory boundary.
+
+**Discovery metadata is cached at loop start for the duration of the loop.** This means:
+
+- Scripts added, removed, or renamed during loop execution are not detected until the next invocation.
+- Changes to a `package.json` `main` field are not detected until the next invocation.
+- **Edits to the contents of an already-discovered script file take effect on subsequent iterations**, because the child process reads the file from disk each time it is spawned.
+
+**Warnings** (invalid `main` field, unsupported extensions in directories, paths escaping the script directory) are printed to stderr during discovery. Discovery runs at loop start for script mode and during `--help`.
 
 ### 5.2 Name Collision
 
@@ -257,37 +279,45 @@ Not all commands require `.loopx/` to exist or be valid:
 | `loopx version` | No | No |
 | `loopx env *` | No | No |
 | `loopx output` | No | No |
-| `loopx -h` / `--help` | No (shows warnings if missing/invalid) | No (shows warnings) |
+| `loopx -h` / `--help` | No | Non-fatal (warnings shown) |
 | `loopx install <url>` | No (creates if needed) | No |
 | `loopx [script-name]` | Yes | Yes |
-| `loopx -- <command>` | No (unless `goto` targets a script) | Deferred until `goto` resolution |
 
 ---
 
 ## 6. Script Execution
 
-### 6.1 Bash Scripts
+### 6.1 Working Directory
+
+The working directory for script execution depends on the script type:
+
+- **File scripts:** Run with the directory where `loopx` was invoked as the working directory.
+- **Directory scripts:** Run with the script's own directory as the working directory (e.g., `.loopx/my-pipeline/`), so relative imports and `node_modules/` resolve naturally.
+
+loopx injects `LOOPX_PROJECT_ROOT` into every script's environment, set to the absolute path of the directory where `loopx` was invoked. This is essential for directory scripts that need to reference project files outside their own directory.
+
+### 6.2 Bash Scripts
 
 Bash scripts (`.sh`) are executed as child processes via `/bin/bash`. The script's stdout is captured as its structured output. Stderr is passed through to the user's terminal.
 
-### 6.2 JS/TS Scripts
+### 6.3 JS/TS Scripts
 
 JavaScript and TypeScript scripts are executed as child processes using `tsx`, which handles `.js`, `.jsx`, `.ts`, and `.tsx` files uniformly. `tsx` is a dependency of loopx and does not need to be installed separately by the user.
+
+**JS/TS scripts must be ESM and must use `import`, not `require`.** CommonJS is not supported. `.mjs` and `.cjs` extensions are intentionally unsupported.
 
 - Stdout is captured as structured output.
 - Stderr is passed through to the user's terminal.
 
 When running under Bun, loopx uses Bun's native TypeScript/JSX support instead of `tsx`.
 
-### 6.3 Directory Scripts
+### 6.4 Directory Scripts
 
 For directory scripts, loopx reads the `main` field from the directory's `package.json` to determine the entry point file. The entry point is then executed using the same rules as file scripts — bash for `.sh`, tsx/bun for JS/TS extensions.
 
-The script's working directory is set to the directory script's directory (e.g., `.loopx/my-pipeline/`), so relative imports and `node_modules/` resolve naturally.
+### 6.5 `output()` Function (JS/TS)
 
-### 6.4 `output()` Function (JS/TS)
-
-When imported from `loopx`, the `output()` function writes structured JSON to stdout and immediately terminates the process (`process.exit(0)`).
+When imported from `loopx`, the `output()` function writes structured JSON to stdout and terminates the process.
 
 ```typescript
 import { output } from "loopx";
@@ -296,11 +326,16 @@ output({ result: "hello", goto: "next-step" });
 // process exits here — no code after this line runs
 ```
 
-Since `output()` calls `process.exit()`, calling it multiple times is not possible — only the first call takes effect.
+**Behavior:**
 
-If `output()` is called with a value that does not conform to the `Output` interface (e.g., a plain string), the value is serialized as `{ result: String(value) }`.
+- `output()` **flushes stdout** before calling `process.exit(0)`, ensuring the JSON payload is not lost.
+- Since `output()` calls `process.exit()`, calling it multiple times is not possible — only the first call takes effect.
+- The argument must be an object containing at least one known field (`result`, `goto`, or `stop`) with a defined value. Calling `output({})` (no known fields) throws an error.
+- Properties whose value is `undefined` are treated as absent (they are omitted during JSON serialization). For example, `output({ result: "done", goto: undefined })` is equivalent to `output({ result: "done" })`.
+- If called with a non-object value (e.g., a plain string, number, or boolean), the value is serialized as `{ result: String(value) }`.
+- If called with `null` or `undefined`, an error is thrown.
 
-### 6.5 `input()` Function (JS/TS)
+### 6.6 `input()` Function (JS/TS)
 
 When imported from `loopx`, the `input()` function reads the input piped from the previous script via stdin:
 
@@ -314,11 +349,15 @@ output({ result: `processed: ${data}` });
 
 `input()` returns a `Promise<string>`. On the first iteration (when no input is available), it resolves to an empty string.
 
-### 6.6 Input Piping
+**The result is cached:** calling `input()` multiple times within the same script execution returns the same string each time.
 
-When a script's output includes `result` and the next script is determined by `goto`, the `result` value is delivered to the next script via **stdin** — the `result` string is written to the next script's stdin.
+### 6.7 Input Piping
 
-### 6.7 Initial Input
+When a script's output includes both `result` and `goto`, the `result` value is delivered to the next script via **stdin** — the `result` string is written to the next script's stdin.
+
+**`result` is only piped when `goto` is present.** When the loop resets to the starting target (no `goto` in the output), the starting target receives empty stdin, regardless of any `result` value in the previous output.
+
+### 6.8 Initial Input
 
 The first script invocation in a loop receives **no input**. Stdin is empty.
 
@@ -328,21 +367,24 @@ The first script invocation in a loop receives **no input**. Stdin is empty.
 
 ### 7.1 Basic Loop
 
-1. If running in script mode, validate the `.loopx/` directory (check for name collisions, reserved names, name restrictions). Cache the discovery results.
+1. Validate the `.loopx/` directory (check for name collisions, reserved names, name restrictions). Cache the discovery results.
 2. Load environment variables (global + local via `-e`). Cache the resolved set for the duration of the loop.
-3. Determine the starting script (named argument or `default`) or ad-hoc command.
-4. Execute the script/command with no input (first iteration).
-5. Capture stdout. Parse it as structured output per section 2.3.
-6. Increment the iteration counter.
-7. If `stop` is `true`: exit with code 0.
-8. If `-n` was specified and the iteration count has been reached: exit with code 0.
-9. If `goto` is present:
-   a. Validate that the named script exists in `.loopx/` (performing discovery first if not yet done, e.g., in ad-hoc mode). If not found, print an error and exit with code 1.
-   b. Execute the `goto` script with `result` piped via stdin (or empty stdin if `result` is absent).
-   c. Return to step 5 with the new script's output.
-10. If `goto` is absent:
-    a. Re-run the **starting script** (not the most recently executed script) with no input.
-    b. Return to step 5.
+3. Determine the starting target: named script or `default` script.
+4. If `-n 0` was specified: exit with code 0 (no iterations executed).
+5. Execute the starting target with no input (first iteration).
+6. Capture stdout. Parse it as structured output per section 2.3.
+7. Increment the iteration counter.
+8. If `stop` is `true`: exit with code 0.
+9. If `-n` was specified and the iteration count has been reached: exit with code 0. The output from this final iteration is still yielded/observed before termination.
+10. If `goto` is present:
+    a. Validate that the named script exists in the cached discovery results. If not found, print an error and exit with code 1.
+    b. Execute the `goto` script with `result` piped via stdin (or empty stdin if `result` is absent).
+    c. Return to step 6 with the new script's output.
+11. If `goto` is absent:
+    a. Re-run the **starting target** with no input.
+    b. Return to step 6.
+
+**Iteration counting:** `-n` / `maxIterations` counts **every target execution**, including goto hops — not just returns to the starting target. For example, if script A outputs `goto: "B"` and B outputs `goto: "C"`, that is three iterations (A, B, C).
 
 **The CLI does not print `result` to its own stdout at any point.** All human-readable output from scripts should go to stderr, which passes through to the terminal. Structured results are accessed via the programmatic API (section 9).
 
@@ -351,6 +393,15 @@ The first script invocation in a loop receives **no input**. Stdin is empty.
 - **Non-zero exit code from a script:** The loop **stops immediately**. loopx exits with code 1. The script's stderr has already been passed through to the terminal. Any stdout produced by the script before it failed is not parsed as structured output.
 - **Invalid `goto` target:** If `goto` references a script name that does not exist in `.loopx/`, loopx prints an error message to stderr and exits with code 1.
 - **Missing `.loopx/` directory:** When running a named or default script, if `.loopx/` does not exist, loopx exits with an error instructing the user to create it.
+
+### 7.3 Signal Handling
+
+loopx handles process signals to ensure clean shutdown:
+
+- **SIGINT / SIGTERM:** The signal is forwarded to the **active child process group** (not just the direct child). This ensures grandchild processes (e.g., agent CLIs spawned by scripts) also receive the signal, preventing orphaned processes.
+- **Grace period:** After forwarding the signal, loopx waits **5 seconds** for the child process group to exit. If the process group has not exited after 5 seconds, loopx sends SIGKILL to the process group.
+- **Exit code:** After the child exits, loopx exits with code `128 + signal number` (standard POSIX convention, e.g., 130 for SIGINT).
+- **Between iterations:** If no child process is running (e.g., between iterations), loopx exits immediately with the appropriate signal exit code.
 
 ---
 
@@ -361,10 +412,20 @@ The first script invocation in a loop receives **no input**. Stdin is empty.
 Global environment variables are stored in the loopx configuration directory at:
 
 ```
-~/.config/loopx/env
+$XDG_CONFIG_HOME/loopx/env
 ```
 
-The file uses standard `.env` format (`KEY=VALUE`, one per line, `#` comments, blank lines ignored).
+If `XDG_CONFIG_HOME` is not set, it defaults to `~/.config`, resulting in `~/.config/loopx/env`.
+
+The file uses `.env` format with the following rules:
+
+- One `KEY=VALUE` pair per line.
+- **No whitespace is permitted around `=`.** The key extends to the first `=`, and the value is everything after it to the end of the line (trimmed of trailing whitespace).
+- Lines starting with `#` are comments. **Inline comments are not supported** — a `#` after a value is part of the value.
+- Blank lines are ignored.
+- Duplicate keys: **last occurrence wins**.
+- Values are single-line strings. Values may be optionally wrapped in double quotes (`"`) or single quotes (`'`), which are stripped. **No escape sequence interpretation** — content inside quotes is treated literally (e.g., `"\n"` is a backslash followed by `n`, not a newline).
+- No multiline value support.
 
 If the directory or file does not exist, loopx treats it as having no global variables. The directory is created on first `loopx env set`.
 
@@ -372,23 +433,33 @@ If the directory or file does not exist, loopx treats it as having no global var
 
 ### 8.2 Local Override (`-e`)
 
-When `-e <path>` is specified, the file at `<path>` is read (standard `.env` format) and its variables are merged with global env vars. Local values take precedence on conflict.
+When `-e <path>` is specified, the file at `<path>` is read using the same `.env` format rules. If the file does not exist, loopx exits with an error.
+
+Local variables are merged with global env vars. Local values take precedence on conflict.
 
 ### 8.3 Injection
 
-All resolved environment variables (global + local overrides) are injected into the script's execution environment alongside the inherited system environment. loopx env vars take precedence over inherited system env vars of the same name.
+All resolved environment variables are injected into the script's execution environment alongside the inherited system environment, with the following precedence (highest wins):
 
-loopx also injects the following variables into every script execution:
+1. **loopx-injected variables** (`LOOPX_BIN`, `LOOPX_PROJECT_ROOT`) — always override any user-supplied values of the same name.
+2. **Local env file** (`-e`) values.
+3. **Global loopx env** (`$XDG_CONFIG_HOME/loopx/env`) values.
+4. **Inherited system environment.**
+
+loopx injects the following variables into every script execution:
 
 | Variable | Value |
 |----------|-------|
-| `LOOPX_BIN` | Absolute path to the loopx binary |
+| `LOOPX_BIN` | Resolved realpath of the effective loopx binary (post-delegation) |
+| `LOOPX_PROJECT_ROOT` | Absolute path to the directory where `loopx` was invoked |
+
+**Note:** For Node.js/tsx, module resolution for `import from "loopx"` is handled via `--import` and a custom resolve hook (see section 3.3), not via `NODE_PATH`. For Bun, `NODE_PATH` is set internally but is not considered a user-facing injected variable.
 
 ---
 
 ## 9. Programmatic API
 
-loopx can be imported and used from TypeScript/JavaScript:
+loopx can be imported and used from TypeScript/JavaScript. **This requires loopx to be installed as a local dependency** (`npm install loopx` or `npm install --save-dev loopx`).
 
 ### 9.1 `run(scriptName?: string)`
 
@@ -404,7 +475,7 @@ for await (const output of loop) {
 // loop has ended (stop: true or max iterations reached)
 ```
 
-Returns an `AsyncGenerator<Output>` that yields the `Output` from each loop iteration. The generator completes when the loop ends via `stop: true` or when `maxIterations` is reached.
+Returns an `AsyncGenerator<Output>` that yields the `Output` from each loop iteration. The generator completes when the loop ends via `stop: true` or when `maxIterations` is reached. **The output from the final iteration is always yielded before the generator completes.**
 
 Options can be passed as a second argument:
 
@@ -415,6 +486,8 @@ for await (const output of run("myscript", { maxIterations: 10, envFile: ".env" 
   // ...
 }
 ```
+
+**Early termination:** If the consumer breaks out of the `for await` loop or calls `generator.return()`, loopx terminates the active child process group (SIGTERM, then SIGKILL after 5 seconds) and cleans up.
 
 ### 9.2 `runPromise(scriptName?: string)`
 
@@ -437,7 +510,7 @@ The programmatic API has different behavior from the CLI:
 
 ### 9.4 `output(value)` and `input()`
 
-These functions are documented in sections 6.4 and 6.5. They are designed for use **inside scripts**, not in application code that calls `run()` / `runPromise()`.
+These functions are documented in sections 6.5 and 6.6. They are designed for use **inside scripts**, not in application code that calls `run()` / `runPromise()`.
 
 ### 9.5 Types
 
@@ -453,8 +526,14 @@ interface Output {
 interface RunOptions {
   maxIterations?: number;
   envFile?: string;
+  signal?: AbortSignal;
+  cwd?: string;
 }
 ```
+
+- When `signal` is provided and aborted, the active child process group is terminated and the generator/promise completes with an abort error.
+- `cwd` specifies the working directory for script resolution and execution. Defaults to `process.cwd()` at the time `run()` or `runPromise()` is called. The `.loopx/` directory is resolved relative to this path.
+- `maxIterations` counts every target execution, including goto hops. `maxIterations: 0` mirrors CLI `-n 0` behavior: validates and exits without executing any iterations.
 
 ---
 
@@ -464,13 +543,29 @@ interface RunOptions {
 loopx install <source>
 ```
 
-Installs a script into the `.loopx/` directory, creating it if necessary. The source format determines the install behavior:
+Installs a script into the `.loopx/` directory, creating it if necessary.
 
-### 10.1 Source Types
+### 10.1 Source Detection
 
-#### File URL
+Sources are classified using the following rules, applied in order:
 
-A URL pointing to a single file (e.g., `https://example.com/scripts/myscript.ts`).
+1. **`org/repo` shorthand:** A source matching the pattern `<org>/<repo>` (no protocol prefix, exactly one slash, no additional path segments) is expanded to `https://github.com/<org>/<repo>.git` and treated as a git source.
+2. **Known git hosts:** A URL whose hostname is `github.com`, `gitlab.com`, or `bitbucket.org` is treated as a git source, even without a `.git` suffix.
+3. **`.git` URL:** Any other URL ending in `.git` is treated as a git source.
+4. **Tarball URL:** A URL ending in `.tar.gz` or `.tgz` is downloaded and extracted as a directory script.
+5. **Single-file URL:** Any other URL is treated as a single file download.
+
+```
+loopx install myorg/my-agent-script
+# equivalent to: loopx install https://github.com/myorg/my-agent-script.git
+
+loopx install https://github.com/myorg/my-agent-script
+# also treated as git (github.com host detected)
+```
+
+### 10.2 Source Type Details
+
+#### Single-file URL
 
 - The filename is derived from the URL's last path segment, with query strings and fragments stripped.
 - The file must have a supported extension (`.sh`, `.js`, `.jsx`, `.ts`, `.tsx`); otherwise an error is displayed.
@@ -478,29 +573,18 @@ A URL pointing to a single file (e.g., `https://example.com/scripts/myscript.ts`
 
 #### Git URL
 
-A URL ending in `.git` or recognized as a git remote (e.g., `https://github.com/org/repo.git`).
-
 - The repository is cloned with `--depth 1` (shallow clone) into `.loopx/<repo-name>/`.
-- The script name is derived from the repository name (last path segment, minus `.git` suffix).
+- The script name is derived from the repository name (last path segment, minus `.git` suffix if present).
 - The cloned directory must contain a `package.json` with a `main` field pointing to a supported extension. If not, the clone is removed and an error is displayed.
 
 #### Tarball URL
 
-A URL pointing to a `.tar.gz` or `.tgz` archive.
+- The archive is downloaded and extracted.
+- **If extraction yields a single top-level directory**, that directory is treated as the package root and moved to `.loopx/<archive-name>/`. If extraction yields multiple top-level entries, the extracted contents are placed directly in `.loopx/<archive-name>/`.
+- `archive-name` is the URL's last path segment minus archive extensions (`.tar.gz`, `.tgz`).
+- The resulting directory must contain a `package.json` with a `main` field pointing to a supported extension. If not, the directory is removed and an error is displayed.
 
-- The archive is downloaded and extracted into `.loopx/<archive-name>/`, where `archive-name` is the filename minus archive extensions.
-- The extracted directory must contain a `package.json` with a `main` field pointing to a supported extension. If not, the directory is removed and an error is displayed.
-
-#### `org/repo` Shorthand
-
-A source matching the pattern `<org>/<repo>` (no protocol, no slashes beyond the single separator) is expanded to `https://github.com/<org>/<repo>.git` and installed as a git source.
-
-```
-loopx install myorg/my-agent-script
-# equivalent to: loopx install https://github.com/myorg/my-agent-script.git
-```
-
-### 10.2 Common Rules
+### 10.3 Common Rules
 
 All install sources share these rules:
 
@@ -518,7 +602,7 @@ All install sources share these rules:
 - Available options and subcommands
 - A dynamically generated list of scripts discovered in the current `.loopx/` directory (name and file type)
 
-If `.loopx/` does not exist, help is still displayed without the script list. If `.loopx/` exists but contains validation errors (name collisions, reserved names), help is still displayed with warnings about the invalid scripts.
+Help performs **non-fatal discovery and validation**: if `.loopx/` does not exist, help is displayed without the script list. If `.loopx/` exists but contains validation errors (name collisions, reserved names), help is displayed with warnings about the invalid scripts.
 
 ---
 
@@ -526,8 +610,9 @@ If `.loopx/` does not exist, help is still displayed without the script list. If
 
 | Code | Meaning |
 |------|---------|
-| 0 | Clean exit: loop ended via `stop: true`, `-n` limit reached, or successful subcommand execution. |
-| 1 | Error: script exited non-zero, validation failure, invalid `goto` target, missing script, or missing `.loopx/` directory. |
+| 0 | Clean exit: loop ended via `stop: true`, `-n` limit reached (including `-n 0`), or successful subcommand execution. |
+| 1 | Error: script exited non-zero, validation failure, invalid `goto` target, missing script, missing `.loopx/` directory, or usage error (invalid `-n` value, missing `-e` file). |
+| 128+N | Interrupted by signal N (e.g., 130 for SIGINT). |
 
 Note: A non-zero exit code from any script causes loopx to exit with code 1. Scripts that need error resilience should handle errors internally and exit 0.
 
@@ -542,4 +627,6 @@ Note: A non-zero exit code from any script causes loopx to exit with code 1. Scr
 | `install` | Script name | Reserved for `loopx install` subcommand |
 | `version` | Script name | Reserved for `loopx version` subcommand |
 | `default` | Script name | The script run when no name is provided |
-| `LOOPX_BIN` | Env variable | Absolute path to the loopx binary, injected into every script |
+| `LOOPX_BIN` | Env variable | Resolved realpath of the effective loopx binary (post-delegation) |
+| `LOOPX_PROJECT_ROOT` | Env variable | Absolute path to the directory where loopx was invoked |
+| `LOOPX_DELEGATED` | Env variable | Set to `1` during delegation to prevent recursion |
