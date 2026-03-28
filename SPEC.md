@@ -61,6 +61,8 @@ A loop is a repeated execution cycle modeled as a **state machine**. Each iterat
 
 The **starting target** is the original script specified when loopx was invoked — either a named script or the `default` script. The `goto` mechanism is a **state transition, not a permanent reassignment.** When a target finishes without its own `goto`, execution returns to the starting target. The loop always resets to its initial state after a transition chain completes.
 
+**Self-referencing goto:** A script may `goto` itself (e.g., script A outputs `{ goto: "A" }`). This is a normal transition and counts as an iteration.
+
 **Example:**
 ```
 Starting target: A (script)
@@ -90,8 +92,9 @@ interface Output {
 - Only a **top-level JSON object** can be treated as structured output. Arrays, primitives (strings, numbers, booleans), and `null` fall back to raw result treatment.
 - If stdout is a valid JSON object containing at least one known field (`result`, `goto`, `stop`), it is parsed as structured output.
 - If stdout is not valid JSON, is not an object, or is a valid JSON object but contains none of the known fields, the entire stdout content is treated as `{ result: <raw output> }`.
+- **Empty stdout** (0 bytes) is treated as `{ result: "" }`. This is the default case for scripts that produce no output, and causes the loop to reset (no `goto`, no `stop`).
 - Extra JSON fields beyond `result`, `goto`, and `stop` are silently ignored.
-- If `result` is present but not a string, it is coerced via `String(value)`.
+- If `result` is present but not a string, it is coerced via `String(value)`. This includes `null`: `{"result": null}` produces result `"null"`.
 - If `goto` is present but not a string, it is treated as absent.
 - `stop` must be exactly `true` (boolean). Any other value (including truthy strings like `"true"`, numbers, etc.) is treated as absent. This prevents surprises like `{"stop": "false"}` halting the loop.
 
@@ -168,6 +171,7 @@ loopx [options] [script-name]
 - If `script-name` is omitted, loopx looks for a script named `default` in `.loopx/`.
 - If no `default` script exists and no script name is given, loopx exits with an error message instructing the user to create a script (e.g., "No default script found. Create `.loopx/default.ts` or specify a script name.").
 - If `script-name` does not match any script in `.loopx/`, loopx exits with an error.
+- `loopx default` (explicitly naming the default script) is valid and runs the script named `default`, identical to `loopx` with no script name.
 
 ### 4.2 Options
 
@@ -176,6 +180,10 @@ loopx [options] [script-name]
 | `-n <count>` | Maximum number of loop iterations (see section 7.1 for counting semantics). Must be a non-negative integer; negative values or non-integers are usage errors. `-n 0` validates the starting target (script discovery, name resolution, env file loading) but executes zero iterations, then exits with code 0. |
 | `-e <path>` | Path to a local env file (`.env` format). The file must exist; a missing file is an error. Variables are merged with global env vars; local values take precedence on conflict. |
 | `-h`, `--help` | Print usage information. Dynamically lists available scripts discovered in `.loopx/`. Performs non-fatal discovery and validation — if `.loopx/` is missing or contains invalid scripts, help is still displayed with warnings appended. |
+
+**Flag precedence:** A top-level `-h` / `--help` takes precedence over other top-level arguments and flags, and exits 0 without running scripts or subcommands.
+
+**Duplicate flags:** Repeating `-n` or `-e` (e.g., `-n 5 -n 10` or `-e .env1 -e .env2`) is a usage error. loopx exits with code 1.
 
 ### 4.3 Subcommands
 
@@ -206,7 +214,9 @@ exit 0
 
 Sets a global environment variable stored in the loopx global config directory.
 
-**Validation:** The variable name must match `[A-Za-z_][A-Za-z0-9_]*`.
+**Validation:** The variable name must match `[A-Za-z_][A-Za-z0-9_]*`. Values containing `\n` or `\r` are rejected, since multiline values are not supported by the env file format.
+
+**Serialization:** `loopx env set` writes the value as `KEY="<literal value>"` followed by a newline. No escape sequences are applied — the value is written literally within double quotes. This ensures reliable round-tripping for values containing spaces, `#`, `=`, quotes, and trailing spaces.
 
 #### `loopx env remove <name>`
 
@@ -236,7 +246,7 @@ Creates the `.loopx/` directory if it does not exist.
 Scripts are discovered by scanning the `.loopx/` directory in the current working directory. The `.loopx/` directory is only searched in the current working directory — ancestor directories are not searched.
 
 - **File scripts:** Top-level files with supported extensions (`.sh`, `.js`, `.jsx`, `.ts`, `.tsx`). The script name is the base name (filename without extension).
-- **Directory scripts:** Top-level directories containing a `package.json` with a `main` field pointing to a file with a supported extension. The script name is the directory name. The `main` field must point to a file **within the script's own directory** — paths containing `../` or otherwise escaping the directory are rejected. If `main` points to a file without a supported extension or escapes the directory, the directory is ignored and a warning is printed to stderr.
+- **Directory scripts:** Top-level directories containing a `package.json` with a `main` field pointing to a file with a supported extension. The script name is the directory name. The `main` field must point to a file **within the script's own directory** — paths containing `../` or otherwise escaping the directory are rejected. A directory is ignored and a warning is printed to stderr if any of the following are true: `package.json` is unreadable or invalid JSON; `main` is missing or not a string; `main` points to a file without a supported extension; `main` escapes the directory; or `main` points to a file that does not exist.
 
 Nested directories that do not contain a valid `package.json` with `main` are ignored.
 
@@ -269,6 +279,8 @@ If any script in `.loopx/` uses a reserved name, loopx refuses to start and disp
 
 - Script names must not begin with `-`.
 - Script names must match the pattern `[a-zA-Z0-9_][a-zA-Z0-9_-]*` (start with alphanumeric or underscore, followed by alphanumerics, underscores, or hyphens).
+
+If any script in `.loopx/` violates these restrictions, the behavior depends on the command: in run mode, loopx refuses to start and displays an error message. In help mode, the invalid script is listed with a non-fatal warning.
 
 ### 5.5 Validation Scope
 
@@ -332,7 +344,7 @@ output({ result: "hello", goto: "next-step" });
 - Since `output()` calls `process.exit()`, calling it multiple times is not possible — only the first call takes effect.
 - The argument must be an object containing at least one known field (`result`, `goto`, or `stop`) with a defined value. Calling `output({})` (no known fields) throws an error.
 - Properties whose value is `undefined` are treated as absent (they are omitted during JSON serialization). For example, `output({ result: "done", goto: undefined })` is equivalent to `output({ result: "done" })`.
-- If called with a non-object value (e.g., a plain string, number, or boolean), the value is serialized as `{ result: String(value) }`.
+- If called with a non-object value (e.g., a plain string, number, or boolean), the value is serialized as `{ result: String(value) }`. Arrays are **not** treated as non-object values (since `typeof [] === 'object'`); an array must contain at least one known field with a defined value, just like any other object — so `output([1,2,3])` throws an error (no known fields).
 - If called with `null` or `undefined`, an error is thrown.
 
 ### 6.6 `input()` Function (JS/TS)
@@ -426,8 +438,11 @@ The file uses `.env` format with the following rules:
 - Duplicate keys: **last occurrence wins**.
 - Values are single-line strings. Values may be optionally wrapped in double quotes (`"`) or single quotes (`'`), which are stripped. **No escape sequence interpretation** — content inside quotes is treated literally (e.g., `"\n"` is a backslash followed by `n`, not a newline).
 - No multiline value support.
+- **Key validation:** Only keys matching `[A-Za-z_][A-Za-z0-9_]*` are recognized from env files (both global and local). Non-blank, non-comment lines that do not contain a valid key (e.g., lines without `=`, lines with invalid key names like `1BAD=val` or `KEY WITH SPACES=val`) are ignored with a warning to stderr.
 
 If the directory or file does not exist, loopx treats it as having no global variables. The directory is created on first `loopx env set`.
+
+**Concurrent mutation:** Concurrent writes to the same global env file (e.g., multiple simultaneous `loopx env set` calls) are not guaranteed to be atomic in v1. The result is undefined.
 
 **Environment variables are loaded once at loop start and cached for the duration of the loop.** Changes to env files during loop execution are not picked up until the next invocation.
 
@@ -533,7 +548,8 @@ interface RunOptions {
 
 - When `signal` is provided and aborted, the active child process group is terminated and the generator/promise completes with an abort error.
 - `cwd` specifies the working directory for script resolution and execution. Defaults to `process.cwd()` at the time `run()` or `runPromise()` is called. The `.loopx/` directory is resolved relative to this path.
-- `maxIterations` counts every target execution, including goto hops. `maxIterations: 0` mirrors CLI `-n 0` behavior: validates and exits without executing any iterations.
+- `maxIterations` counts every target execution, including goto hops. `maxIterations: 0` mirrors CLI `-n 0` behavior: validates and exits without executing any iterations. `maxIterations` must be a non-negative integer; invalid values (negative, non-integer, NaN) cause `run()` to throw and `runPromise()` to reject before execution begins.
+- Relative `envFile` paths are resolved against `cwd` if provided, otherwise against `process.cwd()` at call time.
 
 ---
 
@@ -550,7 +566,7 @@ Installs a script into the `.loopx/` directory, creating it if necessary.
 Sources are classified using the following rules, applied in order:
 
 1. **`org/repo` shorthand:** A source matching the pattern `<org>/<repo>` (no protocol prefix, exactly one slash, no additional path segments) is expanded to `https://github.com/<org>/<repo>.git` and treated as a git source.
-2. **Known git hosts:** A URL whose hostname is `github.com`, `gitlab.com`, or `bitbucket.org` is treated as a git source, even without a `.git` suffix.
+2. **Known git hosts:** A URL whose hostname is `github.com`, `gitlab.com`, or `bitbucket.org` is treated as a git source **only when the pathname is exactly `/<owner>/<repo>` or `/<owner>/<repo>.git`**, optionally with a trailing slash. Other URLs on these hosts (e.g., tarball download URLs, raw file URLs, paths with additional segments like `/org/repo/tree/main`) continue through the remaining source-detection rules.
 3. **`.git` URL:** Any other URL ending in `.git` is treated as a git source.
 4. **Tarball URL:** A URL ending in `.tar.gz` or `.tgz` is downloaded and extracted as a directory script.
 5. **Single-file URL:** Any other URL is treated as a single file download.
@@ -581,7 +597,7 @@ loopx install https://github.com/myorg/my-agent-script
 
 - The archive is downloaded and extracted.
 - **If extraction yields a single top-level directory**, that directory is treated as the package root and moved to `.loopx/<archive-name>/`. If extraction yields multiple top-level entries, the extracted contents are placed directly in `.loopx/<archive-name>/`.
-- `archive-name` is the URL's last path segment minus archive extensions (`.tar.gz`, `.tgz`).
+- `archive-name` is the URL's last path segment minus archive extensions (`.tar.gz`, `.tgz`), with query strings and fragments stripped (same as single-file URLs).
 - The resulting directory must contain a `package.json` with a `main` field pointing to a supported extension. If not, the directory is removed and an error is displayed.
 
 ### 10.3 Common Rules
@@ -591,6 +607,7 @@ All install sources share these rules:
 - If a script with the same **name** (regardless of whether it's a file or directory script) already exists in `.loopx/`, loopx displays an error and does not overwrite. The user must manually remove the existing script first.
 - The script name is validated against reserved name and name restriction rules before being saved.
 - **loopx does not run `npm install` or `bun install` after cloning/extracting.** For directory scripts with dependencies, the user must install them manually (e.g., `cd .loopx/my-script && npm install`).
+- **Install failure cleanup:** Any install failure (download error, HTTP non-2xx, git clone failure, extraction failure, post-download validation failure) exits with code 1. Any partially created target file or directory at the destination path is removed before exit.
 
 ---
 

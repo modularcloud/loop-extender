@@ -24,7 +24,7 @@ else
 fi
 
 cat <<PROMPT | pbcopy
-Review SPEC.md and TEST-SPEC.md holistically and let me know if I can start implementing the tests or if I need to modify the test spec. My goal is to be able to comprehensively tests all requirements in the signing spec prior to implementation.
+Review SPEC.md and TEST-SPEC.md holistically and let me know if I can start implementing the tests or if I need to modify the test spec. My goal is to be able to comprehensively tests all requirements in the signing spec prior to implementation. Additionally, f there are any known problems in the spec that need to be resolved, they will be included in SPEC-PROBLEMS.md.
 
 SPEC.md:
 $(cat "$SPEC")
