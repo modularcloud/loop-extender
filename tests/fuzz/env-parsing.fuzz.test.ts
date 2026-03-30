@@ -321,6 +321,41 @@ describe("FUZZ: Env File Parsing", () => {
         { numRuns: 1000 },
       );
     });
+
+    it("e2e: loading same env file twice via CLI yields identical values (50 inputs)", async () => {
+      // Use simple alphanumeric keys/values to avoid shell quoting issues
+      const safeAlphanumeric = fc.string({
+        unit: fc.constantFrom(
+          ..."abcdefghijklmnopqrstuvwxyz0123456789".split(""),
+        ),
+        minLength: 1,
+        maxLength: 20,
+      });
+
+      const envWithKnownVar = fc
+        .tuple(arbitraryEnvKey, safeAlphanumeric)
+        .map(([key, value]) => ({
+          content: `${key}=${value}`,
+          key,
+        }));
+
+      await fc.assert(
+        fc.asyncProperty(envWithKnownVar, async ({ content, key }) => {
+          const { value: value1, exitCode: exit1 } = await runE2EEnvTest(
+            content,
+            key,
+          );
+          const { value: value2, exitCode: exit2 } = await runE2EEnvTest(
+            content,
+            key,
+          );
+          if (exit1 === 0 && exit2 === 0) {
+            expect(value1).toEqual(value2);
+          }
+        }),
+        { numRuns: 50 },
+      );
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -379,6 +414,34 @@ describe("FUZZ: Env File Parsing", () => {
         { numRuns: 1000 },
       );
     });
+
+    it("e2e: env variables observed via CLI are strings (50 inputs)", async () => {
+      // Use simple alphanumeric keys/values to avoid shell quoting issues
+      const safeAlphanumeric = fc.string({
+        unit: fc.constantFrom(
+          ..."abcdefghijklmnopqrstuvwxyz0123456789".split(""),
+        ),
+        minLength: 1,
+        maxLength: 20,
+      });
+
+      const envWithKnownVar = fc
+        .tuple(arbitraryEnvKey, safeAlphanumeric)
+        .map(([key, value]) => ({
+          content: `${key}=${value}`,
+          key,
+        }));
+
+      await fc.assert(
+        fc.asyncProperty(envWithKnownVar, async ({ content, key }) => {
+          const { found, value, exitCode } = await runE2EEnvTest(content, key);
+          if (exitCode === 0 && found) {
+            expect(typeof value).toBe("string");
+          }
+        }),
+        { numRuns: 50 },
+      );
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -410,11 +473,12 @@ describe("FUZZ: Env File Parsing", () => {
       fc.assert(
         fc.property(envWithDuplicates, ({ content, key, lastValue }) => {
           const result = parseEnvFile(content);
-          if (key in result.vars) {
-            // The value for the duplicate key must be the last occurrence's value.
-            // Note: the value may have trailing whitespace trimmed per spec.
-            expect(result.vars[key]).toBe(lastValue);
-          }
+          // The key is a valid KEY=VALUE line that appears at least twice,
+          // so the parser must have it — not checking would be vacuous.
+          expect(result.vars).toHaveProperty(key);
+          // The value for the duplicate key must be the last occurrence's value.
+          // Note: the value may have trailing whitespace trimmed per spec.
+          expect(result.vars[key]).toBe(lastValue);
         }),
         { numRuns: 1000 },
       );

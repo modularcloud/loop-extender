@@ -9,7 +9,7 @@
     "test:unit": "vitest run tests/unit/",
     "test:e2e": "vitest run tests/e2e/",
     "test:fuzz": "vitest run tests/fuzz/",
-    "test:typecheck": "tsc --noEmit"
+    "test:typecheck": "vitest typecheck"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",

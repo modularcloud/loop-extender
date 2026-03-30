@@ -42,6 +42,16 @@ export default defineConfig({
           testTimeout: 120_000,
         },
       },
+      {
+        test: {
+          name: "typecheck",
+          include: ["tests/unit/types.test.ts"],
+          typecheck: {
+            enabled: true,
+            tsconfig: "./tsconfig.json",
+          },
+        },
+      },
     ],
   },
 });

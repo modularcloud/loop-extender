@@ -109,10 +109,13 @@ describe("SPEC: Exit Codes", () => {
         expect(result.exitCode).toBe(1);
       });
 
-      it("T-EXIT-06: validation failure (missing .loopx/) -> exit 1", async () => {
-        project = await createTempProject({ withLoopxDir: false });
+      it("T-EXIT-06: validation failure (name collision) -> exit 1", async () => {
+        project = await createTempProject();
+        // Create two scripts with the same base name but different extensions
+        await createScript(project, "example", ".sh", emitResult("from-sh"));
+        await createScript(project, "example", ".ts", emitResult("from-ts"));
 
-        const result = await runCLI(["myscript"], {
+        const result = await runCLI(["example"], {
           cwd: project.dir,
           runtime,
         });

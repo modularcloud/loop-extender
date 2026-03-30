@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, writeFile, mkdir, symlink, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdtemp, writeFile, mkdir, symlink, rm, access } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 export interface APIDriverResult {
@@ -41,17 +41,34 @@ export async function runAPIDriver(
       "utf-8"
     );
 
-    // Create node_modules/loopx symlink pointing to the actual loopx package
+    // Create node_modules/loopx symlink pointing to the actual loopx package.
+    // Since this IS the loopx project, we try several resolution strategies:
+    //   1. A build output directory (e.g. dist/) if it exists
+    //   2. The project root itself (process.cwd()), which should contain package.json with exports
+    //   3. A node_modules/loopx path as a last resort (e.g. when consumed as a dependency)
     const nodeModulesDir = join(consumerDir, "node_modules");
     await mkdir(nodeModulesDir, { recursive: true });
 
-    // The loopx package is expected to be installed as a dependency
-    // or available at a known path. For now, symlink to wherever it is.
-    const loopxPackagePath = join(process.cwd(), "node_modules", "loopx");
-    try {
-      await symlink(loopxPackagePath, join(nodeModulesDir, "loopx"), "dir");
-    } catch {
-      // If loopx is not installed yet, the driver will fail at import time
+    const candidates = [
+      resolve(process.cwd(), "dist"),
+      resolve(process.cwd()),
+      join(process.cwd(), "node_modules", "loopx"),
+    ];
+
+    let linked = false;
+    for (const candidate of candidates) {
+      try {
+        await access(join(candidate, "package.json"));
+        await symlink(candidate, join(nodeModulesDir, "loopx"), "dir");
+        linked = true;
+        break;
+      } catch {
+        // candidate doesn't have a package.json or symlink failed, try next
+      }
+    }
+
+    if (!linked) {
+      // If nothing worked, the driver will fail at import time
       // which is the expected behavior for pre-implementation testing
     }
 

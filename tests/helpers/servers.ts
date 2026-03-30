@@ -138,7 +138,10 @@ export async function withGitURLRewrite(
   await writeFile(gitConfigPath, config, "utf-8");
 
   const originalGitConfig = process.env.GIT_CONFIG_GLOBAL;
+  const originalHome = process.env.HOME;
   process.env.GIT_CONFIG_GLOBAL = gitConfigPath;
+  // Isolate HOME so that user-level git config (~/.gitconfig) cannot interfere
+  process.env.HOME = tempDir;
 
   try {
     await fn();
@@ -147,6 +150,11 @@ export async function withGitURLRewrite(
       delete process.env.GIT_CONFIG_GLOBAL;
     } else {
       process.env.GIT_CONFIG_GLOBAL = originalGitConfig;
+    }
+    if (originalHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
     }
     await rm(tempDir, { recursive: true, force: true });
   }

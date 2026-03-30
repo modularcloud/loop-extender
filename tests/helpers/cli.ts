@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 export interface CLIResult {
@@ -18,16 +19,24 @@ export interface CLIOptions {
 
 /**
  * Resolve the path to the loopx binary entry point.
- * This assumes the loopx package will have a bin.js at its root.
- * For now, we use a placeholder path that will be configured when
- * the loopx implementation exists.
+ * Reads the loopx package.json bin field to find the actual JS file,
+ * avoiding the shell shim at node_modules/.bin/loopx which cannot
+ * be spawned via `node`.
  */
 function getLoopxBinPath(): string {
-  // The loopx binary is expected to be at the root of the loopx package.
-  // When the implementation exists, this will point to the actual bin.js.
-  // For testing the harness itself, tests that need the CLI will need
-  // the implementation to exist first.
-  return resolve(process.cwd(), "node_modules/.bin/loopx");
+  // Try to resolve the actual JS entry point from the loopx package
+  try {
+    const pkgPath = resolve(process.cwd(), "node_modules/loopx/package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+    const bin = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.loopx;
+    if (bin) {
+      return resolve(process.cwd(), "node_modules/loopx", bin);
+    }
+  } catch {
+    // loopx not installed yet
+  }
+  // Fallback: assume bin.js at package root
+  return resolve(process.cwd(), "node_modules/loopx/bin.js");
 }
 
 export async function runCLI(
@@ -99,11 +108,6 @@ export async function runCLI(
   });
 }
 
-export interface SignalCLIResult extends CLIResult {
-  sendSignal(signal: NodeJS.Signals): void;
-  waitForStderr(pattern: string | RegExp): Promise<void>;
-}
-
 export function runCLIWithSignal(
   args: string[],
   options: CLIOptions = {}
@@ -133,7 +137,8 @@ export function runCLIWithSignal(
 
   let stdout = "";
   let stderr = "";
-  const stderrListeners: Array<{ pattern: string | RegExp; resolve: () => void }> = [];
+  let childExited = false;
+  const stderrListeners: Array<{ pattern: string | RegExp; resolve: () => void; reject: (err: Error) => void }> = [];
 
   child.stdout.on("data", (chunk: Buffer) => {
     stdout += chunk.toString();
@@ -169,6 +174,16 @@ export function runCLIWithSignal(
   const result = new Promise<CLIResult>((resolvePromise, reject) => {
     child.on("close", (code, signal) => {
       clearTimeout(timer);
+      childExited = true;
+      // Reject any pending stderr listeners — the pattern will never match
+      for (const listener of stderrListeners) {
+        listener.reject(
+          new Error(
+            `Child exited (code=${code}, signal=${signal}) before stderr matched pattern: ${listener.pattern}`
+          )
+        );
+      }
+      stderrListeners.length = 0;
       resolvePromise({
         exitCode: code ?? 1,
         stdout,
@@ -197,8 +212,16 @@ export function runCLIWithSignal(
       return Promise.resolve();
     }
 
-    return new Promise<void>((resolve) => {
-      stderrListeners.push({ pattern, resolve });
+    if (childExited) {
+      return Promise.reject(
+        new Error(
+          `Child already exited before stderr matched pattern: ${pattern}`
+        )
+      );
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      stderrListeners.push({ pattern, resolve, reject });
     });
   }
 

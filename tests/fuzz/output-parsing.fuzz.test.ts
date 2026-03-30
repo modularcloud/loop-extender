@@ -314,6 +314,17 @@ describe("FUZZ: Structured Output Parsing", () => {
         { numRuns: 1000 },
       );
     });
+
+    it("e2e: same input via child process twice yields identical outputs (50 inputs)", async () => {
+      await fc.assert(
+        fc.asyncProperty(arbitraryString, async (input) => {
+          const { output: output1 } = await runE2EParseTest(input);
+          const { output: output2 } = await runE2EParseTest(input);
+          expect(output1).toEqual(output2);
+        }),
+        { numRuns: 50 },
+      );
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -382,6 +393,31 @@ describe("FUZZ: Structured Output Parsing", () => {
           }
         }),
         { numRuns: 1000 },
+      );
+    });
+
+    it("e2e: output fields have correct types via child process (50 inputs)", async () => {
+      await fc.assert(
+        fc.asyncProperty(arbitraryOutputObject, async (obj) => {
+          const payload = JSON.stringify(obj);
+          const { output } = await runE2EParseTest(payload);
+
+          // result, if present, must be a string
+          if ("result" in output && output.result !== undefined) {
+            expect(typeof output.result).toBe("string");
+          }
+
+          // goto, if present, must be a string
+          if ("goto" in output && output.goto !== undefined) {
+            expect(typeof output.goto).toBe("string");
+          }
+
+          // stop, if present, must be exactly true
+          if ("stop" in output && output.stop !== undefined) {
+            expect(output.stop).toBe(true);
+          }
+        }),
+        { numRuns: 50 },
       );
     });
   });

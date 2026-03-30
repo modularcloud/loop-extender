@@ -231,10 +231,11 @@ describe("SPEC: Global Env File", () => {
 import { run } from "loopx";
 
 try {
-  await run("default", {
+  const gen = run("default", {
     maxIterations: 1,
     cwd: ${JSON.stringify(project.dir)},
   });
+  const result = await gen.next();
   process.stdout.write("NO_ERROR");
 } catch (err) {
   process.stdout.write("THREW:" + (err as Error).message);
@@ -318,7 +319,7 @@ describe("SPEC: Env File Parsing", () => {
     rawEnvContent: string,
     varname: string,
     runtime: "node" | "bun" = "node",
-  ): Promise<{ present: boolean; value?: string }> {
+  ): Promise<{ present: boolean; value?: string; stderr: string }> {
     const { mkdtemp, mkdir: mkdirAsync, rm } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
 
@@ -349,7 +350,8 @@ describe("SPEC: Env File Parsing", () => {
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
-      return JSON.parse(readFileSync(markerPath, "utf-8"));
+      const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+      return { ...observed, stderr: result.stderr };
     } finally {
       await localProject.cleanup();
       if (originalXdg === undefined) {
@@ -441,6 +443,7 @@ describe("SPEC: Env File Parsing", () => {
       const result = await parseEnvAndObserve(content, "GOOD_KEY", runtime);
       expect(result.present).toBe(true);
       expect(result.value).toBe("present");
+      expect(result.stderr).toMatch(/warning|invalid|ignored|malformed/i);
     });
 
     // T-ENV-15a: Empty value KEY=
@@ -466,6 +469,7 @@ describe("SPEC: Env File Parsing", () => {
       const result = await parseEnvAndObserve(content, "VALID_KEY", runtime);
       expect(result.present).toBe(true);
       expect(result.value).toBe("ok");
+      expect(result.stderr).toMatch(/warning|invalid|ignored|malformed/i);
 
       // Also verify 1BAD is not set
       const badResult = await parseEnvAndObserve(content, "1BAD", runtime);
@@ -478,6 +482,7 @@ describe("SPEC: Env File Parsing", () => {
       const result = await parseEnvAndObserve(content, "OK_VAR", runtime);
       expect(result.present).toBe(true);
       expect(result.value).toBe("works");
+      expect(result.stderr).toMatch(/warning|invalid|ignored|malformed/i);
     });
 
     // T-ENV-15e: Unmatched quotes (literal, not stripped)
