@@ -504,7 +504,11 @@ for await (const output of run("myscript", { maxIterations: 10, envFile: ".env" 
 }
 ```
 
-**Early termination:** If the consumer breaks out of the `for await` loop, calls `generator.return()`, or aborts the `signal`, loopx terminates the active child process group (if one is running — SIGTERM, then SIGKILL after 5 seconds) and ensures no further iterations start. If no child process is active at the time of cancellation (e.g., `break` after a yield, between iterations), the generator simply completes with no further yields.
+**Early termination:** There are two cancellation mechanisms with different semantics:
+
+- **Consumer-driven (`break`, `generator.return()`):** loopx terminates the active child process group (if one is running — SIGTERM, then SIGKILL after 5 seconds) and ensures no further iterations start. If no child process is active at the time of cancellation (e.g., `break` after a yield, between iterations), the generator simply completes with no further yields. This is a silent, clean completion.
+
+- **AbortSignal:** When the `signal` is aborted, loopx terminates the active child process group (if one is running — SIGTERM, then SIGKILL after 5 seconds) and the generator **throws an abort error**. This applies regardless of whether a child process is active — aborting the signal always produces an error, even if it occurs between iterations or before the first `next()` call. This follows conventional JavaScript `AbortSignal` semantics.
 
 ### 9.2 `runPromise(scriptName?: string)`
 

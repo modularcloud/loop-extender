@@ -25,13 +25,13 @@
 
 ### 1.3 Coverage Scope
 
-This suite is the **implementation-driving** test suite — it defines the behavior that must pass before a feature is considered complete. Not all SPEC.md requirements are covered by automated tests in this suite:
+This suite is the **implementation-driving** test suite — it defines the behavior that must pass before a feature is considered complete. All SPEC.md requirements are covered by automated tests in this suite, including:
 
-- **Spec 3.1 (Global Install):** The global install workflow (`npm install -g loopx` → `loopx` available on `PATH`) is a **release-gate requirement**, not part of the regular automated suite. The E2E tests exercise the built binary directly, which covers all runtime behavior. A true global-install smoke test (`npm pack` → install into isolated global prefix → run against fixture project) should be run as part of the release process, not on every CI run.
+- **Spec 3.1 (Global Install):** Covered by T-INST-GLOBAL-01, which exercises the full `npm pack` → install into isolated global prefix → run against fixture project workflow. This runs in CI on every build.
 
-- **Spec 7.3 (Signal Handling — between iterations):** The between-iterations signal case (signal arrives when no child process is running) is inherently timing-sensitive and difficult to test reliably in a black-box E2E harness. Coverage for this clause is **partial**: T-SIG-07a provides a supplementary unit-level test if the implementation exposes a testable code path, but is otherwise skipped. The active-child signal cases (T-SIG-01–06) are fully covered.
+- **Spec 7.3 (Signal Handling — between iterations):** Covered by T-SIG-07, which sends a signal between iterations by coordinating via marker files. Tagged `@flaky-retry(3)` due to inherent timing sensitivity. The active-child signal cases (T-SIG-01–06) are fully covered without retry.
 
-- **Spec 9.1 (Async Generator Cancellation):** Two cancellation scenarios are tested: "break after yield" (T-API-06), which verifies no further iterations start, and "return during pending next" (T-API-09a), which verifies active child process termination. Both are fully specified.
+- **Spec 9.1 (Async Generator Cancellation):** Multiple cancellation scenarios are tested: "break after yield" (T-API-06), "return during pending next" (T-API-09a), "abort signal during active child" (T-API-10a), "pre-aborted signal" (T-API-10b), and "abort between iterations" (T-API-10c).
 
 ---
 
@@ -238,19 +238,25 @@ A catalog of reusable fixture scripts used across tests. Each is a function that
 | `exit-code(n)` | bash | `exit <n>` |
 | `cat-stdin()` | bash | Reads stdin, echoes it as result |
 | `write-stderr(msg)` | bash | `echo '<msg>' >&2` then produces output |
-| `sleep-then-exit(seconds)` | bash | Sleeps, then exits. For signal tests. |
-| `write-env-to-file(varname, markerPath)` | bash | Writes `$VARNAME` to a marker file. Observation via filesystem, not CLI stdout. |
+| `sleep-then-exit(seconds)` | bash | Sleeps for `<seconds>`, then exits 0. General-purpose long-running script. For signal tests, prefer the dedicated `signal-*` fixtures which follow the ready-protocol. |
+| `write-env-to-file(varname, markerPath)` | bash | `printf '%s' "$VARNAME"` to a marker file. Uses `printf '%s'` (not `echo`) to avoid trailing newline and backslash interpretation. Observation via filesystem, not CLI stdout. |
 | `observe-env(varname, markerPath)` | ts | Writes JSON `{ "present": true, "value": "..." }` or `{ "present": false }` to a marker file using `fs.writeFileSync`. Distinguishes unset from empty string. Use instead of `write-env-to-file` when the test must differentiate between a variable being absent vs set to `""`. |
-| `write-cwd-to-file(markerPath)` | bash | Writes `$PWD` to a marker file. |
-| `write-value-to-file(value, markerPath)` | bash | Writes a literal value to a marker file. General-purpose observation helper. |
+| `write-cwd-to-file(markerPath)` | bash | `printf '%s' "$PWD"` to a marker file. Uses `printf '%s'` (not `echo`) for exact-byte safety. |
+| `write-value-to-file(value, markerPath)` | bash | `printf '%s' '<value>'` to a marker file. Uses `printf '%s'` (not `echo`) for exact-byte safety — avoids trailing newlines, backslash interpretation, and issues with values starting with `-`. General-purpose observation helper. |
 | `stdout-writer(payloadFile)` | ts | Reads `payloadFile` from disk and writes its contents to stdout via `process.stdout.write()`. Used for fuzz and exact-byte output tests. |
 | `ts-output(fields)` | ts | Uses `import { output } from "loopx"` to emit structured output |
 | `ts-input-echo()` | ts | Reads input(), outputs it as result |
 | `ts-import-check()` | ts | Imports from "loopx", outputs success marker |
-| `spawn-grandchild()` | bash | Spawns a background subprocess, then waits. For process group signal tests. |
+| `signal-ready-then-sleep(markerPath)` | bash | Writes `$$` (the script's PID) to a marker file using `printf '%s'`, then writes `"ready"` to stderr, then sleeps indefinitely. The stderr marker allows the test harness to `waitForStderr("ready")` before sending a signal, ensuring the child is alive. |
+| `signal-trap-exit(markerPath, delay)` | bash | Traps SIGTERM with a handler that sleeps for `<delay>` seconds then exits 0. On startup, writes `$$` to a marker file using `printf '%s'` and writes `"ready"` to stderr. Used for grace-period tests — delay < 5s tests clean exit, delay > 5s tests SIGKILL escalation. |
+| `signal-trap-ignore(markerPath)` | bash | Traps SIGTERM and ignores it (handler is a no-op). On startup, writes `$$` to a marker file using `printf '%s'` and writes `"ready"` to stderr, then sleeps indefinitely. Used for SIGKILL-after-grace-period tests (T-SIG-05). |
+| `spawn-grandchild(markerPath)` | bash | Spawns a background subprocess (e.g., `sleep 3600 &`), writes both `$$` (script PID) and `$!` (grandchild PID) to a marker file (one per line) using `printf '%s\n'`, writes `"ready"` to stderr, then `wait`s. For process group signal tests (T-SIG-06). |
+| `write-pid-to-file(markerPath)` | ts | Writes `process.pid` to a marker file using `fs.writeFileSync`, writes `"ready"` to stderr, then runs a long-running operation (e.g., `setTimeout(() => {}, 999999)`). Used for API cancellation tests (T-API-09a, T-API-10a) where a JS/TS script is needed. |
 | `counter(file)` | bash | Appends "1" to a counter file each invocation, outputs count as result |
 
-**Fixture naming note:** The `emit-*` fixtures replace the previous `echo-*` fixtures. `printf` is used instead of `echo` to provide exact byte control — `echo` appends a trailing newline which can mangle exact byte expectations in parser tests. For tests that specifically need to verify trailing-newline handling, use `emit-raw-ln`. The `write-*-to-file` fixtures observe values via the filesystem rather than CLI stdout, since the CLI never prints `result` to its own stdout (Spec 7.1). The `observe-env` fixture is a TS-based alternative to `write-env-to-file` that writes structured JSON (`{ "present": boolean, "value"?: string }`) to a marker file using `fs.writeFileSync` for exact-byte safety. Use `observe-env` when a test must distinguish between a variable being unset vs set to an empty string — `write-env-to-file` (bash `echo $VAR`) produces identical output for both cases.
+**Fixture naming note:** The `emit-*` fixtures replace the previous `echo-*` fixtures. `printf` is used instead of `echo` to provide exact byte control — `echo` appends a trailing newline which can mangle exact byte expectations in parser tests. For tests that specifically need to verify trailing-newline handling, use `emit-raw-ln`. The `write-*-to-file` fixtures observe values via the filesystem rather than CLI stdout, since the CLI never prints `result` to its own stdout (Spec 7.1). All bash `write-*-to-file` fixtures use `printf '%s'` (not `echo`) to write values, ensuring exact-byte safety for trailing spaces, backslashes, and values starting with `-`. The `observe-env` fixture is a TS-based alternative to `write-env-to-file` that writes structured JSON (`{ "present": boolean, "value"?: string }`) to a marker file using `fs.writeFileSync` for exact-byte safety. Use `observe-env` when a test must distinguish between a variable being unset vs set to an empty string — `write-env-to-file` (bash `printf '%s' "$VAR"`) produces identical output for both cases.
+
+**Signal/cancellation fixtures:** The `signal-ready-then-sleep`, `signal-trap-exit`, `signal-trap-ignore`, `spawn-grandchild`, and `write-pid-to-file` fixtures are purpose-built for signal and cancellation tests. They all follow a common protocol: (1) write PID(s) to a marker file on startup, (2) write `"ready"` to stderr, (3) block. The stderr marker allows `waitForStderr("ready")` to synchronize the test harness before sending signals, preventing races. The marker file PIDs allow post-test verification that processes were actually killed.
 
 **Bash JSON safety warning:** The `emit-result`, `emit-goto`, and `emit-result-goto` fixtures use `printf` with `%s` substitution to produce JSON. This is only safe for simple string values that do not contain double quotes (`"`), backslashes (`\`), newlines, or other JSON-special characters — these would produce malformed JSON. For tests that require exact-byte control, JSON-special characters in values, or arbitrary binary content, use the `stdout-writer` TS fixture (which reads a pre-written payload from disk) or `emit-raw`/`emit-raw-ln` (which output exact bytes without JSON framing).
 
@@ -595,8 +601,8 @@ These tests verify the actual bytes written to the env file, not just round-trip
 
 - **T-EXEC-08**: `.ts` script runs and produces structured output. Observe via `runPromise({ maxIterations: 1 })`: the yielded Output has the expected `result`. *(Spec 6.3)*
 - **T-EXEC-09**: `.js` script runs and produces structured output. Observe via `runPromise({ maxIterations: 1 })`. *(Spec 6.3)*
-- **T-EXEC-10**: `.tsx` script runs and produces structured output. Observe via `runPromise({ maxIterations: 1 })`. The fixture must be self-contained: use a trivial JSX expression that does not depend on React or any runtime (e.g., a script that assigns `const el = <string>` using a custom JSX pragma that returns a plain string, or simply verifies the extension is accepted by having the script output a result without actually using JSX syntax). The goal is to confirm tsx processes `.tsx` files. *(Spec 6.3)*
-- **T-EXEC-11**: `.jsx` script runs and produces structured output. Observe via `runPromise({ maxIterations: 1 })`. Same self-contained fixture approach as T-EXEC-10 — verify the extension is accepted and the script executes. *(Spec 6.3)*
+- **T-EXEC-10**: `.tsx` script runs and produces structured output. Observe via `runPromise({ maxIterations: 1 })`. The fixture **must use actual TSX syntax** to verify that the runtime handles JSX transformation, not just extension acceptance. Use a self-contained JSX pragma that does not depend on React: e.g., `/** @jsxImportSource ./jsx-shim */` where the shim's `jsx()` function returns a plain string, or use `React.createElement = (tag: string) => tag;` and write `const el = <div/>;`. The script outputs `{ result: String(el) }`. This proves the TSX-to-JS compilation actually ran. *(Spec 6.3)*
+- **T-EXEC-11**: `.jsx` script runs and produces structured output. Observe via `runPromise({ maxIterations: 1 })`. Same approach as T-EXEC-10 — the fixture **must use actual JSX syntax** (e.g., `const el = <div/>;` with a custom pragma or shim) to verify JSX transformation works, not just that the extension is accepted. *(Spec 6.3)*
 - **T-EXEC-12**: JS/TS script stderr passes through to CLI stderr. *(Spec 6.3)*
 - **T-EXEC-13**: JS/TS script can use TypeScript type annotations (verifies tsx handles TS syntax under Node.js). `[Node]` *(Spec 6.3)*
 - **T-EXEC-13b**: JS/TS script can use TypeScript type annotations under Bun (verifies Bun's native TS support). `[Bun]` *(Spec 6.3)*
@@ -633,6 +639,7 @@ These tests use bash fixture scripts that echo specific strings to stdout. **Par
 - **T-PARSE-10**: Script outputs `true` (JSON boolean). Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "true"` (raw stdout string). *(Spec 2.3)*
 - **T-PARSE-11**: Script outputs `null` (JSON null). Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "null"` (raw stdout string). *(Spec 2.3)*
 - **T-PARSE-12**: Script outputs `not json at all`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "not json at all"`. *(Spec 2.3)*
+- **T-PARSE-12a**: Raw fallback preserves exact stdout including trailing newline. Script outputs `hello\n` (using `emit-raw-ln("hello")` fixture — `printf '%s\n' 'hello'`). Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "hello\n"` — the trailing newline is part of the raw result, not stripped. *(Spec 2.3)*
 - **T-PARSE-13**: Script produces empty stdout (no output). Assert via `runPromise({ maxIterations: 1 })`: yielded Output is `{ result: "" }` — not an empty object `{}`. *(Spec 2.3)*
 
 #### Type Coercion
@@ -720,6 +727,8 @@ All env tests use `withGlobalEnv` to isolate from the real user config.
 - **T-ENV-03**: `XDG_CONFIG_HOME` is respected. Set `XDG_CONFIG_HOME=/tmp/custom`, run `loopx env set X Y`, verify file exists at `/tmp/custom/loopx/env`. *(Spec 8.1)*
 - **T-ENV-04**: When `XDG_CONFIG_HOME` is unset, default is `~/.config`. Use `withIsolatedHome` (not `withGlobalEnv`) to safely verify the fallback path without touching the real home directory. *(Spec 8.1)*
 - **T-ENV-05**: Config directory created on first `env set`. Start with no directory, run `env set`, verify directory was created. *(Spec 8.1)*
+- **T-ENV-05a**: Unreadable global env file. Create the global env file, then `chmod 000` it. Run `loopx -n 1 myscript` → exits with code 1 and an error message about the unreadable file. **This test is conditional on `process.getuid() !== 0`** — root can read any file, so the test is skipped when running as root. *(Spec 8.1)*
+- **T-ENV-05b**: Unreadable global env file via programmatic API. Same setup as T-ENV-05a (`chmod 000`). `run("myscript")` returns a generator; on the first `next()`, the generator throws an error about the unreadable file. **Conditional on `process.getuid() !== 0`.** *(Spec 8.1, 9.3)*
 
 #### Env File Parsing
 
@@ -746,6 +755,7 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 
 - **T-ENV-16**: `-e local.env` loads variables into script environment. Script writes the env var to a marker file. Assert marker file contains the expected value. *(Spec 8.2)*
 - **T-ENV-17**: `-e nonexistent.env` → error, exit 1. *(Spec 8.2)*
+- **T-ENV-17a**: `-e unreadable.env` → error, exit 1. Create a local env file, then `chmod 000` it. Run `loopx -e unreadable.env -n 1 myscript` → exits with code 1 and an error message. Behavior is identical to an unreadable global env file (Spec 8.1). **This test is conditional on `process.getuid() !== 0`.** *(Spec 8.2)*
 - **T-ENV-18**: Global has `X=global`, local has `X=local`. Script writes `$X` to a marker file → marker contains `local`. *(Spec 8.2)*
 - **T-ENV-19**: Global has `A=1`, local has `B=2`. Script writes both to marker files → `A=1` and `B=2` both present. *(Spec 8.2)*
 
@@ -822,7 +832,7 @@ These tests verify `LOOPX_BIN` through loop behavior and side-effect files — n
 
 **Spec refs:** 9.1–9.5
 
-Tests import `run` and `runPromise` from the built loopx package and call them with `cwd` pointing to temp project directories.
+**Runtime-matrix methodology:** All programmatic API tests that run under both Node.js and Bun use `runAPIDriver()` to spawn a driver process under the target runtime. This is the correct way to test API behavior under Bun — importing loopx directly inside a Node-hosted Vitest process does not exercise Bun's runtime. Node-only direct-import tests may exist as supplementary smoke tests, but they do not substitute for `runAPIDriver()`-based coverage in the runtime matrix.
 
 #### `run()` (AsyncGenerator)
 
@@ -836,12 +846,14 @@ Tests import `run` and `runPromise` from the built loopx package and call them w
 - **T-API-08**: `run("myscript", { maxIterations: 0 })` → generator completes immediately with no yields. *(Spec 9.5)*
 - **T-API-09**: `run()` with no script name runs the `default` script. *(Spec 9.1)*
 - **T-API-09b**: `run()` cwd snapshot timing. Create two temp projects, each with a `default` script that writes a unique marker. Call `run()` while `process.cwd()` is project A (no explicit `cwd` option). Then change `process.cwd()` to project B before calling `next()`. Assert the generator executes project A's script, not project B's — proving `cwd` was snapshotted at `run()` call time. *(Spec 9.1, 9.5)*
-- **T-API-09a**: Manual iterator cancellation during a pending `next()`. Use a long-running script (e.g., `sleep-then-exit(30)` fixture). Obtain the async iterator, call `iterator.next()` to start the first iteration, then immediately call `iterator.return()` while `next()` is still pending (the child process is actively running). Assert: (1) the child process / process group is terminated (the script writes its PID to a marker file on startup; after `return()` resolves, verify the PID is no longer running), and (2) the generator completes with no further yields. *(Spec 9.1)*
+- **T-API-09a**: Manual iterator cancellation during a pending `next()`. Use the `write-pid-to-file` fixture (a TS script that writes its PID to a marker file, writes `"ready"` to stderr, then blocks). Obtain the async iterator, call `iterator.next()` to start the first iteration. Wait for the child to be ready (e.g., poll the marker file or observe stderr). Then call `iterator.return()` while `next()` is still pending. Assert: (1) the child process / process group is terminated (read PID from marker file, verify it is no longer running), and (2) the generator completes with no further yields. *(Spec 9.1)*
 
 #### `run()` with AbortSignal
 
 - **T-API-10**: `run("myscript", { signal })` — aborting the signal terminates the loop and the generator throws an abort error. *(Spec 9.5)*
-- **T-API-10a**: `run("myscript", { signal })` — aborting the signal while a child process is actively running terminates the child process group. Use a long-running script that writes its PID to a marker file. Abort the signal mid-iteration. Assert the PID is no longer running after the generator throws. *(Spec 9.5, 9.1)*
+- **T-API-10a**: `run("myscript", { signal })` — aborting the signal while a child process is actively running terminates the child process group. Use the `write-pid-to-file` fixture. Wait for the child to write its PID to the marker file and emit `"ready"` on stderr. Abort the signal. Assert: (1) the generator throws an abort error, and (2) the PID from the marker file is no longer running. *(Spec 9.5, 9.1)*
+- **T-API-10b**: Pre-aborted signal. Create an `AbortController`, call `controller.abort()` immediately, then call `run("myscript", { signal: controller.signal })`. On the first `next()`, the generator throws an abort error. No child process is spawned (use a counter file to verify no script ran). *(Spec 9.5, 9.1)*
+- **T-API-10c**: Signal aborted between iterations (no active child). Use a script that emits a result with no `goto` (loop resets). Collect the first yield, then abort the signal before calling `next()` again. The next `next()` call throws an abort error. No further iterations execute. *(Spec 9.5, 9.1)*
 
 #### `runPromise()`
 
@@ -865,6 +877,10 @@ Tests import `run` and `runPromise` from the built loopx package and call them w
 - **T-API-20c**: `run("myscript")` with `.loopx/` containing a name collision — `run()` returns a generator. On the first `next()`, the generator throws (validation failure). No child process is spawned. *(Spec 9.1, 9.3)*
 - **T-API-20d**: `run("myscript", { envFile: "nonexistent.env" })` — `run()` returns a generator. On the first `next()`, the generator throws because the env file does not exist. No child process is spawned. *(Spec 9.1, 9.3, 9.5)*
 - **T-API-20e**: `runPromise("myscript", { envFile: "nonexistent.env" })` — rejects because the env file does not exist. *(Spec 9.3, 9.5)*
+- **T-API-20f**: `run("myscript", { cwd: dirWithoutLoopx })` — `run()` returns a generator without throwing. On the first `next()`, the generator throws because `.loopx/` does not exist in the specified `cwd`. *(Spec 9.1, 9.3)*
+- **T-API-20g**: `runPromise("myscript", { cwd: dirWithoutLoopx })` — rejects because `.loopx/` does not exist. *(Spec 9.3)*
+- **T-API-20h**: `run(undefined, { cwd: dirWithLoopxButNoDefault })` — `run()` returns a generator. On the first `next()`, the generator throws because no `default` script exists. *(Spec 9.1, 9.3)*
+- **T-API-20i**: `runPromise(undefined, { cwd: dirWithLoopxButNoDefault })` — rejects because no `default` script exists. *(Spec 9.3)*
 
 #### `envFile` Option
 
@@ -876,6 +892,7 @@ Tests import `run` and `runPromise` from the built loopx package and call them w
 
 - **T-API-22**: `run("myscript", { maxIterations: -1 })` → `run()` returns a generator. On the first `next()`, the generator throws (non-negative integer required). No script is executed. *(Spec 9.1, 9.5)*
 - **T-API-23**: `run("myscript", { maxIterations: 1.5 })` → `run()` returns a generator. On the first `next()`, the generator throws (non-integer). No script is executed. *(Spec 9.1, 9.5)*
+- **T-API-23a**: `run("myscript", { maxIterations: NaN })` → `run()` returns a generator. On the first `next()`, the generator throws (NaN is not a valid non-negative integer). No script is executed. *(Spec 9.1, 9.5)*
 - **T-API-24**: `runPromise("myscript", { maxIterations: NaN })` → rejects before execution. *(Spec 9.5)*
 - **T-API-24a**: `runPromise("myscript", { maxIterations: -1 })` → rejects before execution (negative values are invalid). *(Spec 9.5)*
 - **T-API-24b**: `runPromise("myscript", { maxIterations: 1.5 })` → rejects before execution (non-integer values are invalid). *(Spec 9.5)*
@@ -883,6 +900,7 @@ Tests import `run` and `runPromise` from the built loopx package and call them w
 #### `runPromise()` with AbortSignal
 
 - **T-API-25**: `runPromise("myscript", { signal })` — aborting the signal terminates the loop and the promise rejects with an abort error. *(Spec 9.5)*
+- **T-API-25a**: `runPromise("myscript", { signal })` with pre-aborted signal — the promise rejects immediately with an abort error. No child process is spawned. *(Spec 9.5)*
 
 ### 4.10 Install Command
 
@@ -956,20 +974,23 @@ These tests verify that git/tarball installs apply the same validation as discov
 - **T-INST-38**: Tarball install where extracted directory has invalid JSON in `package.json` → directory removed, error, exit code 1. *(Spec 10.2, 5.1)*
 - **T-INST-39**: Tarball install where extracted directory has `package.json` with `main` pointing to a missing file → directory removed, error, exit code 1. *(Spec 10.2, 5.1)*
 
+#### Global Install Smoke Test
+
+- **T-INST-GLOBAL-01**: Full global install lifecycle. `npm pack` the built loopx package, install the resulting tarball into an isolated global prefix (using `npm install -g --prefix <tempdir>`), create a fixture project with a `.loopx/default.ts` script, run `<tempdir>/bin/loopx -n 1` against the fixture project, and assert the script ran (via marker file) and exit code is 0. This exercises the full Spec 3.1 workflow: global binary on PATH, module resolution for `import from "loopx"`, and script execution. *(Spec 3.1)*
+
 ### 4.11 Signal Handling
 
 **Spec refs:** 7.3
 
-Signal tests use the `sleep-then-exit` fixture (a bash script that sleeps for a long time) and the `spawn-grandchild` fixture.
+Signal tests use the `signal-ready-then-sleep`, `signal-trap-exit`, `signal-trap-ignore`, and `spawn-grandchild` fixtures. All signal fixtures follow the ready-protocol: write PID to marker file, write `"ready"` to stderr, then block. Tests use `waitForStderr("ready")` to synchronize before sending signals.
 
-- **T-SIG-01**: Send SIGINT to loopx while a script is running. Assert loopx exits with code 130 (128 + 2). *(Spec 7.3)*
-- **T-SIG-02**: Send SIGTERM to loopx while a script is running. Assert loopx exits with code 143 (128 + 15). *(Spec 7.3)*
-- **T-SIG-03**: After SIGINT, the child script process is no longer running. Check by writing child PID to a file, then verifying the process is gone after loopx exits. *(Spec 7.3)*
-- **T-SIG-04**: Grace period: child script traps SIGTERM and exits within 2 seconds. Assert loopx exits cleanly (no SIGKILL needed, exit code 128+15). *(Spec 7.3)*
-- **T-SIG-05**: Grace period exceeded: child script traps SIGTERM and hangs (ignores it). Assert loopx sends SIGKILL after ~5 seconds and exits. *(Spec 7.3)*
-- **T-SIG-06**: Process group signal: script spawns a grandchild process. Send SIGTERM to loopx. Assert both the script and grandchild are terminated. *(Spec 7.3)*
-- ~~**T-SIG-07**~~: *Moved to robustness suite.* Signal between iterations is too timing-sensitive for reliable black-box E2E testing.
-- **T-SIG-07a**: *(Supplementary / unit-level)* Between-iterations signal behavior: if the implementation exposes an internal hook or testable code path for the "no child running" signal case (Spec 7.3), verify that loopx exits immediately with the appropriate signal exit code when a signal arrives between iterations. If no such internal API exists, this test is skipped and coverage for this clause is marked as partial. *(Spec 7.3)*
+- **T-SIG-01**: Send SIGINT to loopx while a script is running. Use `signal-ready-then-sleep` fixture. `waitForStderr("ready")`, then send SIGINT. Assert loopx exits with code 130 (128 + 2). *(Spec 7.3)*
+- **T-SIG-02**: Send SIGTERM to loopx while a script is running. Use `signal-ready-then-sleep` fixture. `waitForStderr("ready")`, then send SIGTERM. Assert loopx exits with code 143 (128 + 15). *(Spec 7.3)*
+- **T-SIG-03**: After SIGINT, the child script process is no longer running. Use `signal-ready-then-sleep` fixture which writes PID to marker file. After loopx exits, read the PID from the marker file and verify the process is gone (e.g., `kill(pid, 0)` throws). *(Spec 7.3)*
+- **T-SIG-04**: Grace period: child script traps SIGTERM and exits within 2 seconds. Use `signal-trap-exit(markerPath, 2)` fixture. `waitForStderr("ready")`, send SIGTERM. Assert loopx exits with code 128+15 (no SIGKILL needed — child exited within grace period). *(Spec 7.3)*
+- **T-SIG-05**: Grace period exceeded: child script traps SIGTERM and hangs (ignores it). Use `signal-trap-ignore(markerPath)` fixture. `waitForStderr("ready")`, send SIGTERM. Assert loopx sends SIGKILL after ~5 seconds and exits. Verify the child PID (from marker file) is no longer running. *(Spec 7.3)*
+- **T-SIG-06**: Process group signal: script spawns a grandchild process. Use `spawn-grandchild(markerPath)` fixture. `waitForStderr("ready")`, send SIGTERM to loopx. Read both PIDs from marker file. Assert both the script and grandchild are no longer running after loopx exits. *(Spec 7.3)*
+- **T-SIG-07**: Between-iterations signal: Use a script that outputs no `goto` or `stop` (so the loop resets) and writes a ready marker to a known file after each iteration. The test sends SIGTERM between iterations by coordinating via the marker file. Assert loopx exits immediately with code 143 (128 + 15). This test may require a small sleep or poll to hit the between-iterations window, so it is tagged as `@flaky-retry(3)` to tolerate occasional timing misses. *(Spec 7.3)*
 
 ### 4.12 CLI Delegation
 
@@ -1063,7 +1084,7 @@ For each generated input:
 4. Assert the invariants above.
 
 **Iterations:** The structured output fuzzer has two tiers:
-- **Unit-level parser fuzzing:** At least 1000 random inputs per property. These call the parser function directly (no child process), so they are fast. This is where high-volume fuzzing lives.
+- **Unit-level parser fuzzing:** At least 1000 random inputs per property. These call the parser function directly (no child process), so they are fast. This is where high-volume fuzzing lives. **Testability requirement:** The implementation must expose the output parsing logic as an importable pure function (e.g., `parseOutput(stdout: string): Output`) in a package-private module that tests can import. Without this, unit-level fuzzing is not possible and the 1000+ input requirement is reduced to the E2E tier's 50–100 range.
 - **E2E fuzzing:** At most 50–100 random inputs per property. Each input spawns a real child process, so high iteration counts are prohibitively slow. The E2E layer is a randomized smoke test to catch integration issues the unit fuzzer cannot.
 
 ### 5.2 Env File Fuzzer
@@ -1092,7 +1113,7 @@ For each generated input:
 
 - **F-ENV-05: Comment lines never produce variables.** Lines starting with `#` never result in environment variables being set.
 
-**Iterations:** Same two-tier approach as section 5.1: at least 1000 inputs at the unit-parser level, 50–100 at the E2E level.
+**Iterations:** Same two-tier approach as section 5.1: at least 1000 inputs at the unit-parser level, 50–100 at the E2E level. **Testability requirement:** Same as section 5.1 — the implementation must expose the env parsing logic as an importable pure function for unit-level fuzzing.
 
 ---
 
@@ -1104,7 +1125,9 @@ Unit tests provide fast feedback on isolated parsing/logic functions. They are N
 
 **File:** `tests/unit/parse-output.test.ts`
 
-If the output parsing logic is exposed as an internal function (e.g., `parseOutput(stdout: string): Output`), test it directly:
+**Testability requirement:** The implementation must expose the output parsing logic as an importable pure function (e.g., `parseOutput(stdout: string): Output`) in a package-private module. This is required for unit tests and high-volume fuzz testing (section 5.1). If the function is not exposed, these tests cannot run and coverage falls back to E2E only.
+
+Test the parser function directly:
 
 - Valid JSON objects with various field combinations
 - Type coercion cases (result as number, goto as boolean, stop as string)
@@ -1116,7 +1139,9 @@ If the output parsing logic is exposed as an internal function (e.g., `parseOutp
 
 **File:** `tests/unit/parse-env.test.ts`
 
-If the env parser is exposed as an internal function:
+**Testability requirement:** Same as section 6.1 — the implementation must expose the env parsing logic as an importable pure function. Required for unit tests and high-volume fuzz testing (section 5.2).
+
+Test the parser function directly:
 
 - Standard KEY=VALUE pairs
 - Comments, blank lines
@@ -1140,7 +1165,14 @@ Test the source classification logic (section 10.1) in isolation:
 
 **File:** `tests/unit/types.test.ts`
 
-These tests verify the public TypeScript type surface documented in Spec section 9.5. They use compile-time assertions (e.g., `expectTypeOf` from vitest, or `tsd`, or a `tsc --noEmit` check) to verify the exported types match the spec — not just that the runtime behavior is correct.
+These tests verify the public TypeScript type surface documented in Spec section 9.5. **They must be validated via a real typecheck stage — not just ordinary Vitest runtime execution.** A test that merely imports a type and uses it at runtime can pass vacuously if the type is `any` or the assertion is elided at compile time.
+
+**Required execution method (pick one):**
+- **Vitest typecheck mode** (`vitest typecheck`): runs type-level assertions via `expectTypeOf` without executing runtime code.
+- **`tsc --noEmit`**: a separate CI step that typechecks the test file against the built package's `.d.ts` files.
+- **`tsd`**: a dedicated type-testing library that asserts against `.d.ts` exports.
+
+Ordinary `vitest run` on `types.test.ts` is **not sufficient** as the sole verification. If `vitest run` is used, it must be paired with one of the above to ensure the type assertions are enforced at the type level.
 
 **Setup:** The test file imports from the built loopx package as a real consumer would (same symlink/link approach as `runAPIDriver`).
 
@@ -1191,10 +1223,11 @@ CI should test against:
 
 1. **Build**: Compile/bundle loopx.
 2. **Phase 0 (Harness)**: Run `tests/harness/`. Fail the pipeline if any fail.
-3. **Unit Tests**: Run `tests/unit/`.
-4. **E2E Tests**: Run `tests/e2e/`. Parameterized over runtime matrix.
-5. **Fuzz Tests**: Run `tests/fuzz/` with a CI-appropriate iteration count (e.g., 5000).
-6. **Stub Validation** (optional, periodic): Run spec tests against stub binary and verify failure count hasn't decreased (tests haven't become vacuous).
+3. **Typecheck**: Run `tsc --noEmit` or `vitest typecheck` on `tests/unit/types.test.ts` to verify public type surface. This must run as a dedicated stage, not as part of ordinary Vitest runtime execution (see section 6.4).
+4. **Unit Tests**: Run `tests/unit/`.
+5. **E2E Tests**: Run `tests/e2e/`. Parameterized over runtime matrix.
+6. **Fuzz Tests**: Run `tests/fuzz/` with a CI-appropriate iteration count (e.g., 5000).
+7. **Stub Validation** (optional, periodic): Run spec tests against stub binary and verify failure count hasn't decreased (tests haven't become vacuous).
 
 ### 8.3 Timeouts
 
@@ -1218,9 +1251,11 @@ CI should test against:
 
 This section tracks any tests that are blocked by unresolved spec ambiguities. If a test's assertions depend on a spec decision that has not been made, it is listed here so it cannot be accidentally treated as an authoritative failure.
 
-**All previously identified spec problems (SP-15 through SP-26) have been resolved.** No tests are currently blocked by pending spec decisions.
+**All previously identified spec problems (SP-15 through SP-27) have been resolved.** No tests are currently blocked by pending spec decisions.
 
-Resolved during this revision: SP-15 (unmatched quotes → literal preserved), SP-17 (install validation → full 5.1 parity), SP-20/SP-21 (shorthand → reject `.git` suffix, consistent expansion), SP-22 (run() errors → lazy on first iteration), SP-23 (version format → bare string + newline), SP-24 (shadowed loopx → local wins, standard resolution), SP-25 (tarball detection → parsed URL pathname), SP-26 (cancellation → always terminate if child active).
+Resolved during this revision: SP-27 (AbortSignal cancellation semantics — resolved: AbortSignal always throws/rejects, `break`/`generator.return()` completes silently. SPEC.md section 9.1 updated to clarify the distinction.)
+
+Resolved in prior revisions: SP-15 (unmatched quotes → literal preserved), SP-17 (install validation → full 5.1 parity), SP-20/SP-21 (shorthand → reject `.git` suffix, consistent expansion), SP-22 (run() errors → lazy on first iteration), SP-23 (version format → bare string + newline), SP-24 (shadowed loopx → local wins, standard resolution), SP-25 (tarball detection → parsed URL pathname), SP-26 (cancellation → always terminate if child active).
 
 ---
 
@@ -1233,8 +1268,8 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 1 | Overview (ESM-only) | T-MOD-22 |
 | 2.1 | Script (file & directory) | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-MOD-03a, T-EXEC-18a |
 | 2.2 | Loop (state machine) | T-LOOP-01–05, T-LOOP-16–17 |
-| 2.3 | Structured Output | T-PARSE-01–29, F-PARSE-01–05 |
-| 3.1 | Global Install | **Release-smoke / manual.** The E2E suite tests the built binary directly, not a `npm install -g` artifact. A true global-install test (`npm pack` → install into temp global prefix → run against fixture project) is a release-gate smoke test, not part of the regular E2E suite. Runtime behavior is covered by other sections. |
+| 2.3 | Structured Output | T-PARSE-01–29, T-PARSE-12a, F-PARSE-01–05 |
+| 3.1 | Global Install | T-INST-GLOBAL-01 |
 | 3.2 | CLI Delegation | T-DEL-01–06 |
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21 |
@@ -1256,15 +1291,15 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 6.8 | Initial Input | T-LOOP-14 |
 | 7.1 | Basic Loop | T-LOOP-01–10, T-LOOP-25 |
 | 7.2 | Error Handling | T-LOOP-18–24 |
-| 7.3 | Signal Handling | T-SIG-01–06, T-SIG-07a (partial — between-iterations case may require unit-level test or be skipped) |
-| 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-25–25a, F-ENV-01–05 |
-| 8.2 | Local Env Override | T-ENV-16–19, T-ENV-25a |
+| 7.3 | Signal Handling | T-SIG-01–07 |
+| 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-05a–05b, T-ENV-25–25a, F-ENV-01–05 |
+| 8.2 | Local Env Override | T-ENV-16–19, T-ENV-17a, T-ENV-25a |
 | 8.3 | Env Injection Precedence | T-ENV-20–24, T-ENV-20a, T-ENV-21a |
-| 9.1 | run() | T-API-01–09b, T-API-10–10a, T-TYPE-04, T-TYPE-06–07 |
-| 9.2 | runPromise() | T-API-11–14b, T-TYPE-05–07 |
-| 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20e |
+| 9.1 | run() | T-API-01–09b, T-API-10–10c, T-TYPE-04, T-TYPE-06–07 |
+| 9.2 | runPromise() | T-API-11–14b, T-API-25–25a, T-TYPE-05–07 |
+| 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20i |
 | 9.4 | output() and input() (script-side) | T-MOD-04–14a, T-MOD-13a–13g (output()), T-MOD-15–18 (input()) — these are the same tests listed under 6.5/6.6; 9.4 references them |
-| 9.5 | Types / RunOptions | T-API-07–08, T-API-10, T-API-20d–20e, T-API-21–21b, T-API-22–25, T-API-24a–24b, T-TYPE-01–07 |
+| 9.5 | Types / RunOptions | T-API-07–08, T-API-10–10c, T-API-20d–20e, T-API-21–21b, T-API-22–25a, T-API-23a, T-API-24a–24b, T-TYPE-01–07 |
 | 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08d |
 | 10.2 | Source Type Details | T-INST-09–26b, T-INST-34–39 |
 | 10.3 | Common Install Rules | T-INST-27–33 |
