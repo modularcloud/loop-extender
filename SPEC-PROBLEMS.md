@@ -91,3 +91,19 @@ The spec does not clearly say whether `run()`:
 This matters for library ergonomics and for tests like T-API-20a (missing script), T-API-22/23 (invalid maxIterations). The current test spec softens these tests to assert only that an error occurs before any child execution, not exactly when.
 
 **Recommended resolution:** Define one model explicitly. A natural choice: `run()` snapshots options/cwd immediately but surfaces all errors when iteration begins (first `next()` or equivalent). This matches a natural async-generator implementation where the generator function body runs lazily.
+
+---
+
+### SP-23: `loopx version` output format is under-specified
+
+**Sections:** 4.3, 3.4
+
+The spec says `loopx version` "prints the installed version of loopx and exits," but it does not define whether stdout must be:
+
+- the bare version string, e.g. `1.2.3`
+- a labeled string, e.g. `loopx 1.2.3`
+- or whether a trailing newline is required
+
+TEST-SPEC.md currently assumes exact equality with `package.json`'s `version` field (T-CLI-01, T-MOD-21), which is stricter than the current spec text.
+
+**Recommended resolution:** Define `loopx version` as printing the bare package version string followed by a newline, with no additional text.

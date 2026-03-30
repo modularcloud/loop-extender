@@ -64,6 +64,7 @@ tests/
     parse-output.test.ts       Output parsing logic (supplementary)
     parse-env.test.ts          Env file parsing logic (supplementary)
     source-detection.test.ts   Install source classification
+    types.test.ts              Compile-time type surface verification
   helpers/
     cli.ts                     CLI spawning utilities (runCLI, runCLIWithSignal)
     api-driver.ts              Programmatic API driver (runAPIDriver)
@@ -353,7 +354,7 @@ Each test is identified by a unique ID (`T-<SECTION>-<NUMBER>`), references a SP
 
 #### Help & Version
 
-- **T-CLI-01**: `loopx version` prints a version string, exits 0. Assert trimmed stdout matches the `version` field from loopx's own `package.json` (do not assert a bare semver regex — the spec does not mandate a specific format beyond printing the version). Does not require `.loopx/` to exist. *(Spec 4.3, 5.5)*
+- **T-CLI-01**: `loopx version` prints a version string, exits 0. Assert trimmed stdout exactly matches the `version` field from loopx's own `package.json`. Does not require `.loopx/` to exist. **Depends on SP-23** — this test assumes the spec resolves to "bare version string followed by a newline, no additional text." If SP-23 resolves differently, adjust the assertion. *(Spec 4.3, 5.5)*
 - **T-CLI-02**: `loopx -h` prints usage text containing "loopx" and "usage" (case-insensitive), exits 0. *(Spec 4.2)*
 - **T-CLI-03**: `loopx --help` produces the same output as `-h`. *(Spec 4.2)*
 - **T-CLI-04**: `loopx -h` with `.loopx/` containing scripts lists discovered script names in output. *(Spec 11)*
@@ -482,6 +483,7 @@ These tests verify the actual bytes written to the env file, not just round-trip
 #### Directory Script Discovery
 
 - **T-DISC-11**: `.loopx/mypipe/` with `package.json` (`"main": "index.ts"`) and `index.ts` → discoverable as `mypipe`. *(Spec 2.1, 5.1)*
+- **T-DISC-11a**: `.loopx/mypipe/` with `package.json` (`"main": "src/index.ts"`) and `src/index.ts` → discoverable as `mypipe`. This verifies that `main` can point to a subpath within the directory, not just a top-level file. *(Spec 2.1, 5.1)*
 - **T-DISC-12**: `.loopx/nopackage/` directory with no `package.json` → ignored. `loopx -n 1 nopackage` fails. *(Spec 2.1, 5.1)*
 - **T-DISC-13**: `.loopx/nomain/` with `package.json` that has no `main` field → ignored. *(Spec 2.1, 5.1)*
 - **T-DISC-14**: `.loopx/mypipe/` with `"main": "index.sh"` → discoverable (bash entry point). *(Spec 5.1)*
@@ -621,13 +623,18 @@ These tests use bash fixture scripts that echo specific strings to stdout. **Par
 - **T-PARSE-15**: `{"result": true}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "true"`. *(Spec 2.3)*
 - **T-PARSE-16**: `{"result": {"nested": "obj"}}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "[object Object]"`. *(Spec 2.3)*
 - **T-PARSE-17**: `{"result": null}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "null"`. *(Spec 2.3)*
-- **T-PARSE-18**: `{"goto": 42}` (goto is not a string). Assert via `runPromise({ maxIterations: 1 })`: yielded Output has no `goto` property — it is treated as absent, not as raw fallback. The output is parsed as structured (it is a JSON object with a known field), but the invalid-typed `goto` is discarded. *(Spec 2.3)*
-- **T-PARSE-19**: `{"goto": true}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has no `goto` property. *(Spec 2.3)*
-- **T-PARSE-20**: `{"goto": null}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has no `goto` property. *(Spec 2.3)*
-- **T-PARSE-21**: `{"stop": "true"}` (string, not boolean). Assert via `runPromise({ maxIterations: 1 })`: yielded Output has no `stop` property. Loop continues (does not halt). *(Spec 2.3)*
-- **T-PARSE-22**: `{"stop": 1}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has no `stop` property. *(Spec 2.3)*
-- **T-PARSE-23**: `{"stop": false}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has no `stop` property. *(Spec 2.3)*
-- **T-PARSE-24**: `{"stop": "false"}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has no `stop` property. *(Spec 2.3)*
+- **T-PARSE-18**: `{"goto": 42}` (goto is not a string). Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}` — an empty object with no `result`, `goto`, or `stop` properties. The output is parsed as structured (it is a JSON object with a known field), but the invalid-typed `goto` is discarded. This is distinct from raw fallback, which would yield `{ result: '{"goto":42}' }`. *(Spec 2.3)*
+- **T-PARSE-19**: `{"goto": true}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
+- **T-PARSE-20**: `{"goto": null}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
+- **T-PARSE-21**: `{"stop": "true"}` (string, not boolean). Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. Loop continues (does not halt). *(Spec 2.3)*
+- **T-PARSE-22**: `{"stop": 1}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
+- **T-PARSE-23**: `{"stop": false}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
+- **T-PARSE-24**: `{"stop": "false"}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
+
+#### Mixed Valid/Invalid Fields
+
+- **T-PARSE-28**: `{"result":"x","goto":42}` (valid result + invalid goto). Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{ result: "x" }` — the valid `result` is preserved, the invalid-typed `goto` is discarded. No `goto` or `stop` properties present. *(Spec 2.3)*
+- **T-PARSE-29**: `{"result":"x","stop":"true"}` (valid result + invalid stop). Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{ result: "x" }` — the valid `result` is preserved, the invalid-typed `stop` is discarded. Loop continues (does not halt). *(Spec 2.3)*
 
 #### Whitespace & Formatting
 
@@ -676,7 +683,7 @@ These tests use bash fixture scripts that echo specific strings to stdout. **Par
 - **T-LOOP-21**: Script exits with code 2 → same behavior (any non-zero is an error). *(Spec 7.2)*
 - **T-LOOP-22**: Script fails on iteration 3 of 5 (`-n 5`). Assert exactly 3 iterations ran (loop stopped at failure). *(Spec 7.2)*
 - **T-LOOP-23**: Script's stderr output on failure is visible on CLI stderr. *(Spec 7.2)*
-- **T-LOOP-24**: Script's stdout on failure is NOT parsed as structured output. Use a script that prints valid JSON to stdout then exits 1 — the JSON should not be treated as output. *(Spec 7.2)*
+- **T-LOOP-24**: Script's stdout on failure is NOT parsed as structured output. Use a script that prints `{"result":"should-not-appear","stop":true}` to stdout then exits 1. Observe via `run()`: the generator should throw on the failing iteration without yielding any `Output` for that iteration. If the JSON were parsed, it would yield a result and halt cleanly — the throw with no yield proves it was not parsed. *(Spec 7.2)*
 
 #### Final Iteration Output
 
@@ -727,7 +734,9 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 #### Injection Precedence
 
 - **T-ENV-20**: `LOOPX_BIN` is always set, even if the user sets `LOOPX_BIN=fake` in global/local env. Script writes `$LOOPX_BIN` to a marker file → marker contains the real binary path, not `"fake"`. *(Spec 8.3)*
+- **T-ENV-20a**: `LOOPX_BIN` overrides inherited system environment. Spawn loopx with `LOOPX_BIN=fake` in the process environment (not via env files). Script writes `$LOOPX_BIN` to a marker file → marker contains the real binary path, not `"fake"`. *(Spec 8.3)*
 - **T-ENV-21**: `LOOPX_PROJECT_ROOT` always set, overrides user-supplied value. Script writes `$LOOPX_PROJECT_ROOT` to a marker file → marker contains the real invocation directory. *(Spec 8.3)*
+- **T-ENV-21a**: `LOOPX_PROJECT_ROOT` overrides inherited system environment. Spawn loopx with `LOOPX_PROJECT_ROOT=/fake/path` in the process environment. Script writes `$LOOPX_PROJECT_ROOT` to a marker file → marker contains the real invocation directory, not `"/fake/path"`. *(Spec 8.3)*
 - **T-ENV-22**: System env has `SYS_VAR=sys`, global env has `SYS_VAR=global`. Script writes `$SYS_VAR` to a marker file → marker contains `global`. *(Spec 8.3)*
 - **T-ENV-23**: System env has `SYS_VAR=sys`, no loopx override. Script writes `$SYS_VAR` to a marker file → marker contains `sys`. *(Spec 8.3)*
 - **T-ENV-24**: Full precedence chain. Set `VAR` at system, global, and local levels. Script writes `$VAR` to a marker file. Assert local wins. Then remove from local → global wins. Then remove from global → system wins. *(Spec 8.3)*
@@ -774,13 +783,17 @@ These tests observe `output()` behavior via the programmatic API (`run()` / `run
 - **T-MOD-17**: `input()` called twice in the same script returns the same value (cached). *(Spec 6.6)*
 - **T-MOD-18**: `input()` returns a Promise (test by awaiting it). *(Spec 6.6)*
 
+#### ESM-Only Package Contract
+
+- **T-MOD-22**: `[Node]` Attempting `require("loopx")` from a CommonJS consumer script fails with a module format error. Create a temporary consumer directory with `package.json` (no `"type": "module"`) and a `.js` file containing `const loopx = require("loopx")`. Run it under Node.js. Assert it exits non-zero with an error indicating the package is ESM-only (e.g., ERR_REQUIRE_ESM). This verifies the published package contract from Spec section 1. *(Spec 1)*
+
 #### `LOOPX_BIN` in Bash Scripts
 
 These tests verify `LOOPX_BIN` through loop behavior and side-effect files — not by inspecting CLI stdout. **These tests use `withDelegationSetup` (or the real executable path), not `runCLI`**, because `runCLI`'s `node /path/to/bin.js` invocation does not exercise realpath resolution of `LOOPX_BIN`.
 
 - **T-MOD-19**: Bash script uses `$LOOPX_BIN output --result "payload" --goto "reader"` to produce structured output. A second script `reader` reads stdin and writes the received value to a marker file. Assert the marker file contains `"payload"`. *(Spec 3.4)*
 - **T-MOD-20**: Bash script writes `$LOOPX_BIN` to a marker file. Assert the marker file contains a valid path to an executable file (file exists and is executable). *(Spec 3.4)*
-- **T-MOD-21**: Bash script runs `$LOOPX_BIN version` and captures its stdout to a marker file. Assert the marker file content matches loopx's own `package.json` `version` field (same approach as T-CLI-01 — do not assert a bare semver regex). *(Spec 3.4)*
+- **T-MOD-21**: Bash script runs `$LOOPX_BIN version` and captures its stdout to a marker file. Assert the marker file content (trimmed) matches loopx's own `package.json` `version` field. **Depends on SP-23** — same assumption as T-CLI-01 regarding version output format. *(Spec 3.4)*
 
 ### 4.9 Programmatic API
 
@@ -902,6 +915,17 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 - **T-INST-32**: Git clone failure (non-existent repo) → error, exit code 1, no partial directory left in `.loopx/`. *(Spec 10.3)*
 - **T-INST-33**: Tarball extraction failure (corrupt archive) → error, exit code 1, no partial directory left in `.loopx/`. *(Spec 10.3)*
 
+#### Install Post-Validation (Directory Scripts)
+
+These tests verify that git/tarball installs apply the same validation as discovery (Spec 5.1) to the resulting directory. **Blocked by SP-17** — the spec does not explicitly require install to validate beyond "package.json with main pointing to supported extension." These tests assume SP-17 resolves to full parity with discovery validation.
+
+- **T-INST-34**: Git install where cloned repo has invalid JSON in `package.json` → clone removed, error, exit code 1, no partial directory left in `.loopx/`. **Blocked by SP-17.** *(Spec 10.2, 5.1)*
+- **T-INST-35**: Git install where cloned repo has `package.json` with non-string `main` (e.g., `{"main": 42}`) → clone removed, error, exit code 1. **Blocked by SP-17.** *(Spec 10.2, 5.1)*
+- **T-INST-36**: Git install where cloned repo has `package.json` with `main` escaping the directory (e.g., `{"main": "../escape.ts"}`) → clone removed, error, exit code 1. **Blocked by SP-17.** *(Spec 10.2, 5.1)*
+- **T-INST-37**: Git install where cloned repo has `package.json` with `main` pointing to a file that does not exist → clone removed, error, exit code 1. **Blocked by SP-17.** *(Spec 10.2, 5.1)*
+- **T-INST-38**: Tarball install where extracted directory has invalid JSON in `package.json` → directory removed, error, exit code 1. **Blocked by SP-17.** *(Spec 10.2, 5.1)*
+- **T-INST-39**: Tarball install where extracted directory has `package.json` with `main` pointing to a missing file → directory removed, error, exit code 1. **Blocked by SP-17.** *(Spec 10.2, 5.1)*
+
 ### 4.11 Signal Handling
 
 **Spec refs:** 7.3
@@ -1008,7 +1032,9 @@ For each generated input:
 3. Alternatively, use the programmatic API (`run()`) to observe the parsed output directly.
 4. Assert the invariants above.
 
-**Iterations:** At least 1000 random inputs per property. Increase for CI.
+**Iterations:** The structured output fuzzer has two tiers:
+- **Unit-level parser fuzzing:** At least 1000 random inputs per property. These call the parser function directly (no child process), so they are fast. This is where high-volume fuzzing lives.
+- **E2E fuzzing:** At most 50–100 random inputs per property. Each input spawns a real child process, so high iteration counts are prohibitively slow. The E2E layer is a randomized smoke test to catch integration issues the unit fuzzer cannot.
 
 ### 5.2 Env File Fuzzer
 
@@ -1036,7 +1062,7 @@ For each generated input:
 
 - **F-ENV-05: Comment lines never produce variables.** Lines starting with `#` never result in environment variables being set.
 
-**Iterations:** At least 1000 random inputs per property.
+**Iterations:** Same two-tier approach as section 5.1: at least 1000 inputs at the unit-parser level, 50–100 at the E2E level.
 
 ---
 
@@ -1079,6 +1105,22 @@ Test the source classification logic (section 10.1) in isolation:
 - `org/repo` → git (github)
 - Various URLs → correct source type
 - Edge cases: URLs with ports, auth, paths, query strings
+
+### 6.4 Compile-Time Type Tests
+
+**File:** `tests/unit/types.test.ts`
+
+These tests verify the public TypeScript type surface documented in Spec section 9.5. They use compile-time assertions (e.g., `expectTypeOf` from vitest, or `tsd`, or a `tsc --noEmit` check) to verify the exported types match the spec — not just that the runtime behavior is correct.
+
+**Setup:** The test file imports from the built loopx package as a real consumer would (same symlink/link approach as `runAPIDriver`).
+
+- **T-TYPE-01**: `import type { Output, RunOptions } from "loopx"` compiles without error. *(Spec 9.5)*
+- **T-TYPE-02**: `Output` has optional `result?: string`, `goto?: string`, `stop?: boolean` fields — and no other required fields. Assert via `expectTypeOf<Output>()` or equivalent. *(Spec 9.5)*
+- **T-TYPE-03**: `RunOptions` has optional `maxIterations?: number`, `envFile?: string`, `signal?: AbortSignal`, `cwd?: string` fields. *(Spec 9.5)*
+- **T-TYPE-04**: `run()` returns `AsyncGenerator<Output>`. Assert that `import { run } from "loopx"` compiles and the return type is assignable to `AsyncGenerator<Output>`. *(Spec 9.1, 9.5)*
+- **T-TYPE-05**: `runPromise()` returns `Promise<Output[]>`. Assert the return type is assignable to `Promise<Output[]>`. *(Spec 9.2, 9.5)*
+- **T-TYPE-06**: `run()` and `runPromise()` accept an optional `RunOptions` second argument. *(Spec 9.1, 9.2, 9.5)*
+- **T-TYPE-07**: `run()` and `runPromise()` accept an optional script name as the first argument (`string | undefined`). *(Spec 9.1, 9.2, 9.5)*
 
 ---
 
@@ -1148,17 +1190,18 @@ Maps each SPEC.md section to the test IDs that verify it.
 
 | Spec Section | Description | Test IDs |
 |-------------|-------------|----------|
-| 2.1 | Script (file & directory) | T-DISC-01–17, T-DISC-14a–14c, T-DISC-16a–16d, T-MOD-03a, T-EXEC-18a |
+| 1 | Overview (ESM-only) | T-MOD-22 |
+| 2.1 | Script (file & directory) | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-MOD-03a, T-EXEC-18a |
 | 2.2 | Loop (state machine) | T-LOOP-01–05, T-LOOP-16–17 |
-| 2.3 | Structured Output | T-PARSE-01–27, F-PARSE-01–05 |
-| 3.1 | Global Install | T-CLI-01 (version prints from global install), T-MOD-01–03 (import resolution works from global install) |
+| 2.3 | Structured Output | T-PARSE-01–29, F-PARSE-01–05 |
+| 3.1 | Global Install | **Release-smoke / manual.** The E2E suite tests the built binary directly, not a `npm install -g` artifact. A true global-install test (`npm pack` → install into temp global prefix → run against fixture project) is a release-gate smoke test, not part of the regular E2E suite. Runtime behavior is covered by other sections. |
 | 3.2 | CLI Delegation | T-DEL-01–06 |
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21 |
 | 4.1 | Running Scripts | T-CLI-08–13 |
 | 4.2 | Options (-n, -e, -h) | T-CLI-02–07g, T-CLI-14–22d, T-CLI-20a–20b |
 | 4.3 | Subcommands | T-SUB-01–19, T-SUB-14a–14k |
-| 5.1 | Discovery | T-DISC-01–17, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38, T-DISC-47–49 |
+| 5.1 | Discovery | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38, T-DISC-47–49 |
 | 5.2 | Name Collision | T-DISC-18–21, T-CLI-22b |
 | 5.3 | Reserved Names | T-DISC-22–26, T-CLI-22c |
 | 5.4 | Name Restrictions | T-DISC-27–32, T-DISC-30a–30b, T-CLI-07d, T-CLI-22d, T-EDGE-05 |
@@ -1176,14 +1219,14 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 7.3 | Signal Handling | T-SIG-01–06, T-SIG-07a (partial — between-iterations case may require unit-level test or be skipped) |
 | 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-25, F-ENV-01–05 |
 | 8.2 | Local Env Override | T-ENV-16–19 |
-| 8.3 | Env Injection Precedence | T-ENV-20–24 |
-| 9.1 | run() | T-API-01–09a, T-API-10 |
-| 9.2 | runPromise() | T-API-11–14b |
+| 8.3 | Env Injection Precedence | T-ENV-20–24, T-ENV-20a, T-ENV-21a |
+| 9.1 | run() | T-API-01–09a, T-API-10, T-TYPE-04, T-TYPE-06–07 |
+| 9.2 | runPromise() | T-API-11–14b, T-TYPE-05–07 |
 | 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20e |
 | 9.4 | output() and input() (script-side) | T-MOD-04–14a, T-MOD-13a–13c (output()), T-MOD-15–18 (input()) — these are the same tests listed under 6.5/6.6; 9.4 references them |
-| 9.5 | Types / RunOptions | T-API-07–08, T-API-10, T-API-20d–20e, T-API-21–25 |
+| 9.5 | Types / RunOptions | T-API-07–08, T-API-10, T-API-20d–20e, T-API-21–25, T-TYPE-01–07 |
 | 10.1 | Source Detection | T-INST-01–08c |
-| 10.2 | Source Type Details | T-INST-09–26b |
+| 10.2 | Source Type Details | T-INST-09–26b, T-INST-34–39 (blocked by SP-17) |
 | 10.3 | Common Install Rules | T-INST-27–33 |
 | 11 | Help | T-CLI-02–07g |
 | 12 | Exit Codes | T-EXIT-01–13 |
