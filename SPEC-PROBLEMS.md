@@ -65,3 +65,29 @@ The spec says directory scripts "must not" list loopx as their own dependency, b
 The shorthand rule expands `<org>/<repo>` to `https://github.com/<org>/<repo>.git`. As written, an input like `org/repo.git` would expand to `https://github.com/org/repo.git.git`.
 
 **Recommended resolution:** Either forbid `.git` in shorthand input or strip a trailing `.git` before expansion.
+
+---
+
+### SP-21: `org/repo` shorthand expansion is inconsistent across the spec
+
+**Sections:** 4.3, 10.1
+
+Section 4.3 says the shorthand expands to `https://github.com/org/repo` (no `.git` suffix). Section 10.1 says it expands to `https://github.com/<org>/<repo>.git` (with `.git` suffix). These are not the same rule, and the difference matters for source detection (rule 2 vs rule 3 in section 10.1).
+
+T-INST-01 currently asserts only "treated as a git source" rather than the exact expanded string, which is safe until this is resolved.
+
+**Recommended resolution:** Pick one canonical normalization rule and use it consistently in both sections. The `.git` suffix version (10.1) is more explicit and avoids ambiguity with known-host pathname matching.
+
+---
+
+### SP-22: `run()` error timing is underspecified
+
+**Sections:** 9.1, 9.3, 9.5
+
+The spec does not clearly say whether `run()`:
+- throws synchronously at call time for validation/discovery errors, or
+- always returns a generator and throws only when iteration begins (first `next()`)
+
+This matters for library ergonomics and for tests like T-API-20a (missing script), T-API-22/23 (invalid maxIterations). The current test spec softens these tests to assert only that an error occurs before any child execution, not exactly when.
+
+**Recommended resolution:** Define one model explicitly. A natural choice: `run()` snapshots options/cwd immediately but surfaces all errors when iteration begins (first `next()` or equivalent). This matches a natural async-generator implementation where the generator function body runs lazily.
