@@ -107,3 +107,51 @@ The spec says `loopx version` "prints the installed version of loopx and exits,"
 TEST-SPEC.md currently assumes exact equality with `package.json`'s `version` field (T-CLI-01, T-MOD-21), which is stricter than the current spec text.
 
 **Recommended resolution:** Define `loopx version` as printing the bare package version string followed by a newline, with no additional text.
+
+---
+
+### SP-24: Shadowed loopx resolution is underspecified / possibly contradictory
+
+**Sections:** 2.1, 3.3
+
+The spec currently mixes two incompatible policies:
+
+- **Section 3.3** provides a strong guarantee: bare specifier imports of `"loopx"` are intercepted by a custom module resolve hook (Node) or `NODE_PATH` (Bun) and resolved to the running CLI's package exports. This implies the CLI-provided package always wins.
+- **Section 2.1** provides an advisory warning: "Directory scripts must not list `loopx` as their own dependency. Installing a separate version of loopx inside a directory script may cause version mismatches." This implies the behavior is undefined or at least unreliable.
+
+If 3.3's guarantee holds absolutely, then a local `node_modules/loopx` inside a directory script should be overridden — the custom loader intercepts the bare specifier before Node's normal resolution finds the local package. But for Bun, section 3.3 uses `NODE_PATH`, which may not reliably override a local `node_modules/loopx` (Bun's resolver may prefer the closer `node_modules` over `NODE_PATH`).
+
+This directly affects T-MOD-03a and T-DEL-06, which currently assume the stronger guarantee.
+
+**Recommended resolution:** Either (a) strengthen 3.3 to explicitly guarantee the CLI-provided package always wins even when a shadow exists in `node_modules`, and specify how this is enforced per-runtime, or (b) weaken the guarantee to advisory status matching 2.1 and mark the scenario as undefined behavior in v1. Option (b) is simpler and avoids runtime-specific corner cases.
+
+---
+
+### SP-25: Tarball detection with query strings / fragments is under-specified
+
+**Sections:** 10.1, 10.2
+
+Section 10.1 says tarballs are URLs "ending in `.tar.gz` or `.tgz`." Section 10.2 explicitly strips query strings and fragments for archive-name derivation, and TEST-SPEC tests (T-INST-26a) already assume URLs like `pkg.tar.gz?token=abc` are treated as tarballs.
+
+However, the URL `http://example.com/pkg.tar.gz?token=abc` does not literally "end in `.tar.gz`" — the query string follows the extension. Source classification and archive-name derivation need to use consistent URL parsing.
+
+**Recommended resolution:** Define source classification as operating on the parsed URL pathname (with query string and fragment ignored). This makes `http://example.com/pkg.tar.gz?token=abc` match the tarball rule (pathname ends in `.tar.gz`), and aligns source detection with the archive-name stripping behavior already described in 10.2.
+
+---
+
+### SP-26: Async-generator cancellation semantics are not precise enough to test cleanly
+
+**Sections:** 9.1, 9.5
+
+Section 9.1 says: "If the consumer breaks out of the `for await` loop or calls `generator.return()`, loopx terminates the active child process group and cleans up." This conflates two different cancellation modes:
+
+1. **Break after yield:** A normal `break` from `for await` happens after a `yield`, when the previous iteration's child process has already exited and the next iteration has not yet started. There is no "active child process group" to terminate. The observable guarantee is simply that no further iterations start.
+
+2. **Return during pending next:** Calling `generator.return()` while a `next()` is pending (a child process is actively running) requires actually terminating the active child process group.
+
+The current wording does not distinguish these cases, making it unclear what the testable contract is for each. T-API-06 (break after yield) can pass vacuously if it only checks "child is no longer running," since there was no child running at that point.
+
+**Recommended resolution:** Clarify that:
+- The observable guarantee for `break` / `for await` completion is that no more iterations start after cancellation.
+- The active-child termination guarantee applies specifically to `generator.return()` called during a pending `next()`, and to `signal` abortion mid-iteration.
+- Both modes result in the generator completing (no further yields).
