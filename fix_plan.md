@@ -10,11 +10,11 @@ Status legend: `[ ]` = not started, `[x]` = complete
 
 These must be done first; everything else depends on them.
 
-- [ ] **Initialize `package.json`** — name, version, type: "module", devDependencies (vitest, fast-check, execa, get-port, tsx, typescript), scripts (`test`, `test:harness`, `test:unit`, `test:e2e`, `test:fuzz`, `test:typecheck`)
-- [ ] **Create `tsconfig.json`** — strict mode, ESM, target ES2022+, paths alias for `loopx/internal` if needed, include `tests/`
-- [ ] **Create `vitest.config.ts`** — configure test file patterns, timeouts per suite (harness 10s, unit 5s, e2e 30s, signals 60s, fuzz 120s), serial execution for signal tests, setupFiles if needed
-- [ ] **Create `.gitignore`** — node_modules, dist, coverage, .vitest, tmp/test artifacts
-- [ ] **Create directory structure** per TEST-SPEC §2.2:
+- [x] **Initialize `package.json`** — name, version, type: "module", devDependencies (vitest, fast-check, execa, get-port, tsx, typescript), scripts (`test`, `test:harness`, `test:unit`, `test:e2e`, `test:fuzz`, `test:typecheck`)
+- [x] **Create `tsconfig.json`** — strict mode, ESM, target ES2022+, paths alias for `loopx/internal` if needed, include `tests/`
+- [x] **Create `vitest.config.ts`** — configure test file patterns, timeouts per suite (harness 10s, unit 5s, e2e 30s, signals 60s, fuzz 120s), serial execution for signal tests, setupFiles if needed
+- [x] **Create `.gitignore`** — node_modules, dist, coverage, .vitest, tmp/test artifacts
+- [x] **Create directory structure** per TEST-SPEC §2.2:
   ```
   tests/
     harness/
@@ -32,70 +32,70 @@ The helper library is the foundation for all tests. Must be built before any tes
 
 ### `tests/helpers/fixtures.ts` (TEST-SPEC §2.3, §2.4)
 
-- [ ] **`createTempProject(options?): TempProject`** — creates isolated temp dir with optional `.loopx/` subdir; returns `{ dir, loopxDir, cleanup() }`; self-cleaning via afterEach or explicit cleanup
-- [ ] **`createScript(project, name, ext, content): string`** — writes a file script to `.loopx/` with correct content; returns full path; sets executable bit for `.sh`
-- [ ] **`createDirScript(project, name, main, files): string`** — creates directory script in `.loopx/` with `package.json` containing `main` field plus additional files; returns directory path
-- [ ] **`createBashScript(project, name, body): string`** — shorthand for `.sh` with `#!/bin/bash` header and executable permission
+- [x] **`createTempProject(options?): TempProject`** — creates isolated temp dir with optional `.loopx/` subdir; returns `{ dir, loopxDir, cleanup() }`; self-cleaning via afterEach or explicit cleanup
+- [x] **`createScript(project, name, ext, content): string`** — writes a file script to `.loopx/` with correct content; returns full path; sets executable bit for `.sh`
+- [x] **`createDirScript(project, name, main, files): string`** — creates directory script in `.loopx/` with `package.json` containing `main` field plus additional files; returns directory path
+- [x] **`createBashScript(project, name, body): string`** — shorthand for `.sh` with `#!/bin/bash` header and executable permission
 
 ### `tests/helpers/cli.ts` (TEST-SPEC §2.3)
 
-- [ ] **`runCLI(args, options?): Promise<CLIResult>`** — spawns the `loopx` binary as child process; supports `cwd`, `env`, `runtime` ("node"|"bun"), `timeout` (default 30s), `input`; returns `{ exitCode, stdout, stderr, signal }`; for Node spawns `node /path/to/bin.js`, for Bun spawns `bun /path/to/bin.js`
-- [ ] **`runCLIWithSignal(args, options): Promise<CLIResult>`** — like `runCLI` but returns `sendSignal(signal)` and `waitForStderr(pattern)` for signal synchronization
+- [x] **`runCLI(args, options?): Promise<CLIResult>`** — spawns the `loopx` binary as child process; supports `cwd`, `env`, `runtime` ("node"|"bun"), `timeout` (default 30s), `input`; returns `{ exitCode, stdout, stderr, signal }`; for Node spawns `node /path/to/bin.js`, for Bun spawns `bun /path/to/bin.js`
+- [x] **`runCLIWithSignal(args, options): Promise<CLIResult>`** — like `runCLI` but returns `sendSignal(signal)` and `waitForStderr(pattern)` for signal synchronization
 
 ### `tests/helpers/api-driver.ts` (TEST-SPEC §2.3)
 
-- [ ] **`runAPIDriver(runtime, code, options?): Promise<{ stdout, stderr, exitCode }>`** — spawns a driver script under specified runtime that imports from the loopx package; creates a temporary consumer directory with `package.json` and symlinked `node_modules/loopx`; exercises real package exports
+- [x] **`runAPIDriver(runtime, code, options?): Promise<{ stdout, stderr, exitCode }>`** — spawns a driver script under specified runtime that imports from the loopx package; creates a temporary consumer directory with `package.json` and symlinked `node_modules/loopx`; exercises real package exports
 
 ### `tests/helpers/env.ts` (TEST-SPEC §2.3)
 
-- [ ] **`createEnvFile(path, vars): void`** — writes well-formed `.env` file with `KEY=VALUE\n` lines
-- [ ] **`writeEnvFileRaw(path, content): void`** — writes raw text to file with no transformation; for testing malformed env content
-- [ ] **`withGlobalEnv(vars, fn): Promise<void>`** — sets `XDG_CONFIG_HOME` to temp dir, writes global env file, runs fn, cleans up
-- [ ] **`withIsolatedHome(fn): Promise<void>`** — sets `HOME` to temp dir, optionally unsets `XDG_CONFIG_HOME`, runs fn, restores
+- [x] **`createEnvFile(path, vars): void`** — writes well-formed `.env` file with `KEY=VALUE\n` lines
+- [x] **`writeEnvFileRaw(path, content): void`** — writes raw text to file with no transformation; for testing malformed env content
+- [x] **`withGlobalEnv(vars, fn): Promise<void>`** — sets `XDG_CONFIG_HOME` to temp dir, writes global env file, runs fn, cleans up
+- [x] **`withIsolatedHome(fn): Promise<void>`** — sets `HOME` to temp dir, optionally unsets `XDG_CONFIG_HOME`, runs fn, restores
 
 ### `tests/helpers/servers.ts` (TEST-SPEC §2.3, §2.6)
 
-- [ ] **`startLocalHTTPServer(routes): Promise<{ url, close }>`** — lightweight `http.createServer` serving fixture files; supports single-file routes, tarball routes, query string routes, error routes (404, 500)
-- [ ] **`startLocalGitServer(repos): Promise<{ url, close }>`** — creates local bare git repos, serves via `file://` URLs; creates bare repos with `git init --bare`, clone/commit/push fixture content
-- [ ] **`withGitURLRewrite(rewrites, fn): Promise<void>`** — sets up isolated git config via `GIT_CONFIG_GLOBAL` with `url.<base>.insteadOf` rules for known-host URL rewriting to local `file://` repos
+- [x] **`startLocalHTTPServer(routes): Promise<{ url, close }>`** — lightweight `http.createServer` serving fixture files; supports single-file routes, tarball routes, query string routes, error routes (404, 500)
+- [x] **`startLocalGitServer(repos): Promise<{ url, close }>`** — creates local bare git repos, serves via `file://` URLs; creates bare repos with `git init --bare`, clone/commit/push fixture content
+- [x] **`withGitURLRewrite(rewrites, fn): Promise<void>`** — sets up isolated git config via `GIT_CONFIG_GLOBAL` with `url.<base>.insteadOf` rules for known-host URL rewriting to local `file://` repos
 
 ### `tests/helpers/runtime.ts` (TEST-SPEC §2.3, §2.5)
 
-- [ ] **`forEachRuntime(fn): void`** — test parameterization helper; runs test block once per available runtime (Node.js, Bun); skips if runtime not installed
-- [ ] **Runtime detection** — detect availability of Node.js (>= 20.6) and Bun (>= 1.0)
+- [x] **`forEachRuntime(fn): void`** — test parameterization helper; runs test block once per available runtime (Node.js, Bun); skips if runtime not installed
+- [x] **Runtime detection** — detect availability of Node.js (>= 20.6) and Bun (>= 1.0)
 
 ### `tests/helpers/delegation.ts` (TEST-SPEC §2.3)
 
-- [ ] **`withDelegationSetup(options): Promise<DelegationFixture>`** — provisions realistic delegation fixtures: creates launcher files and symlinks in `node_modules/.bin/loopx`; returns `{ projectDir, globalBinPath, localBinPath, runGlobal(args), cleanup() }`
+- [x] **`withDelegationSetup(options): Promise<DelegationFixture>`** — provisions realistic delegation fixtures: creates launcher files and symlinks in `node_modules/.bin/loopx`; returns `{ projectDir, globalBinPath, localBinPath, runGlobal(args), cleanup() }`
 
 ### Fixture Scripts (TEST-SPEC §2.4)
 
 All fixture script factory functions — each returns script content string:
 
-- [ ] **`emit-result(value)`** — bash: `printf '{"result":"%s"}' '<value>'`
-- [ ] **`emit-goto(target)`** — bash: `printf '{"goto":"%s"}' '<target>'`
-- [ ] **`emit-stop()`** — bash: `printf '{"stop":true}'`
-- [ ] **`emit-result-goto(value, target)`** — bash: `printf '{"result":"%s","goto":"%s"}' '<value>' '<target>'`
-- [ ] **`emit-raw(text)`** — bash: `printf '%s' '<text>'`
-- [ ] **`emit-raw-ln(text)`** — bash: `printf '%s\n' '<text>'`
-- [ ] **`exit-code(n)`** — bash: `exit <n>`
-- [ ] **`cat-stdin()`** — bash: reads stdin, echoes as result
-- [ ] **`write-stderr(msg)`** — bash: `echo '<msg>' >&2` then produces output
-- [ ] **`sleep-then-exit(seconds)`** — bash: sleeps then exits 0
-- [ ] **`write-env-to-file(varname, markerPath)`** — bash: `printf '%s' "$VARNAME"` to marker file
-- [ ] **`observe-env(varname, markerPath)`** — ts: writes JSON `{ present, value? }` to marker file via `fs.writeFileSync`
-- [ ] **`write-cwd-to-file(markerPath)`** — bash: `printf '%s' "$PWD"` to marker file
-- [ ] **`write-value-to-file(value, markerPath)`** — bash: `printf '%s' '<value>'` to marker file
-- [ ] **`stdout-writer(payloadFile)`** — ts: reads file, writes to stdout via `process.stdout.write()`
-- [ ] **`ts-output(fields)`** — ts: uses `import { output } from "loopx"` to emit structured output
-- [ ] **`ts-input-echo()`** — ts: reads `input()`, outputs as result
-- [ ] **`ts-import-check()`** — ts: imports from "loopx", outputs success marker
-- [ ] **`signal-ready-then-sleep(markerPath)`** — bash: writes PID to marker, "ready" to stderr, sleeps
-- [ ] **`signal-trap-exit(markerPath, delay)`** — bash: traps SIGTERM with delay handler, writes PID, "ready" to stderr
-- [ ] **`signal-trap-ignore(markerPath)`** — bash: traps SIGTERM (no-op handler), writes PID, "ready" to stderr
-- [ ] **`spawn-grandchild(markerPath)`** — bash: spawns background process, writes both PIDs to marker, "ready" to stderr
-- [ ] **`write-pid-to-file(markerPath)`** — ts: writes `process.pid` to marker, "ready" to stderr, blocks
-- [ ] **`counter(file)`** — bash: appends "1" to counter file, outputs count as result
+- [x] **`emit-result(value)`** — bash: `printf '{"result":"%s"}' '<value>'`
+- [x] **`emit-goto(target)`** — bash: `printf '{"goto":"%s"}' '<target>'`
+- [x] **`emit-stop()`** — bash: `printf '{"stop":true}'`
+- [x] **`emit-result-goto(value, target)`** — bash: `printf '{"result":"%s","goto":"%s"}' '<value>' '<target>'`
+- [x] **`emit-raw(text)`** — bash: `printf '%s' '<text>'`
+- [x] **`emit-raw-ln(text)`** — bash: `printf '%s\n' '<text>'`
+- [x] **`exit-code(n)`** — bash: `exit <n>`
+- [x] **`cat-stdin()`** — bash: reads stdin, echoes as result
+- [x] **`write-stderr(msg)`** — bash: `echo '<msg>' >&2` then produces output
+- [x] **`sleep-then-exit(seconds)`** — bash: sleeps then exits 0
+- [x] **`write-env-to-file(varname, markerPath)`** — bash: `printf '%s' "$VARNAME"` to marker file
+- [x] **`observe-env(varname, markerPath)`** — ts: writes JSON `{ present, value? }` to marker file via `fs.writeFileSync`
+- [x] **`write-cwd-to-file(markerPath)`** — bash: `printf '%s' "$PWD"` to marker file
+- [x] **`write-value-to-file(value, markerPath)`** — bash: `printf '%s' '<value>'` to marker file
+- [x] **`stdout-writer(payloadFile)`** — ts: reads file, writes to stdout via `process.stdout.write()`
+- [x] **`ts-output(fields)`** — ts: uses `import { output } from "loopx"` to emit structured output
+- [x] **`ts-input-echo()`** — ts: reads `input()`, outputs as result
+- [x] **`ts-import-check()`** — ts: imports from "loopx", outputs success marker
+- [x] **`signal-ready-then-sleep(markerPath)`** — bash: writes PID to marker, "ready" to stderr, sleeps
+- [x] **`signal-trap-exit(markerPath, delay)`** — bash: traps SIGTERM with delay handler, writes PID, "ready" to stderr
+- [x] **`signal-trap-ignore(markerPath)`** — bash: traps SIGTERM (no-op handler), writes PID, "ready" to stderr
+- [x] **`spawn-grandchild(markerPath)`** — bash: spawns background process, writes both PIDs to marker, "ready" to stderr
+- [x] **`write-pid-to-file(markerPath)`** — ts: writes `process.pid` to marker, "ready" to stderr, blocks
+- [x] **`counter(file)`** — bash: appends "1" to counter file, outputs count as result
 
 ---
 
@@ -103,21 +103,21 @@ All fixture script factory functions — each returns script content string:
 
 Must pass without any loopx implementation. Validates the test infrastructure itself. (TEST-SPEC §3.1)
 
-- [ ] **H-01**: Temp project creation and cleanup — `createTempProject()` creates dir, `cleanup()` removes it
-- [ ] **H-02**: Script fixture creation — `createScript()` writes file to `.loopx/` with correct content/permissions
-- [ ] **H-03**: Directory script fixture creation — `createDirScript()` creates expected structure with `package.json`
-- [ ] **H-04**: Bash script is executable — created `.sh` has execute permission bit
-- [ ] **H-05**: Env file creation — `createEnvFile()` writes readable file with expected content
-- [ ] **H-06**: Process spawning captures exit code — spawn `node -e "process.exit(42)"`, assert exit code 42
-- [ ] **H-07**: Process spawning captures stdout — spawn `echo hello`, assert stdout `"hello\n"`
-- [ ] **H-08**: Process spawning captures stderr — spawn `node -e "console.error('err')"`, assert stderr contains `"err"`
-- [ ] **H-09**: Process spawning respects cwd — spawn `pwd` with specific cwd, assert matches
-- [ ] **H-10**: Process spawning respects env — spawn `echo $MY_VAR` with `MY_VAR=hello`, assert output
-- [ ] **H-11**: Signal delivery works — spawn sleeping process, send SIGTERM, assert termination
-- [ ] **H-12**: Local HTTP server starts and serves content — start server, fetch route, assert response
-- [ ] **H-13**: Local git repo is cloneable — create bare repo, clone, verify files exist
-- [ ] **H-14**: Runtime detection — `forEachRuntime` correctly detects available runtimes
-- [ ] **H-15**: Global env isolation — `withGlobalEnv` uses temp dir, doesn't touch real `~/.config`
+- [x] **H-01**: Temp project creation and cleanup — `createTempProject()` creates dir, `cleanup()` removes it
+- [x] **H-02**: Script fixture creation — `createScript()` writes file to `.loopx/` with correct content/permissions
+- [x] **H-03**: Directory script fixture creation — `createDirScript()` creates expected structure with `package.json`
+- [x] **H-04**: Bash script is executable — created `.sh` has execute permission bit
+- [x] **H-05**: Env file creation — `createEnvFile()` writes readable file with expected content
+- [x] **H-06**: Process spawning captures exit code — spawn `node -e "process.exit(42)"`, assert exit code 42
+- [x] **H-07**: Process spawning captures stdout — spawn `echo hello`, assert stdout `"hello\n"`
+- [x] **H-08**: Process spawning captures stderr — spawn `node -e "console.error('err')"`, assert stderr contains `"err"`
+- [x] **H-09**: Process spawning respects cwd — spawn `pwd` with specific cwd, assert matches
+- [x] **H-10**: Process spawning respects env — spawn `echo $MY_VAR` with `MY_VAR=hello`, assert output
+- [x] **H-11**: Signal delivery works — spawn sleeping process, send SIGTERM, assert termination
+- [x] **H-12**: Local HTTP server starts and serves content — start server, fetch route, assert response
+- [x] **H-13**: Local git repo is cloneable — create bare repo, clone, verify files exist
+- [x] **H-14**: Runtime detection — `forEachRuntime` correctly detects available runtimes
+- [x] **H-15**: Global env isolation — `withGlobalEnv` uses temp dir, doesn't touch real `~/.config`
 
 ---
 
