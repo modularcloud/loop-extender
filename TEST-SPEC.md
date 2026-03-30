@@ -1298,7 +1298,7 @@ CI should test against:
 
 This section tracks any tests that are blocked by unresolved spec ambiguities. If a test's assertions depend on a spec decision that has not been made, it is listed here so it cannot be accidentally treated as an authoritative failure.
 
-All previously identified spec problems (SP-15 through SP-27) have been resolved. Three new spec issues (SP-28, SP-29, SP-30) were identified during this review and have been resolved with SPEC.md updates. See SPEC-PROBLEMS.md for the full resolution record.
+All previously identified spec problems (SP-15 through SP-30) have been resolved. SP-31 (install name-collision across different destination paths) was identified and resolved during this revision.
 
 **Currently pending:** None. All identified issues have been resolved.
 
