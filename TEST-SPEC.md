@@ -31,7 +31,7 @@ This suite is the **implementation-driving** test suite — it defines the behav
 
 - **Spec 7.3 (Signal Handling — between iterations):** The between-iterations signal case (signal arrives when no child process is running) is inherently timing-sensitive and difficult to test reliably in a black-box E2E harness. Coverage for this clause is **partial**: T-SIG-07a provides a supplementary unit-level test if the implementation exposes a testable code path, but is otherwise skipped. The active-child signal cases (T-SIG-01–06) are fully covered.
 
-- **Spec 9.1 (Async Generator Cancellation):** Two cancellation modes exist: "break after yield" (T-API-06) and "return during pending next" (T-API-09a). The latter is partially blocked by SP-26 pending spec clarification of the precise cancellation contract.
+- **Spec 9.1 (Async Generator Cancellation):** Two cancellation scenarios are tested: "break after yield" (T-API-06), which verifies no further iterations start, and "return during pending next" (T-API-09a), which verifies active child process termination. Both are fully specified.
 
 ---
 
@@ -240,6 +240,7 @@ A catalog of reusable fixture scripts used across tests. Each is a function that
 | `write-stderr(msg)` | bash | `echo '<msg>' >&2` then produces output |
 | `sleep-then-exit(seconds)` | bash | Sleeps, then exits. For signal tests. |
 | `write-env-to-file(varname, markerPath)` | bash | Writes `$VARNAME` to a marker file. Observation via filesystem, not CLI stdout. |
+| `observe-env(varname, markerPath)` | ts | Writes JSON `{ "present": true, "value": "..." }` or `{ "present": false }` to a marker file using `fs.writeFileSync`. Distinguishes unset from empty string. Use instead of `write-env-to-file` when the test must differentiate between a variable being absent vs set to `""`. |
 | `write-cwd-to-file(markerPath)` | bash | Writes `$PWD` to a marker file. |
 | `write-value-to-file(value, markerPath)` | bash | Writes a literal value to a marker file. General-purpose observation helper. |
 | `stdout-writer(payloadFile)` | ts | Reads `payloadFile` from disk and writes its contents to stdout via `process.stdout.write()`. Used for fuzz and exact-byte output tests. |
@@ -249,7 +250,9 @@ A catalog of reusable fixture scripts used across tests. Each is a function that
 | `spawn-grandchild()` | bash | Spawns a background subprocess, then waits. For process group signal tests. |
 | `counter(file)` | bash | Appends "1" to a counter file each invocation, outputs count as result |
 
-**Fixture naming note:** The `emit-*` fixtures replace the previous `echo-*` fixtures. `printf` is used instead of `echo` to provide exact byte control — `echo` appends a trailing newline which can mangle exact byte expectations in parser tests. For tests that specifically need to verify trailing-newline handling, use `emit-raw-ln`. The `write-*-to-file` fixtures observe values via the filesystem rather than CLI stdout, since the CLI never prints `result` to its own stdout (Spec 7.1).
+**Fixture naming note:** The `emit-*` fixtures replace the previous `echo-*` fixtures. `printf` is used instead of `echo` to provide exact byte control — `echo` appends a trailing newline which can mangle exact byte expectations in parser tests. For tests that specifically need to verify trailing-newline handling, use `emit-raw-ln`. The `write-*-to-file` fixtures observe values via the filesystem rather than CLI stdout, since the CLI never prints `result` to its own stdout (Spec 7.1). The `observe-env` fixture is a TS-based alternative to `write-env-to-file` that writes structured JSON (`{ "present": boolean, "value"?: string }`) to a marker file using `fs.writeFileSync` for exact-byte safety. Use `observe-env` when a test must distinguish between a variable being unset vs set to an empty string — `write-env-to-file` (bash `echo $VAR`) produces identical output for both cases.
+
+**Bash JSON safety warning:** The `emit-result`, `emit-goto`, and `emit-result-goto` fixtures use `printf` with `%s` substitution to produce JSON. This is only safe for simple string values that do not contain double quotes (`"`), backslashes (`\`), newlines, or other JSON-special characters — these would produce malformed JSON. For tests that require exact-byte control, JSON-special characters in values, or arbitrary binary content, use the `stdout-writer` TS fixture (which reads a pre-written payload from disk) or `emit-raw`/`emit-raw-ln` (which output exact bytes without JSON framing).
 
 ### 2.5 Runtime Matrix
 
@@ -364,7 +367,7 @@ Each test is identified by a unique ID (`T-<SECTION>-<NUMBER>`), references a SP
 
 #### Help & Version
 
-- **T-CLI-01**: `loopx version` prints a version string, exits 0. Assert trimmed stdout exactly matches the `version` field from loopx's own `package.json`. Does not require `.loopx/` to exist. **Depends on SP-23** — this test assumes the spec resolves to "bare version string followed by a newline, no additional text." If SP-23 resolves differently, adjust the assertion. *(Spec 4.3, 5.5)*
+- **T-CLI-01**: `loopx version` prints the bare package version string followed by a newline, exits 0. Assert trimmed stdout exactly matches the `version` field from loopx's own `package.json`. No additional text or labels. Does not require `.loopx/` to exist. *(Spec 4.3, 5.5)*
 - **T-CLI-02**: `loopx -h` prints usage text containing "loopx" and "usage" (case-insensitive), exits 0. *(Spec 4.2)*
 - **T-CLI-03**: `loopx --help` produces the same output as `-h`. *(Spec 4.2)*
 - **T-CLI-04**: `loopx -h` with `.loopx/` containing scripts lists discovered script names in output. *(Spec 11)*
@@ -378,6 +381,8 @@ Each test is identified by a unique ID (`T-<SECTION>-<NUMBER>`), references a SP
 - **T-CLI-07e**: `loopx -h version` prints help and exits 0 (help flag takes precedence over subcommand). The `version` subcommand does not execute. *(Spec 4.2)*
 - **T-CLI-07f**: `loopx -h env set FOO bar` prints help and exits 0 (help flag takes precedence over `env` subcommand). *(Spec 4.2)*
 - **T-CLI-07g**: `loopx -h --invalid-flag` prints help and exits 0 (help flag takes precedence over invalid flags). *(Spec 4.2)*
+- **T-CLI-07h**: `loopx -h` with `.loopx/` containing a directory script with a bad `package.json` (invalid JSON) prints help with a non-fatal warning on stderr about the invalid directory script. Help still exits 0. The invalid directory script is not listed in the script listing. *(Spec 5.1, 11)*
+- **T-CLI-07i**: `loopx -h` with `.loopx/` containing a directory script whose `main` escapes the directory (e.g., `"main": "../escape.ts"`) prints help with a non-fatal warning on stderr. Help still exits 0. *(Spec 5.1, 11)*
 
 #### Default Script Invocation
 
@@ -449,10 +454,10 @@ Each test is identified by a unique ID (`T-<SECTION>-<NUMBER>`), references a SP
 - **T-SUB-14a**: `loopx env set KEY "value with spaces"` → `loopx env list` shows `KEY=value with spaces`. Value round-trips correctly. *(Spec 4.3)*
 - **T-SUB-14b**: `loopx env set KEY "value#hash"` → value preserved including `#`. *(Spec 4.3)*
 - **T-SUB-14c**: `loopx env set KEY "val=ue"` → value with `=` round-trips correctly. *(Spec 4.3)*
-- **T-SUB-14d**: `loopx env set KEY $'value\nwith newline'` → rejected (multiline values not supported). Exit code 1. *(Spec 4.3)*
+- **T-SUB-14d**: `loopx env set KEY <value containing an actual newline byte>` → rejected (multiline values not supported). Exit code 1. The test helper passes the argument as an array element containing a literal newline (e.g., `"value\nwith newline"`), not via shell evaluation. *(Spec 4.3)*
 - **T-SUB-14e**: `loopx env set KEY 'val"ue'` → `loopx env list` shows `KEY=val"ue`. Embedded double quotes round-trip correctly. *(Spec 4.3)*
 - **T-SUB-14f**: `loopx env set KEY "value  "` → `loopx env list` shows `KEY=value  `. Trailing spaces in the value are preserved. *(Spec 4.3)*
-- **T-SUB-14g**: `loopx env set KEY $'value\rwith cr'` → rejected (carriage return, like newline, is not supported). Exit code 1. *(Spec 4.3)*
+- **T-SUB-14g**: `loopx env set KEY <value containing an actual CR byte>` → rejected (carriage return, like newline, is not supported). Exit code 1. The test helper passes the argument as an array element containing a literal carriage return (e.g., `"value\rwith cr"`), not via shell evaluation. *(Spec 4.3)*
 
 #### `loopx env set` On-Disk Serialization
 
@@ -480,11 +485,11 @@ These tests verify the actual bytes written to the env file, not just round-trip
 
 #### File Script Discovery
 
-- **T-DISC-01**: `.loopx/myscript.sh` is discoverable. `loopx -n 1 myscript` runs it. *(Spec 5.1)*
-- **T-DISC-02**: `.loopx/myscript.js` is discoverable. *(Spec 5.1)*
-- **T-DISC-03**: `.loopx/myscript.jsx` is discoverable. *(Spec 5.1)*
-- **T-DISC-04**: `.loopx/myscript.ts` is discoverable. *(Spec 5.1)*
-- **T-DISC-05**: `.loopx/myscript.tsx` is discoverable. *(Spec 5.1)*
+- **T-DISC-01**: `.loopx/myscript.sh` is discoverable. `loopx -n 1 myscript` runs it. Assert via marker file (use `write-value-to-file` fixture): the script writes a known value to a marker file, and the marker file exists with the expected content after execution. Exit code 0 alone is not sufficient. *(Spec 5.1)*
+- **T-DISC-02**: `.loopx/myscript.js` is discoverable. `loopx -n 1 myscript` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.1)*
+- **T-DISC-03**: `.loopx/myscript.jsx` is discoverable. `loopx -n 1 myscript` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.1)*
+- **T-DISC-04**: `.loopx/myscript.ts` is discoverable. `loopx -n 1 myscript` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.1)*
+- **T-DISC-05**: `.loopx/myscript.tsx` is discoverable. `loopx -n 1 myscript` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.1)*
 - **T-DISC-06**: `.loopx/myscript.mjs` is NOT discoverable. `loopx -n 1 myscript` fails with "not found." *(Spec 2.1, 5.1)*
 - **T-DISC-07**: `.loopx/myscript.cjs` is NOT discoverable. *(Spec 2.1, 5.1)*
 - **T-DISC-08**: `.loopx/myscript.txt` is NOT discoverable. *(Spec 5.1)*
@@ -493,14 +498,14 @@ These tests verify the actual bytes written to the env file, not just round-trip
 
 #### Directory Script Discovery
 
-- **T-DISC-11**: `.loopx/mypipe/` with `package.json` (`"main": "index.ts"`) and `index.ts` → discoverable as `mypipe`. *(Spec 2.1, 5.1)*
+- **T-DISC-11**: `.loopx/mypipe/` with `package.json` (`"main": "index.ts"`) and `index.ts` → discoverable as `mypipe`. `loopx -n 1 mypipe` runs it. Assert via marker file or `runPromise({ maxIterations: 1 })`: the entry point executes and produces an observable output. *(Spec 2.1, 5.1)*
 - **T-DISC-11a**: `.loopx/mypipe/` with `package.json` (`"main": "src/index.ts"`) and `src/index.ts` → discoverable as `mypipe`. This verifies that `main` can point to a subpath within the directory, not just a top-level file. *(Spec 2.1, 5.1)*
 - **T-DISC-12**: `.loopx/nopackage/` directory with no `package.json` → ignored. `loopx -n 1 nopackage` fails. *(Spec 2.1, 5.1)*
 - **T-DISC-13**: `.loopx/nomain/` with `package.json` that has no `main` field → ignored. *(Spec 2.1, 5.1)*
-- **T-DISC-14**: `.loopx/mypipe/` with `"main": "index.sh"` → discoverable (bash entry point). *(Spec 5.1)*
-- **T-DISC-14a**: `.loopx/mypipe/` with `"main": "index.js"` → discoverable (JS entry point). *(Spec 5.1)*
-- **T-DISC-14b**: `.loopx/mypipe/` with `"main": "index.jsx"` → discoverable (JSX entry point). *(Spec 5.1)*
-- **T-DISC-14c**: `.loopx/mypipe/` with `"main": "index.tsx"` → discoverable (TSX entry point). *(Spec 5.1)*
+- **T-DISC-14**: `.loopx/mypipe/` with `"main": "index.sh"` → discoverable (bash entry point). `loopx -n 1 mypipe` runs it. Assert via marker file: the entry point executes and writes a known value to a marker file. *(Spec 5.1)*
+- **T-DISC-14a**: `.loopx/mypipe/` with `"main": "index.js"` → discoverable (JS entry point). `loopx -n 1 mypipe` runs it. Assert via marker file: the entry point executes and writes a known value. *(Spec 5.1)*
+- **T-DISC-14b**: `.loopx/mypipe/` with `"main": "index.jsx"` → discoverable (JSX entry point). `loopx -n 1 mypipe` runs it. Assert via marker file: the entry point executes and writes a known value. *(Spec 5.1)*
+- **T-DISC-14c**: `.loopx/mypipe/` with `"main": "index.tsx"` → discoverable (TSX entry point). `loopx -n 1 mypipe` runs it. Assert via marker file: the entry point executes and writes a known value. *(Spec 5.1)*
 - **T-DISC-15**: `.loopx/mypipe/` with `"main": "index.py"` → warning on stderr, directory ignored. *(Spec 5.1)*
 - **T-DISC-16**: `.loopx/mypipe/` with `"main": "../escape.ts"` → warning on stderr, directory ignored. *(Spec 5.1)*
 - **T-DISC-16a**: `.loopx/mypipe/` with `package.json` containing invalid JSON (e.g., `{invalid}`) → warning on stderr, directory ignored. `loopx -n 1 mypipe` fails. *(Spec 5.1)*
@@ -530,8 +535,8 @@ These tests verify the actual bytes written to the env file, not just round-trip
 - **T-DISC-28**: `.loopx/my-script.sh` (hyphen in middle) → valid, no error. *(Spec 5.4)*
 - **T-DISC-29**: `.loopx/_underscore.sh` → valid. *(Spec 5.4)*
 - **T-DISC-30**: `.loopx/ABC123.sh` → valid. *(Spec 5.4)*
-- **T-DISC-30a**: `.loopx/1start.sh` → valid (digits are allowed as the first character of a script name per `[a-zA-Z0-9_]`). `loopx -n 1 1start` runs it. *(Spec 5.4)*
-- **T-DISC-30b**: `.loopx/42.sh` → valid (all-digit script name). *(Spec 5.4)*
+- **T-DISC-30a**: `.loopx/1start.sh` → valid (digits are allowed as the first character of a script name per `[a-zA-Z0-9_]`). `loopx -n 1 1start` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.4)*
+- **T-DISC-30b**: `.loopx/42.sh` → valid (all-digit script name). `loopx -n 1 42` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.4)*
 - **T-DISC-31**: `.loopx/has space.sh` → error (space not in allowed pattern). *(Spec 5.4)*
 - **T-DISC-32**: `.loopx/has.dot.sh` — the base name is `has.dot` (everything before `.sh`). This contains a `.` which is not in `[a-zA-Z0-9_-]`. → error. *(Spec 5.4)*
 
@@ -557,6 +562,8 @@ These tests verify the actual bytes written to the env file, not just round-trip
 - **T-DISC-44**: `loopx env set X Y` when `.loopx/` exists and contains collisions → exits 0, AND `loopx env list` subsequently shows `X=Y`. Assert stderr does not contain script-validation warnings. *(Spec 5.5)*
 - **T-DISC-45**: `loopx output --result "x"` when `.loopx/` exists and contains reserved names → exits 0, AND stdout contains valid JSON with `result: "x"`. Assert stderr does not contain script-validation warnings. *(Spec 5.5)*
 - **T-DISC-46**: `loopx install <source>` when `.loopx/` exists and contains collisions → the install succeeds (exits 0, installed script present in `.loopx/`). Assert stderr does not contain script-validation warnings about existing scripts. *(Spec 5.5)*
+- **T-DISC-46a**: `loopx env remove X` when `.loopx/` doesn't exist → exits 0 (silent no-op, since there is no variable to remove). Assert stderr does not contain script-validation warnings. *(Spec 5.5, 4.3)*
+- **T-DISC-46b**: `loopx env remove X` when `.loopx/` exists and contains name collisions → exits 0 (the `env remove` subcommand does not trigger script validation). Assert stderr does not contain script-validation warnings. *(Spec 5.5, 4.3)*
 
 #### Discovery Scope
 
@@ -709,7 +716,7 @@ All env tests use `withGlobalEnv` to isolate from the real user config.
 #### Global Env File
 
 - **T-ENV-01**: Variable set via `loopx env set` is available in a script. Use `write-env-to-file` fixture: the script writes `$VAR_NAME` to a marker file. Assert the marker file contains the expected value. *(Spec 8.1, 8.3)*
-- **T-ENV-02**: Variable removed via `loopx env remove` is no longer available in scripts. Use `write-env-to-file` fixture: the script writes `$VAR_NAME` to a marker file. Assert the marker file is empty (variable unset). *(Spec 8.1)*
+- **T-ENV-02**: Variable removed via `loopx env remove` is no longer available in scripts. Use `observe-env` fixture: the script writes JSON to a marker file. Assert the marker file contains `{ "present": false }` (variable truly unset, not merely empty). *(Spec 8.1)*
 - **T-ENV-03**: `XDG_CONFIG_HOME` is respected. Set `XDG_CONFIG_HOME=/tmp/custom`, run `loopx env set X Y`, verify file exists at `/tmp/custom/loopx/env`. *(Spec 8.1)*
 - **T-ENV-04**: When `XDG_CONFIG_HOME` is unset, default is `~/.config`. Use `withIsolatedHome` (not `withGlobalEnv`) to safely verify the fallback path without touching the real home directory. *(Spec 8.1)*
 - **T-ENV-05**: Config directory created on first `env set`. Start with no directory, run `env set`, verify directory was created. *(Spec 8.1)*
@@ -729,11 +736,11 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 - **T-ENV-14**: `writeEnvFileRaw(path, "KEY=value   \n")`. Trailing whitespace on value trimmed → value is `value`. *(Spec 8.1)*
 - **T-ENV-15**: `writeEnvFileRaw(path, "KEY = value\n")`. No whitespace around `=`: the key is `KEY ` which contains a space. Test that this does NOT set `KEY` to `value`. Assert a warning on stderr about the invalid key. *(Spec 8.1)*
 - **T-ENV-15f**: `writeEnvFileRaw(path, "KEY= value\n")`. The value is everything after the first `=` to end of line, trimmed of trailing whitespace. Script sees `KEY` with value ` value` (leading space preserved). *(Spec 8.1)*
-- **T-ENV-15a**: `writeEnvFileRaw(path, "KEY=\n")`. Empty value. Script sees `KEY` with value `""`. *(Spec 8.1)*
+- **T-ENV-15a**: `writeEnvFileRaw(path, "KEY=\n")`. Empty value. Use `observe-env` fixture: assert marker contains `{ "present": true, "value": "" }` — the variable is present with an empty string value, not absent. *(Spec 8.1)*
 - **T-ENV-15b**: `writeEnvFileRaw(path, "KEY=a=b=c\n")`. Multiple `=`. Script sees `KEY` with value `a=b=c` (split on first `=`). *(Spec 8.1)*
-- **T-ENV-15c**: `writeEnvFileRaw(path, "1BAD=val\n")`. Invalid key (starts with digit). Line ignored with warning to stderr. Script does not see `1BAD`. *(Spec 8.1)*
+- **T-ENV-15c**: `writeEnvFileRaw(path, "1BAD=val\n")`. Invalid key (starts with digit). Line ignored with warning to stderr. Use `observe-env` fixture with varname `1BAD`: assert marker contains `{ "present": false }` — confirming the variable is truly unset. *(Spec 8.1)*
 - **T-ENV-15d**: `writeEnvFileRaw(path, "justtext\n")`. Malformed non-comment line without `=`. Line ignored with warning to stderr. *(Spec 8.1)*
-- **T-ENV-15e**: `writeEnvFileRaw(path, 'KEY="hello\n')`. Unmatched quotes: opening double quote, no closing. The spec says quotes are stripped when values are "optionally wrapped" — an unmatched quote is not wrapping, so the literal `"hello` is the value. **Blocked by SP-15** — this test is not normative until the spec resolves unmatched quote behavior. *(Spec 8.1)*
+- **T-ENV-15e**: `writeEnvFileRaw(path, 'KEY="hello\n')`. Unmatched quotes: opening double quote, no closing. "Wrapped" requires both opening and closing quotes of the same type — an unmatched quote is not wrapping, so the literal value `"hello` (including the quote character) is preserved. *(Spec 8.1)*
 
 #### Local Env Override (`-e`)
 
@@ -755,6 +762,7 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 #### Env Caching
 
 - **T-ENV-25**: During a multi-iteration loop, modify the global env file between iterations (use a script that rewrites the env file as a side effect on iteration 1). On iteration 2, a different script writes `$VAR` to a marker file. Assert the marker contains the original value (env loaded once at start, not re-read). *(Spec 8.1)*
+- **T-ENV-25a**: During a multi-iteration loop with `-e local.env`, modify `local.env` between iterations (use a script that rewrites the local env file as a side effect on iteration 1). On iteration 2, a different script writes `$VAR` to a marker file via `observe-env`. Assert the marker contains the original value (local env file loaded once at start, not re-read per iteration). *(Spec 8.2)*
 
 ### 4.8 Module Resolution & Script Helpers
 
@@ -765,7 +773,7 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 - **T-MOD-01**: A TS script with `import { output } from "loopx"` runs successfully under Node.js. `[Node]` *(Spec 3.3)*
 - **T-MOD-02**: Same import works under Bun. `[Bun]` *(Spec 3.3)*
 - **T-MOD-03**: A JS script with `import { output } from "loopx"` also works. *(Spec 3.3)*
-- **T-MOD-03a**: A directory script that has its own `node_modules/loopx` (a fake/different version) still resolves `import from "loopx"` to the running CLI's package, not the local shadow. The shadow package must be **observably wrong** — it exports an `output()` function that writes a distinctive marker (e.g., `{"__shadow": true}`) to a marker file and then writes different JSON to stdout, instead of the real structured output behavior. The test asserts that the real `output()` behavior is observed (correct structured output via `runPromise`) AND that the shadow's marker file does not exist. This discriminates between "the real package resolved" and "any working `output()` was available." `[Node]` only — **Blocked by SP-24.** The spec's guarantee that `import "loopx"` resolves to the running CLI's package (Spec 3.3) is in tension with the advisory "must not" in section 2.1. For Bun, the `NODE_PATH` mechanism may not reliably override a local `node_modules/loopx`. This test is not normative until SP-24 is resolved. *(Spec 3.3, 2.1)*
+- **T-MOD-03a**: A directory script that has its own `node_modules/loopx` (a different version) resolves `import from "loopx"` to the **local** package, not the running CLI's package. Standard module resolution applies — the closest `node_modules` wins. The local shadow package exports an `output()` function that writes a distinctive marker to a marker file before writing JSON to stdout. The test asserts that the shadow's marker file **exists** (proving the local package was resolved). This verifies the spec's "standard module resolution applies" behavior (Spec 2.1, 3.3). *(Spec 3.3, 2.1)*
 
 #### `output()` Function
 
@@ -786,6 +794,8 @@ These tests observe `output()` behavior via the programmatic API (`run()` / `run
 - **T-MOD-13b**: Script uses `output({ result: undefined, goto: undefined, stop: undefined })`. All known fields are `undefined`, which are omitted during JSON serialization — equivalent to `output({})`. Script crashes with non-zero exit code (no known fields with defined values). *(Spec 6.5)*
 - **T-MOD-13d**: Script uses `output({ stop: false })`. The `stop` field has a defined value (`false`), which is a known field — so `output()` accepts the object (it has at least one known field with a defined value). The emitted JSON `{"stop":false}` is then parsed by the loop engine, where `stop` must be exactly `true` (boolean) to take effect. Observe via `runPromise({ maxIterations: 2 })`: the first yielded Output is `{}` (the `stop: false` is discarded during parsing), and the loop continues to a second iteration rather than halting. *(Spec 6.5, 2.3)*
 - **T-MOD-13e**: Script uses `output({ goto: 42 })`. The `goto` field has a defined value (`42`), which is a known field — so `output()` accepts the object. The emitted JSON `{"goto":42}` is then parsed by the loop engine, where `goto` must be a string. Observe via `runPromise({ maxIterations: 2 })`: the first yielded Output is `{}` (the non-string `goto` is discarded during parsing), and the loop resets to the starting target rather than transitioning. *(Spec 6.5, 2.3)*
+- **T-MOD-13f**: Script uses `output({ result: null })`. The `result` field has a defined value (`null`), which is a known field — so `output()` accepts the object. The emitted JSON `{"result":null}` is then parsed by the loop engine, where non-string `result` is coerced via `String()`. Observe via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "null"`. *(Spec 6.5, 2.3)*
+- **T-MOD-13g**: Script uses `output({ goto: null })`. The `goto` field has a defined value (`null`), which is a known field — so `output()` accepts the object. The emitted JSON `{"goto":null}` is then parsed by the loop engine, where `goto` must be a string. Observe via `runPromise({ maxIterations: 2 })`: the first yielded Output is `{}` (the null `goto` is discarded during parsing), and the loop resets to the starting target. *(Spec 6.5, 2.3)*
 - **T-MOD-14**: Code after `output()` does not execute. Script: `output({ result: "a" }); writeFileSync("/tmp/marker", "ran")`. Assert marker file does not exist. *(Spec 6.5)*
 - **T-MOD-14a**: Large-payload flush: Script uses `output({ result: "x".repeat(1_000_000) })` (1 MB result). Observe via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has the full 1 MB string without truncation. This exercises the flush-before-exit guarantee in section 6.5. *(Spec 6.5)*
 
@@ -806,7 +816,7 @@ These tests verify `LOOPX_BIN` through loop behavior and side-effect files — n
 
 - **T-MOD-19**: Bash script uses `$LOOPX_BIN output --result "payload" --goto "reader"` to produce structured output. A second script `reader` reads stdin and writes the received value to a marker file. Assert the marker file contains `"payload"`. *(Spec 3.4)*
 - **T-MOD-20**: Bash script writes `$LOOPX_BIN` to a marker file. Assert the marker file contains a valid path to an executable file (file exists and is executable). *(Spec 3.4)*
-- **T-MOD-21**: Bash script runs `$LOOPX_BIN version` and captures its stdout to a marker file. Assert the marker file content (trimmed) matches loopx's own `package.json` `version` field. **Depends on SP-23** — same assumption as T-CLI-01 regarding version output format. *(Spec 3.4)*
+- **T-MOD-21**: Bash script runs `$LOOPX_BIN version` and captures its stdout to a marker file. Assert the marker file content (trimmed) matches loopx's own `package.json` `version` field. *(Spec 3.4)*
 
 ### 4.9 Programmatic API
 
@@ -821,15 +831,17 @@ Tests import `run` and `runPromise` from the built loopx package and call them w
 - **T-API-03**: Generator completes (returns `{ done: true }`) when script outputs `stop: true`. *(Spec 9.1)*
 - **T-API-04**: Generator completes when `maxIterations` is reached. *(Spec 9.1)*
 - **T-API-05**: The output from the final iteration is yielded before the generator completes. *(Spec 9.1)*
-- **T-API-06**: Breaking out of `for await` loop after the first yield prevents further iterations from starting. Setup: script produces a result (no `stop`) on each iteration, with `maxIterations: 10`. Break after receiving the first yield. Assert: no additional iterations execute (use a counter file — counter should be exactly 1). Note: a normal `break` from `for await` happens after a yield, when there is typically no active child process. The observable guarantee being tested is "no more iterations start after cancellation," not active child termination. See T-API-09a for the active-child case. *(Spec 9.1)*
+- **T-API-06**: Breaking out of `for await` loop after the first yield prevents further iterations from starting. Setup: script produces a result (no `stop`) on each iteration, with `maxIterations: 10`. Break after receiving the first yield. Assert: no additional iterations execute (use a counter file — counter should be exactly 1). *(Spec 9.1)*
 - **T-API-07**: `run("myscript", { cwd: "/path/to/project" })` resolves scripts relative to the given cwd. *(Spec 9.5)*
 - **T-API-08**: `run("myscript", { maxIterations: 0 })` → generator completes immediately with no yields. *(Spec 9.5)*
 - **T-API-09**: `run()` with no script name runs the `default` script. *(Spec 9.1)*
-- **T-API-09a**: Manual iterator cancellation during a pending `next()`. Use a long-running script (e.g., `sleep-then-exit(30)` fixture). Obtain the async iterator, call `iterator.next()` to start the first iteration, then immediately call `iterator.return()` while `next()` is still pending (the child process is actively running). Assert: (1) the child process / process group is terminated (the script writes its PID to a marker file on startup; after `return()` resolves, verify the PID is no longer running), and (2) the generator completes with no further yields. This tests the "actively running child" cancellation path, which is distinct from T-API-06's "break after yield" path. **Partially blocked by SP-26** — the spec does not precisely distinguish these two cancellation modes. *(Spec 9.1)*
+- **T-API-09b**: `run()` cwd snapshot timing. Create two temp projects, each with a `default` script that writes a unique marker. Call `run()` while `process.cwd()` is project A (no explicit `cwd` option). Then change `process.cwd()` to project B before calling `next()`. Assert the generator executes project A's script, not project B's — proving `cwd` was snapshotted at `run()` call time. *(Spec 9.1, 9.5)*
+- **T-API-09a**: Manual iterator cancellation during a pending `next()`. Use a long-running script (e.g., `sleep-then-exit(30)` fixture). Obtain the async iterator, call `iterator.next()` to start the first iteration, then immediately call `iterator.return()` while `next()` is still pending (the child process is actively running). Assert: (1) the child process / process group is terminated (the script writes its PID to a marker file on startup; after `return()` resolves, verify the PID is no longer running), and (2) the generator completes with no further yields. *(Spec 9.1)*
 
 #### `run()` with AbortSignal
 
 - **T-API-10**: `run("myscript", { signal })` — aborting the signal terminates the loop and the generator throws an abort error. *(Spec 9.5)*
+- **T-API-10a**: `run("myscript", { signal })` — aborting the signal while a child process is actively running terminates the child process group. Use a long-running script that writes its PID to a marker file. Abort the signal mid-iteration. Assert the PID is no longer running after the generator throws. *(Spec 9.5, 9.1)*
 
 #### `runPromise()`
 
@@ -848,10 +860,10 @@ Tests import `run` and `runPromise` from the built loopx package and call them w
 - **T-API-18**: Script stderr is forwarded to the calling process's stderr. *(Spec 9.3)*
 - **T-API-19**: When `run()` throws, previously yielded outputs are preserved (the caller already consumed them). Test: collect outputs in an array, handle the throw, verify array has the partial results. *(Spec 9.3)*
 - ~~**T-API-20**~~: *Removed.* "Partial outputs are not available" from `runPromise()` rejection is not meaningfully observable beyond the promise rejecting. The relevant surface is already covered by T-API-13 (rejection on non-zero exit), T-API-15 (no stdout leakage), and T-API-19 (partial outputs preserved with `run()`). *(Spec 9.3)*
-- **T-API-20a**: `run("nonexistent")` — errors before any child process is spawned because the script does not exist. The error may surface synchronously at `run()` call time or on the first `next()` — the test asserts only that an error occurs and no child was executed (use a counter file in `.loopx/` to verify no script ran). **Blocked by SP-22** — exact error timing is not normative until the spec resolves `run()` eagerness. *(Spec 9.3)*
+- **T-API-20a**: `run("nonexistent")` — `run()` returns a generator without throwing. On the first `next()`, the generator throws because the script does not exist. No child process is spawned (use a counter file in `.loopx/` to verify no script ran). *(Spec 9.1, 9.3)*
 - **T-API-20b**: `runPromise("nonexistent")` — rejects because the script does not exist. *(Spec 9.3)*
-- **T-API-20c**: `run("myscript")` with `.loopx/` containing a name collision — errors before any child process is spawned (validation failure). Same timing caveat as T-API-20a. *(Spec 9.3)*
-- **T-API-20d**: `run("myscript", { envFile: "nonexistent.env" })` — errors before any child process is spawned because the env file does not exist. Same timing caveat as T-API-20a. *(Spec 9.3, 9.5)*
+- **T-API-20c**: `run("myscript")` with `.loopx/` containing a name collision — `run()` returns a generator. On the first `next()`, the generator throws (validation failure). No child process is spawned. *(Spec 9.1, 9.3)*
+- **T-API-20d**: `run("myscript", { envFile: "nonexistent.env" })` — `run()` returns a generator. On the first `next()`, the generator throws because the env file does not exist. No child process is spawned. *(Spec 9.1, 9.3, 9.5)*
 - **T-API-20e**: `runPromise("myscript", { envFile: "nonexistent.env" })` — rejects because the env file does not exist. *(Spec 9.3, 9.5)*
 
 #### `envFile` Option
@@ -862,8 +874,8 @@ Tests import `run` and `runPromise` from the built loopx package and call them w
 
 #### `maxIterations` Validation
 
-- **T-API-22**: `run("myscript", { maxIterations: -1 })` → errors before any child process is spawned (non-negative integer required). The error may surface synchronously at `run()` call time or on the first `next()`. Assert only that an error occurs and no script was executed. **Blocked by SP-22.** *(Spec 9.5)*
-- **T-API-23**: `run("myscript", { maxIterations: 1.5 })` → errors before any child process is spawned. Same timing caveat as T-API-22. *(Spec 9.5)*
+- **T-API-22**: `run("myscript", { maxIterations: -1 })` → `run()` returns a generator. On the first `next()`, the generator throws (non-negative integer required). No script is executed. *(Spec 9.1, 9.5)*
+- **T-API-23**: `run("myscript", { maxIterations: 1.5 })` → `run()` returns a generator. On the first `next()`, the generator throws (non-integer). No script is executed. *(Spec 9.1, 9.5)*
 - **T-API-24**: `runPromise("myscript", { maxIterations: NaN })` → rejects before execution. *(Spec 9.5)*
 - **T-API-24a**: `runPromise("myscript", { maxIterations: -1 })` → rejects before execution (negative values are invalid). *(Spec 9.5)*
 - **T-API-24b**: `runPromise("myscript", { maxIterations: 1.5 })` → rejects before execution (non-integer values are invalid). *(Spec 9.5)*
@@ -880,7 +892,8 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 
 #### Source Detection
 
-- **T-INST-01**: `loopx install myorg/my-script` is treated as a git source (github shorthand). Verify by using `withGitURLRewrite` to redirect the expected github URL to a local bare repo, and asserting that the repo is cloned into `.loopx/my-script/`. Do not assert the exact expanded URL string — assert only that it is treated as a git source and the resulting directory script is named `my-script`. **Blocked by SP-21** — the exact expansion rule is inconsistent across spec sections. *(Spec 10.1)*
+- **T-INST-01**: `loopx install myorg/my-script` is treated as a git source (github shorthand). Expands to `https://github.com/myorg/my-script.git`. Verify by using `withGitURLRewrite` to redirect `https://github.com/myorg/my-script.git` to a local bare repo, and asserting that the repo is cloned into `.loopx/my-script/`. *(Spec 10.1)*
+- **T-INST-01a**: `loopx install myorg/my-script.git` → error, exit code 1. The `<repo>` segment of the shorthand must not end in `.git`. Users who want a `.git` URL must provide the full URL. *(Spec 10.1)*
 - **T-INST-02**: `loopx install https://github.com/org/repo` → treated as git (known host). *(Spec 10.1)*
 - **T-INST-03**: `loopx install https://gitlab.com/org/repo` → treated as git. *(Spec 10.1)*
 - **T-INST-04**: `loopx install https://bitbucket.org/org/repo` → treated as git. *(Spec 10.1)*
@@ -891,7 +904,7 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 - **T-INST-08a**: `loopx install https://github.com/org/repo/archive/main.tar.gz` → treated as tarball (not git), because the pathname has more than two segments. *(Spec 10.1)*
 - **T-INST-08b**: `loopx install https://github.com/org/repo/raw/main/script.ts` → treated as single file (not git), because the pathname has additional path segments. *(Spec 10.1)*
 - **T-INST-08c**: `loopx install https://github.com/org/repo/` → treated as git (trailing slash allowed on known host). *(Spec 10.1)*
-- **T-INST-08d**: `loopx install http://localhost:PORT/pkg.tar.gz?token=abc` → treated as tarball. Source detection should operate on the URL pathname (ignoring query string), so `pkg.tar.gz?token=abc` is still recognized as a tarball by its `.tar.gz` extension. **Blocked by SP-25** — the spec says tarballs are URLs "ending in `.tar.gz` or `.tgz`" without explicitly stating that source classification uses the parsed pathname. *(Spec 10.1)*
+- **T-INST-08d**: `loopx install http://localhost:PORT/pkg.tar.gz?token=abc` → treated as tarball. Source detection operates on the URL pathname (ignoring query string), so the pathname `/pkg.tar.gz` is recognized as a tarball by its `.tar.gz` extension. *(Spec 10.1)*
 
 #### Single-File Install
 
@@ -934,14 +947,14 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 
 #### Install Post-Validation (Directory Scripts)
 
-These tests verify that git/tarball installs apply the same validation as discovery (Spec 5.1) to the resulting directory. **Blocked by SP-17** — the spec does not explicitly require install to validate beyond "package.json with main pointing to supported extension." These tests assume SP-17 resolves to full parity with discovery validation.
+These tests verify that git/tarball installs apply the same validation as discovery (Spec 5.1) to the resulting directory.
 
-- **T-INST-34**: Git install where cloned repo has invalid JSON in `package.json` → clone removed, error, exit code 1, no partial directory left in `.loopx/`. **Blocked by SP-17.** *(Spec 10.2, 5.1)*
-- **T-INST-35**: Git install where cloned repo has `package.json` with non-string `main` (e.g., `{"main": 42}`) → clone removed, error, exit code 1. **Blocked by SP-17.** *(Spec 10.2, 5.1)*
-- **T-INST-36**: Git install where cloned repo has `package.json` with `main` escaping the directory (e.g., `{"main": "../escape.ts"}`) → clone removed, error, exit code 1. **Blocked by SP-17.** *(Spec 10.2, 5.1)*
-- **T-INST-37**: Git install where cloned repo has `package.json` with `main` pointing to a file that does not exist → clone removed, error, exit code 1. **Blocked by SP-17.** *(Spec 10.2, 5.1)*
-- **T-INST-38**: Tarball install where extracted directory has invalid JSON in `package.json` → directory removed, error, exit code 1. **Blocked by SP-17.** *(Spec 10.2, 5.1)*
-- **T-INST-39**: Tarball install where extracted directory has `package.json` with `main` pointing to a missing file → directory removed, error, exit code 1. **Blocked by SP-17.** *(Spec 10.2, 5.1)*
+- **T-INST-34**: Git install where cloned repo has invalid JSON in `package.json` → clone removed, error, exit code 1, no partial directory left in `.loopx/`. *(Spec 10.2, 5.1)*
+- **T-INST-35**: Git install where cloned repo has `package.json` with non-string `main` (e.g., `{"main": 42}`) → clone removed, error, exit code 1. *(Spec 10.2, 5.1)*
+- **T-INST-36**: Git install where cloned repo has `package.json` with `main` escaping the directory (e.g., `{"main": "../escape.ts"}`) → clone removed, error, exit code 1. *(Spec 10.2, 5.1)*
+- **T-INST-37**: Git install where cloned repo has `package.json` with `main` pointing to a file that does not exist → clone removed, error, exit code 1. *(Spec 10.2, 5.1)*
+- **T-INST-38**: Tarball install where extracted directory has invalid JSON in `package.json` → directory removed, error, exit code 1. *(Spec 10.2, 5.1)*
+- **T-INST-39**: Tarball install where extracted directory has `package.json` with `main` pointing to a missing file → directory removed, error, exit code 1. *(Spec 10.2, 5.1)*
 
 ### 4.11 Signal Handling
 
@@ -983,7 +996,7 @@ The "global" binary is the primary build. The "local" binary is a separate build
 - **T-DEL-03**: Nearest ancestor wins. Create local installs at both CWD and parent. Assert CWD's version is used. *(Spec 3.2)*
 - **T-DEL-04**: `LOOPX_DELEGATED=1` in environment prevents delegation. Even if `node_modules/.bin/loopx` exists, the global binary runs. *(Spec 3.2)*
 - **T-DEL-05**: After delegation, `LOOPX_BIN` contains the resolved realpath of the local binary (not the global one, not a symlink). *(Spec 3.2)*
-- **T-DEL-06**: After delegation, `import from "loopx"` in scripts resolves to the **local (delegated-to) version's** package, not the global version. The local version must be **observably distinct** — e.g., it includes an additional non-standard export (like `__loopxVersion`) or writes a distinctive marker during module initialization. A TS script imports from `"loopx"` and checks for the local version's marker. Assert that the script observes the local version's marker, not the global's. This discrimination prevents the test from passing vacuously when any working `output()` is available. **Partially blocked by SP-24** — the mechanism for ensuring this resolution varies by runtime. *(Spec 3.2)*
+- **T-DEL-06**: After delegation, `import from "loopx"` in scripts resolves to the **local (delegated-to) version's** package, not the global version. The local version must be **observably distinct** — e.g., it includes an additional non-standard export (like `__loopxVersion`) or writes a distinctive marker during module initialization. A TS script imports from `"loopx"` and checks for the local version's marker. Assert that the script observes the local version's marker, not the global's. *(Spec 3.2)*
 
 ### 4.13 Exit Codes (Cross-Cutting)
 
@@ -1039,7 +1052,7 @@ Fuzz tests use `fast-check` for property-based testing. They are designed to fin
 
 - **F-PARSE-04: Raw fallback consistency.** If the stdout is not a valid JSON object containing at least one known field, the entire stdout is treated as the `result` value. Verify by piping through a goto chain and checking the received value.
 
-- **F-PARSE-05: Binary-safe.** Stdout containing null bytes, high-unicode, or other binary content does not cause crashes or hangs.
+- **F-PARSE-05: Non-ASCII safe.** Stdout containing UTF-8 text with embedded NUL bytes, control characters (0x01–0x1F), and high Unicode (emoji, CJK, supplementary plane codepoints) does not cause crashes or hangs. This property does not test arbitrary binary byte sequences — the spec does not define encoding behavior for non-UTF-8 content.
 
 #### Methodology
 
@@ -1201,7 +1214,17 @@ CI should test against:
 
 ---
 
-## Appendix: Spec Requirement Traceability Matrix
+## 9. Pending Spec Decisions
+
+This section tracks any tests that are blocked by unresolved spec ambiguities. If a test's assertions depend on a spec decision that has not been made, it is listed here so it cannot be accidentally treated as an authoritative failure.
+
+**All previously identified spec problems (SP-15 through SP-26) have been resolved.** No tests are currently blocked by pending spec decisions.
+
+Resolved during this revision: SP-15 (unmatched quotes → literal preserved), SP-17 (install validation → full 5.1 parity), SP-20/SP-21 (shorthand → reject `.git` suffix, consistent expansion), SP-22 (run() errors → lazy on first iteration), SP-23 (version format → bare string + newline), SP-24 (shadowed loopx → local wins, standard resolution), SP-25 (tarball detection → parsed URL pathname), SP-26 (cancellation → always terminate if child active).
+
+---
+
+## Appendix A: Spec Requirement Traceability Matrix
 
 Maps each SPEC.md section to the test IDs that verify it.
 
@@ -1212,38 +1235,38 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 2.2 | Loop (state machine) | T-LOOP-01–05, T-LOOP-16–17 |
 | 2.3 | Structured Output | T-PARSE-01–29, F-PARSE-01–05 |
 | 3.1 | Global Install | **Release-smoke / manual.** The E2E suite tests the built binary directly, not a `npm install -g` artifact. A true global-install test (`npm pack` → install into temp global prefix → run against fixture project) is a release-gate smoke test, not part of the regular E2E suite. Runtime behavior is covered by other sections. |
-| 3.2 | CLI Delegation | T-DEL-01–06 (T-DEL-06 partially blocked by SP-24) |
-| 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a (blocked by SP-24) |
+| 3.2 | CLI Delegation | T-DEL-01–06 |
+| 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21 |
 | 4.1 | Running Scripts | T-CLI-08–13 |
-| 4.2 | Options (-n, -e, -h) | T-CLI-02–07g, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b |
-| 4.3 | Subcommands | T-SUB-01–19, T-SUB-14a–14k |
+| 4.2 | Options (-n, -e, -h) | T-CLI-02–07i, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b |
+| 4.3 | Subcommands | T-SUB-01–19, T-SUB-14a–14k, T-DISC-46a–46b |
 | 5.1 | Discovery | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38, T-DISC-47–49 |
 | 5.2 | Name Collision | T-DISC-18–21, T-CLI-22b |
 | 5.3 | Reserved Names | T-DISC-22–26, T-CLI-22c |
 | 5.4 | Name Restrictions | T-DISC-27–32, T-DISC-30a–30b, T-CLI-07d, T-CLI-22d, T-EDGE-05 |
-| 5.5 | Validation Scope | T-DISC-39–46, T-SUB-06, T-SUB-13, T-SUB-19 |
+| 5.5 | Validation Scope | T-DISC-39–46b, T-SUB-06, T-SUB-13, T-SUB-19 |
 | 6.1 | Working Directory | T-EXEC-01–04 |
 | 6.2 | Bash Scripts | T-EXEC-05–07 |
 | 6.3 | JS/TS Scripts | T-EXEC-08–13b |
 | 6.4 | Directory Scripts | T-EXEC-15–18, T-EXEC-18a |
-| 6.5 | output() Function | T-MOD-04–14a, T-MOD-13a–13e |
+| 6.5 | output() Function | T-MOD-04–14a, T-MOD-13a–13g |
 | 6.6 | input() Function | T-MOD-15–18 |
 | 6.7 | Input Piping | T-LOOP-11–15 |
 | 6.8 | Initial Input | T-LOOP-14 |
 | 7.1 | Basic Loop | T-LOOP-01–10, T-LOOP-25 |
 | 7.2 | Error Handling | T-LOOP-18–24 |
 | 7.3 | Signal Handling | T-SIG-01–06, T-SIG-07a (partial — between-iterations case may require unit-level test or be skipped) |
-| 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-25, F-ENV-01–05 |
-| 8.2 | Local Env Override | T-ENV-16–19 |
+| 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-25–25a, F-ENV-01–05 |
+| 8.2 | Local Env Override | T-ENV-16–19, T-ENV-25a |
 | 8.3 | Env Injection Precedence | T-ENV-20–24, T-ENV-20a, T-ENV-21a |
-| 9.1 | run() | T-API-01–09a (T-API-09a partially blocked by SP-26), T-API-10, T-TYPE-04, T-TYPE-06–07 |
+| 9.1 | run() | T-API-01–09b, T-API-10–10a, T-TYPE-04, T-TYPE-06–07 |
 | 9.2 | runPromise() | T-API-11–14b, T-TYPE-05–07 |
 | 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20e |
-| 9.4 | output() and input() (script-side) | T-MOD-04–14a, T-MOD-13a–13e (output()), T-MOD-15–18 (input()) — these are the same tests listed under 6.5/6.6; 9.4 references them |
+| 9.4 | output() and input() (script-side) | T-MOD-04–14a, T-MOD-13a–13g (output()), T-MOD-15–18 (input()) — these are the same tests listed under 6.5/6.6; 9.4 references them |
 | 9.5 | Types / RunOptions | T-API-07–08, T-API-10, T-API-20d–20e, T-API-21–21b, T-API-22–25, T-API-24a–24b, T-TYPE-01–07 |
-| 10.1 | Source Detection | T-INST-01–08d |
-| 10.2 | Source Type Details | T-INST-09–26b, T-INST-34–39 (blocked by SP-17) |
+| 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08d |
+| 10.2 | Source Type Details | T-INST-09–26b, T-INST-34–39 |
 | 10.3 | Common Install Rules | T-INST-27–33 |
-| 11 | Help | T-CLI-02–07g |
+| 11 | Help | T-CLI-02–07i |
 | 12 | Exit Codes | T-EXIT-01–13 |

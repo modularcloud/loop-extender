@@ -45,11 +45,11 @@ A directory containing a `package.json` with a `main` field pointing to a file w
     ...
 ```
 
-Directory scripts allow scripts to have their own dependencies managed via standard `npm install` or `bun install` within the directory. **loopx does not auto-install dependencies.** If `node_modules/` is missing and the script fails to import a package, the resulting error is a normal Node.js module resolution error.
+Directory scripts allow scripts to have their own dependencies managed via standard `npm install` or `bun install` within the directory. **loopx does not auto-install dependencies.** If `node_modules/` is missing and the script fails to import a package, the resulting error is the active runtime's normal module resolution error.
 
 A directory in `.loopx/` is only recognized as a script if it contains a `package.json` with a `main` field. Directories without this are ignored (and may exist for other purposes such as shared utilities).
 
-**Important:** Directory scripts must not list `loopx` as their own dependency. The loopx helpers (`output`, `input`) are provided automatically by the running CLI via a custom module loader (see section 3.3). Installing a separate version of loopx inside a directory script may cause version mismatches.
+**Important:** Directory scripts should not list `loopx` as their own dependency. The loopx helpers (`output`, `input`) are provided automatically by the running CLI via a custom module loader (see section 3.3). However, if a directory script has its own `node_modules/loopx`, standard module resolution applies and the local version will take precedence. This may cause version mismatches between the script's helpers and the running CLI. loopx does not validate or reject this scenario in v1.
 
 ### 2.2 Loop
 
@@ -146,7 +146,7 @@ Scripts spawned by loopx (in `.loopx/`) need access to the `output` and `input` 
 
 **For Bun:** Bun's module resolver supports `NODE_PATH` for both CJS and ESM. loopx sets `NODE_PATH` to include its own package directory when running under Bun.
 
-In both cases, the resolution **always points to the post-delegation version.** If a local install triggered delegation, the helpers resolve to the local version's package. This ensures script helpers match the running CLI version.
+In both cases, the resolution **points to the post-delegation version** when no closer `node_modules/loopx` exists. If a local install triggered delegation, the helpers resolve to the local version's package. However, if a directory script has its own `node_modules/loopx`, standard module resolution applies and the closer package takes precedence over the CLI-provided one (see section 2.1).
 
 ### 3.4 Bash Script Binary Access
 
@@ -189,7 +189,7 @@ loopx [options] [script-name]
 
 #### `loopx version`
 
-Prints the installed version of loopx and exits.
+Prints the installed version of loopx to stdout and exits. The output is the bare package version string (e.g., `1.2.3`) followed by a newline, with no additional text or labels.
 
 #### `loopx output`
 
@@ -230,7 +230,7 @@ Lists all currently set global environment variables. Output format is one `KEY=
 
 Installs a script into the `.loopx/` directory. See section 10 for full details. Supports:
 
-- **`org/repo` shorthand** — expands to `https://github.com/org/repo` and clones as a directory script.
+- **`org/repo` shorthand** — expands to `https://github.com/org/repo.git` and clones as a directory script.
 - **Git URL** — clones a repository as a directory script.
 - **Tarball URL** — extracts an archive as a directory script.
 - **Single-file URL** — downloads a single script file.
@@ -436,11 +436,11 @@ The file uses `.env` format with the following rules:
 - Lines starting with `#` are comments. **Inline comments are not supported** — a `#` after a value is part of the value.
 - Blank lines are ignored.
 - Duplicate keys: **last occurrence wins**.
-- Values are single-line strings. Values may be optionally wrapped in double quotes (`"`) or single quotes (`'`), which are stripped. **No escape sequence interpretation** — content inside quotes is treated literally (e.g., `"\n"` is a backslash followed by `n`, not a newline).
+- Values are single-line strings. Values may be optionally wrapped in double quotes (`"`) or single quotes (`'`), which are stripped. "Wrapped" means the value begins and ends with the same quote character — if quotes are unmatched (e.g., `KEY="hello` or `KEY='world`), the value is treated literally with no quotes stripped. **No escape sequence interpretation** — content inside quotes is treated literally (e.g., `"\n"` is a backslash followed by `n`, not a newline).
 - No multiline value support.
 - **Key validation:** Only keys matching `[A-Za-z_][A-Za-z0-9_]*` are recognized from env files (both global and local). Non-blank, non-comment lines that do not contain a valid key (e.g., lines without `=`, lines with invalid key names like `1BAD=val` or `KEY WITH SPACES=val`) are ignored with a warning to stderr.
 
-If the directory or file does not exist, loopx treats it as having no global variables. The directory is created on first `loopx env set`.
+If the directory or file does not exist, loopx treats it as having no global variables. The directory is created on first `loopx env set`. If the file exists but is unreadable (e.g., permission denied), loopx exits with code 1 and an error message.
 
 **Concurrent mutation:** Concurrent writes to the same global env file (e.g., multiple simultaneous `loopx env set` calls) are not guaranteed to be atomic in v1. The result is undefined.
 
@@ -492,6 +492,8 @@ for await (const output of loop) {
 
 Returns an `AsyncGenerator<Output>` that yields the `Output` from each loop iteration. The generator completes when the loop ends via `stop: true` or when `maxIterations` is reached. **The output from the final iteration is always yielded before the generator completes.**
 
+**Error timing:** `run()` snapshots its options and `cwd` at call time, but all errors (validation failures, missing scripts, discovery errors) are surfaced lazily when iteration begins (i.e., on the first `next()` call or equivalent). The `run()` call itself always returns a generator without throwing.
+
 Options can be passed as a second argument:
 
 ```typescript
@@ -502,7 +504,7 @@ for await (const output of run("myscript", { maxIterations: 10, envFile: ".env" 
 }
 ```
 
-**Early termination:** If the consumer breaks out of the `for await` loop or calls `generator.return()`, loopx terminates the active child process group (SIGTERM, then SIGKILL after 5 seconds) and cleans up.
+**Early termination:** If the consumer breaks out of the `for await` loop, calls `generator.return()`, or aborts the `signal`, loopx terminates the active child process group (if one is running — SIGTERM, then SIGKILL after 5 seconds) and ensures no further iterations start. If no child process is active at the time of cancellation (e.g., `break` after a yield, between iterations), the generator simply completes with no further yields.
 
 ### 9.2 `runPromise(scriptName?: string)`
 
@@ -548,7 +550,7 @@ interface RunOptions {
 
 - When `signal` is provided and aborted, the active child process group is terminated and the generator/promise completes with an abort error.
 - `cwd` specifies the working directory for script resolution and execution. Defaults to `process.cwd()` at the time `run()` or `runPromise()` is called. The `.loopx/` directory is resolved relative to this path.
-- `maxIterations` counts every target execution, including goto hops. `maxIterations: 0` mirrors CLI `-n 0` behavior: validates and exits without executing any iterations. `maxIterations` must be a non-negative integer; invalid values (negative, non-integer, NaN) cause `run()` to throw and `runPromise()` to reject before execution begins.
+- `maxIterations` counts every target execution, including goto hops. `maxIterations: 0` mirrors CLI `-n 0` behavior: validates and exits without executing any iterations. `maxIterations` must be a non-negative integer; invalid values (negative, non-integer, NaN) cause `run()` to throw on first iteration and `runPromise()` to reject.
 - Relative `envFile` paths are resolved against `cwd` if provided, otherwise against `process.cwd()` at call time.
 
 ---
@@ -565,10 +567,10 @@ Installs a script into the `.loopx/` directory, creating it if necessary.
 
 Sources are classified using the following rules, applied in order:
 
-1. **`org/repo` shorthand:** A source matching the pattern `<org>/<repo>` (no protocol prefix, exactly one slash, no additional path segments) is expanded to `https://github.com/<org>/<repo>.git` and treated as a git source.
+1. **`org/repo` shorthand:** A source matching the pattern `<org>/<repo>` (no protocol prefix, exactly one slash, no additional path segments) is expanded to `https://github.com/<org>/<repo>.git` and treated as a git source. The `<repo>` segment must not end in `.git` — inputs like `org/repo.git` are rejected with an error. Users who want to specify a `.git` URL must provide the full URL (e.g., `https://github.com/org/repo.git`).
 2. **Known git hosts:** A URL whose hostname is `github.com`, `gitlab.com`, or `bitbucket.org` is treated as a git source **only when the pathname is exactly `/<owner>/<repo>` or `/<owner>/<repo>.git`**, optionally with a trailing slash. Other URLs on these hosts (e.g., tarball download URLs, raw file URLs, paths with additional segments like `/org/repo/tree/main`) continue through the remaining source-detection rules.
 3. **`.git` URL:** Any other URL ending in `.git` is treated as a git source.
-4. **Tarball URL:** A URL ending in `.tar.gz` or `.tgz` is downloaded and extracted as a directory script.
+4. **Tarball URL:** A URL whose **pathname** (ignoring query string and fragment) ends in `.tar.gz` or `.tgz` is downloaded and extracted as a directory script.
 5. **Single-file URL:** Any other URL is treated as a single file download.
 
 ```
@@ -591,14 +593,14 @@ loopx install https://github.com/myorg/my-agent-script
 
 - The repository is cloned with `--depth 1` (shallow clone) into `.loopx/<repo-name>/`.
 - The script name is derived from the repository name (last path segment, minus `.git` suffix if present).
-- The cloned directory must contain a `package.json` with a `main` field pointing to a supported extension. If not, the clone is removed and an error is displayed.
+- The cloned directory is validated using the same directory-script rules as section 5.1: `package.json` must be readable valid JSON, `main` must be a string with a supported extension, must not escape the directory, and must point to an existing file. If any validation fails, the clone is removed and an error is displayed.
 
 #### Tarball URL
 
 - The archive is downloaded and extracted.
 - **If extraction yields a single top-level directory**, that directory is treated as the package root and moved to `.loopx/<archive-name>/`. If extraction yields multiple top-level entries, the extracted contents are placed directly in `.loopx/<archive-name>/`.
 - `archive-name` is the URL's last path segment minus archive extensions (`.tar.gz`, `.tgz`), with query strings and fragments stripped (same as single-file URLs).
-- The resulting directory must contain a `package.json` with a `main` field pointing to a supported extension. If not, the directory is removed and an error is displayed.
+- The resulting directory is validated using the same directory-script rules as section 5.1: `package.json` must be readable valid JSON, `main` must be a string with a supported extension, must not escape the directory, and must point to an existing file. If any validation fails, the directory is removed and an error is displayed.
 
 ### 10.3 Common Rules
 
