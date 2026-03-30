@@ -611,7 +611,8 @@ loopx install https://github.com/myorg/my-agent-script
 
 All install sources share these rules:
 
-- If any filesystem entry (file or directory, whether or not it is a discovered script) already exists at the destination path in `.loopx/`, loopx displays an error and does not overwrite. The user must manually remove the existing entry first. This includes non-script directories that may exist for shared utilities (see section 2.1).
+- **Destination-path collision:** If any filesystem entry (file or directory, whether or not it is a discovered script) already exists at the destination path in `.loopx/`, loopx displays an error and does not overwrite. The user must manually remove the existing entry first. This includes non-script directories that may exist for shared utilities (see section 2.1).
+- **Script-name collision:** If the derived script name would collide with any existing discovered script in `.loopx/` — even if the destination filesystem path is different — loopx displays an error and does not install. For example, if `.loopx/foo.sh` exists and the install would create `.loopx/foo/`, the install is rejected because both resolve to script name `foo`. This prevents install from creating a state that would fail discovery validation (section 5.2).
 - The script name is validated against reserved name and name restriction rules before being saved.
 - **loopx does not run `npm install` or `bun install` after cloning/extracting.** For directory scripts with dependencies, the user must install them manually (e.g., `cd .loopx/my-script && npm install`).
 - **Install failure cleanup:** Any install failure (download error, HTTP non-2xx, git clone failure, extraction failure, post-download validation failure) exits with code 1. Any partially created target file or directory at the destination path is removed before exit.

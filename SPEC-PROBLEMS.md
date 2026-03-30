@@ -4,6 +4,16 @@ This document tracks ambiguities, gaps, and underspecified behaviors in SPEC.md 
 
 ## Resolved
 
+### SP-31: Install name-collision behavior across different destination paths
+
+**Status:** Resolved
+
+**Problem:** Section 10.3 rejects installs when a filesystem entry already exists at the destination path. This was broadened by SP-30 to cover non-script entries too. However, it did not address what happens when the destination path is *different* but the derived script name would collide with an existing discovered script.
+
+**Resolution:** `loopx install` always rejects when the derived script name would collide with any existing discovered script in `.loopx/`, even if the destination filesystem path is different. This includes non-script utility directories — if `.loopx/foo/` exists as a utility directory (no `package.json`) and the user installs `foo.ts`, the install is rejected because the destination-path collision check (which covers all filesystem entries) catches it.
+
+**SPEC.md change:** Added explicit "script-name collision" rule to section 10.3 alongside the existing "destination-path collision" rule.
+
 ### SP-28: Mid-loop removed/renamed script behavior
 
 **Status:** Resolved

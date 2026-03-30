@@ -54,7 +54,7 @@ The implementation **must** expose the following pure functions as package-priva
 - The exact module path and export mechanism is an implementation detail, but the test suite must be able to `import { parseOutput } from "loopx/internal"` (or equivalent). The implementation may use TypeScript `paths` aliases, a `package.json` `exports` subpath, or a direct relative import from the test files.
 - These exports are **not** part of the public semver contract. They may change shape between minor versions.
 
-**If the implementation does not expose these seams:** Unit tests (section 6.1, 6.2) cannot run, and fuzz tests (section 5.1, 5.2) are limited to the E2E tier only (50–100 inputs per property instead of 1000+). This is acceptable but significantly reduces parser edge-case coverage.
+**These seams are a hard implementation requirement.** Unit tests (section 6.1, 6.2) and high-volume fuzz tests (section 5.1, 5.2) depend on them. The implementation is not considered complete until these exports are available and importable by the test suite.
 
 ---
 
@@ -404,12 +404,13 @@ Each test is identified by a unique ID (`T-<SECTION>-<NUMBER>`), references a SP
 - **T-CLI-06**: `loopx -h` with `.loopx/` containing name collisions prints help with warnings on stderr. *(Spec 11)*
 - **T-CLI-07**: `loopx -h` with `.loopx/` containing reserved names prints help with warnings on stderr. *(Spec 11)*
 - **T-CLI-07d**: `loopx -h` with `.loopx/` containing a script with an invalid name (e.g., `-startswithdash.sh`) prints help with a non-fatal warning on stderr about the invalid name. The invalid script is still listed in the help output (section 5.4 says invalid-name scripts are listed with a warning in help mode). Help still exits 0. *(Spec 5.4, 11)*
-- **T-CLI-07a**: `loopx -h` with `.loopx/` containing scripts lists script names and includes type information for each. Assert that each discovered script name appears in the output and that the output contains type-related text (e.g., "ts", "sh") near each name. Do not assert an exact rendering format. *(Spec 11)*
+- **T-CLI-07a**: `loopx -h` with `.loopx/` containing scripts lists script names and includes type information for each. Assert that each discovered script name appears in the output and that the output contains the file type (e.g., "ts", "sh") somewhere in the help text. Do not assert proximity between the name and type text, and do not assert an exact rendering format — only that both the name and its type are present. *(Spec 11)*
 - **T-CLI-07b**: `loopx -n 5 -h` prints help and exits 0 (help flag takes precedence over other flags). *(Spec 4.2)*
 - **T-CLI-07c**: `loopx myscript -h` prints help and exits 0 (help flag takes precedence over script name). *(Spec 4.2)*
 - **T-CLI-07e**: `loopx -h version` prints help and exits 0 (help flag takes precedence over subcommand). The `version` subcommand does not execute. *(Spec 4.2)*
 - **T-CLI-07f**: `loopx -h env set FOO bar` prints help and exits 0 (help flag takes precedence over `env` subcommand). *(Spec 4.2)*
 - **T-CLI-07g**: `loopx -h --invalid-flag` prints help and exits 0 (help flag takes precedence over invalid flags). *(Spec 4.2)*
+- **T-CLI-07j**: `loopx -h -e nonexistent.env` prints help and exits 0 (help flag takes precedence over `-e`). The nonexistent env file is not read or validated. *(Spec 4.2)*
 - **T-CLI-07h**: `loopx -h` with `.loopx/` containing a directory script with a bad `package.json` (invalid JSON) prints help with a non-fatal warning on stderr about the invalid directory script. Help still exits 0. The invalid directory script is not listed in the script listing. *(Spec 5.1, 11)*
 - **T-CLI-07i**: `loopx -h` with `.loopx/` containing a directory script whose `main` escapes the directory (e.g., `"main": "../escape.ts"`) prints help with a non-fatal warning on stderr. Help still exits 0. *(Spec 5.1, 11)*
 
@@ -582,6 +583,8 @@ These tests verify the actual bytes written to the env file, not just round-trip
 
 - **T-DISC-37**: During a loop (`-n 3`), create a new script in `.loopx/` between iteration 1 and 2 (using a script that creates a file). Then have iteration 2 `goto` the new script name → error (not in cached discovery). *(Spec 5.1)*
 - **T-DISC-38**: During a loop, modify the content of an already-discovered script between iterations. Assert the new content takes effect on the next iteration (since the file is re-read from disk). *(Spec 5.1)*
+- **T-DISC-38a**: During a multi-iteration loop, an already-discovered script is removed (deleted from disk) between iterations. On the next iteration that would execute this script (either via goto or as the starting target), loopx fails at spawn time because the cached entry path no longer exists. Assert loopx exits with code 1. Use a two-script setup: script A writes a marker file and outputs `goto:"B"` on the first iteration; between iterations, a side-effect from A removes script B's file. When loopx tries to spawn B, it fails. *(Spec 5.1, 7.2)*
+- **T-DISC-38b**: During a multi-iteration loop, an already-discovered script is renamed (moved to a different filename) between iterations. The cached entry path becomes stale. On the next iteration that would execute the original script, loopx fails at spawn time. Assert loopx exits with code 1. *(Spec 5.1, 7.2)*
 
 #### Run-Mode Discovery Warnings
 
@@ -759,6 +762,8 @@ All env tests use `withGlobalEnv` to isolate from the real user config.
 - **T-ENV-05a**: Unreadable global env file. Create the global env file, then `chmod 000` it. Run `loopx -n 1 myscript` → exits with code 1 and an error message about the unreadable file. **This test is conditional on `process.getuid() !== 0`** — root can read any file, so the test is skipped when running as root. *(Spec 8.1)*
 - **T-ENV-05b**: Unreadable global env file via programmatic API. Same setup as T-ENV-05a (`chmod 000`). `run("myscript")` returns a generator; on the first `next()`, the generator throws an error about the unreadable file. **Conditional on `process.getuid() !== 0`.** *(Spec 8.1, 9.3)*
 - **T-ENV-05c**: Unreadable global env file with `loopx env list`. Create the global env file with content, then `chmod 000`. Run `loopx env list` → exits with code 1 and an error message about the unreadable file. **Conditional on `process.getuid() !== 0`.** *(Spec 8.1)*
+- **T-ENV-05d**: Unreadable global env file with `loopx env set`. Create the global env file with content, then `chmod 000`. Run `loopx env set KEY val` → exits with code 1 and an error message about the unreadable file. The `env set` command must read the existing file before writing (to preserve other entries), so an unreadable file is an error. **Conditional on `process.getuid() !== 0`.** *(Spec 8.1)*
+- **T-ENV-05e**: Unreadable global env file with `loopx env remove`. Create the global env file with content, then `chmod 000`. Run `loopx env remove KEY` → exits with code 1 and an error message about the unreadable file. The `env remove` command must read the existing file to remove a key, so an unreadable file is an error. **Conditional on `process.getuid() !== 0`.** *(Spec 8.1)*
 
 #### Env File Parsing
 
@@ -877,6 +882,7 @@ These tests verify `LOOPX_BIN` through loop behavior and side-effect files — n
 - **T-API-09**: `run()` with no script name runs the `default` script. *(Spec 9.1)*
 - **T-API-09b**: `run()` cwd snapshot timing. Create two temp projects, each with a `default` script that writes a unique marker. Call `run()` while `process.cwd()` is project A (no explicit `cwd` option). Then change `process.cwd()` to project B before calling `next()`. Assert the generator executes project A's script, not project B's — proving `cwd` was snapshotted at `run()` call time. *(Spec 9.1, 9.5)*
 - **T-API-09a**: Manual iterator cancellation during a pending `next()`. Use the `write-pid-to-file` fixture (a TS script that writes its PID to a marker file, writes `"ready"` to stderr, then blocks). Obtain the async iterator, call `iterator.next()` to start the first iteration. Wait for the child to be ready (e.g., poll the marker file or observe stderr). Then call `iterator.return()` while `next()` is still pending. Assert: (1) the child process / process group is terminated (read PID from marker file, verify it is no longer running), and (2) the generator completes with no further yields. *(Spec 9.1)*
+- **T-API-09c**: `run()` options snapshot — mutating `maxIterations` after call. Create a `RunOptions` object with `maxIterations: 2`. Call `run("myscript", opts)` to obtain the generator. Then mutate `opts.maxIterations = 100`. Iterate the generator to completion. Assert exactly 2 outputs are yielded — proving the options were snapshotted at `run()` call time and the mutation had no effect. *(Spec 9.1)*
 
 #### `run()` with AbortSignal
 
@@ -894,6 +900,7 @@ These tests verify `LOOPX_BIN` through loop behavior and side-effect files — n
 - **T-API-14a**: `runPromise()` with no script name runs the `default` script. *(Spec 9.2, 9.1)*
 - **T-API-14b**: `runPromise("myscript", { maxIterations: 0 })` resolves with an empty array `[]`. *(Spec 9.2, 9.5)*
 - **T-API-14c**: `runPromise()` cwd snapshot timing. Create two temp projects, each with a `default` script that writes a unique marker. Call `runPromise()` while `process.cwd()` is project A (no explicit `cwd` option). Change `process.cwd()` to project B before the promise resolves. Assert the promise resolves with outputs from project A's script, not project B's — proving `cwd` was snapshotted at `runPromise()` call time. *(Spec 9.2, 9.5)*
+- **T-API-14d**: `runPromise()` options snapshot — mutating `maxIterations` after call. Create a `RunOptions` object with `maxIterations: 2`. Call `runPromise("myscript", opts)` to obtain the promise. Then mutate `opts.maxIterations = 100`. Await the promise. Assert exactly 2 outputs are returned — proving the options were snapshotted at `runPromise()` call time. *(Spec 9.2, 9.1)*
 
 #### Error Behavior
 
@@ -932,6 +939,7 @@ These tests verify `LOOPX_BIN` through loop behavior and side-effect files — n
 
 - **T-API-25**: `runPromise("myscript", { signal })` — aborting the signal terminates the loop and the promise rejects with an abort error. *(Spec 9.5)*
 - **T-API-25a**: `runPromise("myscript", { signal })` with pre-aborted signal — the promise rejects immediately with an abort error. No child process is spawned. *(Spec 9.5)*
+- **T-API-25b**: `runPromise("myscript", { signal, maxIterations: 3 })` — abort signal between iterations. Use a script that completes quickly (no `goto`, no `stop`). Set up the `AbortController` and abort the signal after a short delay (enough for one iteration to complete but before the loop finishes all 3). Assert the promise rejects with an abort error. Since `runPromise` is an all-or-nothing API, the rejection occurs even though some iterations completed internally. *(Spec 9.5, 9.2)*
 
 ### 4.10 Install Command
 
@@ -986,8 +994,10 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 
 #### Common Rules
 
-- **T-INST-27**: Installing when a script with the same name already exists → error, existing script untouched. *(Spec 10.3)*
-- **T-INST-27a**: Installing when a non-script directory with the same name already exists in `.loopx/` (e.g., `.loopx/foo/` exists as a shared utility directory with no `package.json`) → error, existing directory untouched. This verifies that install refuses to overwrite any existing filesystem entry, not just discovered scripts. *(Spec 10.3)*
+- **T-INST-27**: Destination-path collision. Installing when a filesystem entry already exists at the exact destination path → error, existing entry untouched. Example: `.loopx/foo.ts` exists, install a single-file URL that would also place `foo.ts` → rejected. *(Spec 10.3)*
+- **T-INST-27a**: Destination-path collision with non-script directory. Installing when a non-script directory with the same name already exists in `.loopx/` (e.g., `.loopx/foo/` exists as a shared utility directory with no `package.json`, install a git repo that would go to `.loopx/foo/`) → error, existing directory untouched. *(Spec 10.3)*
+- **T-INST-27b**: Script-name collision across different path types. `.loopx/foo.sh` exists (file script named `foo`), install a git repo that would clone to `.loopx/foo/` — different destination path, but same derived script name `foo`. → error, existing script untouched, no `.loopx/foo/` directory created. *(Spec 10.3, 5.2)*
+- **T-INST-27c**: Script-name collision across different file extensions. `.loopx/foo.ts` exists (file script named `foo`), install a single-file URL for `foo.sh` → error. Both resolve to script name `foo`. The existing `.loopx/foo.ts` is untouched and no `.loopx/foo.sh` is created. *(Spec 10.3, 5.2)*
 - **T-INST-28**: Installing a script with a reserved name (e.g., `output.ts`) → error, nothing saved. *(Spec 10.3)*
 - **T-INST-29**: Installing a script with invalid name (e.g., `-invalid.ts`) → error, nothing saved. *(Spec 10.3)*
 - **T-INST-30**: No automatic `npm install` / `bun install` after clone/extract. Verify `node_modules/` does not appear in installed directory script. *(Spec 10.3)*
@@ -1121,7 +1131,7 @@ For each generated input:
 4. Assert the invariants above.
 
 **Iterations:** The structured output fuzzer has two tiers:
-- **Unit-level parser fuzzing:** At least 1000 random inputs per property. These call the parser function directly (no child process), so they are fast. This is where high-volume fuzzing lives. **Testability requirement:** The implementation must expose the output parsing logic as an importable pure function (e.g., `parseOutput(stdout: string): Output`) in a package-private module that tests can import. Without this, unit-level fuzzing is not possible and the 1000+ input requirement is reduced to the E2E tier's 50–100 range.
+- **Unit-level parser fuzzing:** At least 1000 random inputs per property. These call the parser function directly (no child process), so they are fast. This is where high-volume fuzzing lives. Uses the `parseOutput` internal seam (section 1.4).
 - **E2E fuzzing:** At most 50–100 random inputs per property. Each input spawns a real child process, so high iteration counts are prohibitively slow. The E2E layer is a randomized smoke test to catch integration issues the unit fuzzer cannot.
 
 ### 5.2 Env File Fuzzer
@@ -1150,7 +1160,7 @@ For each generated input:
 
 - **F-ENV-05: Comment lines never produce variables.** Lines starting with `#` never result in environment variables being set.
 
-**Iterations:** Same two-tier approach as section 5.1: at least 1000 inputs at the unit-parser level, 50–100 at the E2E level. **Testability requirement:** Same as section 5.1 — the implementation must expose the env parsing logic as an importable pure function for unit-level fuzzing.
+**Iterations:** Same two-tier approach as section 5.1: at least 1000 inputs at the unit-parser level, 50–100 at the E2E level. Uses the `parseEnvFile` internal seam (section 1.4).
 
 ---
 
@@ -1162,7 +1172,7 @@ Unit tests provide fast feedback on isolated parsing/logic functions. They are N
 
 **File:** `tests/unit/parse-output.test.ts`
 
-**Testability requirement:** The implementation must expose the output parsing logic as an importable pure function (e.g., `parseOutput(stdout: string): Output`) in a package-private module. This is required for unit tests and high-volume fuzz testing (section 5.1). If the function is not exposed, these tests cannot run and coverage falls back to E2E only.
+Uses the `parseOutput` internal seam (section 1.4).
 
 Test the parser function directly:
 
@@ -1176,7 +1186,7 @@ Test the parser function directly:
 
 **File:** `tests/unit/parse-env.test.ts`
 
-**Testability requirement:** Same as section 6.1 — the implementation must expose the env parsing logic as an importable pure function. Required for unit tests and high-volume fuzz testing (section 5.2).
+Uses the `parseEnvFile` internal seam (section 1.4).
 
 Test the parser function directly:
 
@@ -1296,6 +1306,7 @@ Resolved during this revision:
 - SP-28 (mid-loop removed/renamed script behavior — resolved: discovery caching freezes names and resolved paths; execution uses cached path; file disappearance fails at spawn time as a normal child-process launch error)
 - SP-29 (CommonJS support — resolved: using `require()` / CommonJS in loopx JS/TS scripts is invalid and must fail at execution time)
 - SP-30 (install collision with non-script entries — resolved: loopx refuses to overwrite any existing filesystem entry at the destination path, not just discovered scripts)
+- SP-31 (install name-collision across different destination paths — resolved: install always rejects when the derived script name would collide with any existing discovered script, even if the destination path differs)
 
 Resolved in prior revisions: SP-15 (unmatched quotes → literal preserved), SP-17 (install validation → full 5.1 parity), SP-20/SP-21 (shorthand → reject `.git` suffix, consistent expansion), SP-22 (run() errors → lazy on first iteration), SP-23 (version format → bare string + newline), SP-24 (shadowed loopx → local wins, standard resolution), SP-25 (tarball detection → parsed URL pathname), SP-26 (cancellation → always terminate if child active), SP-27 (AbortSignal cancellation semantics — AbortSignal always throws/rejects, `break`/`generator.return()` completes silently).
 
@@ -1316,9 +1327,9 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21 |
 | 4.1 | Running Scripts | T-CLI-08–13 |
-| 4.2 | Options (-n, -e, -h) | T-CLI-02–07i, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b |
+| 4.2 | Options (-n, -e, -h) | T-CLI-02–07j, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b |
 | 4.3 | Subcommands | T-SUB-01–19, T-SUB-06a–06b, T-SUB-14a–14k, T-DISC-46a–46b |
-| 5.1 | Discovery | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38, T-DISC-47–50 |
+| 5.1 | Discovery | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38b, T-DISC-47–50 |
 | 5.2 | Name Collision | T-DISC-18–21, T-CLI-22b |
 | 5.3 | Reserved Names | T-DISC-22–26, T-CLI-22c |
 | 5.4 | Name Restrictions | T-DISC-27–32, T-DISC-30a–30b, T-CLI-07d, T-CLI-22d, T-EDGE-05 |
@@ -1332,18 +1343,18 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 6.7 | Input Piping | T-LOOP-11–15 |
 | 6.8 | Initial Input | T-LOOP-14 |
 | 7.1 | Basic Loop | T-LOOP-01–10, T-LOOP-25 |
-| 7.2 | Error Handling | T-LOOP-18–24 |
+| 7.2 | Error Handling | T-LOOP-18–24, T-DISC-38a–38b |
 | 7.3 | Signal Handling | T-SIG-01–07 |
-| 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-05a–05c, T-ENV-25–25a, F-ENV-01–05 |
+| 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-05a–05e, T-ENV-25–25a, F-ENV-01–05 |
 | 8.2 | Local Env Override | T-ENV-16–19, T-ENV-17a, T-ENV-25a |
 | 8.3 | Env Injection Precedence | T-ENV-20–24, T-ENV-20a, T-ENV-21a |
-| 9.1 | run() | T-API-01–09b, T-API-10–10c, T-TYPE-04, T-TYPE-06–07 |
-| 9.2 | runPromise() | T-API-11–14c, T-API-25–25a, T-TYPE-05–07 |
+| 9.1 | run() | T-API-01–09c, T-API-10–10c, T-TYPE-04, T-TYPE-06–07 |
+| 9.2 | runPromise() | T-API-11–14d, T-API-25–25b, T-TYPE-05–07 |
 | 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20i |
 | 9.4 | output() and input() (script-side) | T-MOD-04–14a, T-MOD-13a–13g (output()), T-MOD-15–18 (input()) — these are the same tests listed under 6.5/6.6; 9.4 references them |
-| 9.5 | Types / RunOptions | T-API-07–08, T-API-10–10c, T-API-20d–20e, T-API-21–21b, T-API-22–25a, T-API-23a, T-API-24a–24b, T-TYPE-01–07 |
+| 9.5 | Types / RunOptions | T-API-07–08, T-API-10–10c, T-API-20d–20e, T-API-21–21b, T-API-22–25b, T-API-23a, T-API-24a–24b, T-TYPE-01–07 |
 | 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08d |
 | 10.2 | Source Type Details | T-INST-09–26b, T-INST-34–39c |
-| 10.3 | Common Install Rules | T-INST-27–27a, T-INST-28–33 |
-| 11 | Help | T-CLI-02–07i |
+| 10.3 | Common Install Rules | T-INST-27–27c, T-INST-28–33 |
+| 11 | Help | T-CLI-02–07j |
 | 12 | Exit Codes | T-EXIT-01–13 |
