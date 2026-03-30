@@ -257,6 +257,7 @@ Nested directories that do not contain a valid `package.json` with `main` are ig
 - Scripts added, removed, or renamed during loop execution are not detected until the next invocation.
 - Changes to a `package.json` `main` field are not detected until the next invocation.
 - **Edits to the contents of an already-discovered script file take effect on subsequent iterations**, because the child process reads the file from disk each time it is spawned.
+- **If a discovered script's underlying file or directory is removed or renamed mid-loop**, execution uses the cached entry path and fails at spawn time as a normal child-process launch error. This is treated as a non-zero exit (section 7.2).
 
 **Warnings** (invalid `main` field, unsupported extensions in directories, paths escaping the script directory) are printed to stderr during discovery. Discovery runs at loop start for script mode and during `--help`.
 
@@ -316,7 +317,7 @@ Bash scripts (`.sh`) are executed as child processes via `/bin/bash`. The script
 
 JavaScript and TypeScript scripts are executed as child processes using `tsx`, which handles `.js`, `.jsx`, `.ts`, and `.tsx` files uniformly. `tsx` is a dependency of loopx and does not need to be installed separately by the user.
 
-**JS/TS scripts must be ESM and must use `import`, not `require`.** CommonJS is not supported. `.mjs` and `.cjs` extensions are intentionally unsupported.
+**JS/TS scripts must be ESM and must use `import`, not `require`.** CommonJS is not supported. `.mjs` and `.cjs` extensions are intentionally unsupported. Using CommonJS syntax (`require()`, `module.exports`, `exports`) in a loopx script is an error — the script will fail at execution time.
 
 - Stdout is captured as structured output.
 - Stderr is passed through to the user's terminal.
@@ -610,7 +611,7 @@ loopx install https://github.com/myorg/my-agent-script
 
 All install sources share these rules:
 
-- If a script with the same **name** (regardless of whether it's a file or directory script) already exists in `.loopx/`, loopx displays an error and does not overwrite. The user must manually remove the existing script first.
+- If any filesystem entry (file or directory, whether or not it is a discovered script) already exists at the destination path in `.loopx/`, loopx displays an error and does not overwrite. The user must manually remove the existing entry first. This includes non-script directories that may exist for shared utilities (see section 2.1).
 - The script name is validated against reserved name and name restriction rules before being saved.
 - **loopx does not run `npm install` or `bun install` after cloning/extracting.** For directory scripts with dependencies, the user must install them manually (e.g., `cd .loopx/my-script && npm install`).
 - **Install failure cleanup:** Any install failure (download error, HTTP non-2xx, git clone failure, extraction failure, post-download validation failure) exits with code 1. Any partially created target file or directory at the destination path is removed before exit.
