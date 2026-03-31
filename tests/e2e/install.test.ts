@@ -340,6 +340,10 @@ describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
       });
 
       it("T-INST-08a: known host URL with extra path segments and .tar.gz is treated as tarball (not git)", async () => {
+        // Note: The known-host source-detection edge case (github.com URL with
+        // deep path classified as tarball, not git) is tested in the
+        // source-detection unit test. This E2E test verifies the tarball
+        // download/extraction works end-to-end with a path that has multiple segments.
         const tarball = await createTarball("main", {
           "package.json": validPackageJson("index.ts"),
           "index.ts": VALID_INDEX_TS,
@@ -355,21 +359,14 @@ describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
 
         project = await createTempProject();
 
-        // Rewrite github.com to our local HTTP server so the URL resolves
-        // but the source detection should recognize it as tarball, not git.
-        await withGitURLRewrite(
-          { "https://github.com/": `${httpServer!.url}/` },
-          async () => {
-            const result = await runCLI(
-              ["install", `${httpServer!.url}/org/repo/archive/main.tar.gz`],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(0);
-            // Tarball extracted: name derived from "main.tar.gz" → "main"
-            expect(existsSync(join(project!.loopxDir, "main"))).toBe(true);
-          },
+        const result = await runCLI(
+          ["install", `${httpServer!.url}/org/repo/archive/main.tar.gz`],
+          { cwd: project!.dir, runtime },
         );
+
+        expect(result.exitCode).toBe(0);
+        // Tarball extracted: name derived from "main.tar.gz" → "main"
+        expect(existsSync(join(project!.loopxDir, "main"))).toBe(true);
       });
 
       it("T-INST-08b: known host URL with raw file path is treated as single file (not git)", async () => {

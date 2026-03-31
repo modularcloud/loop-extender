@@ -20,6 +20,8 @@ Tracks active issues and recent fix batches for the test harness (not the loopx 
 - T-EDGE-05 split into T-EDGE-05a/b/c sub-tests; T-EDGE-12 split into T-EDGE-12a/12b — all spec aspects covered.
 - T-API-20j/k/l are extra tests not in spec (renamed from old IDs).
 - T-ENV-25/25a use a single counter-based script instead of spec's suggestion of "a different script" for iteration 2 — functionally equivalent.
+- T-INST-08a uses localhost URL instead of github.com (known-host classification is tested in source-detection unit tests; E2E tests tarball download end-to-end).
+- T-LOOP-02 uses inline bash scripts instead of counter() fixture (functionally equivalent, tracks execution order directly).
 
 ---
 
@@ -40,6 +42,9 @@ Tracks active issues and recent fix batches for the test harness (not the loopx 
 
 ### Comment fix
 - **edge-cases.test.ts**: T-EDGE-05b comment corrected — was incorrectly describing decomposed form (`cafe\u0301`) when the code uses precomposed form (`caf\u00e9`).
+
+### Dead code removal
+- **install.test.ts**: T-INST-08a removed unnecessary `withGitURLRewrite` wrapper (the test uses a localhost URL, not a github.com URL, so the git URL rewrite was dead code). Added comment explaining the known-host edge case is covered in source-detection unit tests.
 
 ---
 
