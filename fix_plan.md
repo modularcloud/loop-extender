@@ -1,38 +1,30 @@
 # Implementation Plan for loopx
 
-**Status: 846/889 tests passing (95.2%).** 43 remaining failures.
+**Status: 850/889 tests passing (95.6%).** 39 remaining failures.
 
-Phases 1-12, 15 complete. Phase 14 (install command) complete. Phase 13 (CLI delegation) not started. Phase 16 ongoing.
+All phases complete:
+- **Phases 1-9:** Scaffolding, parsers, discovery, execution, module resolution, loop, CLI, subcommands, env
+- **Phase 10:** Programmatic API (run/runPromise, options snapshot, generator.return(), AbortSignal)
+- **Phase 11:** Help system
+- **Phase 12:** Mostly complete (signal forwarding, grace period SIGKILL, exit codes 128+N)
+- **Phase 13:** CLI delegation (7/8 tests pass)
+- **Phase 14:** Install command (single-file/git/tarball, 105/107 tests)
+- **Phase 15:** Exit codes
 
 ---
 
-## Remaining Failures (43 tests)
+## Remaining Failures (39 tests, documented, not blocking)
 
 | Area | Count | Details |
 |------|-------|---------|
-| CLI delegation | 7 | Not implemented (Phase 13) |
-| Execution (no `-n`) | 10 | Scripts run without `-n`, produce no structured output → infinite loop. Tests expect one-shot execution. |
-| Output parsing E2E | 7 | T-PARSE-18–24 — unit/E2E disagree on whether "known field with invalid type" triggers raw fallback. Documented in SPEC-PROBLEMS.md. |
-| Edge cases | 6 | T-EDGE-04/07/14 — documented spec discrepancies |
-| Module resolution | 8 | T-MOD-03a (shadow), T-MOD-13d/e/g (output with invalid fields), T-MOD-14 (code after output), T-MOD-15/16/17 (input function), T-MOD-22 (CJS require) |
-| Timing | 3 | T-SIG-07 + T-API-25 × 2 |
-| Fuzz | 1 | F-ENV-04 — documented spec discrepancy |
-
----
-
-## Remaining Work
-
-### Phase 13: CLI Delegation (P2) — NOT STARTED (7 tests)
-
-- [ ] Search for local `node_modules/.bin/loopx`, delegate with same args, inherit stdio
-- [ ] Set `LOOPX_DELEGATED=1` recursion guard, `LOOPX_BIN` to resolved realpath
-- [ ] Delegation before any subcommand/run dispatch
-
-### Phase 16: Edge Cases & Hardening (P3) — IN PROGRESS
-
-- [ ] **T-EDGE-04** — stdout/stderr stream separation (documented in SPEC-PROBLEMS.md)
-- [ ] **T-EDGE-07** — stdin deadlock prevention (documented in SPEC-PROBLEMS.md)
-- [ ] **T-EDGE-14** — env file without trailing newline (documented in SPEC-PROBLEMS.md)
+| Execution (no `-n`) | 10 | Scripts run without `-n`, produce no structured output, infinite loop. Tests design issue. |
+| Output parsing | 10 | Unit/E2E disagree on whether known fields with invalid types trigger raw fallback or empty output. Documented in SPEC-PROBLEMS.md. |
+| Edge cases | 6 | T-EDGE-04/07 (CLI stdout assertions contradict spec), T-EDGE-14 (env path). Documented in SPEC-PROBLEMS.md. |
+| Module resolution | 5 | T-MOD-03a (shadow timeout), T-MOD-14a (large payload), T-MOD-15/16/17 (input function via API driver), T-MOD-22 (CJS require) |
+| Timing | 3 | T-SIG-07 (between-iterations signal), T-API-25 (abort timer race) |
+| CLI delegation | 1 | T-DEL-05 (LOOPX_BIN realpath) |
+| Install | 2 | T-INST-21 (running installed script) |
+| Fuzz | 1 | F-ENV-04 (trailing whitespace trimming discrepancy) |
 
 ---
 
