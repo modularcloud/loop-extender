@@ -41,7 +41,7 @@ describe("SPEC: 6.1 Working Directory", () => {
     // Create a bash file script that writes $PWD to a marker file
     await createBashScript(project, "check-cwd", writeCwdToFile(markerPath).replace("#!/bin/bash\n", ""));
 
-    const result = await runCLI(["check-cwd"], { cwd: project.dir });
+    const result = await runCLI(["-n", "1", "check-cwd"], { cwd: project.dir });
 
     expect(existsSync(markerPath)).toBe(true);
     const recordedCwd = readFileSync(markerPath, "utf-8");
@@ -59,7 +59,7 @@ describe("SPEC: 6.1 Working Directory", () => {
       "run.sh": `#!/bin/bash\nprintf '%s' "$PWD" > "${markerPath}"\n`,
     });
 
-    const result = await runCLI(["mypipe"], { cwd: project.dir });
+    const result = await runCLI(["-n", "1", "mypipe"], { cwd: project.dir });
 
     expect(existsSync(markerPath)).toBe(true);
     const recordedCwd = readFileSync(markerPath, "utf-8");
@@ -80,7 +80,7 @@ describe("SPEC: 6.1 Working Directory", () => {
       writeEnvToFile("LOOPX_PROJECT_ROOT", markerPath),
     );
 
-    await runCLI(["check-projroot"], { cwd: project.dir });
+    await runCLI(["-n", "1", "check-projroot"], { cwd: project.dir });
 
     expect(existsSync(markerPath)).toBe(true);
     const recordedRoot = readFileSync(markerPath, "utf-8");
@@ -96,7 +96,7 @@ describe("SPEC: 6.1 Working Directory", () => {
       "run.sh": `#!/bin/bash\nprintf '%s' "$LOOPX_PROJECT_ROOT" > "${markerPath}"\n`,
     });
 
-    await runCLI(["mypipe2"], { cwd: project.dir });
+    await runCLI(["-n", "1", "mypipe2"], { cwd: project.dir });
 
     expect(existsSync(markerPath)).toBe(true);
     const recordedRoot = readFileSync(markerPath, "utf-8");
@@ -153,7 +153,7 @@ process.stdout.write(JSON.stringify(outputs));
     // Create a bash script that writes a known string to stderr
     await createScript(project, "stderr-test", ".sh", writeStderr("STDERR_SENTINEL_MSG"));
 
-    const result = await runCLI(["stderr-test"], { cwd: project.dir });
+    const result = await runCLI(["-n", "1", "stderr-test"], { cwd: project.dir });
 
     // stderr from the script should appear in CLI's stderr
     expect(result.stderr).toContain("STDERR_SENTINEL_MSG");
@@ -169,7 +169,7 @@ process.stdout.write(JSON.stringify(outputs));
     const scriptContent = `printf '%s' 'no-shebang-ran' > "${markerPath}"\nprintf '{"result":"ok"}'\n`;
     await createScript(project, "no-shebang", ".sh", scriptContent);
 
-    await runCLI(["no-shebang"], { cwd: project.dir });
+    await runCLI(["-n", "1", "no-shebang"], { cwd: project.dir });
 
     expect(existsSync(markerPath)).toBe(true);
     const markerContent = readFileSync(markerPath, "utf-8");
@@ -310,7 +310,7 @@ process.stdout.write(JSON.stringify({ result: "ok" }));
 `;
     await createScript(project, "ts-stderr", ".ts", tsContent);
 
-    const result = await runCLI(["ts-stderr"], { cwd: project.dir });
+    const result = await runCLI(["-n", "1", "ts-stderr"], { cwd: project.dir });
 
     expect(result.stderr).toContain("TS_STDERR_SENTINEL");
   });
@@ -403,7 +403,7 @@ process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
 `;
     await createScript(project, "cjs-test", ".js", cjsContent);
 
-    const result = await runCLI(["cjs-test"], { cwd: project.dir });
+    const result = await runCLI(["-n", "1", "cjs-test"], { cwd: project.dir });
 
     // CJS is rejected — the script should fail and loopx should exit non-zero
     expect(result.exitCode).not.toBe(0);
@@ -497,7 +497,7 @@ process.stdout.write(JSON.stringify({ result: greeting }));
       "node_modules/my-local-lib/index.js": `export const greeting = "hello-from-local-dep";\n`,
     });
 
-    const result = await runCLI(["with-deps"], { cwd: project.dir });
+    const result = await runCLI(["-n", "1", "with-deps"], { cwd: project.dir });
 
     // Verify the import succeeded by checking the marker file
     expect(existsSync(markerPath)).toBe(true);
@@ -517,7 +517,7 @@ process.stdout.write(JSON.stringify({ result: "ok" }));
 `,
     });
 
-    await runCLI(["cwd-check"], { cwd: project.dir });
+    await runCLI(["-n", "1", "cwd-check"], { cwd: project.dir });
 
     expect(existsSync(markerPath)).toBe(true);
     const recordedCwd = readFileSync(markerPath, "utf-8");
