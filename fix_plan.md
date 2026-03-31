@@ -1,72 +1,38 @@
 # Implementation Plan for loopx
 
-**Status: 774/889 tests passing (87%).** 115 remaining failures.
+**Status: 846/889 tests passing (95.2%).** 43 remaining failures.
 
-Phases 1-11, 15 complete. Phase 10 (API), 12 (signals) substantially complete. Phases 13-14 not started. Phase 16 ongoing.
+Phases 1-12, 15 complete. Phase 14 (install command) complete. Phase 13 (CLI delegation) not started. Phase 16 ongoing.
 
 ---
 
-## Completed Phases
+## Remaining Failures (43 tests)
 
-| Phase | Area | Status |
-|-------|------|--------|
-| 1 | Project Scaffolding | COMPLETE |
-| 2 | Internal Parsers (P0) | COMPLETE |
-| 3 | Script Discovery & Validation (P0) | COMPLETE (T-DISC-46 blocked on install) |
-| 4 | Script Execution Engine (P0) | COMPLETE |
-| 5 | Module Resolution Hook (P0) | COMPLETE |
-| 6 | Loop State Machine (P0) | COMPLETE |
-| 7 | CLI Interface & Argument Parsing (P1) | COMPLETE |
-| 8 | Subcommands (P1) | COMPLETE |
-| 9 | Environment Variable Management (P1) | COMPLETE |
-| 10 | Programmatic API (P1) | COMPLETE |
-| 11 | Help System (P1) | COMPLETE |
-| 15 | Exit Codes (cross-cutting) | COMPLETE |
+| Area | Count | Details |
+|------|-------|---------|
+| CLI delegation | 7 | Not implemented (Phase 13) |
+| Execution (no `-n`) | 10 | Scripts run without `-n`, produce no structured output → infinite loop. Tests expect one-shot execution. |
+| Output parsing E2E | 7 | T-PARSE-18–24 — unit/E2E disagree on whether "known field with invalid type" triggers raw fallback. Documented in SPEC-PROBLEMS.md. |
+| Edge cases | 6 | T-EDGE-04/07/14 — documented spec discrepancies |
+| Module resolution | 8 | T-MOD-03a (shadow), T-MOD-13d/e/g (output with invalid fields), T-MOD-14 (code after output), T-MOD-15/16/17 (input function), T-MOD-22 (CJS require) |
+| Timing | 3 | T-SIG-07 + T-API-25 × 2 |
+| Fuzz | 1 | F-ENV-04 — documented spec discrepancy |
 
 ---
 
 ## Remaining Work
 
-### Phase 12: Signal Handling (P2) — PARTIAL
-
-Exit codes 128+N and AbortController forwarding working. Remaining:
-
-- [ ] **Process group management** — Spawn children with `detached: true` + negative PID for `process.kill(-pid, signal)` to reach grandchildren
-- [ ] **T-SIG-01 through T-SIG-07** (~6 tests, T-SIG-05 now passes) — need process group signal forwarding with detached children
-
-### Phase 13: CLI Delegation (P2) — NOT STARTED (~8 tests)
+### Phase 13: CLI Delegation (P2) — NOT STARTED (7 tests)
 
 - [ ] Search for local `node_modules/.bin/loopx`, delegate with same args, inherit stdio
 - [ ] Set `LOOPX_DELEGATED=1` recursion guard, `LOOPX_BIN` to resolved realpath
 - [ ] Delegation before any subcommand/run dispatch
-- [ ] **Tests:** T-DEL-01 through T-DEL-08
-
-### Phase 14: Install Command (P2) — NOT STARTED (~47 tests)
-
-- [ ] Source detection via `classifySource()`
-- [ ] Single-file download, git clone, tarball extract
-- [ ] `.loopx/` directory creation, collision checks, name validation
-- [ ] Failure cleanup of partial files/directories
-- [ ] **Tests:** T-INST-01 through T-INST-GLOBAL-01, plus T-DISC-46
 
 ### Phase 16: Edge Cases & Hardening (P3) — IN PROGRESS
 
 - [ ] **T-EDGE-04** — stdout/stderr stream separation (documented in SPEC-PROBLEMS.md)
 - [ ] **T-EDGE-07** — stdin deadlock prevention (documented in SPEC-PROBLEMS.md)
 - [ ] **T-EDGE-14** — env file without trailing newline (documented in SPEC-PROBLEMS.md)
-
----
-
-## Remaining Failure Summary (115 tests)
-
-| Area | Count | Key Tests | Status |
-|------|-------|-----------|--------|
-| Install command | ~47 | T-INST-*, T-DISC-46 | Not implemented |
-| CLI delegation | ~8 | T-DEL-* | Not implemented |
-| Signal handling | ~6 | T-SIG-* (minus T-SIG-05) | Need process group management |
-| Edge cases | ~3 | T-EDGE-04, T-EDGE-07, T-EDGE-14 | Documented in SPEC-PROBLEMS.md |
-| Fuzz / spec issues | ~2 | F-ENV-04, F-PARSE-04 e2e | Documented in SPEC-PROBLEMS.md |
-| Other | ~49 | output-parsing e2e, module-resolution, delegation, install suites | Mixed |
 
 ---
 
