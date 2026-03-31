@@ -1,6 +1,4 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFileSync, accessSync } from "node:fs";
-import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ScriptEntry } from "./discovery.js";
@@ -10,26 +8,9 @@ const __dirname = dirname(__filename);
 
 const LOADER_REGISTER_PATH = resolve(__dirname, "loader-register.js");
 
-// Resolve tsx binary path from the loopx installation
-function findTsx(): string {
-  try {
-    const req = createRequire(import.meta.url);
-    const tsxPkgPath = req.resolve("tsx/package.json");
-    const tsxPkg = JSON.parse(readFileSync(tsxPkgPath, "utf-8"));
-    const bin =
-      typeof tsxPkg.bin === "string" ? tsxPkg.bin : tsxPkg.bin?.tsx;
-    if (bin) return resolve(dirname(tsxPkgPath), bin);
-  } catch {}
-  // Fallback: look in node_modules/.bin relative to our package
-  const candidate = resolve(__dirname, "..", "node_modules", ".bin", "tsx");
-  try {
-    accessSync(candidate);
-    return candidate;
-  } catch {}
-  return "tsx";
-}
-
-const TSX_PATH = findTsx();
+// Add our node_modules/.bin to PATH so tsx is findable regardless of CWD
+const LOOPX_BIN_DIR = resolve(__dirname, "..", "node_modules", ".bin");
+const LOOPX_NODE_MODULES = resolve(__dirname, "..", "node_modules");
 
 export interface ExecResult {
   stdout: string;
@@ -64,18 +45,22 @@ export function executeScript(
 
   const cwd = script.type === "directory" ? script.dirPath! : projectRoot;
 
-  // NODE_PATH ensures require("loopx") works in CJS contexts (when tsx
-  // transforms import to require for files without "type":"module").
-  // The --import hook handles ESM resolution separately.
-  const nodeModulesDir = resolve(__dirname, "..", "node_modules");
+  // Add loopx's node_modules/.bin to PATH so tsx is findable from any CWD.
+  // Add NODE_PATH so require("loopx") works in CJS contexts (tsx transforms
+  // import to require for files without "type":"module").
+  const currentPath = env.PATH || process.env.PATH || "";
+  const currentNodePath = env.NODE_PATH || "";
 
   const scriptEnv: Record<string, string> = {
     ...env,
     LOOPX_PROJECT_ROOT: projectRoot,
     LOOPX_BIN: loopxBin,
-    NODE_PATH: env.NODE_PATH
-      ? `${nodeModulesDir}:${env.NODE_PATH}`
-      : nodeModulesDir,
+    PATH: currentPath.includes(LOOPX_BIN_DIR)
+      ? currentPath
+      : `${LOOPX_BIN_DIR}:${currentPath}`,
+    NODE_PATH: currentNodePath
+      ? `${LOOPX_NODE_MODULES}:${currentNodePath}`
+      : LOOPX_NODE_MODULES,
   };
 
   let command: string;
@@ -85,8 +70,8 @@ export function executeScript(
     command = "/bin/bash";
     args = [script.scriptPath];
   } else {
-    command = process.execPath; // node
-    args = [TSX_PATH, "--import", LOADER_REGISTER_PATH, script.scriptPath];
+    command = "tsx";
+    args = ["--import", LOADER_REGISTER_PATH, script.scriptPath];
   }
 
   return new Promise<ExecResult>((resolvePromise, reject) => {
