@@ -221,7 +221,7 @@ console.log(JSON.stringify({ result: outputs[0]?.result }));
       it("T-EDGE-05b: unicode in script name is rejected", async () => {
         project = await createTempProject();
 
-        // Create a script with a unicode name (cafe\u0301 = café)
+        // Create a script with a unicode name (U+00E9 = precomposed é)
         await createScript(
           project,
           "caf\u00e9",
@@ -365,19 +365,33 @@ printf '{"result":"read-done"}'`,
 
   describe("SPEC: Very large -n value, no overflow", () => {
     forEachRuntime((runtime) => {
-      it("T-EDGE-11: -n 999999 with script that stops on first iteration works normally", async () => {
+      it("T-EDGE-11: -n 999999 with script that stops after a few iterations works normally", async () => {
         project = await createTempProject();
+        const counterFile = join(project.dir, "edge11-counter.txt");
 
-        // Script that stops immediately on the first iteration
-        await createScript(project, "stop-first", ".sh", emitStop());
+        // Script runs for a few iterations then stops on the 4th.
+        // This exercises the large -n value with actual iteration counting.
+        const scriptBody = `#!/bin/bash
+printf '1' >> "${counterFile}"
+COUNT=$(wc -c < "${counterFile}" | tr -d ' ')
+if [ "$COUNT" -ge 4 ]; then
+  printf '{"stop":true}'
+else
+  printf '{"result":"iter-%s"}' "$COUNT"
+fi
+`;
+        await createScript(project, "stop-later", ".sh", scriptBody);
 
-        const result = await runCLI(["-n", "999999", "stop-first"], {
+        const result = await runCLI(["-n", "999999", "stop-later"], {
           cwd: project.dir,
           runtime,
         });
 
-        // Should exit 0 with only 1 iteration (stop on first)
+        // Should exit 0 after exactly 4 iterations (stop on 4th)
         expect(result.exitCode).toBe(0);
+        expect(existsSync(counterFile)).toBe(true);
+        const content = readFileSync(counterFile, "utf-8");
+        expect(content).toBe("1111");
       });
     });
   });
@@ -413,6 +427,8 @@ printf '{"result":"read-done"}'`,
         });
 
         expect(result.exitCode).toBe(1);
+        // Stderr should mention the script was not found
+        expect(result.stderr.length).toBeGreaterThan(0);
       });
     });
   });

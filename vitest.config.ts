@@ -25,6 +25,7 @@ export default defineConfig({
         test: {
           name: "e2e",
           include: ["tests/e2e/**/*.test.ts"],
+          exclude: ["tests/e2e/signals.test.ts"],
           testTimeout: 30_000,
         },
       },

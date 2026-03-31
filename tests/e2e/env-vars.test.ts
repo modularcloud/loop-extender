@@ -205,6 +205,9 @@ describe("SPEC: Global Env File", () => {
         });
 
         expect(result.exitCode).toBe(1);
+        // Spec: "exits with code 1 and an error message about the unreadable file"
+        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr.toLowerCase()).toMatch(/unreadable|permission|denied|access|cannot read/i);
       });
     });
 
@@ -264,6 +267,9 @@ try {
 
         const result = await runCLI(["env", "list"], { runtime });
         expect(result.exitCode).toBe(1);
+        // Spec: "exits with code 1 and an error message about the unreadable file"
+        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr.toLowerCase()).toMatch(/unreadable|permission|denied|access|cannot read/i);
       });
     });
 
@@ -282,6 +288,9 @@ try {
           runtime,
         });
         expect(result.exitCode).toBe(1);
+        // Spec: "exits with code 1 and an error message about the unreadable file"
+        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr.toLowerCase()).toMatch(/unreadable|permission|denied|access|cannot read/i);
       });
     });
 
@@ -300,6 +309,9 @@ try {
           runtime,
         });
         expect(result.exitCode).toBe(1);
+        // Spec: "exits with code 1 and an error message about the unreadable file"
+        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr.toLowerCase()).toMatch(/unreadable|permission|denied|access|cannot read/i);
       });
     });
   });
@@ -436,14 +448,20 @@ describe("SPEC: Env File Parsing", () => {
       expect(result.value).toBe("value");
     });
 
-    // T-ENV-15: No whitespace around = (invalid key with space)
-    it("T-ENV-15: key with whitespace around = is invalid and produces a warning", async () => {
-      const content = `BAD KEY =value\nGOOD_KEY=present\n`;
-      // The bad line should be ignored; GOOD_KEY should still work
-      const result = await parseEnvAndObserve(content, "GOOD_KEY", runtime);
-      expect(result.present).toBe(true);
-      expect(result.value).toBe("present");
-      expect(result.stderr).toMatch(/warning|invalid|ignored|malformed/i);
+    // T-ENV-15: No whitespace around = (key includes trailing space)
+    it("T-ENV-15: KEY = value (spaces around =) treats key as 'KEY ' which is invalid", async () => {
+      // Spec: "KEY = value\n" — the key is "KEY " (with trailing space),
+      // which contains a space and is therefore invalid.
+      // This does NOT set KEY to "value". A warning is emitted.
+      const content = `KEY = value\nGOOD_KEY=present\n`;
+      // Verify GOOD_KEY still works (the bad line doesn't break parsing)
+      const goodResult = await parseEnvAndObserve(content, "GOOD_KEY", runtime);
+      expect(goodResult.present).toBe(true);
+      expect(goodResult.value).toBe("present");
+      expect(goodResult.stderr).toMatch(/warning|invalid|ignored|malformed/i);
+      // Verify KEY is NOT set (the line with spaces around = was rejected)
+      const keyResult = await parseEnvAndObserve(content, "KEY", runtime);
+      expect(keyResult.present).toBe(false);
     });
 
     // T-ENV-15a: Empty value KEY=

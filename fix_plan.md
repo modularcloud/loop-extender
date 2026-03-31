@@ -17,10 +17,33 @@ Tracks active issues and recent fix batches for the test harness (not the loopx 
 - T-LOOP-23 tests stderr pass-through but writeStderr fixture exits 0; spec says "on failure".
 - T-INST-31a is an extra test (HTTP 500) not in spec but useful.
 - T-DEL-02, T-DEL-03, T-DEL-06 manually construct fixtures instead of using withDelegationSetup (needed for non-standard directory layouts).
+- T-EDGE-05 split into T-EDGE-05a/b/c sub-tests; T-EDGE-12 split into T-EDGE-12a/12b — all spec aspects covered.
+- T-API-20j/k/l are extra tests not in spec (renamed from old IDs).
+- T-ENV-25/25a use a single counter-based script instead of spec's suggestion of "a different script" for iteration 2 — functionally equivalent.
 
 ---
 
-## Recent Fixes (2026-03-31)
+## Recent Fixes (2026-03-31, batch 2)
+
+### Vitest config fix
+- **vitest.config.ts**: Excluded `tests/e2e/signals.test.ts` from the `e2e` project to prevent signals tests from running twice (once in `e2e` with 30s timeout, once in `signals` with 60s timeout and serial execution).
+
+### T-ENV-15 test input corrected
+- **env-vars.test.ts**: T-ENV-15 now uses spec-exact input `KEY = value\n` (key with trailing space before `=`) instead of `BAD KEY =value\n`. Also added explicit assertion that `KEY` is NOT set.
+
+### Missing stderr assertions added
+- **env-vars.test.ts**: T-ENV-05a, T-ENV-05c, T-ENV-05d, T-ENV-05e now assert stderr contains an error message about the unreadable file (spec requires "exits with code 1 and an error message").
+- **edge-cases.test.ts**: T-EDGE-12b now asserts stderr is non-empty (script not found error).
+
+### T-EDGE-11 strengthened
+- **edge-cases.test.ts**: T-EDGE-11 now runs 4 iterations before stopping (was 1). Uses a counter script that stops on the 4th iteration, better exercising the large `-n` value with actual iteration counting.
+
+### Comment fix
+- **edge-cases.test.ts**: T-EDGE-05b comment corrected — was incorrectly describing decomposed form (`cafe\u0301`) when the code uses precomposed form (`caf\u00e9`).
+
+---
+
+## Recent Fixes (2026-03-31, batch 1)
 
 ### Test ID realignment
 
