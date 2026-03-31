@@ -1,8 +1,8 @@
 # Implementation Plan for loopx
 
-**Status: 772/889 tests passing (87%).** 117 remaining failures.
+**Status: 774/889 tests passing (87%).** 115 remaining failures.
 
-Phases 1-9, 11 complete. Phase 10 (API), 12 (signals), 15 (exit codes) substantially complete. Phases 13-14 not started. Phase 16 ongoing.
+Phases 1-11, 15 complete. Phase 10 (API), 12 (signals) substantially complete. Phases 13-14 not started. Phase 16 ongoing.
 
 ---
 
@@ -19,9 +19,9 @@ Phases 1-9, 11 complete. Phase 10 (API), 12 (signals), 15 (exit codes) substanti
 | 7 | CLI Interface & Argument Parsing (P1) | COMPLETE |
 | 8 | Subcommands (P1) | COMPLETE |
 | 9 | Environment Variable Management (P1) | COMPLETE |
-| 10 | Programmatic API (P1) | COMPLETE — options snapshotting, generator.return() cancellation, AbortSignal in runPromise all working |
+| 10 | Programmatic API (P1) | COMPLETE |
 | 11 | Help System (P1) | COMPLETE |
-| 15 | Exit Codes (cross-cutting) | COMPLETE — 128+N signal exit codes working |
+| 15 | Exit Codes (cross-cutting) | COMPLETE |
 
 ---
 
@@ -29,14 +29,12 @@ Phases 1-9, 11 complete. Phase 10 (API), 12 (signals), 15 (exit codes) substanti
 
 ### Phase 12: Signal Handling (P2) — PARTIAL
 
-Exit codes 128+N working. Signal forwarding via AbortController working. Remaining:
+Exit codes 128+N and AbortController forwarding working. Remaining:
 
 - [ ] **Process group management** — Spawn children with `detached: true` + negative PID for `process.kill(-pid, signal)` to reach grandchildren
-- [ ] **T-SIG-01 through T-SIG-07** (~7 tests) — need process group signal forwarding with detached children
+- [ ] **T-SIG-01 through T-SIG-07** (~6 tests, T-SIG-05 now passes) — need process group signal forwarding with detached children
 
 ### Phase 13: CLI Delegation (P2) — NOT STARTED (~8 tests)
-
-*(Spec 3.2)*
 
 - [ ] Search for local `node_modules/.bin/loopx`, delegate with same args, inherit stdio
 - [ ] Set `LOOPX_DELEGATED=1` recursion guard, `LOOPX_BIN` to resolved realpath
@@ -44,8 +42,6 @@ Exit codes 128+N working. Signal forwarding via AbortController working. Remaini
 - [ ] **Tests:** T-DEL-01 through T-DEL-08
 
 ### Phase 14: Install Command (P2) — NOT STARTED (~47 tests)
-
-*(Spec 10.1-10.3)*
 
 - [ ] Source detection via `classifySource()`
 - [ ] Single-file download, git clone, tarball extract
@@ -61,23 +57,20 @@ Exit codes 128+N working. Signal forwarding via AbortController working. Remaini
 
 ---
 
-## Remaining Failure Summary (117 tests)
+## Remaining Failure Summary (115 tests)
 
 | Area | Count | Key Tests | Status |
 |------|-------|-----------|--------|
 | Install command | ~47 | T-INST-*, T-DISC-46 | Not implemented |
 | CLI delegation | ~8 | T-DEL-* | Not implemented |
-| Signal handling | ~7 | T-SIG-* | Need process group management |
-| Edge cases | ~6 | T-EDGE-04, T-EDGE-07, T-EDGE-14 | Documented in SPEC-PROBLEMS.md |
-| API timing | 2 | T-API-25 | Timing-sensitive |
-| Fuzz tests | 2 | F-ENV-04, F-PARSE-04 e2e | Documented in SPEC-PROBLEMS.md |
-| Other | ~45 | output-parsing e2e, module-resolution, delegation, install suites | Mixed |
+| Signal handling | ~6 | T-SIG-* (minus T-SIG-05) | Need process group management |
+| Edge cases | ~3 | T-EDGE-04, T-EDGE-07, T-EDGE-14 | Documented in SPEC-PROBLEMS.md |
+| Fuzz / spec issues | ~2 | F-ENV-04, F-PARSE-04 e2e | Documented in SPEC-PROBLEMS.md |
+| Other | ~49 | output-parsing e2e, module-resolution, delegation, install suites | Mixed |
 
 ---
 
 ## Known Minor Test Harness Deviations (documented, not blocking)
-
-These are cosmetic deviations in the test harness that do not affect correctness. They should not be "fixed" — the implementation should conform to SPEC.md, not to the test's deviation.
 
 - T-CLI-08 uses `.sh` instead of `.ts` for default script — functionally equivalent
 - T-SIG-04 uses 1-second delay instead of spec's 2-second — still well under 5s grace period

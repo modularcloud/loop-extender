@@ -13,6 +13,7 @@ import {
   envRemove,
   envList,
 } from "./env.js";
+import { installCommand } from "./install.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -257,8 +258,12 @@ async function main(): Promise<void> {
   }
 
   if (args.subcommand === "install") {
-    process.stderr.write("Error: loopx install not yet implemented\n");
-    process.exit(1);
+    if (args.subcommandArgs.length < 1) {
+      process.stderr.write("Error: loopx install requires a <source> argument\n");
+      process.exit(1);
+    }
+    await installCommand(args.subcommandArgs[0], cwd);
+    process.exit(0);
   }
 
   // Run mode: requires .loopx/
