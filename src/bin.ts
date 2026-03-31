@@ -1,50 +1,130 @@
 #!/usr/bin/env node
 
-/**
- * loopx CLI entry point.
- *
- * This is the main binary invoked as `loopx [options] [script-name]`.
- * Full CLI implementation will be built incrementally across phases.
- */
+import { readFileSync, realpathSync } from "node:fs";
+import { resolve, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { discoverScripts } from "./discovery.js";
+import { runLoop } from "./loop.js";
+import {
+  loadGlobalEnv,
+  loadLocalEnv,
+  mergeEnv,
+  envSet,
+  envRemove,
+  envList,
+} from "./env.js";
 
-const args = process.argv.slice(2);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
-// Help flag takes precedence over everything
-if (args.includes("-h") || args.includes("--help")) {
-  printHelp();
-  process.exit(0);
+// Read version from dist/package.json
+function getVersion(): string {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(resolve(__dirname, "package.json"), "utf-8")
+    );
+    return pkg.version;
+  } catch {
+    return "0.0.0";
+  }
 }
 
-// Subcommands
-const subcommand = args[0];
-
-if (subcommand === "version") {
-  // Read version from package.json
-  // For now, print the version directly
-  console.log("0.1.0");
-  process.exit(0);
+// Resolve the effective loopx binary path
+function getLoopxBin(): string {
+  try {
+    return realpathSync(resolve(__dirname, "bin.js"));
+  } catch {
+    return resolve(__dirname, "bin.js");
+  }
 }
 
-if (subcommand === "output") {
-  handleOutputSubcommand(args.slice(1));
-  process.exit(0);
+// --- Argument Parsing ---
+interface ParsedArgs {
+  help: boolean;
+  maxIterations?: number;
+  envFile?: string;
+  subcommand?: string;
+  subcommandArgs: string[];
+  scriptName?: string;
 }
 
-if (subcommand === "env") {
-  console.error("loopx env: not yet implemented");
-  process.exit(1);
+function parseArgs(argv: string[]): ParsedArgs {
+  const result: ParsedArgs = {
+    help: false,
+    subcommandArgs: [],
+  };
+
+  // Help flag takes precedence over everything
+  if (argv.includes("-h") || argv.includes("--help")) {
+    result.help = true;
+    return result;
+  }
+
+  let i = 0;
+  let sawN = false;
+  let sawE = false;
+
+  while (i < argv.length) {
+    const arg = argv[i];
+
+    if (arg === "-n") {
+      if (sawN) {
+        process.stderr.write("Error: duplicate -n flag\n");
+        process.exit(1);
+      }
+      sawN = true;
+      i++;
+      if (i >= argv.length) {
+        process.stderr.write("Error: -n requires a value\n");
+        process.exit(1);
+      }
+      const val = argv[i];
+      const num = Number(val);
+      if (!Number.isInteger(num) || num < 0 || val.trim() === "") {
+        process.stderr.write(
+          `Error: -n must be a non-negative integer, got '${val}'\n`
+        );
+        process.exit(1);
+      }
+      result.maxIterations = num;
+    } else if (arg === "-e") {
+      if (sawE) {
+        process.stderr.write("Error: duplicate -e flag\n");
+        process.exit(1);
+      }
+      sawE = true;
+      i++;
+      if (i >= argv.length) {
+        process.stderr.write("Error: -e requires a value\n");
+        process.exit(1);
+      }
+      result.envFile = argv[i];
+    } else if (!arg.startsWith("-") || arg === "--") {
+      // First non-flag argument
+      // Only recognize subcommands when no flags (-n, -e) precede them
+      if (
+        !sawN &&
+        !sawE &&
+        !result.scriptName &&
+        ["version", "output", "env", "install"].includes(arg)
+      ) {
+        result.subcommand = arg;
+        result.subcommandArgs = argv.slice(i + 1);
+        return result;
+      }
+      result.scriptName = arg;
+    } else {
+      process.stderr.write(`Error: unknown flag '${arg}'\n`);
+      process.exit(1);
+    }
+    i++;
+  }
+
+  return result;
 }
 
-if (subcommand === "install") {
-  console.error("loopx install: not yet implemented");
-  process.exit(1);
-}
-
-// Run mode — requires .loopx/ directory
-console.error("loopx run: not yet implemented");
-process.exit(1);
-
-function printHelp(): void {
+// --- Help ---
+function printHelp(loopxDir: string): void {
   console.log(`Usage: loopx [options] [script-name]
 
 Options:
@@ -57,11 +137,29 @@ Subcommands:
   output        Emit structured output (for bash scripts)
   env           Manage global environment variables
   install       Install a script into .loopx/`);
+
+  const discovery = discoverScripts(loopxDir, "help");
+
+  // Print warnings
+  for (const w of discovery.warnings) {
+    process.stderr.write(w + "\n");
+  }
+
+  if (discovery.scripts.size > 0) {
+    console.log("\nAvailable scripts:");
+    for (const [name, entry] of discovery.scripts) {
+      const typeLabel = entry.type === "directory" ? "directory" : entry.ext;
+      console.log(`  ${name} (${typeLabel})`);
+    }
+  }
 }
 
+// --- Output Subcommand ---
 function handleOutputSubcommand(flags: string[]): void {
   if (flags.length === 0) {
-    console.error("loopx output: at least one flag (--result, --goto, --stop) is required");
+    process.stderr.write(
+      "Error: loopx output requires at least one flag (--result, --goto, --stop)\n"
+    );
     process.exit(1);
   }
 
@@ -73,30 +171,204 @@ function handleOutputSubcommand(flags: string[]): void {
     if (flag === "--result") {
       i++;
       if (i >= flags.length) {
-        console.error("loopx output: --result requires a value");
+        process.stderr.write("Error: --result requires a value\n");
         process.exit(1);
       }
       output.result = flags[i];
     } else if (flag === "--goto") {
       i++;
       if (i >= flags.length) {
-        console.error("loopx output: --goto requires a value");
+        process.stderr.write("Error: --goto requires a value\n");
         process.exit(1);
       }
       output.goto = flags[i];
     } else if (flag === "--stop") {
       output.stop = true;
     } else {
-      console.error(`loopx output: unknown flag: ${flag}`);
+      process.stderr.write(`Error: loopx output: unknown flag '${flag}'\n`);
       process.exit(1);
     }
     i++;
   }
 
   if (Object.keys(output).length === 0) {
-    console.error("loopx output: at least one flag (--result, --goto, --stop) is required");
+    process.stderr.write(
+      "Error: loopx output requires at least one flag (--result, --goto, --stop)\n"
+    );
     process.exit(1);
   }
 
   console.log(JSON.stringify(output));
 }
+
+// --- Env Subcommand ---
+function handleEnvSubcommand(subArgs: string[]): void {
+  const action = subArgs[0];
+
+  if (action === "set") {
+    if (subArgs.length < 3) {
+      process.stderr.write("Error: loopx env set requires <name> <value>\n");
+      process.exit(1);
+    }
+    envSet(subArgs[1], subArgs[2]);
+  } else if (action === "remove") {
+    if (subArgs.length < 2) {
+      process.stderr.write("Error: loopx env remove requires <name>\n");
+      process.exit(1);
+    }
+    envRemove(subArgs[1]);
+  } else if (action === "list") {
+    envList();
+  } else {
+    process.stderr.write(
+      `Error: unknown env subcommand '${action}'. Use set, remove, or list.\n`
+    );
+    process.exit(1);
+  }
+}
+
+// --- Main ---
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2));
+  const cwd = process.cwd();
+  const loopxDir = join(cwd, ".loopx");
+  const loopxBin = getLoopxBin();
+
+  // Help
+  if (args.help) {
+    printHelp(loopxDir);
+    process.exit(0);
+  }
+
+  // Subcommands (no .loopx/ validation needed)
+  if (args.subcommand === "version") {
+    console.log(getVersion());
+    process.exit(0);
+  }
+
+  if (args.subcommand === "output") {
+    handleOutputSubcommand(args.subcommandArgs);
+    process.exit(0);
+  }
+
+  if (args.subcommand === "env") {
+    handleEnvSubcommand(args.subcommandArgs);
+    process.exit(0);
+  }
+
+  if (args.subcommand === "install") {
+    process.stderr.write("Error: loopx install not yet implemented\n");
+    process.exit(1);
+  }
+
+  // Run mode: requires .loopx/
+  const discovery = discoverScripts(loopxDir, "run");
+
+  // Print warnings to stderr
+  for (const w of discovery.warnings) {
+    process.stderr.write(w + "\n");
+  }
+
+  // Check for fatal errors
+  if (discovery.errors.length > 0) {
+    for (const err of discovery.errors) {
+      process.stderr.write(`Error: ${err}\n`);
+    }
+    process.exit(1);
+  }
+
+  // Load environment
+  let globalEnv: Record<string, string> = {};
+  let localEnv: Record<string, string> = {};
+
+  try {
+    const globalResult = loadGlobalEnv();
+    globalEnv = globalResult.vars;
+    for (const w of globalResult.warnings) {
+      process.stderr.write(`Warning: ${w}\n`);
+    }
+  } catch (err: unknown) {
+    process.stderr.write(
+      `Error: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+    process.exit(1);
+  }
+
+  if (args.envFile) {
+    try {
+      const envFilePath = resolve(cwd, args.envFile);
+      const localResult = loadLocalEnv(envFilePath);
+      localEnv = localResult.vars;
+      for (const w of localResult.warnings) {
+        process.stderr.write(`Warning: ${w}\n`);
+      }
+    } catch (err: unknown) {
+      process.stderr.write(
+        `Error: ${err instanceof Error ? err.message : String(err)}\n`
+      );
+      process.exit(1);
+    }
+  }
+
+  const mergedEnv = mergeEnv(globalEnv, localEnv, loopxBin, cwd);
+
+  // Determine starting target
+  const scriptName = args.scriptName || "default";
+  const startingTarget = discovery.scripts.get(scriptName);
+
+  if (!startingTarget) {
+    if (!args.scriptName) {
+      process.stderr.write(
+        "Error: No default script found. Create .loopx/default.ts or specify a script name.\n"
+      );
+    } else {
+      process.stderr.write(
+        `Error: Script '${scriptName}' not found in .loopx/\n`
+      );
+    }
+    process.exit(1);
+  }
+
+  // -n 0: validate then exit
+  if (args.maxIterations === 0) {
+    process.exit(0);
+  }
+
+  // Set up signal handling
+  let signalReceived: NodeJS.Signals | null = null;
+  const signalHandler = (sig: NodeJS.Signals) => {
+    signalReceived = sig;
+  };
+  process.on("SIGINT", signalHandler);
+  process.on("SIGTERM", signalHandler);
+
+  // Run the loop
+  try {
+    const loop = runLoop(startingTarget, discovery.scripts, {
+      maxIterations: args.maxIterations,
+      env: mergedEnv,
+      projectRoot: cwd,
+      loopxBin,
+    });
+
+    for await (const _output of loop) {
+      // Check if signal was received between iterations
+      if (signalReceived) {
+        const sigNum = signalReceived === "SIGINT" ? 2 : 15;
+        process.exit(128 + sigNum);
+      }
+      // CLI never prints result to stdout
+    }
+
+    process.exit(0);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`Error: ${msg}\n`);
+    process.exit(1);
+  }
+}
+
+main().catch((err) => {
+  process.stderr.write(`Fatal: ${err}\n`);
+  process.exit(1);
+});
