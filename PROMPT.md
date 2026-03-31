@@ -12,7 +12,7 @@
 
 3. When you successfully implement a task in @fix_plan.md, then add changed code and @fix_plan.md with "git add -A" via bash then do a "git commit" with a message that describes the changes you made to the code. After the commit do a "git push" to push the changes to the remote repository.
 
-4. If there are no more tasks @fix_plan.md, then follow the instructions in @PLANNING-PROMPT.md to find more tasks. Once you have updated the task with with new tasks, commit, push and do not implement yet. Instead consider your job done. If there are no more tasks left to find even after following these instructions, then write in README.md that this is production ready.
+4. If there are no more tasks @fix_plan.md, then follow the instructions in @PLANNING-PROMPT.md to find more tasks. Once you have updated the task with with new tasks, commit, push and do not implement yet. Instead consider your job done. If there are no more tasks left to find even after following these instructions, then write in README.md that the tests are ready to test production implementations.
 
 5. The goal is to implement the test harness fully prior to working on the implementation. Therefore we expect certain tests to fail when we run them. You are done when (1) all test are correctly implemented (2) all tests that are supposed to pass (given that there is not an implementation) pass (2) all tests that are supposed to fail (given that there is not an implementation) fail.
 
