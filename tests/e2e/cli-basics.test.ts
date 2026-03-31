@@ -374,9 +374,11 @@ describe("SPEC: CLI Basics (T-CLI-01 through T-CLI-23)", () => {
         });
 
         expect(result.exitCode).toBe(1);
-        // Stderr mentions "default" and suggests script creation
+        // Stderr mentions "default" and suggests script creation (Spec 4.1)
         const stderrLower = result.stderr.toLowerCase();
         expect(stderrLower).toContain("default");
+        // Must suggest script creation per spec
+        expect(stderrLower).toMatch(/create|\.loopx/);
       });
 
       it("T-CLI-10: .loopx/ missing -> exit 1", async () => {

@@ -237,6 +237,34 @@ console.log(JSON.stringify({ result: outputs[0]?.result }));
 
         expect(result.exitCode).toBe(1);
       });
+
+      it("T-EDGE-05c: unicode in env values is preserved", async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "unicode-env-marker.txt");
+        const unicodeValue = "\u{1F600}\u4E16\u754C\u{1F389}";
+
+        // Write env file with unicode value
+        const envPath = join(project.dir, "unicode.env");
+        writeEnvFileRaw(envPath, `UNICODE_VAR=${unicodeValue}\n`);
+
+        // Script writes the env var to a marker file
+        await createScript(
+          project,
+          "check-env",
+          ".sh",
+          writeEnvToFile("UNICODE_VAR", markerPath),
+        );
+
+        const result = await runCLI(["-e", envPath, "-n", "1", "check-env"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(markerPath)).toBe(true);
+        const envContent = readFileSync(markerPath, "utf-8");
+        expect(envContent).toBe(unicodeValue);
+      });
     });
   });
 

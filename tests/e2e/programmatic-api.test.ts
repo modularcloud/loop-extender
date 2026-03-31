@@ -936,8 +936,8 @@ console.log(JSON.stringify({ threwError, results }));
       expect(parsed.results[1].result).toBe("iter-2");
     });
 
-    // T-API-20: nonexistent script throws (lazily on first next())
-    it("T-API-20: nonexistent script throws on first next()", async () => {
+    // T-API-20a: nonexistent script throws lazily on first next() (Spec 9.1, 9.3)
+    it("T-API-20a: nonexistent script throws on first next()", async () => {
       project = await createTempProject();
 
       const driverCode = `
@@ -963,8 +963,8 @@ console.log(JSON.stringify({ threwError, errorMsg }));
       expect(parsed.threwError).toBe(true);
     });
 
-    // T-API-20a: name collision throws
-    it("T-API-20a: name collision throws on first next()", async () => {
+    // T-API-20c: name collision throws on first next() (Spec 9.1, 9.3)
+    it("T-API-20c: name collision throws on first next()", async () => {
       project = await createTempProject();
       // Create two scripts with the same base name but different extensions
       await createScript(project, "myscript", ".sh", emitResult("sh-version"));
@@ -992,8 +992,8 @@ console.log(JSON.stringify({ threwError, errorMsg }));
       expect(parsed.threwError).toBe(true);
     });
 
-    // T-API-20b: missing env file throws
-    it("T-API-20b: missing env file throws on first next()", async () => {
+    // T-API-20d: missing env file throws on first next() (Spec 9.1, 9.3, 9.5)
+    it("T-API-20d: missing env file throws on first next()", async () => {
       project = await createTempProject();
       await createScript(project, "myscript", ".sh", emitResult("ok"));
 
@@ -1019,8 +1019,8 @@ console.log(JSON.stringify({ threwError, errorMsg }));
       expect(parsed.threwError).toBe(true);
     });
 
-    // T-API-20c: missing .loopx throws
-    it("T-API-20c: missing .loopx directory throws on first next()", async () => {
+    // T-API-20f: missing .loopx directory throws on first next() (Spec 9.1, 9.3)
+    it("T-API-20f: missing .loopx directory throws on first next()", async () => {
       project = await createTempProject({ withLoopxDir: false });
 
       const driverCode = `
@@ -1045,8 +1045,8 @@ console.log(JSON.stringify({ threwError, errorMsg }));
       expect(parsed.threwError).toBe(true);
     });
 
-    // T-API-20d: no default script throws
-    it("T-API-20d: no default script throws on first next()", async () => {
+    // T-API-20h: no default script throws on first next() (Spec 9.1, 9.3)
+    it("T-API-20h: no default script throws on first next()", async () => {
       project = await createTempProject();
       // .loopx exists but has no default script
       await createScript(project, "other", ".sh", emitResult("not-default"));
@@ -1073,8 +1073,8 @@ console.log(JSON.stringify({ threwError, errorMsg }));
       expect(parsed.threwError).toBe(true);
     });
 
-    // T-API-20e: reserved name script throws
-    it("T-API-20e: reserved name script throws on first next()", async () => {
+    // T-API-20j: reserved name script throws on first next() (extra, extends Spec 9.3 + 5.3)
+    it("T-API-20j: reserved name script throws on first next()", async () => {
       project = await createTempProject();
       // "output" is a reserved name per Spec 5.3
       await createScript(project, "output", ".sh", emitResult("reserved"));
@@ -1101,8 +1101,8 @@ console.log(JSON.stringify({ threwError, errorMsg }));
       expect(parsed.threwError).toBe(true);
     });
 
-    // T-API-20f: invalid name script throws
-    it("T-API-20f: invalid name script throws on first next()", async () => {
+    // T-API-20k: invalid name script throws on first next() (extra, extends Spec 9.3 + 5.4)
+    it("T-API-20k: invalid name script throws on first next()", async () => {
       project = await createTempProject();
       // Script name starting with "-" is invalid per Spec 5.4
       await createScript(project, "-invalid", ".sh", emitResult("bad-name"));
@@ -1129,8 +1129,8 @@ console.log(JSON.stringify({ threwError, errorMsg }));
       expect(parsed.threwError).toBe(true);
     });
 
-    // T-API-20g: nonexistent script with runPromise rejects
-    it("T-API-20g: nonexistent script with runPromise rejects", async () => {
+    // T-API-20b: nonexistent script with runPromise rejects (Spec 9.3)
+    it("T-API-20b: nonexistent script with runPromise rejects", async () => {
       project = await createTempProject();
 
       const driverCode = `
@@ -1150,8 +1150,8 @@ try {
       expect(parsed.rejected).toBe(true);
     });
 
-    // T-API-20h: name collision with runPromise rejects
-    it("T-API-20h: name collision with runPromise rejects", async () => {
+    // T-API-20l: name collision with runPromise rejects (extra, extends Spec 9.3 + 5.2)
+    it("T-API-20l: name collision with runPromise rejects", async () => {
       project = await createTempProject();
       await createScript(project, "myscript", ".sh", emitResult("sh-version"));
       await createScript(project, "myscript", ".ts", 'process.stdout.write(JSON.stringify({ result: "ts-version" }));\n');
@@ -1173,8 +1173,8 @@ try {
       expect(parsed.rejected).toBe(true);
     });
 
-    // T-API-20i: missing env file with runPromise rejects
-    it("T-API-20i: missing env file with runPromise rejects", async () => {
+    // T-API-20e: missing env file with runPromise rejects (Spec 9.3, 9.5)
+    it("T-API-20e: missing env file with runPromise rejects", async () => {
       project = await createTempProject();
       await createScript(project, "myscript", ".sh", emitResult("ok"));
 
@@ -1183,6 +1183,50 @@ import { runPromise } from "loopx";
 
 try {
   await runPromise("myscript", { cwd: ${JSON.stringify(project.dir)}, envFile: "nonexistent.env" });
+  console.log(JSON.stringify({ rejected: false }));
+} catch (e) {
+  console.log(JSON.stringify({ rejected: true, error: e.message || String(e) }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
+      expect(result.exitCode).toBe(0);
+
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(true);
+    });
+
+    // T-API-20g: runPromise with missing .loopx directory rejects (Spec 9.3)
+    it("T-API-20g: missing .loopx directory with runPromise rejects", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+
+      const driverCode = `
+import { runPromise } from "loopx";
+
+try {
+  await runPromise("myscript", { cwd: ${JSON.stringify(project.dir)} });
+  console.log(JSON.stringify({ rejected: false }));
+} catch (e) {
+  console.log(JSON.stringify({ rejected: true, error: e.message || String(e) }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
+      expect(result.exitCode).toBe(0);
+
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(true);
+    });
+
+    // T-API-20i: runPromise with no default script rejects (Spec 9.3)
+    it("T-API-20i: no default script with runPromise rejects", async () => {
+      project = await createTempProject();
+      // .loopx exists but has no default script
+      await createScript(project, "other", ".sh", emitResult("not-default"));
+
+      const driverCode = `
+import { runPromise } from "loopx";
+
+try {
+  await runPromise(undefined, { cwd: ${JSON.stringify(project.dir)} });
   console.log(JSON.stringify({ rejected: false }));
 } catch (e) {
   console.log(JSON.stringify({ rejected: true, error: e.message || String(e) }));
@@ -1352,8 +1396,8 @@ console.log(JSON.stringify({ threwError, errorMsg }));
       expect(parsed.threwError).toBe(true);
     });
 
-    // T-API-22a: float throws for run
-    it("T-API-22a: float maxIterations throws on first next()", async () => {
+    // T-API-23: float maxIterations throws for run (Spec 9.1, 9.5)
+    it("T-API-23: float maxIterations throws on first next()", async () => {
       project = await createTempProject();
       await createScript(project, "myscript", ".sh", emitResult("ok"));
 
@@ -1379,8 +1423,8 @@ console.log(JSON.stringify({ threwError, errorMsg }));
       expect(parsed.threwError).toBe(true);
     });
 
-    // T-API-22b: NaN throws for run
-    it("T-API-22b: NaN maxIterations throws on first next()", async () => {
+    // T-API-23a: NaN maxIterations throws for run (Spec 9.1, 9.5)
+    it("T-API-23a: NaN maxIterations throws on first next()", async () => {
       project = await createTempProject();
       await createScript(project, "myscript", ".sh", emitResult("ok"));
 
@@ -1406,8 +1450,8 @@ console.log(JSON.stringify({ threwError, errorMsg }));
       expect(parsed.threwError).toBe(true);
     });
 
-    // T-API-23: negative throws for runPromise
-    it("T-API-23: negative maxIterations rejects for runPromise", async () => {
+    // T-API-24a: negative maxIterations rejects for runPromise (Spec 9.5)
+    it("T-API-24a: negative maxIterations rejects for runPromise", async () => {
       project = await createTempProject();
       await createScript(project, "myscript", ".sh", emitResult("ok"));
 
@@ -1428,8 +1472,8 @@ try {
       expect(parsed.rejected).toBe(true);
     });
 
-    // T-API-23a: float throws for runPromise
-    it("T-API-23a: float maxIterations rejects for runPromise", async () => {
+    // T-API-24b: float maxIterations rejects for runPromise (Spec 9.5)
+    it("T-API-24b: float maxIterations rejects for runPromise", async () => {
       project = await createTempProject();
       await createScript(project, "myscript", ".sh", emitResult("ok"));
 
@@ -1450,8 +1494,8 @@ try {
       expect(parsed.rejected).toBe(true);
     });
 
-    // T-API-24b: NaN throws for runPromise
-    it("T-API-24b: NaN maxIterations rejects for runPromise", async () => {
+    // T-API-24: NaN maxIterations rejects for runPromise (Spec 9.5)
+    it("T-API-24: NaN maxIterations rejects for runPromise", async () => {
       project = await createTempProject();
       await createScript(project, "myscript", ".sh", emitResult("ok"));
 

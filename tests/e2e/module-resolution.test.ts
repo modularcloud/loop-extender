@@ -10,6 +10,7 @@ import {
 } from "../helpers/fixtures.js";
 import { runCLI } from "../helpers/cli.js";
 import { runAPIDriver } from "../helpers/api-driver.js";
+import { withDelegationSetup, type DelegationFixture } from "../helpers/delegation.js";
 import { isRuntimeAvailable } from "../helpers/runtime.js";
 import { writeEnvToFile } from "../helpers/fixture-scripts.js";
 
@@ -857,37 +858,43 @@ try {
 // ---------------------------------------------------------------------------
 
 describe("SPEC: LOOPX_BIN in Bash Scripts (T-MOD-19 through T-MOD-21)", () => {
-  let project: TempProject | null = null;
+  // These tests use withDelegationSetup (not runCLI) per TEST-SPEC §4.8,
+  // because runCLI's `node /path/to/bin.js` invocation does not exercise
+  // delegation or realpath resolution of LOOPX_BIN.
+  let fixture: DelegationFixture | null = null;
 
   afterEach(async () => {
-    if (project) {
-      await project.cleanup();
-      project = null;
+    if (fixture) {
+      await fixture.cleanup();
+      fixture = null;
     }
   });
 
   it("T-MOD-19: $LOOPX_BIN output produces structured output for goto chain", async () => {
-    project = await createTempProject();
-    const markerPath = join(project.dir, "reader-marker.txt");
+    fixture = await withDelegationSetup();
+    const proj: TempProject = {
+      dir: fixture.projectDir,
+      loopxDir: join(fixture.projectDir, ".loopx"),
+      cleanup: async () => {},
+    };
+    const markerPath = join(fixture.projectDir, "reader-marker.txt");
 
     // Script "sender" uses $LOOPX_BIN output to produce structured output
     // with result and goto to "reader"
     await createBashScript(
-      project,
+      proj,
       "sender",
       `$LOOPX_BIN output --result "payload" --goto "reader"`,
     );
 
     // Script "reader" reads stdin and writes the received value to marker
     await createBashScript(
-      project,
+      proj,
       "reader",
       `INPUT=$(cat)\nprintf '%s' "$INPUT" > "${markerPath}"\nprintf '{"stop":true}'`,
     );
 
-    const result = await runCLI(["-n", "2", "sender"], {
-      cwd: project.dir,
-    });
+    const result = await fixture.runGlobal(["-n", "2", "sender"]);
 
     expect(result.exitCode).toBe(0);
     expect(existsSync(markerPath)).toBe(true);
@@ -896,18 +903,23 @@ describe("SPEC: LOOPX_BIN in Bash Scripts (T-MOD-19 through T-MOD-21)", () => {
   });
 
   it("T-MOD-20: $LOOPX_BIN is valid executable path", async () => {
-    project = await createTempProject();
-    const markerPath = join(project.dir, "loopx-bin-path.txt");
+    fixture = await withDelegationSetup();
+    const proj: TempProject = {
+      dir: fixture.projectDir,
+      loopxDir: join(fixture.projectDir, ".loopx"),
+      cleanup: async () => {},
+    };
+    const markerPath = join(fixture.projectDir, "loopx-bin-path.txt");
 
     // Script writes $LOOPX_BIN to a marker file
     await createScript(
-      project,
+      proj,
       "myscript",
       ".sh",
       writeEnvToFile("LOOPX_BIN", markerPath),
     );
 
-    await runCLI(["-n", "1", "myscript"], { cwd: project.dir });
+    await fixture.runGlobal(["-n", "1", "myscript"]);
 
     expect(existsSync(markerPath)).toBe(true);
     const binPath = readFileSync(markerPath, "utf-8").trim();
@@ -921,17 +933,22 @@ describe("SPEC: LOOPX_BIN in Bash Scripts (T-MOD-19 through T-MOD-21)", () => {
   });
 
   it("T-MOD-21: $LOOPX_BIN version matches package.json version", async () => {
-    project = await createTempProject();
-    const markerPath = join(project.dir, "loopx-version.txt");
+    fixture = await withDelegationSetup();
+    const proj: TempProject = {
+      dir: fixture.projectDir,
+      loopxDir: join(fixture.projectDir, ".loopx"),
+      cleanup: async () => {},
+    };
+    const markerPath = join(fixture.projectDir, "loopx-version.txt");
 
     // Script runs $LOOPX_BIN version and writes stdout to marker
     await createBashScript(
-      project,
+      proj,
       "myscript",
       `$LOOPX_BIN version > "${markerPath}"`,
     );
 
-    await runCLI(["-n", "1", "myscript"], { cwd: project.dir });
+    await fixture.runGlobal(["-n", "1", "myscript"]);
 
     expect(existsSync(markerPath)).toBe(true);
     const versionOutput = readFileSync(markerPath, "utf-8").trim();
