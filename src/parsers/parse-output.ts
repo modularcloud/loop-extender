@@ -32,30 +32,32 @@ export function parseOutput(stdout: string): Output {
 
   const obj = parsed as Record<string, unknown>;
   const output: Output = {};
-  let hasKnownField = false;
+
+  // Determine if any known field key is present in the object.
+  // Per Spec 2.3: presence of a known key (even with invalid type) means
+  // the object is structured output, not raw text.
+  const hasKnownField =
+    "result" in obj || "goto" in obj || "stop" in obj;
+
+  // No known fields -> raw fallback
+  if (!hasKnownField) {
+    return { result: stdout };
+  }
 
   // result: if present, coerce to string
   if ("result" in obj && obj.result !== undefined) {
     output.result =
       typeof obj.result === "string" ? obj.result : String(obj.result);
-    hasKnownField = true;
   }
 
   // goto: must be string, otherwise treat as absent
   if ("goto" in obj && typeof obj.goto === "string") {
     output.goto = obj.goto;
-    hasKnownField = true;
   }
 
   // stop: must be exactly true
   if ("stop" in obj && obj.stop === true) {
     output.stop = true;
-    hasKnownField = true;
-  }
-
-  // No known fields -> raw fallback
-  if (!hasKnownField) {
-    return { result: stdout };
   }
 
   return output;

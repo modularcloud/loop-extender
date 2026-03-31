@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 850/889 tests passing (95.6%).** 39 remaining failures.
+**Status: 860/889 tests passing (96.7%).** 29 remaining failures.
 
 All phases complete:
 - **Phases 1-9:** Scaffolding, parsers, discovery, execution, module resolution, loop, CLI, subcommands, env
@@ -13,12 +13,11 @@ All phases complete:
 
 ---
 
-## Remaining Failures (39 tests, documented, not blocking)
+## Remaining Failures (29 tests, documented, not blocking)
 
 | Area | Count | Details |
 |------|-------|---------|
 | Execution (no `-n`) | 10 | Scripts run without `-n`, produce no structured output, infinite loop. Tests design issue. |
-| Output parsing | 10 | Unit/E2E disagree on whether known fields with invalid types trigger raw fallback or empty output. Documented in SPEC-PROBLEMS.md. |
 | Edge cases | 6 | T-EDGE-04/07 (CLI stdout assertions contradict spec), T-EDGE-14 (env path). Documented in SPEC-PROBLEMS.md. |
 | Module resolution | 5 | T-MOD-03a (shadow timeout), T-MOD-14a (large payload), T-MOD-15/16/17 (input function via API driver), T-MOD-22 (CJS require) |
 | Timing | 3 | T-SIG-07 (between-iterations signal), T-API-25 (abort timer race) |

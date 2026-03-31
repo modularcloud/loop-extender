@@ -102,29 +102,33 @@ describe("SPEC: parseOutput — Type Coercion of result", () => {
 });
 
 describe("SPEC: parseOutput — goto Must Be String", () => {
-  it("goto as number → treated as absent", () => {
+  it("goto as number → treated as absent, structured output {} (known field present)", () => {
     const out = parseOutput('{"goto":123}');
     expect(out).not.toHaveProperty("goto");
-    // With no valid known fields, this falls back to raw
-    expect(out.result).toBe('{"goto":123}');
+    // Known field "goto" is present → structured output, not raw fallback
+    expect(out).not.toHaveProperty("result");
+    expect(Object.keys(out)).toHaveLength(0);
   });
 
-  it("goto as boolean → treated as absent", () => {
+  it("goto as boolean → treated as absent, structured output {}", () => {
     const out = parseOutput('{"goto":true}');
     expect(out).not.toHaveProperty("goto");
-    expect(out.result).toBe('{"goto":true}');
+    expect(out).not.toHaveProperty("result");
+    expect(Object.keys(out)).toHaveLength(0);
   });
 
-  it("goto as null → treated as absent", () => {
+  it("goto as null → treated as absent, structured output {}", () => {
     const out = parseOutput('{"goto":null}');
     expect(out).not.toHaveProperty("goto");
-    expect(out.result).toBe('{"goto":null}');
+    expect(out).not.toHaveProperty("result");
+    expect(Object.keys(out)).toHaveLength(0);
   });
 
-  it("goto as object → treated as absent", () => {
+  it("goto as object → treated as absent, structured output {}", () => {
     const out = parseOutput('{"goto":{"a":"b"}}');
     expect(out).not.toHaveProperty("goto");
-    expect(out.result).toBe('{"goto":{"a":"b"}}');
+    expect(out).not.toHaveProperty("result");
+    expect(Object.keys(out)).toHaveLength(0);
   });
 
   it("goto as non-string alongside valid result → goto absent, result preserved", () => {
@@ -135,29 +139,33 @@ describe("SPEC: parseOutput — goto Must Be String", () => {
 });
 
 describe("SPEC: parseOutput — stop Must Be Exactly true", () => {
-  it('stop as string "true" → treated as absent', () => {
+  it('stop as string "true" → treated as absent, structured output {} (known field present)', () => {
     const out = parseOutput('{"stop":"true"}');
     expect(out).not.toHaveProperty("stop");
-    // No other known fields → raw fallback
-    expect(out.result).toBe('{"stop":"true"}');
+    // Known field "stop" is present → structured output, not raw fallback
+    expect(out).not.toHaveProperty("result");
+    expect(Object.keys(out)).toHaveLength(0);
   });
 
-  it("stop as number 1 → treated as absent", () => {
+  it("stop as number 1 → treated as absent, structured output {}", () => {
     const out = parseOutput('{"stop":1}');
     expect(out).not.toHaveProperty("stop");
-    expect(out.result).toBe('{"stop":1}');
+    expect(out).not.toHaveProperty("result");
+    expect(Object.keys(out)).toHaveLength(0);
   });
 
-  it("stop as false → treated as absent", () => {
+  it("stop as false → treated as absent, structured output {}", () => {
     const out = parseOutput('{"stop":false}');
     expect(out).not.toHaveProperty("stop");
-    expect(out.result).toBe('{"stop":false}');
+    expect(out).not.toHaveProperty("result");
+    expect(Object.keys(out)).toHaveLength(0);
   });
 
-  it('stop as string "false" → treated as absent', () => {
+  it('stop as string "false" → treated as absent, structured output {}', () => {
     const out = parseOutput('{"stop":"false"}');
     expect(out).not.toHaveProperty("stop");
-    expect(out.result).toBe('{"stop":"false"}');
+    expect(out).not.toHaveProperty("result");
+    expect(Object.keys(out)).toHaveLength(0);
   });
 
   it("stop as non-boolean alongside valid result → stop absent, result preserved", () => {
