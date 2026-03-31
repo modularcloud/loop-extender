@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync, realpathSync, existsSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { discoverScripts } from "./discovery.js";
 import { runLoop } from "./loop.js";
 import {
@@ -229,7 +230,36 @@ function handleEnvSubcommand(subArgs: string[]): void {
 }
 
 // --- Main ---
+// --- CLI Delegation ---
+function findLocalBin(startDir: string): string | null {
+  let dir = startDir;
+  while (true) {
+    const candidate = join(dir, "node_modules", ".bin", "loopx");
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
 async function main(): Promise<void> {
+  // Delegation: check for local node_modules/.bin/loopx before anything else
+  if (!process.env.LOOPX_DELEGATED) {
+    const cwd = process.cwd();
+    const localBin = findLocalBin(cwd);
+    if (localBin) {
+      const result = spawnSync(localBin, process.argv.slice(2), {
+        cwd,
+        env: { ...process.env, LOOPX_DELEGATED: "1" },
+        stdio: "inherit",
+      });
+      process.exit(result.status ?? 1);
+    }
+  }
+
   const args = parseArgs(process.argv.slice(2));
   const cwd = process.cwd();
   const loopxDir = join(cwd, ".loopx");
