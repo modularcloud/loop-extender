@@ -20,19 +20,90 @@ function getLoopxBin(): string {
 
 /**
  * Run a loopx script and yield Output for each iteration.
- * Snapshots cwd and options at call time.
- * Errors surfaced lazily on first next().
+ *
+ * Options are snapshotted at call time (Spec 9.1).
+ * Returns a custom AsyncGenerator that supports cancellation via .return().
  */
-export async function* run(
+export function run(
   scriptName?: string,
   options?: RunOptions
 ): AsyncGenerator<Output> {
+  // Snapshot all options at call time (before any async work)
   const cwd = options?.cwd || process.cwd();
   const maxIterations = options?.maxIterations;
   const envFile = options?.envFile;
-  const signal = options?.signal;
+  const externalSignal = options?.signal;
   const loopxBin = getLoopxBin();
 
+  // Internal abort controller for generator.return() cancellation
+  const internalAc = new AbortController();
+
+  // Combine external signal with internal
+  let effectiveSignal: AbortSignal;
+  if (externalSignal) {
+    effectiveSignal = AbortSignal.any([externalSignal, internalAc.signal]);
+  } else {
+    effectiveSignal = internalAc.signal;
+  }
+
+  const gen = runInternal(
+    scriptName,
+    cwd,
+    maxIterations,
+    envFile,
+    effectiveSignal,
+    loopxBin
+  );
+
+  // Wrap generator to intercept .return() for cancellation
+  let returnCalled = false;
+
+  const wrapper: AsyncGenerator<Output> = {
+    next: async () => {
+      try {
+        return await gen.next();
+      } catch (err) {
+        // If return() was called, swallow the abort error
+        if (returnCalled) {
+          return { done: true, value: undefined } as IteratorResult<Output>;
+        }
+        throw err;
+      }
+    },
+    return: async (value?: Output) => {
+      returnCalled = true;
+      internalAc.abort();
+      try {
+        return await gen.return(value as Output);
+      } catch {
+        return { done: true, value: undefined } as IteratorResult<Output>;
+      }
+    },
+    throw: (err: unknown) => gen.throw(err),
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+    async [Symbol.asyncDispose](): Promise<void> {
+      returnCalled = true;
+      internalAc.abort();
+      try {
+        await gen.return(undefined as unknown as Output);
+      } catch {
+        // Swallow errors during dispose
+      }
+    },
+  };
+  return wrapper;
+}
+
+async function* runInternal(
+  scriptName: string | undefined,
+  cwd: string,
+  maxIterations: number | undefined,
+  envFile: string | undefined,
+  signal: AbortSignal,
+  loopxBin: string
+): AsyncGenerator<Output> {
   // Validate maxIterations
   if (maxIterations !== undefined) {
     if (
@@ -51,8 +122,11 @@ export async function* run(
   }
 
   // Check abort signal
-  if (signal?.aborted) {
-    throw signal.reason || new DOMException("The operation was aborted.", "AbortError");
+  if (signal.aborted) {
+    throw (
+      signal.reason ||
+      new DOMException("The operation was aborted.", "AbortError")
+    );
   }
 
   const loopxDir = join(cwd, ".loopx");
@@ -63,7 +137,6 @@ export async function* run(
     throw new Error(discovery.errors.join("; "));
   }
 
-  // Print warnings to stderr
   for (const w of discovery.warnings) {
     process.stderr.write(w + "\n");
   }
@@ -96,32 +169,89 @@ export async function* run(
   }
 
   // Run the loop
-  const loop = runLoop(startingTarget, discovery.scripts, {
-    maxIterations,
-    env: mergedEnv,
-    projectRoot: cwd,
-    loopxBin,
-    signal,
-  });
-
   try {
-    for await (const output of loop) {
-      yield output;
-    }
+    yield* runLoop(startingTarget, discovery.scripts, {
+      maxIterations,
+      env: mergedEnv,
+      projectRoot: cwd,
+      loopxBin,
+      signal,
+    });
   } catch (err) {
+    // If abort was due to internal cancellation (generator.return()),
+    // silently complete instead of throwing
+    if (
+      err instanceof DOMException &&
+      err.name === "AbortError" &&
+      signal.aborted
+    ) {
+      // Check if external signal was the cause
+      // (in that case we should still throw)
+      // internalAc abort vs externalSignal abort
+      // We can't distinguish here directly, so just rethrow
+      throw err;
+    }
     throw err;
   }
 }
 
 /**
  * Run a loopx script and collect all outputs.
+ * When a signal is provided, the promise rejects on abort.
  */
 export async function runPromise(
   scriptName?: string,
   options?: RunOptions
 ): Promise<Output[]> {
+  const signal = options?.signal;
+  if (signal?.aborted) {
+    throw (
+      signal.reason ||
+      new DOMException("The operation was aborted.", "AbortError")
+    );
+  }
+
+  const gen = run(scriptName, options);
   const outputs: Output[] = [];
-  for await (const output of run(scriptName, options)) {
+
+  if (signal) {
+    // Create a persistent abort promise that rejects when the signal aborts.
+    // Once rejected, it stays rejected, causing Promise.race to immediately
+    // reject on the next gen.next() call - even for very fast scripts.
+    const abortPromise = new Promise<IteratorResult<Output>>((_, reject) => {
+      if (signal.aborted) {
+        reject(
+          signal.reason ||
+            new DOMException("The operation was aborted.", "AbortError")
+        );
+        return;
+      }
+      signal.addEventListener(
+        "abort",
+        () =>
+          reject(
+            signal.reason ||
+              new DOMException("The operation was aborted.", "AbortError")
+          ),
+        { once: true }
+      );
+    });
+    abortPromise.catch(() => {}); // prevent unhandled rejection warning
+
+    try {
+      while (true) {
+        const iterResult = await Promise.race([gen.next(), abortPromise]);
+        if (iterResult.done) break;
+        outputs.push(iterResult.value);
+      }
+      return outputs;
+    } catch (err) {
+      await gen.return(undefined as unknown as Output).catch(() => {});
+      throw err;
+    }
+  }
+
+  for await (const output of gen) {
     outputs.push(output);
   }
   return outputs;

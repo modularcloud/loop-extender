@@ -334,10 +334,13 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // Set up signal handling
-  let signalReceived: NodeJS.Signals | null = null;
+  // Set up signal handling with AbortController
+  const ac = new AbortController();
+  let receivedSignal: NodeJS.Signals | null = null;
+
   const signalHandler = (sig: NodeJS.Signals) => {
-    signalReceived = sig;
+    receivedSignal = sig;
+    ac.abort();
   };
   process.on("SIGINT", signalHandler);
   process.on("SIGTERM", signalHandler);
@@ -349,12 +352,13 @@ async function main(): Promise<void> {
       env: mergedEnv,
       projectRoot: cwd,
       loopxBin,
+      signal: ac.signal,
     });
 
     for await (const _output of loop) {
       // Check if signal was received between iterations
-      if (signalReceived) {
-        const sigNum = signalReceived === "SIGINT" ? 2 : 15;
+      if (receivedSignal) {
+        const sigNum = receivedSignal === "SIGINT" ? 2 : 15;
         process.exit(128 + sigNum);
       }
       // CLI never prints result to stdout
@@ -362,6 +366,11 @@ async function main(): Promise<void> {
 
     process.exit(0);
   } catch (err: unknown) {
+    // If a signal was received, exit with 128 + signal number
+    if (receivedSignal) {
+      const sigNum = receivedSignal === "SIGINT" ? 2 : 15;
+      process.exit(128 + sigNum);
+    }
     const msg = err instanceof Error ? err.message : String(err);
     process.stderr.write(`Error: ${msg}\n`);
     process.exit(1);
