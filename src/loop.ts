@@ -1,4 +1,4 @@
-import { setImmediate as setImmediatePromise } from "node:timers/promises";
+import { setTimeout as setTimeoutPromise } from "node:timers/promises";
 import type { Output } from "./types.js";
 import type { ScriptEntry } from "./discovery.js";
 import { executeScript, type ExecResult } from "./execution.js";
@@ -109,13 +109,11 @@ export async function* runLoop(
     // Yield the output
     yield output;
 
-    // Yield to event loop between iterations to allow pending signals
-    // and timers to fire. setImmediate fires in the "check" phase, which
-    // comes after both the "timers" phase (setTimeout callbacks) and the
-    // "poll" phase (signal processing). This ensures abort signals from
-    // both timers and POSIX signals are detected between iterations.
+    // Yield to event loop between iterations. setTimeout(0) goes through
+    // the timer phase, allowing pending abort timers to fire. The ~1ms
+    // minimum delay ensures fast scripts don't starve the event loop.
     if (signal && !signal.aborted) {
-      await setImmediatePromise();
+      await setTimeoutPromise(0);
     }
 
     // Check abort after yield
