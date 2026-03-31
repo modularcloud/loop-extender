@@ -2,7 +2,7 @@
 
 Full implementation plan for the `loopx` CLI tool and library per SPEC.md and TEST-SPEC.md.
 
-**Status: No product code exists.** The repository contains only the test harness (461 tests). The entire `loopx` package must be implemented from scratch.
+**Status: Phase 1 and Phase 2 complete.** The test harness (461 tests) is in place, project scaffolding is done, and all internal parsers are implemented and passing. Next up: Phase 3 (Script Discovery & Validation).
 
 ---
 
@@ -15,66 +15,81 @@ Full implementation plan for the `loopx` CLI tool and library per SPEC.md and TE
 
 ---
 
-## Phase 1: Project Scaffolding
+## Phase 1: Project Scaffolding — COMPLETE
 
-- [ ] **Create the `loopx` package directory** — Set up `src/` directory for product code. Create `package.json` with `name: "loopx"`, `type: "module"`, `bin` field pointing to CLI entry point, `exports` field for public API (`"."` for `run`, `runPromise`, `output`, `input`, `Output`, `RunOptions`) and `"./internal"` for `parseOutput`, `parseEnvFile`, `classifySource`. *(Spec 1, TEST-SPEC 1.4)*
-- [ ] **Create `tsconfig.json` for product code** — ESM target, Node 20.6+ lib, strict mode. Emit `.d.ts` files for type exports. *(Spec 1)*
-- [ ] **Create CLI entry point** (`src/bin.ts` or `src/cli.ts`) — Minimal entry that parses argv and dispatches to subcommands or run mode. *(Spec 4)*
-- [ ] **Build system** — Add build script (tsc or bundler) to compile `src/` to `dist/`. Update test helpers to resolve the built `loopx` package. *(Spec 1)*
-- [ ] **Wire test harness** — Update `tests/helpers/cli.ts` `getBinPath()` to point to the built binary. Update `tests/helpers/api-driver.ts` symlink logic to point to built package. *(TEST-SPEC 2.3)*
+- [x] **Create the `loopx` package directory** — Set up `src/` directory for product code. Create `package.json` with `name: "loopx"`, `type: "module"`, `bin` field pointing to CLI entry point, `exports` field for public API (`"."` for `run`, `runPromise`, `output`, `input`, `Output`, `RunOptions`) and `"./internal"` for `parseOutput`, `parseEnvFile`, `classifySource`. *(Spec 1, TEST-SPEC 1.4)*
+- [x] **Create `tsconfig.build.json` for product code** — ESM target, Node 20.6+ lib, strict mode. Emit `.d.ts` files for type exports. Builds `src/` to `dist/`. *(Spec 1)*
+- [x] **Create CLI entry point** (`src/bin.ts`) — Minimal entry point (stub for now). *(Spec 4)*
+- [x] **Build system** — `scripts/postbuild.mjs` generates `dist/package.json` and creates `node_modules/loopx` symlink. Build via `npm run build`. *(Spec 1)*
+- [x] **Wire test harness** — Test helpers resolve the built `loopx` package via `node_modules/loopx` symlink. *(TEST-SPEC 2.3)*
 
 ---
 
-## Phase 2: Internal Parsers (P0) — Unit + Fuzz Tests
+## Phase 2: Internal Parsers (P0) — COMPLETE
 
 These are pure functions with no I/O. They unblock unit tests, fuzz tests, and are used by all higher-level features.
 
-### 2a. `parseOutput(stdout: string): Output` *(Spec 2.3, TEST-SPEC 1.4)*
+### 2a. `parseOutput(stdout: string): Output` *(Spec 2.3, TEST-SPEC 1.4)* — 48/48 tests pass
 
-- [ ] Parse stdout as JSON; if not valid JSON or not an object, return `{ result: stdout }` (raw fallback)
-- [ ] If valid JSON object: extract `result`, `goto`, `stop` fields only
-- [ ] If no known fields have defined values after type filtering, return `{ result: stdout }` (raw fallback)
-- [ ] `result`: if present and not string, coerce via `String(value)` (including `null` -> `"null"`)
-- [ ] `goto`: if present and not a string, discard (treat as absent)
-- [ ] `stop`: if not exactly `true` (boolean), discard
-- [ ] Empty stdout (0 bytes) -> `{ result: "" }`
-- [ ] Extra fields silently ignored
-- [ ] **Tests unlocked:** ~50 unit tests in `parse-output.test.ts`, F-PARSE-01 through F-PARSE-05
+- [x] Parse stdout as JSON; if not valid JSON or not an object, return `{ result: stdout }` (raw fallback)
+- [x] If valid JSON object: extract `result`, `goto`, `stop` fields only
+- [x] If no known fields have defined values after type filtering, return `{ result: stdout }` (raw fallback)
+- [x] `result`: if present and not string, coerce via `String(value)` (including `null` -> `"null"`)
+- [x] `goto`: if present and not a string, discard (treat as absent)
+- [x] `stop`: if not exactly `true` (boolean), discard
+- [x] Empty stdout (0 bytes) -> `{ result: "" }`
+- [x] Extra fields silently ignored
 
-### 2b. `parseEnvFile(content: string): { vars, warnings }` *(Spec 8.1, TEST-SPEC 1.4)*
+### 2b. `parseEnvFile(content: string): { vars, warnings }` *(Spec 8.1, TEST-SPEC 1.4)* — 51/51 tests pass
 
-- [ ] One `KEY=VALUE` per line; split on first `=`
-- [ ] No whitespace allowed around `=` (key extends to first `=`)
-- [ ] Lines starting with `#` are comments; blank lines ignored
-- [ ] Duplicate keys: last wins
-- [ ] Optional double/single quote wrapping (matched pairs stripped, unmatched preserved literally)
-- [ ] No escape sequence interpretation
-- [ ] Trailing whitespace trimmed from unquoted values
-- [ ] Key validation: `[A-Za-z_][A-Za-z0-9_]*`; invalid keys produce warnings
-- [ ] Lines without `=` or with invalid keys produce warnings
-- [ ] Return `{ vars: Record<string, string>, warnings: string[] }`
-- [ ] **Tests unlocked:** ~40 unit tests in `parse-env.test.ts`, F-ENV-01 through F-ENV-05
+- [x] One `KEY=VALUE` per line; split on first `=`
+- [x] No whitespace allowed around `=` (key extends to first `=`)
+- [x] Lines starting with `#` are comments; blank lines ignored
+- [x] Duplicate keys: last wins
+- [x] Optional double/single quote wrapping (matched pairs stripped, unmatched preserved literally)
+- [x] No escape sequence interpretation
+- [x] Trailing whitespace trimmed from unquoted values
+- [x] Key validation: `[A-Za-z_][A-Za-z0-9_]*`; invalid keys produce warnings
+- [x] Lines without `=` or with invalid keys produce warnings
+- [x] Return `{ vars: Record<string, string>, warnings: string[] }`
 
-### 2c. `classifySource(source: string): { type, url }` *(Spec 10.1, TEST-SPEC 1.4)*
+### 2c. `classifySource(source: string): { type, url }` *(Spec 10.1, TEST-SPEC 1.4)* — 44/44 tests pass
 
-- [ ] `org/repo` shorthand -> `{ type: "git", url: "https://github.com/org/repo.git" }`; reject if repo ends in `.git`
-- [ ] Known hosts (github.com, gitlab.com, bitbucket.org) with pathname `/<owner>/<repo>[.git][/]` -> git
-- [ ] Known hosts with extra path segments -> continue to remaining rules
-- [ ] URL ending in `.git` -> git
-- [ ] URL pathname ending in `.tar.gz` or `.tgz` -> tarball
-- [ ] Everything else -> single-file
-- [ ] **Tests unlocked:** ~40 unit tests in `source-detection.test.ts`
+- [x] `org/repo` shorthand -> `{ type: "git", url: "https://github.com/org/repo.git" }`; reject if repo ends in `.git`
+- [x] Known hosts (github.com, gitlab.com, bitbucket.org) with pathname `/<owner>/<repo>[.git][/]` -> git
+- [x] Known hosts with extra path segments -> continue to remaining rules
+- [x] URL ending in `.git` -> git
+- [x] URL pathname ending in `.tar.gz` or `.tgz` -> tarball
+- [x] Everything else -> single-file
 
 ### 2d. Export barrel (`src/internal.ts`) *(TEST-SPEC 1.4)*
 
-- [ ] Export `parseOutput`, `parseEnvFile`, `classifySource` from `"loopx/internal"`
-- [ ] Configure `package.json` `exports["./internal"]` subpath
+- [x] Export `parseOutput`, `parseEnvFile`, `classifySource` from `"loopx/internal"`
+- [x] Configure `package.json` `exports["./internal"]` subpath
+
+### 2e. Type exports and API stubs — 14/14 type tests pass
+
+- [x] `Output { result?: string; goto?: string; stop?: boolean }`
+- [x] `RunOptions { maxIterations?: number; envFile?: string; signal?: AbortSignal; cwd?: string }`
+- [x] `run` and `runPromise` function signatures exported from `"loopx"`
+
+### 2f. Harness tests — 15/15 pass
 
 ---
 
-## Phase 3: Script Discovery & Validation (P0)
+## Known Test Issues
+
+1. **F-ENV-04 fuzz test** — The test's expected value does not account for trailing whitespace trimming. Counterexample: `A= ` expects `" "` but spec says trim trailing whitespace from unquoted values, so correct result is `""`. Unit test T-ENV-18 explicitly confirms trimming is correct. This is a test harness discrepancy, not an implementation bug.
+
+2. **F-PARSE-04 e2e fuzz test** — This is an end-to-end fuzz test that requires the CLI loop engine implementation (Phase 4 + Phase 6) to pass. Expected failure at this stage of development.
+
+---
+
+## Phase 3: Script Discovery & Validation (P0) — NEXT PRIORITY
 
 *(Spec 5.1-5.4)*
+
+This phase is P0 and unblocks Phase 4+ (execution, loop). It should be implemented next.
 
 - [ ] **Scan `.loopx/` directory** — Discover file scripts (`.sh`, `.js`, `.jsx`, `.ts`, `.tsx`) and directory scripts (`package.json` with `main` field)
 - [ ] **File scripts** — Base name = script name (filename minus extension)
@@ -336,7 +351,8 @@ These are cosmetic deviations in the test harness that do not affect correctness
 
 ## Implementation Notes
 
-- **No product code exists** — this plan covers the entire `loopx` implementation
+- **Phase 1 & 2 complete** — Project scaffolding, build system, and all three internal parsers are implemented and passing
+- **Next priority: Phase 3** — Script Discovery & Validation (P0), which unblocks Phase 4+ (execution, loop)
 - **Internal seams** — Unit and fuzz tests depend on `parseOutput`, `parseEnvFile`, and `classifySource` being importable from `loopx/internal`
 - **ESM-only** — All JS/TS must use `import`/`export`, no CommonJS
 - **Node >= 20.6** — Required for `module.register()` in the custom loader

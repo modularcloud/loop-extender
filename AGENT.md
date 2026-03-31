@@ -8,6 +8,8 @@
 - Run unit tests only: `npx vitest run tests/unit/`
 - Run e2e tests only: `npx vitest run tests/e2e/`
 - Run fuzz tests only: `npx vitest run tests/fuzz/`
+- Build loopx package: `npm run build` (compiles src/ to dist/, creates dist/package.json, symlinks node_modules/loopx)
+- Rebuild is needed after any src/ changes before running tests
 - Type check: `npx tsc --noEmit`
 
 ## Project Structure

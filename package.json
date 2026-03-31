@@ -4,6 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/postbuild.mjs",
     "test": "vitest run",
     "test:harness": "vitest run tests/harness/",
     "test:unit": "vitest run tests/unit/",
