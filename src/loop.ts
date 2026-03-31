@@ -1,4 +1,4 @@
-import { setTimeout as setTimeoutPromise } from "node:timers/promises";
+import { setImmediate as setImmediatePromise } from "node:timers/promises";
 import type { Output } from "./types.js";
 import type { ScriptEntry } from "./discovery.js";
 import { executeScript, type ExecResult } from "./execution.js";
@@ -71,7 +71,14 @@ export async function* runLoop(
     });
 
     if (abortPromise) {
-      result = await Promise.race([execPromise, abortPromise]);
+      try {
+        result = await Promise.race([execPromise, abortPromise]);
+      } catch (err) {
+        // If abortPromise won the race, wait for the execution to complete
+        // so the child process cleanup (SIGTERM → grace period → SIGKILL) can finish
+        await execPromise.catch(() => {});
+        throw err;
+      }
     } else {
       result = await execPromise;
     }
@@ -102,11 +109,13 @@ export async function* runLoop(
     // Yield the output
     yield output;
 
-    // Yield to event loop between iterations to allow timer callbacks
-    // (e.g., AbortSignal) to fire. setTimeout(0) goes through the timer
-    // phase, ensuring pending timers get a chance to run.
+    // Yield to event loop between iterations to allow pending signals
+    // and timers to fire. setImmediate fires in the "check" phase, which
+    // comes after both the "timers" phase (setTimeout callbacks) and the
+    // "poll" phase (signal processing). This ensures abort signals from
+    // both timers and POSIX signals are detected between iterations.
     if (signal && !signal.aborted) {
-      await setTimeoutPromise(0);
+      await setImmediatePromise();
     }
 
     // Check abort after yield

@@ -364,6 +364,12 @@ async function main(): Promise<void> {
       // CLI never prints result to stdout
     }
 
+    // Check one more time after loop completes
+    if (receivedSignal) {
+      const sigNum = receivedSignal === "SIGINT" ? 2 : 15;
+      process.exit(128 + sigNum);
+    }
+
     process.exit(0);
   } catch (err: unknown) {
     // If a signal was received, exit with 128 + signal number

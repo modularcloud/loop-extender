@@ -75,7 +75,7 @@ export function executeScript(
     });
 
     let stdout = "";
-    let settled = false;
+    let aborted = false;
     let graceTimer: ReturnType<typeof setTimeout> | null = null;
 
     child.stdout.on("data", (chunk: Buffer) => {
@@ -92,16 +92,14 @@ export function executeScript(
     child.stdin.end();
 
     const onAbort = () => {
-      if (settled) return;
-      settled = true;
+      aborted = true;
       killProcessGroup(child, "SIGTERM");
       graceTimer = setTimeout(() => {
         killProcessGroup(child, "SIGKILL");
       }, 5000);
-      reject(
-        signal?.reason ||
-          new DOMException("The operation was aborted.", "AbortError")
-      );
+      // Don't reject immediately — wait for child to actually exit.
+      // The loop uses Promise.race with an abortPromise for fast detection.
+      // The grace period (SIGTERM → 5s → SIGKILL) needs time to complete.
     };
 
     if (signal) {
@@ -111,16 +109,20 @@ export function executeScript(
     child.on("close", (code) => {
       if (graceTimer) clearTimeout(graceTimer);
       if (signal) signal.removeEventListener("abort", onAbort);
-      if (settled) return;
-      settled = true;
-      resolvePromise({ stdout, exitCode: code ?? 1 });
+
+      if (aborted) {
+        reject(
+          signal?.reason ||
+            new DOMException("The operation was aborted.", "AbortError")
+        );
+      } else {
+        resolvePromise({ stdout, exitCode: code ?? 1 });
+      }
     });
 
     child.on("error", (err) => {
       if (graceTimer) clearTimeout(graceTimer);
       if (signal) signal.removeEventListener("abort", onAbort);
-      if (settled) return;
-      settled = true;
       reject(err);
     });
   });
