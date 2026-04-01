@@ -13,12 +13,37 @@ All phases complete:
 
 _No priority 1 or 2 items remaining._
 
-### Priority 3 (Minor / Optional)
+### Priority 3 (Minor / Optional Improvements)
 
 1. **Known-git-host URLs not normalized to append `.git`**
     - `https://github.com/org/repo` (known host, no `.git`) is classified as git but the URL is passed directly to `git clone` without appending `.git`
     - All major hosts (GitHub, GitLab, Bitbucket) accept this; normalizing could break edge cases
     - **Decision:** Leave as-is — spec does not require normalization
+
+2. **Duplicate error/warning messages for reserved and invalid script names**
+    - In `discovery.ts`, the reserved-name check (lines 95-107) and name-pattern check (lines 110-122) iterate over `candidates` (all entries) instead of `nameGroups` (unique names)
+    - If two entries share a reserved name (e.g., `output.sh` and `output/`), the reserved-name error is emitted twice
+    - Fix: iterate over `nameGroups` entries instead of `candidates` for these checks
+
+3. **LOOPX_DELEGATED leaks into script execution environments**
+    - `mergeEnv()` spreads `process.env` which includes `LOOPX_DELEGATED=1` set during delegation
+    - If a user script spawns a nested `loopx` subprocess in a different directory, delegation would be incorrectly skipped
+    - Fix: strip `LOOPX_DELEGATED` from the merged env before passing to child scripts
+
+4. **output() function does not validate goto/stop types**
+    - `goto` and `stop` fields pass through without type validation in `output-fn.ts` (lines 53-58)
+    - Scripts calling `output({ goto: 42 })` get no feedback that the non-string goto will be silently discarded by parseOutput
+    - Fix: throw an error if `goto` is not a string or if `stop` is not a boolean
+
+5. **loader-hook.ts resolve catch clause is too broad**
+    - The catch block in `loader-hook.ts` catches all errors, not just `ERR_MODULE_NOT_FOUND`
+    - If a local `node_modules/loopx` has a corrupted package.json, the error is silently swallowed and the CLI's own package is used instead
+    - Fix: only catch errors with `code === 'ERR_MODULE_NOT_FOUND'`, re-throw others
+
+6. **cwd fallback uses `||` instead of `??` in run.ts**
+    - `options?.cwd || process.cwd()` treats empty string `""` as falsy, falling back to process.cwd()
+    - `??` would be more semantically correct (only default when not provided)
+    - Low risk since empty string cwd is arguably invalid
 
 ---
 
