@@ -11,6 +11,7 @@ import {
   signalReadyThenSleep,
   signalTrapExit,
   signalTrapIgnore,
+  signalTrapReport,
   spawnGrandchild,
   counter,
 } from "../helpers/fixture-scripts.js";
@@ -375,4 +376,64 @@ printf '{"result":"%s"}' "$COUNT"
     },
     { timeout: 30_000, retry: 3 },
   );
+
+  // ─────────────────────────────────────────────
+  // T-SIG-08: Signal Identity — child receives the same signal loopx received
+  // ─────────────────────────────────────────────
+
+  it("T-SIG-08a: SIGINT is forwarded as SIGINT (not SIGTERM)", async () => {
+    project = await createTempProject();
+    const markerPath = join(project.dir, "pid-marker.txt");
+    const reportPath = join(project.dir, "signal-report.txt");
+
+    await createScript(
+      project,
+      "sig-report",
+      ".sh",
+      signalTrapReport(markerPath, reportPath),
+    );
+
+    const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+      ["-n", "1", "sig-report"],
+      { cwd: project.dir, timeout: 30_000 },
+    );
+
+    await waitForStderr("ready");
+
+    sendSignal("SIGINT");
+
+    const outcome = await result;
+    expect(outcome.exitCode).toBe(130);
+
+    const signal = readFileSync(reportPath, "utf-8");
+    expect(signal).toBe("SIGINT");
+  });
+
+  it("T-SIG-08b: SIGTERM is forwarded as SIGTERM (not SIGINT)", async () => {
+    project = await createTempProject();
+    const markerPath = join(project.dir, "pid-marker.txt");
+    const reportPath = join(project.dir, "signal-report.txt");
+
+    await createScript(
+      project,
+      "sig-report",
+      ".sh",
+      signalTrapReport(markerPath, reportPath),
+    );
+
+    const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+      ["-n", "1", "sig-report"],
+      { cwd: project.dir, timeout: 30_000 },
+    );
+
+    await waitForStderr("ready");
+
+    sendSignal("SIGTERM");
+
+    const outcome = await result;
+    expect(outcome.exitCode).toBe(143);
+
+    const signal = readFileSync(reportPath, "utf-8");
+    expect(signal).toBe("SIGTERM");
+  });
 });

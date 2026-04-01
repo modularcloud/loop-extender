@@ -111,6 +111,21 @@ sleep 999999
 }
 
 /**
+ * Traps both SIGINT and SIGTERM, writes which signal was received to reportPath.
+ * Writes PID to marker, "ready" to stderr, sleeps (via wait) until signal arrives.
+ */
+export function signalTrapReport(markerPath: string, reportPath: string): string {
+  return `#!/bin/bash
+trap 'printf SIGINT > "${reportPath}"; exit 130' INT
+trap 'printf SIGTERM > "${reportPath}"; exit 143' TERM
+printf '%s' "$$" > "${markerPath}"
+echo "ready" >&2
+sleep 999999 &
+wait
+`;
+}
+
+/**
  * Spawns a background subprocess, writes both PIDs to marker (one per line),
  * writes "ready" to stderr, then waits.
  */

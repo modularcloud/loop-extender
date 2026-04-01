@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 901/901 tests passing (100%).** All tests pass. Full spec audit complete.
+**Status: 903/903 tests passing (100%).** All tests pass. Full spec audit complete.
 
 All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
@@ -39,29 +39,9 @@ An audit of all commits after `0cf85da` (889/889 passing) identified 19 hard spe
     - `runAPIDriver("bun", driverCode, { cwd })`
     - Parse `outputs[0].result` as JSON → assert `bunVersion` is truthy string
 
-### Batch 5 — Signal Forwarding Test
+### Batch 5 — Signal Forwarding Test ✅ COMPLETE
 
-**File:** `signals.test.ts`
-**Deps:** New fixture in `fixture-scripts.ts`, `runCLIWithSignal`
-
-11. **T-SIG-08** — after T-SIG-07, new "Signal Identity" test
-    - **New fixture needed:** `signalTrapReport(markerPath)` in `fixture-scripts.ts`:
-      ```bash
-      #!/bin/bash
-      MARKER="<markerPath>"
-      PID_MARKER="${MARKER}.pid"
-      printf '%s' "$$" > "$PID_MARKER"
-      trap 'printf SIGINT > "$MARKER"; exit 130' INT
-      trap 'printf SIGTERM > "$MARKER"; exit 143' TERM
-      echo "ready" >&2
-      sleep 999999
-      ```
-    - Two sub-cases (a) and (b), or two separate `it()` blocks:
-      - (a) `sendSignal("SIGINT")` → read marker → assert `"SIGINT"`
-      - (b) `sendSignal("SIGTERM")` → read marker → assert `"SIGTERM"`
-    - Use `runCLIWithSignal(["-n", "1", "sig-report"], { cwd })`
-    - `await waitForStderr("ready")` → `sendSignal(...)` → `await result`
-    - Assert exit code 130 (SIGINT) or 143 (SIGTERM)
+**T-SIG-08** (split into T-SIG-08a/T-SIG-08b) — implemented with new `signalTrapReport` fixture.
 
 ### Batch 6 — Delegation Tests
 
