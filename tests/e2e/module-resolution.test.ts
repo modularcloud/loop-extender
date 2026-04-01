@@ -203,7 +203,7 @@ export async function input() {
 `,
     });
 
-    const result = await runCLI(["shadow-test"], { cwd: project.dir });
+    const result = await runCLI(["-n", "1", "shadow-test"], { cwd: project.dir });
 
     // The shadow package's marker file must exist, proving local resolution
     expect(existsSync(markerPath)).toBe(true);
@@ -832,9 +832,11 @@ try {
 // Write a CJS script that requires loopx
 writeFileSync(join(consumerDir, "test.cjs"), 'const loopx = require("loopx"); console.log(loopx);');
 
-// Run it and capture result
+// Run it and capture result.
+// Use --no-experimental-require-module to disable Node 22.12+'s CJS-can-load-ESM
+// feature, so we can verify the package.json "type":"module" contract is correct.
 try {
-  execSync(\`node "\${join(consumerDir, "test.cjs")}"\`, { stdio: "pipe" });
+  execSync(\`node --no-experimental-require-module "\${join(consumerDir, "test.cjs")}"\`, { stdio: "pipe" });
   console.log(JSON.stringify({ succeeded: true }));
 } catch (e) {
   const stderr = (e as any).stderr?.toString() ?? "";

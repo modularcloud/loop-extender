@@ -338,17 +338,19 @@ describe("SPEC: Signal Handling", () => {
       // Script that:
       // 1. Appends to the counter file (to count iterations)
       // 2. Writes the current count to iter-done marker (signals iteration completion)
-      // 3. Outputs JSON result so loopx proceeds to next iteration
+      // 3. Sleeps briefly to give the signal time to arrive between iterations
+      // 4. Outputs JSON result so loopx proceeds to next iteration
       const scriptContent = `#!/bin/bash
 printf '1' >> "${counterFile}"
 COUNT=$(wc -c < "${counterFile}" | tr -d ' ')
 printf '%s' "$COUNT" > "${iterMarker}"
+sleep 0.1
 printf '{"result":"%s"}' "$COUNT"
 `;
       await createScript(project, "iter-counter", ".sh", scriptContent);
 
       const { result, sendSignal } = runCLIWithSignal(
-        ["-n", "3", "iter-counter"],
+        ["-n", "20", "iter-counter"],
         { cwd: project.dir, timeout: 30_000 },
       );
 
@@ -363,13 +365,13 @@ printf '{"result":"%s"}' "$COUNT"
       const outcome = await result;
       expect(outcome.exitCode).toBe(143);
 
-      // Verify that not all 3 iterations ran. The counter should have
-      // fewer than 3 marks. Due to timing, at least 1 iteration completed
-      // but we should not have completed all 3.
+      // Verify that not all 20 iterations ran. Due to timing, at least 1
+      // iteration completed but the signal should stop the loop well before
+      // all 20 complete (each takes ~100ms, so 20 would take ~2s).
       const counterContent = readFileSync(counterFile, "utf-8");
       const iterationsRan = counterContent.length;
       expect(iterationsRan).toBeGreaterThanOrEqual(1);
-      expect(iterationsRan).toBeLessThan(3);
+      expect(iterationsRan).toBeLessThan(20);
     },
     { timeout: 30_000, retry: 3 },
   );

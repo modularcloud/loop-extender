@@ -28,14 +28,22 @@ export async function resolve(
   context: ResolveContext,
   nextResolve: NextResolve
 ): Promise<ResolveResult> {
-  if (specifier === "loopx") {
-    return {
-      url: new URL("./index.js", import.meta.url).href,
-      shortCircuit: true,
-    };
-  }
+  if (specifier === "loopx" || specifier === "loopx/internal") {
+    // Per Spec 2.1 and 3.3: if a directory script has its own node_modules/loopx,
+    // standard module resolution applies and the local version takes precedence.
+    // Try standard resolution first; fall back to CLI's package only if it fails.
+    try {
+      return await nextResolve(specifier, context);
+    } catch {
+      // No local node_modules/loopx found — provide the CLI's own package.
+    }
 
-  if (specifier === "loopx/internal") {
+    if (specifier === "loopx") {
+      return {
+        url: new URL("./index.js", import.meta.url).href,
+        shortCircuit: true,
+      };
+    }
     return {
       url: new URL("./internal.js", import.meta.url).href,
       shortCircuit: true,

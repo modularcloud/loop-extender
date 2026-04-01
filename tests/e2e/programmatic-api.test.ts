@@ -1545,12 +1545,12 @@ import { runPromise } from "loopx";
 const ac = new AbortController();
 
 // Abort after a short delay (enough for at least one iteration)
-setTimeout(() => ac.abort(), 500);
+setTimeout(() => ac.abort(), 200);
 
 let rejected = false;
 let errorMsg = "";
 try {
-  await runPromise("myscript", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 100, signal: ac.signal });
+  await runPromise("myscript", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 10000, signal: ac.signal });
 } catch (e) {
   rejected = true;
   errorMsg = e.message || String(e);

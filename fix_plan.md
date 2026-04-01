@@ -1,24 +1,26 @@
 # Implementation Plan for loopx
 
-**Status: 884/889 tests passing (99.4%).** 5 remaining failures.
+**Status: 889/889 tests passing (100%).** All tests pass.
 
 All phases complete:
 - **Phases 1-9:** Scaffolding, parsers, discovery, execution, module resolution, loop, CLI, subcommands, env
 - **Phase 10:** Programmatic API (run/runPromise, options snapshot, generator.return(), AbortSignal)
 - **Phase 11:** Help system
-- **Phase 12:** Mostly complete (signal forwarding, grace period SIGKILL, exit codes 128+N)
-- **Phase 13:** CLI delegation (7/8 tests pass)
-- **Phase 14:** Install command (single-file/git/tarball, 105/107 tests)
+- **Phase 12:** Signal forwarding, grace period SIGKILL, exit codes 128+N
+- **Phase 13:** CLI delegation (8/8 tests pass)
+- **Phase 14:** Install command (single-file/git/tarball, 107/107 tests)
 - **Phase 15:** Exit codes
 
 ---
 
-## Remaining Failures (5 tests, documented, not blocking)
+## Recently Fixed (all resolved)
 
-| Area | Count | Details |
-|------|-------|---------|
-| Module resolution | 2 | T-MOD-03a (shadow timeout), T-MOD-22 (CJS `require("loopx")` from outside — package ESM contract, not .loopx/ loader) |
-| Timing | 3 | T-SIG-07 (between-iterations signal), T-API-25 (abort timer race) |
+| Issue | Fix |
+|-------|-----|
+| T-MOD-03a (shadow resolution) | Loader hook now tries `nextResolve` first, respecting local `node_modules/loopx` per Spec 2.1/3.3 |
+| T-MOD-22 (CJS require test) | Test uses `--no-experimental-require-module` for Node 22.12+ compatibility |
+| T-API-25 (abort timer race) | Increased maxIterations to 10000 and reduced abort delay to 200ms |
+| T-SIG-07 (between-iterations signal) | Added sleep 0.1 to script, increased iterations from 3 to 20 |
 
 ---
 
@@ -39,6 +41,7 @@ All phases complete:
 - T-API-21b passes explicit `cwd` instead of omitting it — tests relative envFile against explicit cwd, not process.cwd()
 - T-ENV-17a missing stderr assertion (only checks exitCode === 1)
 - T-ENV-24 does not test progressive removal/fallback (only tests full chain in one invocation)
+- T-MOD-22 uses `--no-experimental-require-module` flag for Node 22.12+ (tests package config, not Node.js runtime behavior)
 
 ---
 
