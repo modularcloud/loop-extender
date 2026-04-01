@@ -14,16 +14,7 @@ All phases complete:
 
 ### Priority 1 (Spec Violations / Real Bugs)
 
-1. **`parse-env.ts` trims trailing whitespace before quote matching**
-    - Code trims trailing whitespace (line 55) *before* checking for matched quotes (lines 58-64)
-    - For `KEY="value" ` (space after closing quote): code produces `value`, spec says `"value"` (with literal quotes)
-    - Spec order: check if wrapped in matching quotes first, then trim trailing whitespace on unquoted values
-    - Fix: check for matched quotes on untrimmed value, then trim only if unquoted
-
-2. **`discovery.ts` readdirSync catch treats all errors as "directory not found"**
-    - Catch at line 33-41 shows "No .loopx/ directory found" for ANY error including EACCES (permission denied)
-    - Spec section 7.2 distinguishes "Missing .loopx/ directory" from other errors
-    - Fix: check `err.code === 'ENOENT'` and show appropriate error for other codes
+*All items resolved.*
 
 ### Priority 2 (Robustness / UX Issues)
 

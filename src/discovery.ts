@@ -32,11 +32,21 @@ export function discoverScripts(
   let dirEntries: string[];
   try {
     dirEntries = readdirSync(loopxDir);
-  } catch {
-    if (mode === "run") {
-      errors.push(
-        "No .loopx/ directory found. Create .loopx/default.ts or specify a script name."
-      );
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") {
+      if (mode === "run") {
+        errors.push(
+          "No .loopx/ directory found. Create .loopx/default.ts or specify a script name."
+        );
+      }
+    } else {
+      const msg = `Cannot read .loopx/ directory: ${(err as Error).message}`;
+      if (mode === "run") {
+        errors.push(msg);
+      } else {
+        warnings.push(msg);
+      }
     }
     return { scripts: new Map(), candidateNames: new Set(), warnings, errors };
   }
