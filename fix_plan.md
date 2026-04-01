@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 912/912 tests passing (100%).** All tests pass. Full spec audit complete.
+**Status: 924/924 tests passing (100%, including fuzz tests).** All tests pass. Full spec audit complete.
 
 All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
@@ -8,83 +8,11 @@ All phases complete:
 - **Phase 20:** Bug fixes and code quality cleanup — env warnings in API, signal exit helper, env serialize helper, redundant injection removed, loader-hook static imports, SSH URL classification, empty tarball error
 - **Phase 21:** Loader-hook catch clause narrowed, discovery deduplication, cwd nullish coalescing
 - **Phase 22:** Discovery ENOENT vs EACCES, PATH dedup entry-match, `??` for env.PATH, install error diagnostics
+- **Phase 23:** 19 new test specs from post-889/889 audit — all 7 batches implemented and passing
 
 ---
 
-## Phase 23: Implement 19 New Test Specs (from post-889/889 audit)
-
-An audit of all commits after `0cf85da` (889/889 passing) identified 19 hard spec requirements that lack test coverage. T-INST-33a was already implemented in commit `76be1f1` and is excluded. SP-32 (SSH URL classification) is excluded pending spec decision.
-
-### Batch 1 — Simple CLI / Parsing / Loop Tests ✅ COMPLETE
-
-**T-CLI-27**, **T-PARSE-20a**, **T-LOOP-18a** — all implemented and passing.
-
-### Batch 2 — Environment Variable Tests ✅ COMPLETE
-
-**T-ENV-24a**, **T-ENV-24b** — all implemented and passing.
-
-### Batch 3 — Programmatic API Tests ✅ COMPLETE
-
-**T-API-08a**, **T-API-14e**, **T-API-21c**, **T-API-21d** — all implemented and passing.
-
-### Batch 4 — Execution Test (Bun-specific) ✅ COMPLETE
-
-**T-EXEC-14** — implemented and passing (Bun-conditional).
-
-### Batch 5 — Signal Forwarding Test ✅ COMPLETE
-
-**T-SIG-08** (split into T-SIG-08a/T-SIG-08b) — implemented with new `signalTrapReport` fixture.
-
-### Batch 6 — Delegation Tests ✅ COMPLETE
-
-**T-DEL-09**, **T-DEL-10**, **T-DEL-11** — all implemented and passing.
-Uses process group signaling (detached spawn + `process.kill(-pid, sig)`) for T-DEL-10/11.
-
-### Batch 7 — Install Tests ✅ COMPLETE
-
-**T-INST-27d**, **T-INST-31b**, **T-INST-39d**, **T-INST-39e**, **T-INST-GLOBAL-01a** — all implemented and passing.
-- T-INST-39d/39e use manually created git repos/tarballs with symlinks (helpers don't support symlinks)
-- T-INST-GLOBAL-01a uses bash script instead of TS with imports due to package naming limitation (see SPEC-PROBLEMS.md)
-
----
-
-### Implementation Order & Priority
-
-| Priority | Batch | Tests | Complexity | Est. lines |
-|----------|-------|-------|------------|------------|
-| P1 | 1 | T-CLI-27, T-PARSE-20a, T-LOOP-18a | Trivial | ~40 |
-| P1 | 2 | T-ENV-24a, T-ENV-24b | Low | ~50 |
-| P1 | 3 | T-API-08a, T-API-14e, T-API-21c, T-API-21d | Medium | ~80 |
-| P1 | 5 | T-SIG-08 | Medium (new fixture) | ~60 |
-| P2 | 4 | T-EXEC-14 | Low (Bun-conditional) | ~25 |
-| P2 | 6 | T-DEL-09, T-DEL-10, T-DEL-11 | Medium-High (manual spawn for 10/11) | ~100 |
-| P2 | 7 | T-INST-27d, T-INST-31b, T-INST-39d, T-INST-39e, T-INST-GLOBAL-01a | High (symlink repos, Bun global) | ~150 |
-
-**Total: 19 tests, ~505 lines of test code + 1 new fixture function.**
-
-**Implementation notes:**
-- T-INST-33a is already implemented — skip it
-- T-DEL-10/11 require manual process spawning (not `fixture.runGlobal`) because signal delivery needs the child handle — write a local `spawnGlobalWithSignal()` helper in delegation.test.ts
-- T-INST-39d/39e require symlink creation inside git repos / tarballs — may need manual repo construction with `execSync` rather than the `startLocalGitServer` helper
-- T-INST-GLOBAL-01a requires Bun installed in CI — conditionally skip
-
----
-
-## Remaining Items
-
-### Priority 1 (Spec Violations / Real Bugs)
-
-*All items resolved.*
-
-### Priority 2 (Robustness / UX Issues)
-
-*All items resolved.*
-
-**Resolved items:**
-- `exitWithSignal()` now uses dynamic `os.constants.signals` lookup
-- NODE_PATH includes both loopx's own node_modules/ and parent directory for Bun global installs
-
-### Priority 3 (Minor / Decision Items)
+## Priority 3 (Minor / Decision Items)
 
 8. **Known-git-host URLs not normalized to append `.git`**
     - **Decision:** Leave as-is — spec does not require normalization
@@ -119,9 +47,11 @@ Uses process group signaling (detached spawn + `process.kill(-pid, sig)`) for T-
 
 - T-CLI-08 uses `.sh` instead of `.ts` for default script — functionally equivalent
 - T-SIG-04 uses 1-second delay instead of spec's 2-second — still well under 5s grace period
+- T-SIG-08 split into T-SIG-08a/T-SIG-08b — both spec aspects (SIGTERM and SIGINT forwarding) are covered
 - T-LOOP-23 tests stderr pass-through but `writeStderr` fixture exits 0; spec says "on failure"
 - T-LOOP-25 uses `"1"`/`"2"` result format instead of spec's `"iter-N"` — functionally equivalent
 - T-INST-31a is an extra test (HTTP 500) not in spec but useful
+- T-INST-GLOBAL-01a uses bash script instead of TS with imports due to package naming limitation (see SPEC-PROBLEMS.md)
 - T-DEL-02, T-DEL-03, T-DEL-06 use custom fixture construction (needed for non-standard layouts)
 - T-EDGE-05 split into T-EDGE-05a/b/c; T-EDGE-12 split into T-EDGE-12a/12b — all spec aspects covered
 - T-API-20j/k/l are extra tests not in spec (renamed from old IDs)
