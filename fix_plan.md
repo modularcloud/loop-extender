@@ -15,10 +15,6 @@ All phases complete:
 
 ## Remaining Spec Gaps (sorted by priority)
 
-### MEDIUM — Stderr Piped Instead of Inherited (Spec 6.2, 6.3)
-
-The spec says "stderr is passed through to the user's terminal." Current implementation uses `stdio: ["pipe", "pipe", "pipe"]` and manually forwards stderr chunks. This causes child processes to lose TTY detection on stderr (`process.stderr.isTTY` is `false`), which disables colored output in child scripts. Fix: use `stdio: ["pipe", "pipe", "inherit"]` instead.
-
 ### MEDIUM — installSingleFile Missing Cleanup on Write Failure (Spec 10.3)
 
 `src/install.ts:247` — `writeFileSync(destPath, result.data)` has no try/catch. If the write fails (disk full, permissions), the partially written file is NOT cleaned up. Spec 10.3 says: "Any partially created target file or directory at the destination path is removed before exit." `installGit` and `installTarball` both properly clean up on failure.

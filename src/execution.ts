@@ -93,7 +93,7 @@ export function executeScript(
     const child = spawn(command, args, {
       cwd,
       env: scriptEnv,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "inherit"],
       detached: true,
     });
 
@@ -103,10 +103,6 @@ export function executeScript(
 
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
-    });
-
-    child.stderr.on("data", (chunk: Buffer) => {
-      process.stderr.write(chunk);
     });
 
     if (input !== undefined && input !== "") {
