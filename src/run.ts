@@ -17,7 +17,7 @@ export function run(
   options?: RunOptions
 ): AsyncGenerator<Output> {
   // Snapshot all options at call time (before any async work)
-  const cwd = options?.cwd || process.cwd();
+  const cwd = options?.cwd ?? process.cwd();
   const maxIterations = options?.maxIterations;
   const envFile = options?.envFile;
   const externalSignal = options?.signal;

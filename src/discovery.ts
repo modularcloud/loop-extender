@@ -91,31 +91,31 @@ export function discoverScripts(
     }
   }
 
-  // Check reserved names
-  for (const c of candidates) {
-    if (RESERVED_NAMES.has(c.name)) {
+  // Check reserved names (iterate unique names, not all candidates)
+  for (const [name] of nameGroups) {
+    if (RESERVED_NAMES.has(name)) {
       if (mode === "run") {
         errors.push(
-          `Script name '${c.name}' is reserved (used by loopx subcommand)`
+          `Script name '${name}' is reserved (used by loopx subcommand)`
         );
       } else {
         warnings.push(
-          `Warning: script '${c.name}' uses a reserved name`
+          `Warning: script '${name}' uses a reserved name`
         );
       }
     }
   }
 
-  // Check name restrictions
-  for (const c of candidates) {
-    if (!NAME_PATTERN.test(c.name)) {
+  // Check name restrictions (iterate unique names, not all candidates)
+  for (const [name] of nameGroups) {
+    if (!NAME_PATTERN.test(name)) {
       if (mode === "run") {
         errors.push(
-          `Script name '${c.name}' is invalid: must match [a-zA-Z0-9_][a-zA-Z0-9_-]*`
+          `Script name '${name}' is invalid: must match [a-zA-Z0-9_][a-zA-Z0-9_-]*`
         );
       } else {
         warnings.push(
-          `Warning: script '${c.name}' has invalid name`
+          `Warning: script '${name}' has invalid name`
         );
       }
     }

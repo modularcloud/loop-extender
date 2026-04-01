@@ -20,10 +20,8 @@ _No priority 1 or 2 items remaining._
     - All major hosts (GitHub, GitLab, Bitbucket) accept this; normalizing could break edge cases
     - **Decision:** Leave as-is — spec does not require normalization
 
-2. **Duplicate error/warning messages for reserved and invalid script names**
-    - In `discovery.ts`, the reserved-name check (lines 95-107) and name-pattern check (lines 110-122) iterate over `candidates` (all entries) instead of `nameGroups` (unique names)
-    - If two entries share a reserved name (e.g., `output.sh` and `output/`), the reserved-name error is emitted twice
-    - Fix: iterate over `nameGroups` entries instead of `candidates` for these checks
+2. ~~**Duplicate error/warning messages for reserved and invalid script names**~~ **FIXED**
+    - Reserved-name and name-pattern checks now iterate over `nameGroups` (unique names) instead of `candidates`
 
 3. ~~**LOOPX_DELEGATED leaks into script execution environments**~~ **FIXED**
     - `mergeEnv()` now destructures out `LOOPX_DELEGATED` before spreading `process.env`
@@ -38,10 +36,8 @@ _No priority 1 or 2 items remaining._
 5. ~~**loader-hook.ts resolve catch clause is too broad**~~ **FIXED**
     - Catch clause now only catches `ERR_MODULE_NOT_FOUND`, re-throws other errors
 
-6. **cwd fallback uses `||` instead of `??` in run.ts**
-    - `options?.cwd || process.cwd()` treats empty string `""` as falsy, falling back to process.cwd()
-    - `??` would be more semantically correct (only default when not provided)
-    - Low risk since empty string cwd is arguably invalid
+6. ~~**cwd fallback uses `||` instead of `??` in run.ts**~~ **FIXED**
+    - Changed to `??` in run.ts for correct nullish coalescing
 
 ---
 
