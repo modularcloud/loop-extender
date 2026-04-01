@@ -11,6 +11,202 @@ All phases complete:
 
 ---
 
+## Phase 23: Implement 19 New Test Specs (from post-889/889 audit)
+
+An audit of all commits after `0cf85da` (889/889 passing) identified 19 hard spec requirements that lack test coverage. T-INST-33a was already implemented in commit `76be1f1` and is excluded. SP-32 (SSH URL classification) is excluded pending spec decision.
+
+### Batch 1 — Simple CLI / Parsing / Loop Tests (no special infra)
+
+**Files:** `cli-basics.test.ts`, `output-parsing.test.ts`, `loop-state.test.ts`
+**Deps:** None — only `runCLI`, `createTempProject`, `createBashScript`, `runAPIDriver`
+
+1. **T-CLI-27** — `cli-basics.test.ts`, inside `forEachRuntime` block near T-CLI-23
+   - `createTempProject()` + `createBashScript(project, "s1", emitResult("x"))`
+   - `runCLI(["s1", "s2"], { cwd, runtime })`
+   - Assert `exitCode === 1`, `stderr` contains "unexpected"
+
+2. **T-PARSE-20a** — `output-parsing.test.ts`, after T-PARSE-24 in "Type Coercion"
+   - `createBashScript(project, "myscript", 'printf \'{"goto":""}\'')` (empty string goto)
+   - Use `runParseTest` helper (calls `runAPIDriver` with `runPromise({ maxIterations: 1 })`)
+   - Expect the driver to exit non-zero or throw (because `""` is not a valid script name)
+   - Alternative: use `runCLI(["-n", "2", "myscript"])` and assert `exitCode === 1`, `stderr` mentions the empty goto target
+
+3. **T-LOOP-18a** — `loop-state.test.ts`, after T-LOOP-19 in "Goto Behavior"
+   - `createBashScript(project, "A", 'printf \'{"goto":""}\'')` + create any dummy target to avoid unrelated errors
+   - `runCLI(["-n", "2", "A"], { cwd, runtime })`
+   - Assert `exitCode === 1`, `stderr` references the empty goto target
+   - Same pattern as T-LOOP-18 (invalid goto)
+
+### Batch 2 — Environment Variable Tests
+
+**File:** `env-vars.test.ts`
+**Deps:** `withGlobalEnv`, `observeEnv` fixture, `createEnvFile`, `writeEnvFileRaw`
+
+4. **T-ENV-24a** — after T-ENV-24, inside "Injection Precedence" section
+   - `createScript(project, "observe", ".ts", observeEnv("LOOPX_DELEGATED", markerPath))`
+   - `runCLI(["-n", "1", "observe"], { cwd, runtime, env: { LOOPX_DELEGATED: "1" } })`
+   - `readFileSync(markerPath)` → parse JSON → assert `{ present: false }`
+   - The `env` option on `runCLI` merges into `process.env`, so `LOOPX_DELEGATED=1` is in the spawned loopx process; the test verifies loopx strips it before passing to scripts
+
+5. **T-ENV-24b** — after T-ENV-24a, same section
+   - `withGlobalEnv({ MY_VAR: "global-value" }, async () => { ... })`
+   - Create local env file: `writeEnvFileRaw(localEnvPath, "MY_VAR=\n")` (empty string value)
+   - `createScript(project, "observe", ".ts", observeEnv("MY_VAR", markerPath))`
+   - `runCLI(["-e", localEnvPath, "-n", "1", "observe"], { cwd, runtime, env: { MY_VAR: "system-value" } })`
+   - Parse marker JSON → assert `{ present: true, value: "" }` (local empty string wins)
+
+### Batch 3 — Programmatic API Tests
+
+**File:** `programmatic-api.test.ts`
+**Deps:** `runAPIDriver`, `createTempProject`, `createBashScript`, `createEnvFile`, `withGlobalEnv`, `writeEnvFileRaw`
+
+6. **T-API-08a** — after T-API-08, inside `run()` section
+   - Create project with NO script matching `"nonexistent"` (but .loopx/ exists with a valid default)
+   - Driver code: `const gen = run("nonexistent", { cwd, maxIterations: 0 }); try { await gen.next(); } catch (e) { console.log(JSON.stringify({ error: e.message })); }`
+   - `runAPIDriver(runtime, driverCode, { cwd })`
+   - Assert `stdout` contains error JSON (generator threw on first `next()`)
+
+7. **T-API-14e** — after T-API-14d, inside `runPromise()` section
+   - Same project setup (no "nonexistent" script)
+   - Driver code: `try { await runPromise("nonexistent", { cwd, maxIterations: 0 }); } catch (e) { console.log(JSON.stringify({ error: e.message })); }`
+   - Assert `stdout` contains error JSON (promise rejected)
+
+8. **T-API-21c** — after T-API-21b, inside `envFile Option` section
+   - Create project with a valid script + malformed local env file (`writeEnvFileRaw(envPath, "justtext\n")`)
+   - Driver code: `const gen = run("myscript", { cwd, maxIterations: 1, envFile }); for await (const o of gen) {}`
+   - `runAPIDriver(runtime, driverCode, { cwd })`
+   - Assert `result.stderr` matches `/warning/i` (env parse warning forwarded)
+
+9. **T-API-21d** — after T-API-21c
+   - Wrap in `withGlobalEnv` that writes malformed content (`writeEnvFileRaw` the global env file with `"1BAD=val\n"`)
+   - Driver code calls `run("myscript", { cwd, maxIterations: 1 })` (no envFile — uses global only)
+   - Assert `result.stderr` matches `/warning/i`
+   - NOTE: Need to pass `XDG_CONFIG_HOME` through to the driver's `env` option so the driver process sees the same global env file
+
+### Batch 4 — Execution Test (Bun-specific)
+
+**File:** `execution.test.ts`
+**Deps:** `isRuntimeAvailable("bun")`, `runAPIDriver`, `createScript`
+
+10. **T-EXEC-14** — after T-EXEC-13a, Bun-only test
+    - `it.skipIf(!isRuntimeAvailable("bun"))("T-EXEC-14: ...", async () => { ... })`
+    - `createScript(project, "bun-check", ".ts", 'import { output } from "loopx";\noutput({ result: JSON.stringify({ bunVersion: process.versions.bun }) });')`
+    - Driver code: `runPromise("bun-check", { cwd, maxIterations: 1 })`
+    - `runAPIDriver("bun", driverCode, { cwd })`
+    - Parse `outputs[0].result` as JSON → assert `bunVersion` is truthy string
+
+### Batch 5 — Signal Forwarding Test
+
+**File:** `signals.test.ts`
+**Deps:** New fixture in `fixture-scripts.ts`, `runCLIWithSignal`
+
+11. **T-SIG-08** — after T-SIG-07, new "Signal Identity" test
+    - **New fixture needed:** `signalTrapReport(markerPath)` in `fixture-scripts.ts`:
+      ```bash
+      #!/bin/bash
+      MARKER="<markerPath>"
+      PID_MARKER="${MARKER}.pid"
+      printf '%s' "$$" > "$PID_MARKER"
+      trap 'printf SIGINT > "$MARKER"; exit 130' INT
+      trap 'printf SIGTERM > "$MARKER"; exit 143' TERM
+      echo "ready" >&2
+      sleep 999999
+      ```
+    - Two sub-cases (a) and (b), or two separate `it()` blocks:
+      - (a) `sendSignal("SIGINT")` → read marker → assert `"SIGINT"`
+      - (b) `sendSignal("SIGTERM")` → read marker → assert `"SIGTERM"`
+    - Use `runCLIWithSignal(["-n", "1", "sig-report"], { cwd })`
+    - `await waitForStderr("ready")` → `sendSignal(...)` → `await result`
+    - Assert exit code 130 (SIGINT) or 143 (SIGTERM)
+
+### Batch 6 — Delegation Tests
+
+**File:** `delegation.test.ts`
+**Deps:** `withDelegationSetup`, `createMarkerBinary`
+
+12. **T-DEL-09** — after T-DEL-08, "Empty LOOPX_DELEGATED"
+    - Same pattern as T-DEL-04 (which tests `LOOPX_DELEGATED: "1"`)
+    - `const fixture = await withDelegationSetup()`
+    - Replace `localBinPath` with `createMarkerBinary(localBinPath, localMarkerPath, "delegated")`
+    - `fixture.runGlobal(["version"], { env: { LOOPX_DELEGATED: "" } })`
+    - Assert `existsSync(localMarkerPath) === false` (delegation was skipped — empty string is "set")
+    - Assert `result.exitCode === 0` (version subcommand ran directly)
+
+13. **T-DEL-10** — "Delegation preserves SIGINT exit code"
+    - `const fixture = await withDelegationSetup()`
+    - Create a `.loopx/` script in `fixture.projectDir` using `signalReadyThenSleep(markerPath)`
+    - Replace `localBinPath` with real loopx (copy or symlink `fixture.loopxBinJs` so delegation target is functional)
+    - Spawn `fixture.globalBinPath` manually using `spawn()` (not `fixture.runGlobal`, because we need the child handle for signal delivery and `waitForStderr`)
+    - Implement inline: `const child = spawn(fixture.globalBinPath, ["-n", "1", "sleeper"], { cwd: fixture.projectDir, env: merged, stdio: ["pipe", "pipe", "pipe"] })`
+    - Accumulate stderr, wait for `"ready"`, send `child.kill("SIGINT")`
+    - On `close` event: assert exit code 130
+    - May need to wrap `localBinPath` as `#!/bin/bash\nexec node "${fixture.loopxBinJs}" "$@"` (replicating delegation target)
+
+14. **T-DEL-11** — "Delegation preserves SIGTERM exit code"
+    - Same as T-DEL-10 but send `"SIGTERM"`, assert exit code 143
+
+### Batch 7 — Install Tests
+
+**File:** `install.test.ts`
+**Deps:** `startLocalHTTPServer`, `startLocalGitServer`, `withGitURLRewrite`, `createTarball` (local helper)
+
+15. **T-INST-27d** — after T-INST-27c, inside "Common Rules"
+    - Create TWO conflicting file scripts: `createBashScript(project, "foo", ...)` writes `foo.sh`, then `createScript(project, "foo", ".ts", ...)` writes `foo.ts` (pre-existing collision)
+    - `startLocalGitServer([{ name: "foo", files: { ... } }])` + `withGitURLRewrite`
+    - `runCLI(["install", "testorg/foo"], { cwd, runtime })`
+    - Assert `exitCode === 1`, `stderr.length > 0`, `existsSync(join(loopxDir, "foo")) === false`, both `foo.sh` and `foo.ts` still exist
+
+16. **T-INST-31b** — after T-INST-31, inside "Common Rules"
+    - Start HTTP server with valid `.ts` file route
+    - Create project, `mkdir .loopx/`, then `chmod 0o555 .loopx/` (read-only)
+    - Guard: `it.skipIf(process.getuid?.() === 0)("T-INST-31b: ...", ...)`
+    - `runCLI(["install", url], { cwd, runtime })`
+    - Assert `exitCode === 1`, `existsSync(join(loopxDir, "script.ts")) === false`
+    - In `finally`: `chmod 0o755 .loopx/` before cleanup (so rm works)
+
+17. **T-INST-39d** — after T-INST-39c, inside "Post-Validation"
+    - Create a local git repo where `entry.ts` is a symlink to `../../outside.ts`
+    - Use `startLocalGitServer` — but symlinks may not survive `git clone`. Alternative: use a post-clone hook or test with a tarball instead
+    - **Practical approach:** If git strips symlinks, this test may need to use a tarball. Check if `startLocalGitServer` preserves symlinks in the bare repo (git does preserve symlinks on POSIX). If it does: `files: { "package.json": '{"main":"entry.ts"}', "entry.ts": null }` won't work since `files` is `Record<string, string>`. Need to manually create the symlink after clone.
+    - **Simpler approach:** After `startLocalGitServer`, manually add a symlink commit to the bare repo before the test runs. Or, create the repo manually with `execSync` instead of using the helper.
+    - Assert: `exitCode === 1`, `stderr.length > 0`, `existsSync(join(loopxDir, repoName)) === false`
+
+18. **T-INST-39e** — after T-INST-39d, same section
+    - Create a tarball containing `package.json` (`main: "entry.ts"`) and `entry.ts` as a symlink to `../../outside.ts`
+    - Use `tar czf` with `--dereference` excluded (default tar preserves symlinks)
+    - Serve via HTTP, install, assert same as T-INST-39d
+
+19. **T-INST-GLOBAL-01a** — after T-INST-GLOBAL-01, inside "Global Install"
+    - `it.skipIf(!isRuntimeAvailable("bun"))("T-INST-GLOBAL-01a: ...", ...)`
+    - Same `npm pack` + `npm install -g --prefix` pattern as T-INST-GLOBAL-01
+    - Create fixture project with `.loopx/default.ts` that uses `import { output } from "loopx"`
+    - Run via `bun <global-prefix>/bin/loopx -n 1` (spawn `bun` directly with the global bin as arg)
+    - Assert marker file created + exit code 0
+
+---
+
+### Implementation Order & Priority
+
+| Priority | Batch | Tests | Complexity | Est. lines |
+|----------|-------|-------|------------|------------|
+| P1 | 1 | T-CLI-27, T-PARSE-20a, T-LOOP-18a | Trivial | ~40 |
+| P1 | 2 | T-ENV-24a, T-ENV-24b | Low | ~50 |
+| P1 | 3 | T-API-08a, T-API-14e, T-API-21c, T-API-21d | Medium | ~80 |
+| P1 | 5 | T-SIG-08 | Medium (new fixture) | ~60 |
+| P2 | 4 | T-EXEC-14 | Low (Bun-conditional) | ~25 |
+| P2 | 6 | T-DEL-09, T-DEL-10, T-DEL-11 | Medium-High (manual spawn for 10/11) | ~100 |
+| P2 | 7 | T-INST-27d, T-INST-31b, T-INST-39d, T-INST-39e, T-INST-GLOBAL-01a | High (symlink repos, Bun global) | ~150 |
+
+**Total: 19 tests, ~505 lines of test code + 1 new fixture function.**
+
+**Implementation notes:**
+- T-INST-33a is already implemented — skip it
+- T-DEL-10/11 require manual process spawning (not `fixture.runGlobal`) because signal delivery needs the child handle — write a local `spawnGlobalWithSignal()` helper in delegation.test.ts
+- T-INST-39d/39e require symlink creation inside git repos / tarballs — may need manual repo construction with `execSync` rather than the `startLocalGitServer` helper
+- T-INST-GLOBAL-01a requires Bun installed in CI — conditionally skip
+
+---
+
 ## Remaining Items
 
 ### Priority 1 (Spec Violations / Real Bugs)
