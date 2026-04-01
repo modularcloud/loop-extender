@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 889/889 tests passing (100%).** All tests pass.
+**Status: 889/889 tests passing (100%).** All tests pass. Full spec audit complete.
 
 All phases complete:
 - **Phases 1-9:** Scaffolding, parsers, discovery, execution, module resolution, loop, CLI, subcommands, env
@@ -10,14 +10,24 @@ All phases complete:
 - **Phase 13:** CLI delegation (8/8 tests pass)
 - **Phase 14:** Install command (single-file/git/tarball, 107/107 tests)
 - **Phase 15:** Exit codes
+- **Phase 16:** Bun runtime support, signal forwarding fix, stderr inherit, install cleanup/symlink checks, minor fixes, API validation fix
 
 ---
 
-## Remaining Spec Gaps (sorted by priority)
+## Full Spec Audit Results
 
-### LOW — Remaining Non-Issues (documented, not blocking)
+Comprehensive audit of all source files against SPEC.md completed. No actionable spec gaps remain.
 
+### Design Notes (not spec violations, documented for awareness)
+
+- `.loopx/package.json` with `{"type":"module"}` auto-created during run mode — implementation detail for tsx ESM support, not in spec
+- `output()` coerces `result` to `String()` eagerly (spec says parseOutput does it) — functionally equivalent, no behavioral difference
+- `output()` treats `goto`/`stop` differently than `result` (no type coercion) — spec says type filtering happens in parseOutput, behavior is correct
+- `envSet`/`envRemove` re-serialize entire file, destroying comments/formatting — spec does not require preservation
+- `envRemove` does not validate variable name (unlike `envSet`) — harmless, invalid keys can't exist in file
+- `NODE_PATH` set for all runtimes, not just Bun — benign redundancy, `--import` hook takes precedence for Node
 - `output()` JS/TS helper omits trailing newline after JSON (bash helper includes it via console.log) — harmless, JSON.parse handles both
+- Discovery silently ignores directories without `main` in package.json (spec has internal ambiguity about whether this should warn)
 
 ---
 

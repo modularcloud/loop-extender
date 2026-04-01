@@ -164,7 +164,11 @@ function validateDirScript(dirPath: string, name: string): string | null {
     return `${name}: main field escapes directory boundary`;
   }
 
-  if (!existsSync(mainPath)) {
+  try {
+    if (!existsSync(mainPath) || !statSync(mainPath).isFile()) {
+      return `${name}: main entry '${mainField}' not found`;
+    }
+  } catch {
     return `${name}: main entry '${mainField}' not found`;
   }
 

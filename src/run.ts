@@ -116,9 +116,6 @@ async function* runInternal(
         `Invalid maxIterations: must be a non-negative integer, got ${maxIterations}`
       );
     }
-    if (maxIterations === 0) {
-      return;
-    }
   }
 
   // Check abort signal
@@ -173,6 +170,11 @@ async function* runInternal(
       );
     }
     throw new Error(`Script '${name}' not found in .loopx/`);
+  }
+
+  // maxIterations: 0 validates then exits (mirrors CLI -n 0)
+  if (maxIterations === 0) {
+    return;
   }
 
   // Run the loop
