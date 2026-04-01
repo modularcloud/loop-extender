@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 890/890 tests passing (100%).** All tests pass. Full spec audit complete.
+**Status: 892/892 tests passing (100%).** All tests pass. Full spec audit complete.
 
 All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
@@ -22,9 +22,7 @@ _All code quality items resolved._
     - `https://github.com/org/repo` (known host, no `.git`) is classified as git but the URL is passed directly to `git clone` without appending `.git`
     - GitHub accepts this, but other hosts may not
 
-9. **Empty tarball gives misleading error**
-    - If a tarball extracts to zero entries, `validateInstalledDirScript` fails with `"no-pkg"` error
-    - A pre-check with a clear "archive is empty" error would be better UX
+~~9. Empty tarball — fixed: pre-check for zero entries with clear "archive is empty" error~~
 
 ---
 

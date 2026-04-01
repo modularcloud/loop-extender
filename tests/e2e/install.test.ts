@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { writeFile, mkdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import {
   createTempProject,
@@ -1315,6 +1315,33 @@ describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
             ).toBe(false);
           },
         );
+      });
+
+      it("T-INST-33a: empty archive -> error with clear message, no partial dir", async () => {
+        // Create a valid but empty tar.gz (just end-of-archive markers)
+        const emptyTmp = join(tmpdir(), `loopx-empty-tar-${Date.now()}`);
+        await mkdir(emptyTmp, { recursive: true });
+        execFileSync("tar", ["czf", join(emptyTmp, "empty.tar.gz"), "-T", "/dev/null"], { cwd: emptyTmp });
+        const emptyArchive = readFileSync(join(emptyTmp, "empty.tar.gz"));
+        await rm(emptyTmp, { recursive: true, force: true });
+
+        httpServer = await startLocalHTTPServer([
+          {
+            path: "/empty.tar.gz",
+            contentType: "application/gzip",
+            body: emptyArchive,
+          },
+        ]);
+
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", `${httpServer.url}/empty.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/empty/i);
+        expect(existsSync(join(project.loopxDir, "empty"))).toBe(false);
       });
 
       it("T-INST-33: corrupt archive -> error, no partial dir", async () => {

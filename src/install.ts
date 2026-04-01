@@ -327,6 +327,10 @@ async function installTarball(
       (e) => e !== "archive.tar.gz"
     );
 
+    if (entries.length === 0) {
+      throw new Error("archive is empty");
+    }
+
     if (
       entries.length === 1 &&
       statSync(join(tmpDir, entries[0])).isDirectory()
