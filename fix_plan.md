@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 903/903 tests passing (100%).** All tests pass. Full spec audit complete.
+**Status: 904/904 tests passing (100%).** All tests pass. Full spec audit complete.
 
 All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
@@ -27,17 +27,9 @@ An audit of all commits after `0cf85da` (889/889 passing) identified 19 hard spe
 
 **T-API-08a**, **T-API-14e**, **T-API-21c**, **T-API-21d** — all implemented and passing.
 
-### Batch 4 — Execution Test (Bun-specific)
+### Batch 4 — Execution Test (Bun-specific) ✅ COMPLETE
 
-**File:** `execution.test.ts`
-**Deps:** `isRuntimeAvailable("bun")`, `runAPIDriver`, `createScript`
-
-10. **T-EXEC-14** — after T-EXEC-13a, Bun-only test
-    - `it.skipIf(!isRuntimeAvailable("bun"))("T-EXEC-14: ...", async () => { ... })`
-    - `createScript(project, "bun-check", ".ts", 'import { output } from "loopx";\noutput({ result: JSON.stringify({ bunVersion: process.versions.bun }) });')`
-    - Driver code: `runPromise("bun-check", { cwd, maxIterations: 1 })`
-    - `runAPIDriver("bun", driverCode, { cwd })`
-    - Parse `outputs[0].result` as JSON → assert `bunVersion` is truthy string
+**T-EXEC-14** — implemented and passing (Bun-conditional).
 
 ### Batch 5 — Signal Forwarding Test ✅ COMPLETE
 

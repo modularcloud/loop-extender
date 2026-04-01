@@ -408,6 +408,34 @@ process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
     // CJS is rejected — the script should fail and loopx should exit non-zero
     expect(result.exitCode).not.toBe(0);
   });
+
+  // T-EXEC-14: Bun native runtime execution
+  it.skipIf(!isRuntimeAvailable("bun"))(
+    "T-EXEC-14: Under Bun, TS scripts run via Bun's native runtime (not tsx)",
+    async () => {
+      project = await createTempProject();
+
+      const tsContent = `import { output } from "loopx";
+output({ result: JSON.stringify({ bunVersion: process.versions.bun }) });
+`;
+      await createScript(project, "bun-check", ".ts", tsContent);
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("bun-check", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+console.log(JSON.stringify(outputs));
+`;
+      const result = await runAPIDriver("bun", driverCode, { cwd: project.dir });
+      expect(result.exitCode).toBe(0);
+
+      const outputs = JSON.parse(result.stdout);
+      expect(outputs).toHaveLength(1);
+
+      const parsed = JSON.parse(outputs[0].result);
+      expect(parsed.bunVersion).toBeTruthy();
+      expect(typeof parsed.bunVersion).toBe("string");
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
