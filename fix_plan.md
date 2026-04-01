@@ -19,19 +19,11 @@ All phases complete:
 
 ### Priority 2 (Robustness / UX Issues)
 
-11. **`exitWithSignal()` hardcodes signal numbers instead of dynamic lookup**
-    - In `bin.ts`, `exitWithSignal` uses `receivedSignal === "SIGINT" ? 2 : 15`
-    - The delegation path at line 275 uses `constants.signals[result.signal]` for dynamic lookup
-    - If additional signals were ever handled, the hardcoded logic would silently map to 15
-    - Fix: use `os.constants.signals[receivedSignal]` for consistency with delegation path
+*All items resolved.*
 
-12. **NODE_PATH may not resolve `import "loopx"` for Bun global installs**
-    - `LOOPX_NODE_MODULES` = `resolve(__dirname, "..", "node_modules")` points to loopx's own nested `node_modules/`
-    - In global install, this directory doesn't contain `loopx` itself
-    - For Node.js this doesn't matter (loader hook handles resolution)
-    - For Bun, `NODE_PATH` needs to include the directory _containing_ the `loopx` package
-    - Fix: also include `resolve(__dirname, "..", "..")` in NODE_PATH
-    - Note: Only affects Bun global installs; development and local installs work correctly
+**Resolved items:**
+- `exitWithSignal()` now uses dynamic `os.constants.signals` lookup
+- NODE_PATH includes both loopx's own node_modules/ and parent directory for Bun global installs
 
 ### Priority 3 (Minor / Decision Items)
 
