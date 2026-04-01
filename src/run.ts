@@ -129,11 +129,17 @@ async function* runInternal(
 
   const globalResult = loadGlobalEnv();
   globalEnv = globalResult.vars;
+  for (const w of globalResult.warnings) {
+    process.stderr.write(`Warning: ${w}\n`);
+  }
 
   if (envFile) {
     const envFilePath = resolve(cwd, envFile);
     const localResult = loadLocalEnv(envFilePath);
     localEnv = localResult.vars;
+    for (const w of localResult.warnings) {
+      process.stderr.write(`Warning: ${w}\n`);
+    }
   }
 
   const mergedEnv = mergeEnv(globalEnv, localEnv, loopxBin, cwd);
