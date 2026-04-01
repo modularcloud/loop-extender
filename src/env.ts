@@ -6,13 +6,14 @@ import {
   accessSync,
   constants,
 } from "node:fs";
+import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { parseEnvFile } from "./parsers/parse-env.js";
 
 export function getGlobalEnvPath(): string {
   const xdg =
     process.env.XDG_CONFIG_HOME ||
-    join(process.env.HOME || "~", ".config");
+    join(process.env.HOME || homedir(), ".config");
   return join(xdg, "loopx", "env");
 }
 

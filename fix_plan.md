@@ -15,14 +15,9 @@ All phases complete:
 
 ## Remaining Spec Gaps (sorted by priority)
 
-### LOW — Various Minor Issues
+### LOW — Remaining Non-Issues (documented, not blocking)
 
-- `--` not handled as standard end-of-flags marker (treated as script name)
-- Extra positional arguments after script name silently ignored (last one wins)
-- `LOOPX_DELEGATED=""` (empty string) would not skip delegation due to JS falsiness
-- `output()` JS/TS helper omits trailing newline after JSON (bash helper includes it via console.log)
-- `HOME` fallback uses literal `"~"` (Node.js doesn't expand tildes)
-- Unused `cwd` parameter in `installSingleFile`, `installGit`, `installTarball`
+- `output()` JS/TS helper omits trailing newline after JSON (bash helper includes it via console.log) — harmless, JSON.parse handles both
 
 ---
 

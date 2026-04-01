@@ -101,13 +101,27 @@ function parseArgs(argv: string[]): ParsedArgs {
         process.exit(1);
       }
       result.envFile = argv[i];
-    } else if (!arg.startsWith("-") || arg === "--") {
-      // First non-flag argument
+    } else if (arg === "--") {
+      // End-of-flags marker: next argument (if any) is the script name
+      i++;
+      if (i < argv.length) {
+        if (result.scriptName) {
+          process.stderr.write(`Error: unexpected argument '${argv[i]}'\n`);
+          process.exit(1);
+        }
+        result.scriptName = argv[i];
+      }
+      break;
+    } else if (!arg.startsWith("-")) {
+      // Positional argument
+      if (result.scriptName) {
+        process.stderr.write(`Error: unexpected argument '${arg}'\n`);
+        process.exit(1);
+      }
       // Only recognize subcommands when no flags (-n, -e) precede them
       if (
         !sawN &&
         !sawE &&
-        !result.scriptName &&
         ["version", "output", "env", "install"].includes(arg)
       ) {
         result.subcommand = arg;
@@ -247,7 +261,7 @@ function findLocalBin(startDir: string): string | null {
 
 async function main(): Promise<void> {
   // Delegation: check for local node_modules/.bin/loopx before anything else
-  if (!process.env.LOOPX_DELEGATED) {
+  if (process.env.LOOPX_DELEGATED === undefined) {
     const cwd = process.cwd();
     const localBin = findLocalBin(cwd);
     if (localBin) {

@@ -43,13 +43,13 @@ export async function installCommand(
 
   switch (type) {
     case "single-file":
-      await installSingleFile(url, loopxDir, cwd);
+      await installSingleFile(url, loopxDir);
       break;
     case "git":
-      await installGit(url, source, loopxDir, cwd);
+      await installGit(url, source, loopxDir);
       break;
     case "tarball":
-      await installTarball(url, loopxDir, cwd);
+      await installTarball(url, loopxDir);
       break;
   }
 }
@@ -211,8 +211,7 @@ async function downloadUrl(
 
 async function installSingleFile(
   url: string,
-  loopxDir: string,
-  cwd: string
+  loopxDir: string
 ): Promise<void> {
   const filename = deriveFilenameFromUrl(url);
   const ext = extname(filename);
@@ -273,8 +272,7 @@ async function installSingleFile(
 async function installGit(
   url: string,
   source: string,
-  loopxDir: string,
-  cwd: string
+  loopxDir: string
 ): Promise<void> {
   const repoName = deriveRepoName(url, source);
   const nameError = validateName(repoName);
@@ -313,8 +311,7 @@ async function installGit(
 
 async function installTarball(
   url: string,
-  loopxDir: string,
-  cwd: string
+  loopxDir: string
 ): Promise<void> {
   const archiveName = deriveArchiveNameFromUrl(url);
   const nameError = validateName(archiveName);
