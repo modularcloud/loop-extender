@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 870/889 tests passing (97.9%).** 19 remaining failures.
+**Status: 876/889 tests passing (98.5%).** 13 remaining failures.
 
 All phases complete:
 - **Phases 1-9:** Scaffolding, parsers, discovery, execution, module resolution, loop, CLI, subcommands, env
@@ -13,12 +13,12 @@ All phases complete:
 
 ---
 
-## Remaining Failures (19 tests, documented, not blocking)
+## Remaining Failures (13 tests, documented, not blocking)
 
 | Area | Count | Details |
 |------|-------|---------|
 | Edge cases | 6 | T-EDGE-04/07 (CLI stdout assertions contradict spec), T-EDGE-14 (env path). Documented in SPEC-PROBLEMS.md. |
-| Module resolution | 5 | T-MOD-03a (shadow timeout), T-MOD-14a (large payload), T-MOD-15/16/17 (input function via API driver), T-MOD-22 (CJS `require("loopx")` from outside — package ESM contract, not .loopx/ loader) |
+| Module resolution | 2 | T-MOD-03a (shadow timeout), T-MOD-22 (CJS `require("loopx")` from outside — package ESM contract, not .loopx/ loader) |
 | Timing | 3 | T-SIG-07 (between-iterations signal), T-API-25 (abort timer race) |
 | CLI delegation | 1 | T-DEL-05 (LOOPX_BIN realpath) |
 | Install | 2 | T-INST-21 (running installed script) |

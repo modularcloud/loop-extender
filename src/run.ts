@@ -1,5 +1,5 @@
 import { join, resolve } from "node:path";
-import { realpathSync } from "node:fs";
+import { realpathSync, existsSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 import type { Output, RunOptions } from "./types.js";
@@ -155,6 +155,13 @@ async function* runInternal(
   }
 
   const mergedEnv = mergeEnv(globalEnv, localEnv, loopxBin, cwd);
+
+  // Ensure .loopx/package.json exists with "type": "module" so that tsx
+  // treats scripts as ESM (required for top-level await, Spec 6.3).
+  const loopxPkg = join(loopxDir, "package.json");
+  if (!existsSync(loopxPkg)) {
+    writeFileSync(loopxPkg, '{"type":"module"}\n', "utf-8");
+  }
 
   // Resolve starting target
   const name = scriptName || "default";

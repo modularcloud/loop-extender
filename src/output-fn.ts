@@ -59,8 +59,21 @@ export function output(value: unknown): never {
   }
 
   const json = JSON.stringify(payload);
-  // writeSync to fd 1 (stdout) ensures data is fully written before exit.
-  // This handles large payloads (1MB+) that might not fit in async buffers.
-  writeSync(1, json);
+  // writeSync on a non-blocking pipe (child process stdout) can throw
+  // EAGAIN when the pipe buffer is full. Retry with partial writes.
+  const buf = Buffer.from(json);
+  let offset = 0;
+  while (offset < buf.length) {
+    try {
+      const written = writeSync(1, buf, offset, buf.length - offset);
+      offset += written;
+    } catch (err: unknown) {
+      if (err instanceof Error && (err as NodeJS.ErrnoException).code === "EAGAIN") {
+        // Pipe buffer full, retry
+        continue;
+      }
+      throw err;
+    }
+  }
   process.exit(0);
 }

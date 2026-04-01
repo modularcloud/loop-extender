@@ -65,18 +65,14 @@ type NextLoad = (
 /**
  * Force .js files in .loopx/ directories to be loaded as ESM.
  * This ensures CommonJS require() is not available (Spec 6.3).
- * tsx normally handles CJS transparently, but the load hook runs first.
  */
 export async function load(
   url: string,
   context: LoadContext,
   nextLoad: NextLoad
 ): Promise<LoadResult> {
-  // Only intercept .js files that appear to be loopx scripts
-  // (files in a .loopx/ directory)
+  // For .js files in .loopx/: read source directly and force ESM
   if (url.endsWith(".js") && url.includes("/.loopx/")) {
-    // Read the source ourselves since Node's ESM loader requires
-    // source to be non-null when format is "module"
     const { readFile } = await import("node:fs/promises");
     const { fileURLToPath } = await import("node:url");
     const filePath = fileURLToPath(url);
