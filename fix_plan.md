@@ -3,32 +3,70 @@
 **Status: 889/889 tests passing (100%).** All tests pass. Full spec audit complete.
 
 All phases complete:
-- **Phases 1-9:** Scaffolding, parsers, discovery, execution, module resolution, loop, CLI, subcommands, env
-- **Phase 10:** Programmatic API (run/runPromise, options snapshot, generator.return(), AbortSignal)
-- **Phase 11:** Help system
-- **Phase 12:** Signal forwarding, grace period SIGKILL, exit codes 128+N
-- **Phase 13:** CLI delegation (8/8 tests pass)
-- **Phase 14:** Install command (single-file/git/tarball, 107/107 tests)
-- **Phase 15:** Exit codes
-- **Phase 16:** Bun runtime support, signal forwarding fix, stderr inherit, install cleanup/symlink checks, minor fixes, API validation fix
-- **Phase 17:** Code quality improvements — race condition fix, dead code removal, constant deduplication, UX fixes
-- **Phase 18:** Install name-collision fix — `checkCollisions` now uses `candidateNames` instead of `scripts` map to detect collisions even when `.loopx/` has pre-existing name collisions
+- **Phases 1-18:** All feature phases done (see git history)
+- **Phase 19:** Code quality deduplication — `makeAbortError`, `getLoopxBin`, `validateDirScript`, `ensureLoopxPackageJson` all extracted to shared modules
 
 ---
 
 ## Remaining Items
 
-### Priority 3 (Code Quality — Deduplication)
+### Priority 1 (Bugs)
 
-These are internal code quality improvements that do not affect spec conformance. All tests pass as-is.
+1. **Delegation drops signal-kill exit code**
+   - `bin.ts` line 271: `process.exit(result.status ?? 1)` — `spawnSync` returns `status = null` when process killed by signal (actual signal in `result.signal`)
+   - Falling back to `1` means delegated `loopx` killed by SIGINT/SIGTERM exits with `1` instead of `128+signal`
+   - **Fix:** Check `result.signal` when `result.status` is null, compute `128 + sigNum`
 
-1. ~~**`makeAbortError` pattern duplicated 6+ times inline**~~ **DONE** — Extracted to `src/abort.ts`, imported in `loop.ts`, `run.ts`, `execution.ts`
+2. **Programmatic API silently drops env file parse warnings**
+   - `run.ts`: `globalResult.warnings` and `localResult.warnings` from `loadGlobalEnv()`/`loadLocalEnv()` are fetched but never emitted
+   - `bin.ts` correctly forwards these to stderr, but the API path discards them
+   - **Fix:** Forward warnings to `process.stderr.write()` in `runInternal()` (matching bin.ts behavior)
 
-2. ~~**`getLoopxBin()` duplicated identically**~~ **DONE** — Extracted to `src/bin-path.ts`, imported in `run.ts` and `bin.ts`
+3. **Help mode shows reserved/invalid-name scripts as available**
+   - `discovery.ts` lines 128-135: In help mode, `errors` is always empty so the map-building block runs unconditionally
+   - Scripts with reserved names (e.g., `output.ts`) or invalid names end up in `discovery.scripts` and are printed under "Available scripts:" in `--help`
+   - These cannot actually be run, so listing them is misleading
+   - **Fix:** Filter reserved/invalid names from the map regardless of mode
 
-3. ~~**`validateDirScript()` duplicated with overlapping logic**~~ **DONE** — Extracted `validateDirScriptCore()` to `src/validate-dir-script.ts`, used by both `discovery.ts` and `install.ts` with code-based result interpretation
+### Priority 2 (Code Quality)
 
-4. ~~**`.loopx/package.json` auto-creation duplicated**~~ **DONE** — Extracted `ensureLoopxPackageJson()` to `src/bin-path.ts`, imported in `run.ts` and `bin.ts`
+4. **`bin-path.ts` duplicate `node:path` import**
+   - Lines 1 and 4 both import from `"node:path"` — should be merged
+
+5. **`bin.ts` stale double section comment**
+   - Lines 238-239: `// --- Main ---` followed by `// --- CLI Delegation ---` — the first is a leftover
+
+6. **Signal exit code computation repeated 3 times in `bin.ts`**
+   - Lines 410-411, 418-419, 426-427 all have identical `const sigNum = receivedSignal === "SIGINT" ? 2 : 15; process.exit(128 + sigNum);`
+   - **Fix:** Extract to a small helper function
+
+7. **`env.ts` serialize-and-write logic duplicated**
+   - `envSet` and `envRemove` both contain identical sort→map→join→writeFileSync pattern
+   - **Fix:** Extract to a private `writeEnvFile(vars, path)` helper
+
+8. **`LOOPX_BIN`/`LOOPX_PROJECT_ROOT` injected redundantly**
+   - Set in `mergeEnv()` (env.ts) AND again in `executeScript()` (execution.ts) `scriptEnv` spread
+   - Values are identical so behavior is correct, but the redundancy could cause confusion during future changes
+   - **Fix:** Remove the re-injection in `execution.ts` since `mergeEnv` already handles it
+
+9. **`loader-hook.ts` uses dynamic imports inside hot path**
+   - Lines 85-86 use `await import("node:fs/promises")` and `await import("node:url")` inside the `load()` hook
+   - These are cached by Node.js after first call, but could be top-level static imports
+
+### Priority 3 (Edge Cases / UX)
+
+10. **`classify-source.ts`: SSH URL without `.git` silently becomes `single-file`**
+    - `git@github.com:org/repo` (no `.git`) falls through to `single-file` classification
+    - Has a comment acknowledging no test coverage
+    - **Fix:** Treat all `git@` URLs as git type regardless of `.git` suffix
+
+11. **Known-git-host URLs not normalized to append `.git`**
+    - `https://github.com/org/repo` (known host, no `.git`) is classified as git but the URL is passed directly to `git clone` without appending `.git`
+    - GitHub accepts this, but other hosts may not
+
+12. **Empty tarball gives misleading error**
+    - If a tarball extracts to zero entries, `validateInstalledDirScript` fails with `"no-pkg"` error
+    - A pre-check with a clear "archive is empty" error would be better UX
 
 ---
 
