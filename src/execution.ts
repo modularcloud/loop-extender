@@ -53,12 +53,12 @@ export function executeScript(
   // Add loopx's node_modules/.bin to PATH so tsx is findable from any CWD.
   // Add NODE_PATH so require("loopx") works in CJS contexts (tsx transforms
   // import to require for files without "type":"module").
-  const currentPath = env.PATH || process.env.PATH || "";
-  const currentNodePath = env.NODE_PATH || "";
+  const currentPath = env.PATH ?? process.env.PATH ?? "";
+  const currentNodePath = env.NODE_PATH ?? "";
 
   const scriptEnv: Record<string, string> = {
     ...env,
-    PATH: currentPath.includes(LOOPX_BIN_DIR)
+    PATH: currentPath.split(":").includes(LOOPX_BIN_DIR)
       ? currentPath
       : `${LOOPX_BIN_DIR}:${currentPath}`,
     NODE_PATH: currentNodePath

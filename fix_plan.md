@@ -18,29 +18,14 @@ All phases complete:
 
 ### Priority 2 (Robustness / UX Issues)
 
-3. **`installGit` catch discards git clone stderr**
-    - In `install.ts` lines 251-261, the catch discards the error from `execFileSync`
-    - User sees only `Error: git clone failed for <url>` with no diagnostic info
-    - Fix: extract and display `err.stderr` from the caught error
+*All items resolved.*
 
-4. **Tarball extraction catch discards error details**
-    - In `install.ts` lines 317-323, `tar` errors replaced with generic "Failed to extract tarball"
-    - Fix: include the original error message
-
-5. **PATH deduplication uses substring match instead of entry match**
-    - In `execution.ts` line 60, `currentPath.includes(LOOPX_BIN_DIR)` is a substring check
-    - If PATH contains `/path/to/bin-extra`, it matches `/path/to/bin` incorrectly
-    - Fix: split on `:` and check entries, or use a proper path-entry comparison
-
-6. **`||` vs `??` for XDG_CONFIG_HOME and HOME in env.ts**
-    - `process.env.XDG_CONFIG_HOME || ...` treats empty string as unset
-    - XDG spec says empty string means "set" and should be used
-    - Fix: change to `??`
-
-7. **`||` vs `??` for PATH override in execution.ts**
-    - `env.PATH || process.env.PATH || ""` discards explicit empty-string PATH from env files
-    - Violates env precedence rules (section 8.3) where local env file wins
-    - Fix: change to `??`
+**Resolved items:**
+- `installGit` catch now includes git clone stderr in error output
+- Tarball extraction catch now includes original error details
+- PATH deduplication uses `split(":").includes()` instead of substring match
+- `||` → `??` for PATH/NODE_PATH in execution.ts (env precedence respected)
+- XDG_CONFIG_HOME `||` in env.ts is correct per XDG spec ("not set or empty" → use default)
 
 ### Priority 3 (Minor / Decision Items)
 
@@ -63,11 +48,11 @@ All phases complete:
 - Output parsing: **conformant** (minor edge case with empty goto)
 - Loop state machine: **conformant** (bug with empty goto string)
 - Script execution: **conformant**
-- Environment management: **conformant** (minor `||` vs `??` issues)
-- Install command: **conformant** (error messages could be better)
+- Environment management: **conformant**
+- Install command: **conformant**
 - Programmatic API: **conformant**
 - Module resolution / loader hooks: **conformant**
-- Script discovery / validation: **conformant** (overly broad catch)
+- Script discovery / validation: **conformant**
 
 ---
 

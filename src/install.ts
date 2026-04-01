@@ -252,11 +252,15 @@ async function installGit(
     execFileSync("git", ["clone", "--depth", "1", url, destPath], {
       stdio: "pipe",
     });
-  } catch {
+  } catch (err: unknown) {
     try {
       rmSync(destPath, { recursive: true, force: true });
     } catch {}
-    process.stderr.write(`Error: git clone failed for ${url}\n`);
+    const stderr = (err as { stderr?: Buffer })?.stderr;
+    const detail = stderr ? stderr.toString().trim() : "";
+    process.stderr.write(
+      `Error: git clone failed for ${url}${detail ? `\n${detail}` : ""}\n`
+    );
     process.exit(1);
   }
 
@@ -318,8 +322,12 @@ async function installTarball(
       execFileSync("tar", ["xzf", tarPath, "-C", tmpDir], {
         stdio: "pipe",
       });
-    } catch {
-      throw new Error("Failed to extract tarball");
+    } catch (err: unknown) {
+      const stderr = (err as { stderr?: Buffer })?.stderr;
+      const detail = stderr ? stderr.toString().trim() : "";
+      throw new Error(
+        `Failed to extract tarball${detail ? `: ${detail}` : ""}`
+      );
     }
 
     // Determine top-level entries (excluding the archive file)
