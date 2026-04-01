@@ -6,6 +6,9 @@
  *   ensuring CommonJS require() fails per Spec 6.3.
  */
 
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+
 interface ResolveContext {
   conditions: string[];
   importAttributes: Record<string, string>;
@@ -82,8 +85,6 @@ export async function load(
   // For .js files in .loopx/: read source directly and force ESM.
   // Exclude node_modules/ to avoid breaking CJS dependencies in directory scripts.
   if (url.endsWith(".js") && url.includes("/.loopx/") && !url.includes("/node_modules/")) {
-    const { readFile } = await import("node:fs/promises");
-    const { fileURLToPath } = await import("node:url");
     const filePath = fileURLToPath(url);
     const source = await readFile(filePath, "utf-8");
     return { format: "module", source, shortCircuit: true };

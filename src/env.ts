@@ -70,6 +70,18 @@ export function mergeEnv(
   };
 }
 
+function writeEnvFile(vars: Record<string, string>, path: string): void {
+  if (Object.keys(vars).length === 0) {
+    writeFileSync(path, "", "utf-8");
+    return;
+  }
+  const lines = Object.entries(vars)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}="${v}"`)
+    .join("\n");
+  writeFileSync(path, lines + "\n", "utf-8");
+}
+
 // --- Subcommand helpers ---
 
 export function envSet(name: string, value: string): void {
@@ -104,16 +116,8 @@ export function envSet(name: string, value: string): void {
     }
   }
 
-  // Set the new value
   existing[name] = value;
-
-  // Serialize all vars
-  const lines = Object.entries(existing)
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([k, v]) => `${k}="${v}"`)
-    .join("\n");
-
-  writeFileSync(envPath, lines + "\n", "utf-8");
+  writeEnvFile(existing, envPath);
 }
 
 export function envRemove(name: string): void {
@@ -134,18 +138,7 @@ export function envRemove(name: string): void {
   const { vars } = parseEnvFile(content);
 
   delete vars[name];
-
-  if (Object.keys(vars).length === 0) {
-    writeFileSync(envPath, "", "utf-8");
-    return;
-  }
-
-  const lines = Object.entries(vars)
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([k, v]) => `${k}="${v}"`)
-    .join("\n");
-
-  writeFileSync(envPath, lines + "\n", "utf-8");
+  writeEnvFile(vars, envPath);
 }
 
 export function envList(): void {

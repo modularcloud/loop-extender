@@ -58,8 +58,6 @@ export function executeScript(
 
   const scriptEnv: Record<string, string> = {
     ...env,
-    LOOPX_PROJECT_ROOT: projectRoot,
-    LOOPX_BIN: loopxBin,
     PATH: currentPath.includes(LOOPX_BIN_DIR)
       ? currentPath
       : `${LOOPX_BIN_DIR}:${currentPath}`,

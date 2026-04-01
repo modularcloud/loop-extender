@@ -236,7 +236,6 @@ function handleEnvSubcommand(subArgs: string[]): void {
   }
 }
 
-// --- Main ---
 // --- CLI Delegation ---
 function findLocalBin(startDir: string): string | null {
   let dir = startDir;
@@ -397,6 +396,11 @@ async function main(): Promise<void> {
   const ac = new AbortController();
   let receivedSignal: NodeJS.Signals | null = null;
 
+  function exitWithSignal(): never {
+    const sigNum = receivedSignal === "SIGINT" ? 2 : 15;
+    process.exit(128 + sigNum);
+  }
+
   const signalHandler = (sig: NodeJS.Signals) => {
     receivedSignal = sig;
     ac.abort(sig);
@@ -415,27 +419,14 @@ async function main(): Promise<void> {
     });
 
     for await (const _output of loop) {
-      // Check if signal was received between iterations
-      if (receivedSignal) {
-        const sigNum = receivedSignal === "SIGINT" ? 2 : 15;
-        process.exit(128 + sigNum);
-      }
-      // CLI never prints result to stdout
+      if (receivedSignal) exitWithSignal();
     }
 
-    // Check one more time after loop completes
-    if (receivedSignal) {
-      const sigNum = receivedSignal === "SIGINT" ? 2 : 15;
-      process.exit(128 + sigNum);
-    }
+    if (receivedSignal) exitWithSignal();
 
     process.exit(0);
   } catch (err: unknown) {
-    // If a signal was received, exit with 128 + signal number
-    if (receivedSignal) {
-      const sigNum = receivedSignal === "SIGINT" ? 2 : 15;
-      process.exit(128 + sigNum);
-    }
+    if (receivedSignal) exitWithSignal();
     const msg = err instanceof Error ? err.message : String(err);
     process.stderr.write(`Error: ${msg}\n`);
     process.exit(1);

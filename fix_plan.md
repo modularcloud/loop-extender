@@ -12,28 +12,7 @@ All phases complete:
 
 ### Priority 2 (Code Quality)
 
-1. **`bin-path.ts` duplicate `node:path` import**
-   - Lines 1 and 4 both import from `"node:path"` — should be merged
-
-2. **`bin.ts` stale double section comment**
-   - Lines 238-239: `// --- Main ---` followed by `// --- CLI Delegation ---` — the first is a leftover
-
-3. **Signal exit code computation repeated 3 times in `bin.ts`**
-   - Lines 410-411, 418-419, 426-427 all have identical `const sigNum = receivedSignal === "SIGINT" ? 2 : 15; process.exit(128 + sigNum);`
-   - **Fix:** Extract to a small helper function
-
-4. **`env.ts` serialize-and-write logic duplicated**
-   - `envSet` and `envRemove` both contain identical sort→map→join→writeFileSync pattern
-   - **Fix:** Extract to a private `writeEnvFile(vars, path)` helper
-
-5. **`LOOPX_BIN`/`LOOPX_PROJECT_ROOT` injected redundantly**
-   - Set in `mergeEnv()` (env.ts) AND again in `executeScript()` (execution.ts) `scriptEnv` spread
-   - Values are identical so behavior is correct, but the redundancy could cause confusion during future changes
-   - **Fix:** Remove the re-injection in `execution.ts` since `mergeEnv` already handles it
-
-6. **`loader-hook.ts` uses dynamic imports inside hot path**
-   - Lines 85-86 use `await import("node:fs/promises")` and `await import("node:url")` inside the `load()` hook
-   - These are cached by Node.js after first call, but could be top-level static imports
+_All code quality items resolved._
 
 ### Priority 3 (Edge Cases / UX)
 
