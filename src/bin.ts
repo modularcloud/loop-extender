@@ -4,6 +4,7 @@ import { readFileSync, realpathSync, existsSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { constants } from "node:os";
 import { discoverScripts } from "./discovery.js";
 import { runLoop } from "./loop.js";
 import {
@@ -268,7 +269,16 @@ async function main(): Promise<void> {
         },
         stdio: "inherit",
       });
-      process.exit(result.status ?? 1);
+      if (result.status !== null) {
+        process.exit(result.status);
+      } else if (result.signal) {
+        const sigNum =
+          constants.signals[result.signal as keyof typeof constants.signals] ??
+          15;
+        process.exit(128 + sigNum);
+      } else {
+        process.exit(1);
+      }
     }
   }
 

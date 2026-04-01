@@ -12,17 +12,12 @@ All phases complete:
 
 ### Priority 1 (Bugs)
 
-1. **Delegation drops signal-kill exit code**
-   - `bin.ts` line 271: `process.exit(result.status ?? 1)` — `spawnSync` returns `status = null` when process killed by signal (actual signal in `result.signal`)
-   - Falling back to `1` means delegated `loopx` killed by SIGINT/SIGTERM exits with `1` instead of `128+signal`
-   - **Fix:** Check `result.signal` when `result.status` is null, compute `128 + sigNum`
-
-2. **Programmatic API silently drops env file parse warnings**
+1. **Programmatic API silently drops env file parse warnings**
    - `run.ts`: `globalResult.warnings` and `localResult.warnings` from `loadGlobalEnv()`/`loadLocalEnv()` are fetched but never emitted
    - `bin.ts` correctly forwards these to stderr, but the API path discards them
    - **Fix:** Forward warnings to `process.stderr.write()` in `runInternal()` (matching bin.ts behavior)
 
-3. **Help mode shows reserved/invalid-name scripts as available**
+2. **Help mode shows reserved/invalid-name scripts as available**
    - `discovery.ts` lines 128-135: In help mode, `errors` is always empty so the map-building block runs unconditionally
    - Scripts with reserved names (e.g., `output.ts`) or invalid names end up in `discovery.scripts` and are printed under "Available scripts:" in `--help`
    - These cannot actually be run, so listing them is misleading
@@ -30,41 +25,41 @@ All phases complete:
 
 ### Priority 2 (Code Quality)
 
-4. **`bin-path.ts` duplicate `node:path` import**
+3. **`bin-path.ts` duplicate `node:path` import**
    - Lines 1 and 4 both import from `"node:path"` — should be merged
 
-5. **`bin.ts` stale double section comment**
+4. **`bin.ts` stale double section comment**
    - Lines 238-239: `// --- Main ---` followed by `// --- CLI Delegation ---` — the first is a leftover
 
-6. **Signal exit code computation repeated 3 times in `bin.ts`**
+5. **Signal exit code computation repeated 3 times in `bin.ts`**
    - Lines 410-411, 418-419, 426-427 all have identical `const sigNum = receivedSignal === "SIGINT" ? 2 : 15; process.exit(128 + sigNum);`
    - **Fix:** Extract to a small helper function
 
-7. **`env.ts` serialize-and-write logic duplicated**
+6. **`env.ts` serialize-and-write logic duplicated**
    - `envSet` and `envRemove` both contain identical sort→map→join→writeFileSync pattern
    - **Fix:** Extract to a private `writeEnvFile(vars, path)` helper
 
-8. **`LOOPX_BIN`/`LOOPX_PROJECT_ROOT` injected redundantly**
+7. **`LOOPX_BIN`/`LOOPX_PROJECT_ROOT` injected redundantly**
    - Set in `mergeEnv()` (env.ts) AND again in `executeScript()` (execution.ts) `scriptEnv` spread
    - Values are identical so behavior is correct, but the redundancy could cause confusion during future changes
    - **Fix:** Remove the re-injection in `execution.ts` since `mergeEnv` already handles it
 
-9. **`loader-hook.ts` uses dynamic imports inside hot path**
+8. **`loader-hook.ts` uses dynamic imports inside hot path**
    - Lines 85-86 use `await import("node:fs/promises")` and `await import("node:url")` inside the `load()` hook
    - These are cached by Node.js after first call, but could be top-level static imports
 
 ### Priority 3 (Edge Cases / UX)
 
-10. **`classify-source.ts`: SSH URL without `.git` silently becomes `single-file`**
+9. **`classify-source.ts`: SSH URL without `.git` silently becomes `single-file`**
     - `git@github.com:org/repo` (no `.git`) falls through to `single-file` classification
     - Has a comment acknowledging no test coverage
     - **Fix:** Treat all `git@` URLs as git type regardless of `.git` suffix
 
-11. **Known-git-host URLs not normalized to append `.git`**
+10. **Known-git-host URLs not normalized to append `.git`**
     - `https://github.com/org/repo` (known host, no `.git`) is classified as git but the URL is passed directly to `git clone` without appending `.git`
     - GitHub accepts this, but other hosts may not
 
-12. **Empty tarball gives misleading error**
+11. **Empty tarball gives misleading error**
     - If a tarball extracts to zero entries, `validateInstalledDirScript` fails with `"no-pkg"` error
     - A pre-check with a clear "archive is empty" error would be better UX
 
