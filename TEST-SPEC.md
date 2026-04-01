@@ -454,6 +454,7 @@ Each test is identified by a unique ID (`T-<SECTION>-<NUMBER>`), references a SP
 #### CLI Stdout Silence
 
 - **T-CLI-23**: `loopx -n 1 myscript` where `myscript` outputs `{"result":"hello"}` and writes a marker file — the CLI's own stdout is empty (result is not printed), AND the marker file exists (proving the script actually ran). Both assertions are required to prevent vacuous passes. *(Spec 7.1)*
+- **T-CLI-27**: `loopx script1 script2` (two positional arguments) exits with code 1. Stderr contains an error about unexpected arguments. The CLI grammar is `loopx [options] [script-name]` — singular. Only zero or one positional argument is accepted. *(Spec 4.1)*
 
 ### 4.2 Subcommands
 
@@ -639,6 +640,7 @@ These tests verify the actual bytes written to the env file, not just round-trip
 - **T-EXEC-13**: JS/TS script can use TypeScript type annotations (verifies tsx handles TS syntax under Node.js). `[Node]` *(Spec 6.3)*
 - **T-EXEC-13b**: JS/TS script can use TypeScript type annotations under Bun (verifies Bun's native TS support). `[Bun]` *(Spec 6.3)*
 - **T-EXEC-13a**: A `.js` script that uses `require()` (CJS) fails with an error. CJS is not supported. *(Spec 6.3)*
+- **T-EXEC-14**: `[Bun]` When running under Bun, JS/TS scripts are executed via Bun's native runtime, not `tsx`. Create a `.ts` fixture script that writes `JSON.stringify({ bunVersion: process.versions.bun })` as its result. Observe via `runPromise({ maxIterations: 1 })`: the yielded Output's `result` parsed as JSON has a truthy `bunVersion` string, confirming the child process ran under Bun (not Node.js/tsx). The spec requires: "When running under Bun, loopx uses Bun's native TypeScript/JSX support instead of tsx." *(Spec 6.3)*
 
 #### Directory Scripts
 
@@ -687,6 +689,7 @@ These tests use bash fixture scripts that echo specific strings to stdout. **Par
 - **T-PARSE-22**: `{"stop": 1}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
 - **T-PARSE-23**: `{"stop": false}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
 - **T-PARSE-24**: `{"stop": "false"}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
+- **T-PARSE-20a**: `{"goto":""}` (empty string goto). An empty string IS a string (`typeof "" === "string"`), so the parser must preserve it — it is NOT treated as absent. Assert via `run()`: the generator throws an error on the first iteration (because `""` is not a valid script name), confirming the empty string was forwarded to the goto validation logic rather than silently discarded. This is distinct from T-PARSE-18/19/20 which test non-string goto values that are discarded. *(Spec 2.3)*
 
 #### Mixed Valid/Invalid Fields
 
@@ -733,6 +736,7 @@ These tests use bash fixture scripts that echo specific strings to stdout. **Par
 - **T-LOOP-17**: A → `goto:"A"` (self-referencing goto). Verify it works: A runs, then A runs again (2 iterations with -n 2). *(Spec 2.2)*
 - **T-LOOP-18**: Goto target that doesn't exist → error, exit code 1. Stderr mentions the invalid target name. *(Spec 7.2)*
 - **T-LOOP-19**: Goto to a script that was not discovered (e.g., a `.mjs` file) → error. *(Spec 7.2)*
+- **T-LOOP-18a**: Script outputs `{"goto":""}` (empty string goto). An empty string is a valid string per section 2.3 parsing rules, so it is preserved as a goto value. However, `""` does not match any script name in `.loopx/` (script names must match `[a-zA-Z0-9_][a-zA-Z0-9_-]*`). Assert: loopx exits with code 1, stderr contains an error about the invalid goto target. The empty string goto must not be silently treated as absent (which would cause the loop to reset instead of erroring). *(Spec 2.3, 7.1, 7.2)*
 
 #### Error Handling
 
@@ -803,6 +807,8 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 - **T-ENV-22**: System env has `SYS_VAR=sys`, global env has `SYS_VAR=global`. Script writes `$SYS_VAR` to a marker file → marker contains `global`. *(Spec 8.3)*
 - **T-ENV-23**: System env has `SYS_VAR=sys`, no loopx override. Script writes `$SYS_VAR` to a marker file → marker contains `sys`. *(Spec 8.3)*
 - **T-ENV-24**: Full precedence chain. Set `VAR` at system, global, and local levels. Script writes `$VAR` to a marker file. Assert local wins. Then remove from local → global wins. Then remove from global → system wins. *(Spec 8.3)*
+- **T-ENV-24a**: `LOOPX_DELEGATED` is not visible in script execution environments. Spawn loopx with `LOOPX_DELEGATED=1` in the process environment (simulating post-delegation state). A script uses the `observe-env` fixture to write the presence/value of `LOOPX_DELEGATED` to a marker file. Assert the marker file contains `{ "present": false }`. The spec (section 8.3) exhaustively lists the loopx-injected variables as `LOOPX_BIN` and `LOOPX_PROJECT_ROOT` — `LOOPX_DELEGATED` is an internal delegation guard (section 3.2) and must not leak into script environments. *(Spec 8.3, 3.2)*
+- **T-ENV-24b**: Empty-string value in local env file overrides non-empty global/system value. System env has `MY_VAR=system`, global env has `MY_VAR=global`, local env file sets `MY_VAR=` (empty string). Script writes `$MY_VAR` to a marker file via `observe-env`. Assert marker contains `{ "present": true, "value": "" }` — the local empty string wins, not the global or system value. This verifies that the env merge logic uses nullish coalescing (not logical OR), preserving empty strings as valid values per the precedence chain. *(Spec 8.3)*
 
 #### Env Caching
 
@@ -879,6 +885,7 @@ These tests verify `LOOPX_BIN` through loop behavior and side-effect files — n
 - **T-API-06**: Breaking out of `for await` loop after the first yield prevents further iterations from starting. Setup: script produces a result (no `stop`) on each iteration, with `maxIterations: 10`. Break after receiving the first yield. Assert: no additional iterations execute (use a counter file — counter should be exactly 1). *(Spec 9.1)*
 - **T-API-07**: `run("myscript", { cwd: "/path/to/project" })` resolves scripts relative to the given cwd. *(Spec 9.5)*
 - **T-API-08**: `run("myscript", { maxIterations: 0 })` → generator completes immediately with no yields. *(Spec 9.5)*
+- **T-API-08a**: `run("nonexistent", { maxIterations: 0 })` → `run()` returns a generator. On the first `next()`, the generator throws because the script does not exist. Even with `maxIterations: 0`, validation (discovery, script resolution, env file loading) runs before the zero-iteration short-circuit. This mirrors CLI `-n 0` behavior (T-CLI-19). *(Spec 9.1, 9.5, 7.1)*
 - **T-API-09**: `run()` with no script name runs the `default` script. *(Spec 9.1)*
 - **T-API-09b**: `run()` cwd snapshot timing. Create two temp projects, each with a `default` script that writes a unique marker. Call `run()` while `process.cwd()` is project A (no explicit `cwd` option). Then change `process.cwd()` to project B before calling `next()`. Assert the generator executes project A's script, not project B's — proving `cwd` was snapshotted at `run()` call time. *(Spec 9.1, 9.5)*
 - **T-API-09a**: Manual iterator cancellation during a pending `next()`. Use the `write-pid-to-file` fixture (a TS script that writes its PID to a marker file, writes `"ready"` to stderr, then blocks). Obtain the async iterator, call `iterator.next()` to start the first iteration. Wait for the child to be ready (e.g., poll the marker file or observe stderr). Then call `iterator.return()` while `next()` is still pending. Assert: (1) the child process / process group is terminated (read PID from marker file, verify it is no longer running), and (2) the generator completes with no further yields. *(Spec 9.1)*
@@ -901,6 +908,7 @@ These tests verify `LOOPX_BIN` through loop behavior and side-effect files — n
 - **T-API-14b**: `runPromise("myscript", { maxIterations: 0 })` resolves with an empty array `[]`. *(Spec 9.2, 9.5)*
 - **T-API-14c**: `runPromise()` cwd snapshot timing. Create two temp projects, each with a `default` script that writes a unique marker. Call `runPromise()` while `process.cwd()` is project A (no explicit `cwd` option). Change `process.cwd()` to project B before the promise resolves. Assert the promise resolves with outputs from project A's script, not project B's — proving `cwd` was snapshotted at `runPromise()` call time. *(Spec 9.2, 9.5)*
 - **T-API-14d**: `runPromise()` options snapshot — mutating `maxIterations` after call. Create a `RunOptions` object with `maxIterations: 2`. Call `runPromise("myscript", opts)` to obtain the promise. Then mutate `opts.maxIterations = 100`. Await the promise. Assert exactly 2 outputs are returned — proving the options were snapshotted at `runPromise()` call time. *(Spec 9.2, 9.1)*
+- **T-API-14e**: `runPromise("nonexistent", { maxIterations: 0 })` rejects because the script does not exist. Even with `maxIterations: 0`, validation (discovery, script resolution) runs before the zero-iteration short-circuit. This mirrors CLI `-n 0` behavior (T-CLI-19). *(Spec 9.2, 9.5, 7.1)*
 
 #### Error Behavior
 
@@ -925,6 +933,8 @@ These tests verify `LOOPX_BIN` through loop behavior and side-effect files — n
 - **T-API-21**: `run("myscript", { envFile: "local.env" })` loads the env file. Script sees the variables. *(Spec 9.5)*
 - **T-API-21a**: `run("myscript", { envFile: "relative/path.env", cwd: "/some/dir" })` — relative envFile path is resolved against the provided `cwd`. *(Spec 9.5)*
 - **T-API-21b**: `run("myscript", { envFile: "relative/path.env" })` with no `cwd` option — relative envFile path is resolved against `process.cwd()` at call time. Set up a temp project, place the env file at a relative path from `process.cwd()`, and verify the script sees the variables. *(Spec 9.5)*
+- **T-API-21c**: Env file parse warnings are forwarded to stderr via the programmatic API. Use `runAPIDriver()` to spawn a driver that calls `run("myscript", { envFile: "local.env" })` where `local.env` contains a malformed line (e.g., `justtext` with no `=`). Assert the driver process's stderr contains a warning about the invalid line. This verifies that local env parse warnings reach stderr in the programmatic API path, not just the CLI path. *(Spec 8.1, 9.3)*
+- **T-API-21d**: Global env file parse warnings are forwarded to stderr via the programmatic API. Set up `XDG_CONFIG_HOME` to a temp directory with a global env file containing a malformed line (e.g., `1BAD=val`). Use `runAPIDriver()` to call `run("myscript")`. Assert the driver process's stderr contains a warning about the invalid key. *(Spec 8.1, 9.3)*
 
 #### `maxIterations` Validation
 
@@ -998,12 +1008,15 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 - **T-INST-27a**: Destination-path collision with non-script directory. Installing when a non-script directory with the same name already exists in `.loopx/` (e.g., `.loopx/foo/` exists as a shared utility directory with no `package.json`, install a git repo that would go to `.loopx/foo/`) → error, existing directory untouched. *(Spec 10.3)*
 - **T-INST-27b**: Script-name collision across different path types. `.loopx/foo.sh` exists (file script named `foo`), install a git repo that would clone to `.loopx/foo/` — different destination path, but same derived script name `foo`. → error, existing script untouched, no `.loopx/foo/` directory created. *(Spec 10.3, 5.2)*
 - **T-INST-27c**: Script-name collision across different file extensions. `.loopx/foo.ts` exists (file script named `foo`), install a single-file URL for `foo.sh` → error. Both resolve to script name `foo`. The existing `.loopx/foo.ts` is untouched and no `.loopx/foo.sh` is created. *(Spec 10.3, 5.2)*
+- **T-INST-27d**: Script-name collision when target name already has a pre-existing collision in `.loopx/`. Setup: `.loopx/foo.sh` and `.loopx/foo.ts` both exist (pre-existing name collision on `foo`). Attempt to install a git repo that would clone to `.loopx/foo/`. Assert: exit code 1, error on stderr mentioning name collision, no `.loopx/foo/` directory created, both `.loopx/foo.sh` and `.loopx/foo.ts` untouched. This is distinct from T-INST-27b/27c: those test single-entry collisions where the name is in the scripts map; this tests that install detects the name even when it is already involved in a pre-existing collision (and therefore excluded from the scripts map during discovery). *(Spec 10.3, 5.2)*
 - **T-INST-28**: Installing a script with a reserved name (e.g., `output.ts`) → error, nothing saved. *(Spec 10.3)*
 - **T-INST-29**: Installing a script with invalid name (e.g., `-invalid.ts`) → error, nothing saved. *(Spec 10.3)*
 - **T-INST-30**: No automatic `npm install` / `bun install` after clone/extract. Verify `node_modules/` does not appear in installed directory script. *(Spec 10.3)*
 - **T-INST-31**: HTTP 404 during single-file download → error, exit code 1, no partial file left in `.loopx/`. *(Spec 10.3)*
+- **T-INST-31b**: Single-file install write failure cleans up partial file. Serve a valid `.ts` file via the local HTTP server, then make `.loopx/` directory read-only (`chmod 0o555`) before running install so the download succeeds but `writeFileSync` fails. Assert: exit code 1, error on stderr, no partial file left at the destination path in `.loopx/`. **This test is conditional on `process.getuid() !== 0`** — root can write to any directory. *(Spec 10.3)*
 - **T-INST-32**: Git clone failure (non-existent repo) → error, exit code 1, no partial directory left in `.loopx/`. *(Spec 10.3)*
 - **T-INST-33**: Tarball extraction failure (corrupt archive) → error, exit code 1, no partial directory left in `.loopx/`. *(Spec 10.3)*
+- **T-INST-33a**: Empty tarball (valid `.tar.gz` with no entries). Serve a valid but empty tarball via the local HTTP server. `loopx install <url>` → exit code 1, stderr contains error about the empty archive, no partial directory left in `.loopx/`. An empty tarball is an extraction failure — it produces zero usable entries. *(Spec 10.3)*
 
 #### Install Post-Validation (Directory Scripts)
 
@@ -1018,10 +1031,13 @@ These tests verify that git/tarball installs apply the same validation as discov
 - **T-INST-39a**: Tarball install where extracted directory has `package.json` with non-string `main` (e.g., `{"main": 42}`) → directory removed, error, exit code 1. *(Spec 10.2, 5.1)*
 - **T-INST-39b**: Tarball install where extracted directory has `package.json` with `main` escaping the directory (e.g., `{"main": "../escape.ts"}`) → directory removed, error, exit code 1. *(Spec 10.2, 5.1)*
 - **T-INST-39c**: Tarball install where extracted directory has `package.json` with `main` pointing to unsupported extension (e.g., `{"main": "index.py"}`) → directory removed, error, exit code 1. *(Spec 10.2, 5.1)*
+- **T-INST-39d**: Git install where cloned repo has `package.json` with `main` pointing to a symlink that resolves outside the directory boundary (e.g., `entry.ts` is a symlink to `../../outside.ts`). Assert: exit code 1, error on stderr referencing the symlink/boundary violation, clone is fully removed from `.loopx/`. Install post-validation must apply the same symlink boundary check as discovery (Spec 5.1: "must still resolve to a path within the script's directory after symlink resolution"). *(Spec 10.2, 5.1)*
+- **T-INST-39e**: Tarball install where extracted directory has `package.json` with `main` pointing to a symlink that resolves outside the directory boundary. Same assertions as T-INST-39d but for tarball installs: exit code 1, error on stderr, extracted directory removed. *(Spec 10.2, 5.1)*
 
 #### Global Install Smoke Test
 
 - **T-INST-GLOBAL-01**: Full global install lifecycle. `npm pack` the built loopx package, install the resulting tarball into an isolated global prefix (using `npm install -g --prefix <tempdir>`), create a fixture project with a `.loopx/default.ts` script, run `<tempdir>/bin/loopx -n 1` against the fixture project, and assert the script ran (via marker file) and exit code is 0. This exercises the full Spec 3.1 workflow: global binary on PATH, module resolution for `import from "loopx"`, and script execution. *(Spec 3.1)*
+- **T-INST-GLOBAL-01a**: `[Bun]` Full global install lifecycle under Bun. Same workflow as T-INST-GLOBAL-01 but the fixture script is run via Bun: install globally, create a fixture project with a `.loopx/default.ts` script that uses `import { output } from "loopx"`, invoke the global `loopx` binary under Bun (`bun <global-bin>/loopx -n 1`). Assert the script ran (via marker file) and `import from "loopx"` resolved correctly. This exercises the `NODE_PATH`-based module resolution path that Bun uses for global installs (Spec 3.3). *(Spec 3.1, 3.3)*
 
 ### 4.11 Signal Handling
 
@@ -1036,6 +1052,7 @@ Signal tests use the `signal-ready-then-sleep`, `signal-trap-exit`, `signal-trap
 - **T-SIG-05**: Grace period exceeded: child script traps SIGTERM and hangs (ignores it). Use `signal-trap-ignore(markerPath)` fixture. `waitForStderr("ready")`, send SIGTERM. Assert loopx sends SIGKILL after ~5 seconds and exits. Verify the child PID (from marker file) is no longer running. *(Spec 7.3)*
 - **T-SIG-06**: Process group signal: script spawns a grandchild process. Use `spawn-grandchild(markerPath)` fixture. `waitForStderr("ready")`, send SIGTERM to loopx. Read both PIDs from marker file. Assert both the script and grandchild are no longer running after loopx exits. *(Spec 7.3)*
 - **T-SIG-07**: Between-iterations signal: Use a script that outputs no `goto` or `stop` (so the loop resets) and writes a ready marker to a known file after each iteration. The test sends SIGTERM between iterations by coordinating via the marker file. Assert loopx exits immediately with code 143 (128 + 15). This test may require a small sleep or poll to hit the between-iterations window, so it is tagged as `@flaky-retry(3)` to tolerate occasional timing misses. *(Spec 7.3)*
+- **T-SIG-08**: The child process receives the same signal that was sent to loopx (forwarding preserves signal identity). Use a bash fixture that traps both SIGINT and SIGTERM separately: `trap 'printf SIGINT > $MARKER' INT; trap 'printf SIGTERM > $MARKER' TERM`. The script writes its PID to a separate marker file and emits `"ready"` to stderr, then sleeps. (a) Send SIGINT to loopx. Read the signal marker file. Assert it contains `"SIGINT"`. (b) Repeat with SIGTERM and assert `"SIGTERM"`. This ensures loopx forwards the *original* signal to the child process group, not a generic SIGTERM for all cases. *(Spec 7.3)*
 
 ### 4.12 CLI Delegation
 
@@ -1065,6 +1082,9 @@ The "global" binary is the primary build. The "local" binary is a separate build
 - **T-DEL-06**: After delegation, `import from "loopx"` in scripts resolves to the **local (delegated-to) version's** package, not the global version. The local version must be **observably distinct** — e.g., it includes an additional non-standard export (like `__loopxVersion`) or writes a distinctive marker during module initialization. A TS script imports from `"loopx"` and checks for the local version's marker. Assert that the script observes the local version's marker, not the global's. *(Spec 3.2)*
 - **T-DEL-07**: Delegation sets `LOOPX_DELEGATED=1` in the delegated process. Use `withDelegationSetup`. The local binary is a script that writes `$LOOPX_DELEGATED` to a marker file via `observe-env`. Assert the marker file contains `{ "present": true, "value": "1" }`. This verifies the environment variable is actually received, not just that the recursion guard works. *(Spec 3.2)*
 - **T-DEL-08**: Delegation happens before command handling. Use `withDelegationSetup`. Run the global binary with `version` as the argument. The local binary writes a marker file on invocation. Assert: (1) the marker file exists (proving the local binary was invoked), and (2) the local binary's version output is observed (not the global's). This verifies delegation occurs before the `version` subcommand is processed. *(Spec 3.2)*
+- **T-DEL-09**: `LOOPX_DELEGATED=""` (empty string) in environment prevents delegation. The spec says delegation is skipped when `LOOPX_DELEGATED` is "set" — in POSIX semantics, an empty string is "set." Use `withDelegationSetup`, spawn the global binary with `env: { LOOPX_DELEGATED: "" }`. Assert the local binary's marker file does NOT exist (the global binary ran directly, delegation was skipped). *(Spec 3.2)*
+- **T-DEL-10**: Delegation preserves SIGINT exit code. Use `withDelegationSetup` with a `.loopx/` fixture containing a `signal-ready-then-sleep` script. Spawn the global binary (which delegates to local). `waitForStderr("ready")`, then send SIGINT to the global binary process. Assert the global binary exits with code 130 (128 + 2). *(Spec 3.2, 7.3, 12)*
+- **T-DEL-11**: Delegation preserves SIGTERM exit code. Same setup as T-DEL-10, but send SIGTERM instead. Assert the global binary exits with code 143 (128 + 15). *(Spec 3.2, 7.3, 12)*
 
 ### 4.13 Exit Codes (Cross-Cutting)
 
@@ -1300,7 +1320,8 @@ This section tracks any tests that are blocked by unresolved spec ambiguities. I
 
 All previously identified spec problems (SP-15 through SP-30) have been resolved. SP-31 (install name-collision across different destination paths) was identified and resolved during this revision.
 
-**Currently pending:** None. All identified issues have been resolved.
+**Currently pending:**
+- SP-32 (SSH/SCP URL classification — commit d6cdb2c classifies all `git@`-prefixed URLs as git sources, but SPEC.md section 10.1 does not mention SSH or SCP-style URLs. The five ordered source detection rules are written entirely in terms of `http(s)://` URLs and the `org/repo` shorthand. Either the spec should be updated to add a rule for `git@` URLs, or the implementation should be narrowed to only handle known-host patterns consistent with Rule 2. No tests are added for this behavior until the spec ambiguity is resolved.)
 
 Resolved during this revision:
 - SP-28 (mid-loop removed/renamed script behavior — resolved: discovery caching freezes names and resolved paths; execution uses cached path; file disappearance fails at spawn time as a normal child-process launch error)
@@ -1321,12 +1342,12 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 1 | Overview (ESM-only) | T-MOD-22 |
 | 2.1 | Script (file & directory) | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-MOD-03a, T-EXEC-18a |
 | 2.2 | Loop (state machine) | T-LOOP-01–05, T-LOOP-16–17 |
-| 2.3 | Structured Output | T-PARSE-01–29, T-PARSE-12a, F-PARSE-01–05 |
-| 3.1 | Global Install | T-INST-GLOBAL-01 |
-| 3.2 | CLI Delegation | T-DEL-01–08 |
+| 2.3 | Structured Output | T-PARSE-01–29, T-PARSE-12a, T-PARSE-20a, F-PARSE-01–05 |
+| 3.1 | Global Install | T-INST-GLOBAL-01, T-INST-GLOBAL-01a |
+| 3.2 | CLI Delegation | T-DEL-01–11 |
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21 |
-| 4.1 | Running Scripts | T-CLI-08–13 |
+| 4.1 | Running Scripts | T-CLI-08–13, T-CLI-27 |
 | 4.2 | Options (-n, -e, -h) | T-CLI-02–07j, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b |
 | 4.3 | Subcommands | T-SUB-01–19, T-SUB-06a–06b, T-SUB-14a–14k, T-DISC-46a–46b |
 | 5.1 | Discovery | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38b, T-DISC-47–50 |
@@ -1336,25 +1357,25 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 5.5 | Validation Scope | T-DISC-39–46b, T-SUB-06, T-SUB-13, T-SUB-19 |
 | 6.1 | Working Directory | T-EXEC-01–04 |
 | 6.2 | Bash Scripts | T-EXEC-05–07 |
-| 6.3 | JS/TS Scripts | T-EXEC-08–13b |
+| 6.3 | JS/TS Scripts | T-EXEC-08–14 |
 | 6.4 | Directory Scripts | T-EXEC-15–18, T-EXEC-18a |
 | 6.5 | output() Function | T-MOD-04–14a, T-MOD-13a–13g |
 | 6.6 | input() Function | T-MOD-15–18 |
 | 6.7 | Input Piping | T-LOOP-11–15 |
 | 6.8 | Initial Input | T-LOOP-14 |
 | 7.1 | Basic Loop | T-LOOP-01–10, T-LOOP-25 |
-| 7.2 | Error Handling | T-LOOP-18–24, T-DISC-38a–38b |
-| 7.3 | Signal Handling | T-SIG-01–07 |
+| 7.2 | Error Handling | T-LOOP-18–24, T-LOOP-18a, T-DISC-38a–38b |
+| 7.3 | Signal Handling | T-SIG-01–08 |
 | 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-05a–05e, T-ENV-25–25a, F-ENV-01–05 |
 | 8.2 | Local Env Override | T-ENV-16–19, T-ENV-17a, T-ENV-25a |
-| 8.3 | Env Injection Precedence | T-ENV-20–24, T-ENV-20a, T-ENV-21a |
-| 9.1 | run() | T-API-01–09c, T-API-10–10c, T-TYPE-04, T-TYPE-06–07 |
-| 9.2 | runPromise() | T-API-11–14d, T-API-25–25b, T-TYPE-05–07 |
-| 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20i |
+| 8.3 | Env Injection Precedence | T-ENV-20–24, T-ENV-20a, T-ENV-21a, T-ENV-24a, T-ENV-24b |
+| 9.1 | run() | T-API-01–09c, T-API-08a, T-API-10–10c, T-TYPE-04, T-TYPE-06–07 |
+| 9.2 | runPromise() | T-API-11–14e, T-API-25–25b, T-TYPE-05–07 |
+| 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20i, T-API-21c–21d |
 | 9.4 | output() and input() (script-side) | T-MOD-04–14a, T-MOD-13a–13g (output()), T-MOD-15–18 (input()) — these are the same tests listed under 6.5/6.6; 9.4 references them |
 | 9.5 | Types / RunOptions | T-API-07–08, T-API-10–10c, T-API-20d–20e, T-API-21–21b, T-API-22–25b, T-API-23a, T-API-24a–24b, T-TYPE-01–07 |
 | 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08d |
-| 10.2 | Source Type Details | T-INST-09–26b, T-INST-34–39c |
-| 10.3 | Common Install Rules | T-INST-27–27c, T-INST-28–33 |
+| 10.2 | Source Type Details | T-INST-09–26b, T-INST-34–39e |
+| 10.3 | Common Install Rules | T-INST-27–27d, T-INST-28–33a, T-INST-31b |
 | 11 | Help | T-CLI-02–07j |
 | 12 | Exit Codes | T-EXIT-01–13 |
