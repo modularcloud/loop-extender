@@ -7,9 +7,8 @@ import {
   readdirSync,
   statSync,
   renameSync,
-  realpathSync,
 } from "node:fs";
-import { join, basename, extname, resolve, relative } from "node:path";
+import { join, basename, extname } from "node:path";
 import { execFileSync } from "node:child_process";
 import { classifySource } from "./parsers/classify-source.js";
 import {
@@ -18,6 +17,7 @@ import {
   RESERVED_NAMES,
   NAME_PATTERN,
 } from "./discovery.js";
+import { validateDirScriptCore } from "./validate-dir-script.js";
 
 export async function installCommand(
   source: string,
@@ -121,67 +121,26 @@ function checkCollisions(
   return null;
 }
 
-function validateDirScript(dirPath: string, name: string): string | null {
-  const pkgPath = join(dirPath, "package.json");
+function validateInstalledDirScript(dirPath: string, name: string): string | null {
+  const result = validateDirScriptCore(dirPath);
+  if (result.valid) return null;
 
-  let pkgContent: string;
-  try {
-    pkgContent = readFileSync(pkgPath, "utf-8");
-  } catch {
-    return `${name}: package.json not found or unreadable`;
-  }
+  const errorMap: Record<string, string> = {
+    "no-pkg": `${name}: package.json not found or unreadable`,
+    "unreadable": `${name}: package.json not found or unreadable`,
+    "invalid-json": `${name}: package.json is invalid JSON`,
+    "invalid-object": `${name}: package.json is not a valid object`,
+    "no-main": `${name}: package.json missing valid 'main' field`,
+    "bad-main-type": `${name}: package.json missing valid 'main' field`,
+    "bad-ext": `${name}: unsupported extension '${result.detail}' for main entry`,
+    "escapes": `${name}: main field escapes directory boundary`,
+    "not-found": `${name}: main entry '${result.detail}' not found`,
+    "not-file": `${name}: main entry '${result.detail}' not found`,
+    "symlink-escape": `${name}: main field resolves outside directory boundary (symlink)`,
+    "resolve-failed": `${name}: main entry cannot be resolved`,
+  };
 
-  let pkg: unknown;
-  try {
-    pkg = JSON.parse(pkgContent);
-  } catch {
-    return `${name}: package.json is invalid JSON`;
-  }
-
-  if (typeof pkg !== "object" || pkg === null) {
-    return `${name}: package.json is not a valid object`;
-  }
-
-  const pkgObj = pkg as Record<string, unknown>;
-
-  if (!("main" in pkgObj) || typeof pkgObj.main !== "string") {
-    return `${name}: package.json missing valid 'main' field`;
-  }
-
-  const mainField = pkgObj.main;
-  const mainExt = extname(mainField);
-
-  if (!SUPPORTED_EXTENSIONS.has(mainExt)) {
-    return `${name}: unsupported extension '${mainExt}' for main entry`;
-  }
-
-  const mainPath = resolve(dirPath, mainField);
-  const relPath = relative(dirPath, mainPath);
-  if (relPath.startsWith("..")) {
-    return `${name}: main field escapes directory boundary`;
-  }
-
-  try {
-    if (!existsSync(mainPath) || !statSync(mainPath).isFile()) {
-      return `${name}: main entry '${mainField}' not found`;
-    }
-  } catch {
-    return `${name}: main entry '${mainField}' not found`;
-  }
-
-  // Symlink boundary check (Spec 5.1 parity)
-  try {
-    const realMainPath = realpathSync(mainPath);
-    const realDirPath = realpathSync(dirPath);
-    const realRel = relative(realDirPath, realMainPath);
-    if (realRel.startsWith("..")) {
-      return `${name}: main field resolves outside directory boundary (symlink)`;
-    }
-  } catch {
-    return `${name}: main entry cannot be resolved`;
-  }
-
-  return null;
+  return errorMap[result.code] || `${name}: validation failed`;
 }
 
 async function downloadUrl(
@@ -302,7 +261,7 @@ async function installGit(
   }
 
   // Validate directory script
-  const validationError = validateDirScript(destPath, repoName);
+  const validationError = validateInstalledDirScript(destPath, repoName);
   if (validationError) {
     rmSync(destPath, { recursive: true, force: true });
     process.stderr.write(`Error: ${validationError}\n`);
@@ -397,7 +356,7 @@ async function installTarball(
   }
 
   // Validate directory script
-  const validationError = validateDirScript(destPath, archiveName);
+  const validationError = validateInstalledDirScript(destPath, archiveName);
   if (validationError) {
     rmSync(destPath, { recursive: true, force: true });
     process.stderr.write(`Error: ${validationError}\n`);

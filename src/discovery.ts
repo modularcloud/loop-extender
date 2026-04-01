@@ -1,10 +1,6 @@
-import {
-  readdirSync,
-  statSync,
-  readFileSync,
-  realpathSync,
-} from "node:fs";
-import { join, extname, basename, resolve, relative } from "node:path";
+import { readdirSync, statSync } from "node:fs";
+import { join, extname, basename } from "node:path";
+import { validateDirScriptCore } from "./validate-dir-script.js";
 
 export const SUPPORTED_EXTENSIONS = new Set([".sh", ".js", ".jsx", ".ts", ".tsx"]);
 export const RESERVED_NAMES = new Set(["output", "env", "install", "version"]);
@@ -145,104 +141,36 @@ function validateDirScript(
   dirName: string,
   dirPath: string
 ): { entry?: ScriptEntry; warning?: string } {
-  const pkgPath = join(dirPath, "package.json");
+  const result = validateDirScriptCore(dirPath);
 
-  let pkgContent: string;
-  try {
-    pkgContent = readFileSync(pkgPath, "utf-8");
-  } catch (err: unknown) {
-    try {
-      statSync(pkgPath);
-      return {
-        warning: `Warning: ${dirName}/package.json is unreadable or has permission issues, skipping`,
-      };
-    } catch {
-      return {};
-    }
-  }
-
-  let pkg: unknown;
-  try {
-    pkg = JSON.parse(pkgContent);
-  } catch {
+  if (result.valid) {
     return {
-      warning: `Warning: ${dirName}/package.json contains invalid JSON, skipping`,
+      entry: {
+        name: dirName,
+        type: "directory",
+        ext: result.mainExt,
+        scriptPath: result.mainPath,
+        dirPath,
+      },
     };
   }
 
-  if (typeof pkg !== "object" || pkg === null) {
-    return {
-      warning: `Warning: ${dirName}/package.json is not a valid object, skipping`,
-    };
-  }
-
-  const pkgObj = pkg as Record<string, unknown>;
-
-  if (!("main" in pkgObj)) {
-    return {};
-  }
-
-  if (typeof pkgObj.main !== "string") {
-    return {
-      warning: `Warning: ${dirName}/package.json main field is not a string, skipping`,
-    };
-  }
-
-  const mainField = pkgObj.main;
-  const mainExt = extname(mainField);
-
-  if (!SUPPORTED_EXTENSIONS.has(mainExt)) {
-    return {
-      warning: `Warning: ${dirName}/package.json main has unsupported extension '${mainExt}', skipping`,
-    };
-  }
-
-  // Check if main escapes directory
-  const mainPath = resolve(dirPath, mainField);
-  const relPath = relative(dirPath, mainPath);
-  if (relPath.startsWith("..")) {
-    return {
-      warning: `Warning: ${dirName}/package.json main escapes directory boundary, skipping`,
-    };
-  }
-
-  // Check if main file exists
-  try {
-    const mainStat = statSync(mainPath);
-    if (!mainStat.isFile()) {
-      return {
-        warning: `Warning: ${dirName}/package.json main '${mainField}' is not a file, skipping`,
-      };
-    }
-  } catch {
-    return {
-      warning: `Warning: ${dirName}/package.json main '${mainField}' not found, skipping`,
-    };
-  }
-
-  // Symlink boundary check
-  try {
-    const realMainPath = realpathSync(mainPath);
-    const realDirPath = realpathSync(dirPath);
-    const realRel = relative(realDirPath, realMainPath);
-    if (realRel.startsWith("..")) {
-      return {
-        warning: `Warning: ${dirName}/package.json main resolves outside directory boundary (symlink), skipping`,
-      };
-    }
-  } catch {
-    return {
-      warning: `Warning: ${dirName}/package.json main cannot be resolved, skipping`,
-    };
-  }
-
-  return {
-    entry: {
-      name: dirName,
-      type: "directory",
-      ext: mainExt,
-      scriptPath: mainPath,
-      dirPath,
-    },
+  // In discovery mode: no-pkg and no-main are silent skips
+  const warningMap: Record<string, string | null> = {
+    "no-pkg": null,
+    "unreadable": `Warning: ${dirName}/package.json is unreadable or has permission issues, skipping`,
+    "invalid-json": `Warning: ${dirName}/package.json contains invalid JSON, skipping`,
+    "invalid-object": `Warning: ${dirName}/package.json is not a valid object, skipping`,
+    "no-main": null,
+    "bad-main-type": `Warning: ${dirName}/package.json main field is not a string, skipping`,
+    "bad-ext": `Warning: ${dirName}/package.json main has unsupported extension '${result.detail}', skipping`,
+    "escapes": `Warning: ${dirName}/package.json main escapes directory boundary, skipping`,
+    "not-found": `Warning: ${dirName}/package.json main '${result.detail}' not found, skipping`,
+    "not-file": `Warning: ${dirName}/package.json main '${result.detail}' is not a file, skipping`,
+    "symlink-escape": `Warning: ${dirName}/package.json main resolves outside directory boundary (symlink), skipping`,
+    "resolve-failed": `Warning: ${dirName}/package.json main cannot be resolved, skipping`,
   };
+
+  const warning = warningMap[result.code];
+  return warning ? { warning } : {};
 }

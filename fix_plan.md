@@ -26,11 +26,7 @@ These are internal code quality improvements that do not affect spec conformance
 
 2. ~~**`getLoopxBin()` duplicated identically**~~ **DONE** — Extracted to `src/bin-path.ts`, imported in `run.ts` and `bin.ts`
 
-3. **`validateDirScript()` duplicated with overlapping logic**
-   - `discovery.ts` lines 144-248: returns `{ entry?: ScriptEntry; warning?: string }`
-   - `install.ts` lines 124-185: returns `string | null` (error message)
-   - Both perform the same checks (package.json, main field, extension, boundary, symlink)
-   - **Fix:** Extract shared validation core, wrap with different return types
+3. ~~**`validateDirScript()` duplicated with overlapping logic**~~ **DONE** — Extracted `validateDirScriptCore()` to `src/validate-dir-script.ts`, used by both `discovery.ts` and `install.ts` with code-based result interpretation
 
 4. ~~**`.loopx/package.json` auto-creation duplicated**~~ **DONE** — Extracted `ensureLoopxPackageJson()` to `src/bin-path.ts`, imported in `run.ts` and `bin.ts`
 
