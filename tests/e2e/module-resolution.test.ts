@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   createTempProject,
@@ -881,6 +881,10 @@ describe("SPEC: LOOPX_BIN in Bash Scripts (T-MOD-19 through T-MOD-21)", () => {
     };
     const markerPath = join(fixture.projectDir, "reader-marker.txt");
 
+    // Remove placeholder local binary so $LOOPX_BIN subcommands don't
+    // try to delegate to it (LOOPX_DELEGATED is not leaked to scripts).
+    unlinkSync(fixture.localBinPath);
+
     // Script "sender" uses $LOOPX_BIN output to produce structured output
     // with result and goto to "reader"
     await createBashScript(
@@ -896,7 +900,7 @@ describe("SPEC: LOOPX_BIN in Bash Scripts (T-MOD-19 through T-MOD-21)", () => {
       `INPUT=$(cat)\nprintf '%s' "$INPUT" > "${markerPath}"\nprintf '{"stop":true}'`,
     );
 
-    // Skip delegation (the placeholder local binary is a no-op).
+    // Skip delegation (the placeholder local binary is removed above).
     // These tests exercise LOOPX_BIN functionality, not delegation.
     const result = await fixture.runGlobal(["-n", "2", "sender"], {
       env: { LOOPX_DELEGATED: "1" },
@@ -948,6 +952,10 @@ describe("SPEC: LOOPX_BIN in Bash Scripts (T-MOD-19 through T-MOD-21)", () => {
       cleanup: async () => {},
     };
     const markerPath = join(fixture.projectDir, "loopx-version.txt");
+
+    // Remove placeholder local binary so $LOOPX_BIN subcommands don't
+    // try to delegate to it (LOOPX_DELEGATED is not leaked to scripts).
+    unlinkSync(fixture.localBinPath);
 
     // Script runs $LOOPX_BIN version and writes stdout to marker
     await createBashScript(

@@ -61,8 +61,9 @@ export function mergeEnv(
   loopxBin: string,
   projectRoot: string
 ): Record<string, string> {
+  const { LOOPX_DELEGATED: _, ...inheritedEnv } = process.env as Record<string, string>;
   return {
-    ...process.env as Record<string, string>,
+    ...inheritedEnv,
     ...globalEnv,
     ...localEnv,
     LOOPX_BIN: loopxBin,

@@ -25,10 +25,9 @@ _No priority 1 or 2 items remaining._
     - If two entries share a reserved name (e.g., `output.sh` and `output/`), the reserved-name error is emitted twice
     - Fix: iterate over `nameGroups` entries instead of `candidates` for these checks
 
-3. **LOOPX_DELEGATED leaks into script execution environments**
-    - `mergeEnv()` spreads `process.env` which includes `LOOPX_DELEGATED=1` set during delegation
-    - If a user script spawns a nested `loopx` subprocess in a different directory, delegation would be incorrectly skipped
-    - Fix: strip `LOOPX_DELEGATED` from the merged env before passing to child scripts
+3. ~~**LOOPX_DELEGATED leaks into script execution environments**~~ **FIXED**
+    - `mergeEnv()` now destructures out `LOOPX_DELEGATED` before spreading `process.env`
+    - Tests updated to remove placeholder local binary in T-MOD-19/21 so `$LOOPX_BIN` subcommands don't re-delegate to the placeholder
 
 4. **output() function does not validate goto/stop types**
     - `goto` and `stop` fields pass through without type validation in `output-fn.ts` (lines 53-58)
