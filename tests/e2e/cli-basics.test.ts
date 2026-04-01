@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import {
   createTempProject,
   createScript,
+  createBashScript,
   type TempProject,
 } from "../helpers/fixtures.js";
 import { runCLI } from "../helpers/cli.js";
@@ -28,7 +29,7 @@ function getExpectedVersion(): string {
   return pkg.version as string;
 }
 
-describe("SPEC: CLI Basics (T-CLI-01 through T-CLI-23)", () => {
+describe("SPEC: CLI Basics (T-CLI-01 through T-CLI-27)", () => {
   let project: TempProject | null = null;
 
   afterEach(async () => {
@@ -759,6 +760,27 @@ printf 'executed' > "${markerFile}"
         expect(existsSync(markerFile)).toBe(true);
         const markerContent = readFileSync(markerFile, "utf-8");
         expect(markerContent).toBe("executed");
+      });
+    });
+  });
+
+  // ─────────────────────────────────────────────
+  // Multiple Positional Arguments
+  // ─────────────────────────────────────────────
+
+  describe("SPEC: Multiple Positional Arguments", () => {
+    forEachRuntime((runtime) => {
+      it("T-CLI-27: two positional arguments → exit 1, stderr mentions unexpected", async () => {
+        project = await createTempProject();
+        await createBashScript(project, "s1", emitResult("x"));
+
+        const result = await runCLI(["s1", "s2"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/unexpected/i);
       });
     });
   });

@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 892/892 tests passing (100%).** All tests pass. Full spec audit complete.
+**Status: 895/895 tests passing (100%).** All tests pass. Full spec audit complete.
 
 All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
@@ -15,27 +15,9 @@ All phases complete:
 
 An audit of all commits after `0cf85da` (889/889 passing) identified 19 hard spec requirements that lack test coverage. T-INST-33a was already implemented in commit `76be1f1` and is excluded. SP-32 (SSH URL classification) is excluded pending spec decision.
 
-### Batch 1 — Simple CLI / Parsing / Loop Tests (no special infra)
+### Batch 1 — Simple CLI / Parsing / Loop Tests ✅ COMPLETE
 
-**Files:** `cli-basics.test.ts`, `output-parsing.test.ts`, `loop-state.test.ts`
-**Deps:** None — only `runCLI`, `createTempProject`, `createBashScript`, `runAPIDriver`
-
-1. **T-CLI-27** — `cli-basics.test.ts`, inside `forEachRuntime` block near T-CLI-23
-   - `createTempProject()` + `createBashScript(project, "s1", emitResult("x"))`
-   - `runCLI(["s1", "s2"], { cwd, runtime })`
-   - Assert `exitCode === 1`, `stderr` contains "unexpected"
-
-2. **T-PARSE-20a** — `output-parsing.test.ts`, after T-PARSE-24 in "Type Coercion"
-   - `createBashScript(project, "myscript", 'printf \'{"goto":""}\'')` (empty string goto)
-   - Use `runParseTest` helper (calls `runAPIDriver` with `runPromise({ maxIterations: 1 })`)
-   - Expect the driver to exit non-zero or throw (because `""` is not a valid script name)
-   - Alternative: use `runCLI(["-n", "2", "myscript"])` and assert `exitCode === 1`, `stderr` mentions the empty goto target
-
-3. **T-LOOP-18a** — `loop-state.test.ts`, after T-LOOP-19 in "Goto Behavior"
-   - `createBashScript(project, "A", 'printf \'{"goto":""}\'')` + create any dummy target to avoid unrelated errors
-   - `runCLI(["-n", "2", "A"], { cwd, runtime })`
-   - Assert `exitCode === 1`, `stderr` references the empty goto target
-   - Same pattern as T-LOOP-18 (invalid goto)
+**T-CLI-27**, **T-PARSE-20a**, **T-LOOP-18a** — all implemented and passing.
 
 ### Batch 2 — Environment Variable Tests
 

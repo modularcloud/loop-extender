@@ -525,6 +525,20 @@ console.log(JSON.stringify(outputs));
         expect(result.stderr).toContain("nonexistent");
       });
 
+      // T-LOOP-18a: Empty string goto → exit 1
+      it("T-LOOP-18a: goto to empty string → exit 1, stderr references empty target", async () => {
+        project = await createTempProject();
+        await createBashScript(project, "A", `printf '{"goto":""}'`);
+
+        const result = await runCLI(["-n", "2", "A"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+      });
+
       // T-LOOP-19: Goto to undiscoverable script → exit 1
       it("T-LOOP-19: goto to undiscoverable script (e.g., .mjs) → exit 1", async () => {
         project = await createTempProject();
