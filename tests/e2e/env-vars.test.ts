@@ -900,6 +900,57 @@ printf '%s' "$SYSTEM_ONLY_VAR" > "${systemOnlyMarker}"
         expect(readFileSync(systemOnlyMarker, "utf-8")).toBe("system-only-value");
       });
     });
+
+    // T-ENV-24a: LOOPX_DELEGATED not visible to scripts
+    it("T-ENV-24a: LOOPX_DELEGATED is stripped from script environment", async () => {
+      project = await createTempProject();
+      const markerPath = join(project.dir, "delegated-marker.json");
+
+      await createScript(
+        project,
+        "observe",
+        ".ts",
+        observeEnv("LOOPX_DELEGATED", markerPath),
+      );
+
+      const result = await runCLI(["-n", "1", "observe"], {
+        cwd: project.dir,
+        runtime,
+        env: { LOOPX_DELEGATED: "1" },
+      });
+
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(readFileSync(markerPath, "utf-8"));
+      expect(data).toEqual({ present: false });
+    });
+
+    // T-ENV-24b: Empty-string in local env overrides non-empty global/system
+    it("T-ENV-24b: empty string in local env file overrides global and system values", async () => {
+      await withGlobalEnv({ MY_VAR: "global-value" }, async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "myvar-marker.json");
+        const localEnvPath = join(project.dir, "local.env");
+
+        await writeEnvFileRaw(localEnvPath, "MY_VAR=\n");
+
+        await createScript(
+          project,
+          "observe",
+          ".ts",
+          observeEnv("MY_VAR", markerPath),
+        );
+
+        const result = await runCLI(["-e", "local.env", "-n", "1", "observe"], {
+          cwd: project.dir,
+          runtime,
+          env: { MY_VAR: "system-value" },
+        });
+
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(readFileSync(markerPath, "utf-8"));
+        expect(data).toEqual({ present: true, value: "" });
+      });
+    });
   });
 });
 

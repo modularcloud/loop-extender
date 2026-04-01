@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 895/895 tests passing (100%).** All tests pass. Full spec audit complete.
+**Status: 897/897 tests passing (100%).** All tests pass. Full spec audit complete.
 
 All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
@@ -19,23 +19,9 @@ An audit of all commits after `0cf85da` (889/889 passing) identified 19 hard spe
 
 **T-CLI-27**, **T-PARSE-20a**, **T-LOOP-18a** — all implemented and passing.
 
-### Batch 2 — Environment Variable Tests
+### Batch 2 — Environment Variable Tests ✅ COMPLETE
 
-**File:** `env-vars.test.ts`
-**Deps:** `withGlobalEnv`, `observeEnv` fixture, `createEnvFile`, `writeEnvFileRaw`
-
-4. **T-ENV-24a** — after T-ENV-24, inside "Injection Precedence" section
-   - `createScript(project, "observe", ".ts", observeEnv("LOOPX_DELEGATED", markerPath))`
-   - `runCLI(["-n", "1", "observe"], { cwd, runtime, env: { LOOPX_DELEGATED: "1" } })`
-   - `readFileSync(markerPath)` → parse JSON → assert `{ present: false }`
-   - The `env` option on `runCLI` merges into `process.env`, so `LOOPX_DELEGATED=1` is in the spawned loopx process; the test verifies loopx strips it before passing to scripts
-
-5. **T-ENV-24b** — after T-ENV-24a, same section
-   - `withGlobalEnv({ MY_VAR: "global-value" }, async () => { ... })`
-   - Create local env file: `writeEnvFileRaw(localEnvPath, "MY_VAR=\n")` (empty string value)
-   - `createScript(project, "observe", ".ts", observeEnv("MY_VAR", markerPath))`
-   - `runCLI(["-e", localEnvPath, "-n", "1", "observe"], { cwd, runtime, env: { MY_VAR: "system-value" } })`
-   - Parse marker JSON → assert `{ present: true, value: "" }` (local empty string wins)
+**T-ENV-24a**, **T-ENV-24b** — all implemented and passing.
 
 ### Batch 3 — Programmatic API Tests
 
