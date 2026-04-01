@@ -14,7 +14,7 @@ const root = resolve(__dirname, "..");
 
 // Write dist/package.json for the loopx package
 const pkg = {
-  name: "loopx",
+  name: "loop-extender",
   version: "0.1.0",
   type: "module",
   bin: {
@@ -29,6 +29,10 @@ const pkg = {
       types: "./internal.d.ts",
       default: "./internal.js",
     },
+  },
+  repository: {
+    type: "git",
+    url: "https://github.com/modularcloud/loop-extender.git",
   },
 };
 

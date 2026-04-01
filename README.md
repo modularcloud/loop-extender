@@ -7,7 +7,7 @@ loopx is a CLI tool that automates repeated execution ("loops") of scripts, prim
 ## Quick Start
 
 ```bash
-npm install -g loopx
+npm install -g loop-extender
 
 # Create a script
 mkdir -p .loopx
