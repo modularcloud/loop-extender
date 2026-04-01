@@ -7,6 +7,7 @@ import {
   readdirSync,
   statSync,
   renameSync,
+  realpathSync,
 } from "node:fs";
 import { join, basename, extname, resolve, relative } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -167,6 +168,18 @@ function validateDirScript(dirPath: string, name: string): string | null {
     return `${name}: main entry '${mainField}' not found`;
   }
 
+  // Symlink boundary check (Spec 5.1 parity)
+  try {
+    const realMainPath = realpathSync(mainPath);
+    const realDirPath = realpathSync(dirPath);
+    const realRel = relative(realDirPath, realMainPath);
+    if (realRel.startsWith("..")) {
+      return `${name}: main field resolves outside directory boundary (symlink)`;
+    }
+  } catch {
+    return `${name}: main entry cannot be resolved`;
+  }
+
   return null;
 }
 
@@ -244,7 +257,17 @@ async function installSingleFile(
     process.exit(1);
   }
 
-  writeFileSync(destPath, result.data);
+  try {
+    writeFileSync(destPath, result.data);
+  } catch (err: unknown) {
+    try {
+      rmSync(destPath, { force: true });
+    } catch {}
+    process.stderr.write(
+      `Error: failed to write ${filename}: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+    process.exit(1);
+  }
 }
 
 async function installGit(

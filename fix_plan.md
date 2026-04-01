@@ -15,14 +15,6 @@ All phases complete:
 
 ## Remaining Spec Gaps (sorted by priority)
 
-### MEDIUM — installSingleFile Missing Cleanup on Write Failure (Spec 10.3)
-
-`src/install.ts:247` — `writeFileSync(destPath, result.data)` has no try/catch. If the write fails (disk full, permissions), the partially written file is NOT cleaned up. Spec 10.3 says: "Any partially created target file or directory at the destination path is removed before exit." `installGit` and `installTarball` both properly clean up on failure.
-
-### MEDIUM — Install Missing Symlink Boundary Check (Spec 10.2, 5.1)
-
-`src/install.ts:126-171` — The `validateDirScript` function does NOT perform the `realpathSync` symlink boundary check that `discovery.ts:219-233` performs. Spec 10.2 says directory scripts are "validated using the same directory-script rules as section 5.1", which includes symlink resolution checking.
-
 ### LOW — Various Minor Issues
 
 - `--` not handled as standard end-of-flags marker (treated as script name)
