@@ -15,15 +15,6 @@ All phases complete:
 
 ## Remaining Spec Gaps (sorted by priority)
 
-### HIGH — Bun Runtime Support (Spec 1, 6.3)
-
-The spec says "Target runtimes: Node.js >= 20.6, Bun >= 1.0" and Section 6.3 says "When running under Bun, loopx uses Bun's native TypeScript/JSX support instead of tsx." The implementation always uses `tsx` for JS/TS script execution with no Bun detection. Areas affected:
-
-- `src/execution.ts` always uses `tsx` command (line 73-74) — needs Bun runtime detection and `bun` as alternate runner
-- `src/execution.ts` uses `--import` loader flag (Node.js-specific) — Bun uses `NODE_PATH` instead (already set unconditionally)
-- No code path exists for `bun run` or Bun's native TS/JSX support
-- Bun API tests pass because the programmatic API (runPromise/run) still spawns scripts via tsx even when the driver runs under Bun
-
 ### MEDIUM — Signal Forwarding Sends Wrong Signal (Spec 7.3)
 
 The spec says "loopx forwards the received signal to the active child process group." Currently, when SIGINT is received, the abort handler in `execution.ts:112` always sends SIGTERM to the child process group instead of forwarding the original signal (SIGINT). Fix: pass signal type through `ac.abort(signalName)` and read `signal.reason` in `onAbort` to forward the correct signal.

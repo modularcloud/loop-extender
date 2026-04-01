@@ -8,6 +8,10 @@ const __dirname = dirname(__filename);
 
 const LOADER_REGISTER_PATH = resolve(__dirname, "loader-register.js");
 
+// Detect Bun runtime — when running under Bun, use Bun's native TS/JSX
+// support instead of tsx (Spec 6.3)
+const isBun = !!process.versions.bun;
+
 // Add our node_modules/.bin to PATH so tsx is findable regardless of CWD
 const LOOPX_BIN_DIR = resolve(__dirname, "..", "node_modules", ".bin");
 const LOOPX_NODE_MODULES = resolve(__dirname, "..", "node_modules");
@@ -68,6 +72,9 @@ export function executeScript(
 
   if (script.ext === ".sh") {
     command = "/bin/bash";
+    args = [script.scriptPath];
+  } else if (isBun) {
+    command = "bun";
     args = [script.scriptPath];
   } else {
     command = "tsx";
