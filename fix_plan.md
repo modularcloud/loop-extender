@@ -11,21 +11,36 @@ All phases complete:
 - **Phase 14:** Install command (single-file/git/tarball, 107/107 tests)
 - **Phase 15:** Exit codes
 - **Phase 16:** Bun runtime support, signal forwarding fix, stderr inherit, install cleanup/symlink checks, minor fixes, API validation fix
-
 - **Phase 17:** Code quality improvements — race condition fix, dead code removal, constant deduplication, UX fixes
-
 - **Phase 18:** Install name-collision fix — `checkCollisions` now uses `candidateNames` instead of `scripts` map to detect collisions even when `.loopx/` has pre-existing name collisions
 
 ---
 
 ## Remaining Items
 
-All Priority 1-3 items from the latest audit have been resolved.
+### Priority 3 (Code Quality — Deduplication)
 
-### Resolved in Phase 18
+These are internal code quality improvements that do not affect spec conformance. All tests pass as-is.
 
-**Priority 1 (Bugs) — FIXED:**
-- ~~Install script-name collision bypass~~: `checkCollisions` in `install.ts` used `discovery.scripts.has(name)` which missed names dropped from the scripts map due to pre-existing collisions. Fixed by adding `candidateNames: Set<string>` to `DiscoveryResult` which tracks ALL candidate names regardless of collisions, and using that in the collision check.
+1. **`makeAbortError` pattern duplicated 6+ times inline**
+   - `loop.ts` has a `makeAbortError()` helper function (line 15)
+   - `execution.ts` has 2 inline copies of `signal.reason || new DOMException(...)` (lines 86-90, 139-141)
+   - `run.ts` has 4 inline copies (lines 122-125, 213-216, 218-222, 224)
+   - **Fix:** Export `makeAbortError` from a shared location and import in all three files
+
+2. **`getLoopxBin()` duplicated identically**
+   - `run.ts` lines 13-19 and `bin.ts` lines 35-41 have the exact same function
+   - **Fix:** Extract to a shared utility module
+
+3. **`validateDirScript()` duplicated with overlapping logic**
+   - `discovery.ts` lines 144-248: returns `{ entry?: ScriptEntry; warning?: string }`
+   - `install.ts` lines 124-185: returns `string | null` (error message)
+   - Both perform the same checks (package.json, main field, extension, boundary, symlink)
+   - **Fix:** Extract shared validation core, wrap with different return types
+
+4. **`.loopx/package.json` auto-creation duplicated**
+   - `run.ts` lines 158-161 and `bin.ts` lines 324-327 have identical code
+   - **Fix:** Extract to a shared function
 
 ---
 
