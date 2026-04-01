@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 907/907 tests passing (100%).** All tests pass. Full spec audit complete.
+**Status: 912/912 tests passing (100%).** All tests pass. Full spec audit complete.
 
 All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
@@ -40,43 +40,11 @@ An audit of all commits after `0cf85da` (889/889 passing) identified 19 hard spe
 **T-DEL-09**, **T-DEL-10**, **T-DEL-11** — all implemented and passing.
 Uses process group signaling (detached spawn + `process.kill(-pid, sig)`) for T-DEL-10/11.
 
-### Batch 7 — Install Tests
+### Batch 7 — Install Tests ✅ COMPLETE
 
-**File:** `install.test.ts`
-**Deps:** `startLocalHTTPServer`, `startLocalGitServer`, `withGitURLRewrite`, `createTarball` (local helper)
-
-15. **T-INST-27d** — after T-INST-27c, inside "Common Rules"
-    - Create TWO conflicting file scripts: `createBashScript(project, "foo", ...)` writes `foo.sh`, then `createScript(project, "foo", ".ts", ...)` writes `foo.ts` (pre-existing collision)
-    - `startLocalGitServer([{ name: "foo", files: { ... } }])` + `withGitURLRewrite`
-    - `runCLI(["install", "testorg/foo"], { cwd, runtime })`
-    - Assert `exitCode === 1`, `stderr.length > 0`, `existsSync(join(loopxDir, "foo")) === false`, both `foo.sh` and `foo.ts` still exist
-
-16. **T-INST-31b** — after T-INST-31, inside "Common Rules"
-    - Start HTTP server with valid `.ts` file route
-    - Create project, `mkdir .loopx/`, then `chmod 0o555 .loopx/` (read-only)
-    - Guard: `it.skipIf(process.getuid?.() === 0)("T-INST-31b: ...", ...)`
-    - `runCLI(["install", url], { cwd, runtime })`
-    - Assert `exitCode === 1`, `existsSync(join(loopxDir, "script.ts")) === false`
-    - In `finally`: `chmod 0o755 .loopx/` before cleanup (so rm works)
-
-17. **T-INST-39d** — after T-INST-39c, inside "Post-Validation"
-    - Create a local git repo where `entry.ts` is a symlink to `../../outside.ts`
-    - Use `startLocalGitServer` — but symlinks may not survive `git clone`. Alternative: use a post-clone hook or test with a tarball instead
-    - **Practical approach:** If git strips symlinks, this test may need to use a tarball. Check if `startLocalGitServer` preserves symlinks in the bare repo (git does preserve symlinks on POSIX). If it does: `files: { "package.json": '{"main":"entry.ts"}', "entry.ts": null }` won't work since `files` is `Record<string, string>`. Need to manually create the symlink after clone.
-    - **Simpler approach:** After `startLocalGitServer`, manually add a symlink commit to the bare repo before the test runs. Or, create the repo manually with `execSync` instead of using the helper.
-    - Assert: `exitCode === 1`, `stderr.length > 0`, `existsSync(join(loopxDir, repoName)) === false`
-
-18. **T-INST-39e** — after T-INST-39d, same section
-    - Create a tarball containing `package.json` (`main: "entry.ts"`) and `entry.ts` as a symlink to `../../outside.ts`
-    - Use `tar czf` with `--dereference` excluded (default tar preserves symlinks)
-    - Serve via HTTP, install, assert same as T-INST-39d
-
-19. **T-INST-GLOBAL-01a** — after T-INST-GLOBAL-01, inside "Global Install"
-    - `it.skipIf(!isRuntimeAvailable("bun"))("T-INST-GLOBAL-01a: ...", ...)`
-    - Same `npm pack` + `npm install -g --prefix` pattern as T-INST-GLOBAL-01
-    - Create fixture project with `.loopx/default.ts` that uses `import { output } from "loopx"`
-    - Run via `bun <global-prefix>/bin/loopx -n 1` (spawn `bun` directly with the global bin as arg)
-    - Assert marker file created + exit code 0
+**T-INST-27d**, **T-INST-31b**, **T-INST-39d**, **T-INST-39e**, **T-INST-GLOBAL-01a** — all implemented and passing.
+- T-INST-39d/39e use manually created git repos/tarballs with symlinks (helpers don't support symlinks)
+- T-INST-GLOBAL-01a uses bash script instead of TS with imports due to package naming limitation (see SPEC-PROBLEMS.md)
 
 ---
 

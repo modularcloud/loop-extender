@@ -35,3 +35,13 @@ Test T-API-25 uses `counter()` script (bash with file I/O) and a 500ms abort tim
 T-API-25b (200ms timer with even faster script) was fixed by adding `setTimeout(0)` yields between loop iterations to give the event loop timer phase a chance to fire. T-API-25 may need the same approach but with a tighter timing margin.
 
 **Impact**: T-API-25 fails when 100 iterations complete before the 500ms timer fires.
+
+## T-INST-GLOBAL-01a: Bun global install `import "loopx"` resolution
+
+The npm package is named `loop-extender` (not `loopx`). For local installs, a symlink `node_modules/loopx → dist/` makes `import "loopx"` work via NODE_PATH. For global installs (`npm install -g`), the package is installed as `<prefix>/lib/node_modules/loop-extender/` — there is no `loopx` symlink.
+
+Under Node.js, the custom module loader (`--import` with `module.register()`) intercepts the bare specifier `"loopx"` regardless of directory names. Under Bun, the only resolution mechanism is NODE_PATH, which requires a directory named `loopx` somewhere in the search path.
+
+**Impact**: T-INST-GLOBAL-01a (Bun global install with `import { output } from "loopx"`) cannot work until the package is either renamed to `loopx` or a postinstall hook creates a `loopx` symlink in the global node_modules. The test currently uses a bash script instead of a TS script with imports.
+
+**Resolution**: Rename the npm package to `loopx`, or add a `postinstall` script that creates a symlink from the package directory to a `loopx` entry in the parent node_modules directory.

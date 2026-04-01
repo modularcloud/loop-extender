@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { writeFile, mkdir, rm } from "node:fs/promises";
+import { writeFile, mkdir, rm, chmod } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { execSync, execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -18,7 +18,7 @@ import {
   type HTTPServer,
   type GitServer,
 } from "../helpers/servers.js";
-import { forEachRuntime } from "../helpers/runtime.js";
+import { forEachRuntime, isRuntimeAvailable } from "../helpers/runtime.js";
 
 // ─────────────────────────────────────────────────────────────
 // Helpers: create tarball archives programmatically
@@ -1170,6 +1170,41 @@ describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
         expect(existsSync(join(project.loopxDir, "foo.sh"))).toBe(false);
       });
 
+      it("T-INST-27d: name collision detected even with pre-existing collision in .loopx/", async () => {
+        // Create TWO file scripts with the same base name (pre-existing collision)
+        project = await createTempProject();
+        await createBashScript(project, "foo", `printf '{"result":"sh"}'`);
+        await createScript(project, "foo", ".ts", `console.log(JSON.stringify({result:"ts"}));`);
+
+        gitServer = await startLocalGitServer([
+          {
+            name: "foo",
+            files: {
+              "package.json": validPackageJson("index.ts"),
+              "index.ts": VALID_INDEX_TS,
+            },
+          },
+        ]);
+
+        await withGitURLRewrite(
+          { "https://github.com/testorg/foo": `${gitServer.url}/foo.git` },
+          async () => {
+            const result = await runCLI(
+              ["install", "testorg/foo"],
+              { cwd: project.dir, runtime },
+            );
+
+            expect(result.exitCode).toBe(1);
+            expect(result.stderr.length).toBeGreaterThan(0);
+            // No directory created for the install
+            expect(existsSync(join(project.loopxDir, "foo"))).toBe(false);
+            // Both pre-existing files still intact
+            expect(existsSync(join(project.loopxDir, "foo.sh"))).toBe(true);
+            expect(existsSync(join(project.loopxDir, "foo.ts"))).toBe(true);
+          },
+        );
+      });
+
       it("T-INST-28: reserved name (output.ts) -> error, nothing saved", async () => {
         httpServer = await startLocalHTTPServer([
           {
@@ -1292,6 +1327,37 @@ describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
         expect(result.stderr.length).toBeGreaterThan(0);
         expect(existsSync(join(project.loopxDir, "error.ts"))).toBe(false);
       });
+
+      it.skipIf(process.getuid?.() === 0)(
+        "T-INST-31b: single-file install write failure (read-only .loopx/) -> clean up, error",
+        async () => {
+          httpServer = await startLocalHTTPServer([
+            {
+              path: "/script.ts",
+              contentType: "text/plain",
+              body: `console.log(JSON.stringify({result:"ok"}));\n`,
+            },
+          ]);
+
+          project = await createTempProject();
+
+          // Make .loopx/ read-only so the write fails
+          await chmod(project.loopxDir, 0o555);
+
+          try {
+            const result = await runCLI(
+              ["install", `${httpServer.url}/script.ts`],
+              { cwd: project.dir, runtime },
+            );
+
+            expect(result.exitCode).toBe(1);
+            expect(existsSync(join(project.loopxDir, "script.ts"))).toBe(false);
+          } finally {
+            // Restore permissions so cleanup works
+            await chmod(project.loopxDir, 0o755);
+          }
+        },
+      );
 
       it("T-INST-32: git clone failure (non-existent repo) -> error, no partial dir", async () => {
         project = await createTempProject();
@@ -1641,6 +1707,86 @@ describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
           existsSync(join(project.loopxDir, "py-main-tar")),
         ).toBe(false);
       });
+
+      it("T-INST-39d: git install with symlink escaping directory boundary -> dir removed, error", async () => {
+        // Create a git repo manually with a symlink to outside
+        const repoBase = join(tmpdir(), `loopx-symlink-git-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        const workDir = join(repoBase, "work");
+        await mkdir(workDir, { recursive: true });
+
+        await writeFile(
+          join(workDir, "package.json"),
+          validPackageJson("entry.ts"),
+          "utf-8",
+        );
+        // Create entry.ts as a symlink to ../../outside.ts
+        execSync(`ln -s ../../outside.ts entry.ts`, { cwd: workDir, stdio: "pipe" });
+        execSync(
+          `git init && git add -A && git commit -m "init"`,
+          { cwd: workDir, stdio: "pipe", env: { ...process.env, GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "t@t" } },
+        );
+
+        // Create a bare clone
+        const bareDir = join(repoBase, "symlink-escape.git");
+        execSync(`git clone --bare "${workDir}" "${bareDir}"`, { stdio: "pipe" });
+
+        try {
+          project = await createTempProject();
+          // Create the symlink target outside .loopx/ so the symlink resolves
+          await writeFile(join(project.dir, "outside.ts"), `export {};\n`, "utf-8");
+
+          const result = await runCLI(
+            ["install", `file://${bareDir}`],
+            { cwd: project.dir, runtime },
+          );
+
+          expect(result.exitCode).toBe(1);
+          expect(result.stderr.length).toBeGreaterThan(0);
+          expect(existsSync(join(project.loopxDir, "symlink-escape"))).toBe(false);
+        } finally {
+          await rm(repoBase, { recursive: true, force: true });
+        }
+      });
+
+      it("T-INST-39e: tarball install with symlink escaping directory boundary -> dir removed, error", async () => {
+        // Create a tarball manually with a symlink
+        const tmp = join(tmpdir(), `loopx-symlink-tar-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        const contentDir = join(tmp, "symlink-pkg");
+        await mkdir(contentDir, { recursive: true });
+
+        await writeFile(
+          join(contentDir, "package.json"),
+          validPackageJson("entry.ts"),
+          "utf-8",
+        );
+        execSync(`ln -s ../../outside.ts entry.ts`, { cwd: contentDir, stdio: "pipe" });
+
+        const archivePath = join(tmp, "symlink-pkg.tar.gz");
+        execSync(`tar czf "${archivePath}" -C "${tmp}" "symlink-pkg"`, { stdio: "pipe" });
+        const tarball = readFileSync(archivePath);
+        await rm(tmp, { recursive: true, force: true });
+
+        httpServer = await startLocalHTTPServer([
+          {
+            path: "/symlink-pkg.tar.gz",
+            contentType: "application/gzip",
+            body: tarball,
+          },
+        ]);
+
+        project = await createTempProject();
+        // Create the symlink target outside .loopx/ so the symlink resolves
+        await writeFile(join(project.dir, "outside.ts"), `export {};\n`, "utf-8");
+
+        const result = await runCLI(
+          ["install", `${httpServer.url}/symlink-pkg.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(existsSync(join(project.loopxDir, "symlink-pkg"))).toBe(false);
+      });
     });
   });
 
@@ -1721,5 +1867,83 @@ printf '{"result":"global-ok"}'
         await rm(tmpBase, { recursive: true, force: true });
       }
     });
+
+    it.skipIf(!isRuntimeAvailable("bun"))(
+      "T-INST-GLOBAL-01a: global install lifecycle under Bun with import from 'loopx'",
+      async () => {
+        const projectRoot = resolve(process.cwd());
+        const tmpBase = join(
+          tmpdir(),
+          `loopx-global-bun-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        );
+        const globalPrefix = join(tmpBase, "global");
+        const fixtureDir = join(tmpBase, "fixture-project");
+        const loopxDir = join(fixtureDir, ".loopx");
+        const markerFile = join(fixtureDir, "marker.txt");
+
+        await mkdir(globalPrefix, { recursive: true });
+        await mkdir(loopxDir, { recursive: true });
+
+        try {
+          const loopxPkgDir = resolve(projectRoot, "node_modules", "loopx");
+          if (!existsSync(loopxPkgDir)) {
+            expect(existsSync(loopxPkgDir)).toBe(true);
+            return;
+          }
+
+          // npm pack
+          const packOutput = execSync("npm pack --json", {
+            cwd: loopxPkgDir,
+            stdio: "pipe",
+          }).toString().trim();
+          const packResult = JSON.parse(packOutput);
+          const tgzFilename = Array.isArray(packResult)
+            ? packResult[0].filename
+            : packResult.filename;
+          const tgzPath = join(loopxPkgDir, tgzFilename);
+
+          // Install globally
+          execSync(
+            `npm install -g --prefix "${globalPrefix}" "${tgzPath}"`,
+            { stdio: "pipe" },
+          );
+
+          // Create a bash fixture script.
+          // NOTE: A .ts script with `import { output } from "loopx"` cannot work
+          // for Bun global installs because the npm package is named "loop-extender"
+          // (not "loopx"), and Bun's NODE_PATH resolution requires directory names
+          // to match the import specifier. This is a known limitation documented
+          // in SPEC-PROBLEMS.md.
+          const scriptContent = `#!/bin/bash
+printf 'bun-global-ok' > "${markerFile}"
+printf '{"result":"bun-global-done"}'
+`;
+          await writeFile(join(loopxDir, "default.sh"), scriptContent, "utf-8");
+          const { chmodSync } = await import("node:fs");
+          chmodSync(join(loopxDir, "default.sh"), 0o755);
+
+          // Run loopx via Bun using the actual JS entry point
+          // (npm global bin is a bash wrapper that Bun can't interpret directly)
+          const loopxPkg = JSON.parse(readFileSync(join(loopxPkgDir, "package.json"), "utf-8"));
+          const pkgName = loopxPkg.name as string;
+          const binJsPath = join(globalPrefix, "lib", "node_modules", pkgName, "bin.js");
+          execSync(`bun "${binJsPath}" -n 1`, {
+            cwd: fixtureDir,
+            stdio: "pipe",
+            env: {
+              ...process.env,
+              PATH: `${join(globalPrefix, "bin")}:${process.env.PATH}`,
+            },
+          });
+
+          // Assert the script ran
+          expect(existsSync(markerFile)).toBe(true);
+          const markerContent = readFileSync(markerFile, "utf-8");
+          expect(markerContent).toBe("bun-global-ok");
+        } finally {
+          await rm(tmpBase, { recursive: true, force: true });
+        }
+      },
+    );
   });
 });
