@@ -3,7 +3,7 @@ name: Publish
 on:
   push:
     tags:
-      - 'v*'
+      - '[0-9]*'
 
 permissions:
   id-token: write
@@ -25,7 +25,7 @@ jobs:
       - run: npm test
 
       - name: Set version from tag
-        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version
+        run: npm version "$GITHUB_REF_NAME" --no-git-tag-version
         working-directory: dist
 
       - run: npm publish --access public

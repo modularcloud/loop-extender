@@ -1,4 +1,5 @@
 import {
+  copyFileSync,
   writeFileSync,
   symlinkSync,
   rmSync,
@@ -62,5 +63,9 @@ mkdirSync(resolve(root, "node_modules"), { recursive: true });
 
 symlinkSync("../dist", linkPath);
 
+// Copy README into dist so npm includes it in the package
+copyFileSync(resolve(root, "README.md"), resolve(root, "dist/README.md"));
+
 console.log("postbuild: dist/package.json created");
+console.log("postbuild: dist/README.md copied");
 console.log("postbuild: node_modules/loopx -> dist/");
