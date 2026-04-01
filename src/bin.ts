@@ -207,18 +207,18 @@ function handleOutputSubcommand(flags: string[]): void {
     i++;
   }
 
-  if (Object.keys(output).length === 0) {
-    process.stderr.write(
-      "Error: loopx output requires at least one flag (--result, --goto, --stop)\n"
-    );
-    process.exit(1);
-  }
-
   console.log(JSON.stringify(output));
 }
 
 // --- Env Subcommand ---
 function handleEnvSubcommand(subArgs: string[]): void {
+  if (subArgs.length === 0) {
+    process.stderr.write(
+      "Error: loopx env requires a subcommand (set, remove, or list).\n"
+    );
+    process.exit(1);
+  }
+
   const action = subArgs[0];
 
   if (action === "set") {

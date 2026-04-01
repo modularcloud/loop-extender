@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
-import { parseEnvFile } from "./parsers/parse-env.js";
+import { parseEnvFile, KEY_PATTERN } from "./parsers/parse-env.js";
 
 export function getGlobalEnvPath(): string {
   const xdg =
@@ -73,8 +73,7 @@ export function mergeEnv(
 // --- Subcommand helpers ---
 
 export function envSet(name: string, value: string): void {
-  const keyPattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
-  if (!keyPattern.test(name)) {
+  if (!KEY_PATTERN.test(name)) {
     process.stderr.write(
       `Error: invalid variable name '${name}': must match [A-Za-z_][A-Za-z0-9_]*\n`
     );

@@ -6,9 +6,9 @@ import {
 } from "node:fs";
 import { join, extname, basename, resolve, relative } from "node:path";
 
-const SUPPORTED_EXTENSIONS = new Set([".sh", ".js", ".jsx", ".ts", ".tsx"]);
-const RESERVED_NAMES = new Set(["output", "env", "install", "version"]);
-const NAME_PATTERN = /^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/;
+export const SUPPORTED_EXTENSIONS = new Set([".sh", ".js", ".jsx", ".ts", ".tsx"]);
+export const RESERVED_NAMES = new Set(["output", "env", "install", "version"]);
+export const NAME_PATTERN = /^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/;
 
 export interface ScriptEntry {
   name: string;

@@ -12,11 +12,12 @@ import {
 import { join, basename, extname, resolve, relative } from "node:path";
 import { execFileSync } from "node:child_process";
 import { classifySource } from "./parsers/classify-source.js";
-import { discoverScripts } from "./discovery.js";
-
-const SUPPORTED_EXTENSIONS = new Set([".sh", ".js", ".jsx", ".ts", ".tsx"]);
-const RESERVED_NAMES = new Set(["output", "env", "install", "version"]);
-const NAME_PATTERN = /^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/;
+import {
+  discoverScripts,
+  SUPPORTED_EXTENSIONS,
+  RESERVED_NAMES,
+  NAME_PATTERN,
+} from "./discovery.js";
 
 export async function installCommand(
   source: string,
@@ -83,10 +84,6 @@ function deriveRepoName(url: string, source: string): string {
     let last = segments[segments.length - 1] || "repo";
     if (last.endsWith(".git")) {
       last = last.slice(0, -4);
-    }
-    // Handle trailing slash
-    if (!last && segments.length > 0) {
-      last = segments[segments.length - 1];
     }
     return last;
   } catch {

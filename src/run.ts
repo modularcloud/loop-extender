@@ -178,30 +178,13 @@ async function* runInternal(
   }
 
   // Run the loop
-  try {
-    yield* runLoop(startingTarget, discovery.scripts, {
-      maxIterations,
-      env: mergedEnv,
-      projectRoot: cwd,
-      loopxBin,
-      signal,
-    });
-  } catch (err) {
-    // If abort was due to internal cancellation (generator.return()),
-    // silently complete instead of throwing
-    if (
-      err instanceof DOMException &&
-      err.name === "AbortError" &&
-      signal.aborted
-    ) {
-      // Check if external signal was the cause
-      // (in that case we should still throw)
-      // internalAc abort vs externalSignal abort
-      // We can't distinguish here directly, so just rethrow
-      throw err;
-    }
-    throw err;
-  }
+  yield* runLoop(startingTarget, discovery.scripts, {
+    maxIterations,
+    env: mergedEnv,
+    projectRoot: cwd,
+    loopxBin,
+    signal,
+  });
 }
 
 /**

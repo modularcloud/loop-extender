@@ -12,22 +12,30 @@ All phases complete:
 - **Phase 15:** Exit codes
 - **Phase 16:** Bun runtime support, signal forwarding fix, stderr inherit, install cleanup/symlink checks, minor fixes, API validation fix
 
+- **Phase 17:** Code quality improvements — race condition fix, dead code removal, constant deduplication, UX fixes
+
 ---
 
-## Full Spec Audit Results
+## Remaining Items
 
-Comprehensive audit of all source files against SPEC.md completed. No actionable spec gaps remain.
+All Priority 1-3 items from the latest audit have been resolved.
 
-### Design Notes (not spec violations, documented for awareness)
+### Resolved in Phase 17
 
-- `.loopx/package.json` with `{"type":"module"}` auto-created during run mode — implementation detail for tsx ESM support, not in spec
-- `output()` coerces `result` to `String()` eagerly (spec says parseOutput does it) — functionally equivalent, no behavioral difference
-- `output()` treats `goto`/`stop` differently than `result` (no type coercion) — spec says type filtering happens in parseOutput, behavior is correct
-- `envSet`/`envRemove` re-serialize entire file, destroying comments/formatting — spec does not require preservation
-- `envRemove` does not validate variable name (unlike `envSet`) — harmless, invalid keys can't exist in file
-- `NODE_PATH` set for all runtimes, not just Bun — benign redundancy, `--import` hook takes precedence for Node
-- `output()` JS/TS helper omits trailing newline after JSON (bash helper includes it via console.log) — harmless, JSON.parse handles both
-- Discovery silently ignores directories without `main` in package.json (spec has internal ambiguity about whether this should warn)
+**Priority 1 (Bugs) — FIXED:**
+- ~~input-fn.ts race condition~~: `readableEnded` check moved BEFORE attaching listeners.
+- ~~loader-hook.ts overly broad .loopx/ check~~: Added `!url.includes("/node_modules/")` exclusion.
+- ~~`loopx env` with no sub-action~~: Added explicit missing-subcommand check with clear error message.
+
+**Priority 2 (Dead Code) — FIXED:**
+- ~~handleOutputSubcommand dead code~~: Removed unreachable second empty-output check.
+- ~~deriveRepoName dead code~~: Removed unreachable trailing-slash handler.
+- ~~runInternal dead catch block~~: Removed no-op catch-and-rethrow.
+
+**Priority 3 (Code Quality) — PARTIALLY FIXED:**
+- ~~Duplicated discovery constants~~: `SUPPORTED_EXTENSIONS`, `RESERVED_NAMES`, `NAME_PATTERN` now exported from `discovery.ts`, imported by `install.ts`.
+- ~~Duplicated KEY_PATTERN~~: Now exported from `parse-env.ts`, imported by `env.ts`.
+- `makeAbortError` still duplicated across `loop.ts`, `execution.ts`, `run.ts` — low priority, deferred.
 
 ---
 

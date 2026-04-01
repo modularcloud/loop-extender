@@ -16,6 +16,15 @@ export function input(): Promise<string> {
   }
 
   return new Promise<string>((resolve) => {
+    // Check if stdin is already ended before attaching listeners
+    // to avoid a race where the 'end' event fires and sets cachedInput,
+    // then this block overwrites it with "".
+    if (process.stdin.readableEnded) {
+      cachedInput = "";
+      resolve(cachedInput);
+      return;
+    }
+
     const chunks: Buffer[] = [];
 
     process.stdin.on("data", (chunk: Buffer) => {
@@ -26,13 +35,6 @@ export function input(): Promise<string> {
       cachedInput = Buffer.concat(chunks).toString("utf-8");
       resolve(cachedInput);
     });
-
-    // If stdin is already ended or not readable
-    if (process.stdin.readableEnded) {
-      cachedInput = "";
-      resolve(cachedInput);
-      return;
-    }
 
     // Resume stdin in case it's paused
     process.stdin.resume();

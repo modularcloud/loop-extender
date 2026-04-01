@@ -79,8 +79,9 @@ export async function load(
   context: LoadContext,
   nextLoad: NextLoad
 ): Promise<LoadResult> {
-  // For .js files in .loopx/: read source directly and force ESM
-  if (url.endsWith(".js") && url.includes("/.loopx/")) {
+  // For .js files in .loopx/: read source directly and force ESM.
+  // Exclude node_modules/ to avoid breaking CJS dependencies in directory scripts.
+  if (url.endsWith(".js") && url.includes("/.loopx/") && !url.includes("/node_modules/")) {
     const { readFile } = await import("node:fs/promises");
     const { fileURLToPath } = await import("node:url");
     const filePath = fileURLToPath(url);

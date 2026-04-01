@@ -3,7 +3,7 @@ export interface ParseEnvResult {
   warnings: string[];
 }
 
-const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+export const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
  * Parse a .env file content into key-value pairs.
