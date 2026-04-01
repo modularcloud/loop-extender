@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 904/904 tests passing (100%).** All tests pass. Full spec audit complete.
+**Status: 907/907 tests passing (100%).** All tests pass. Full spec audit complete.
 
 All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
@@ -35,31 +35,10 @@ An audit of all commits after `0cf85da` (889/889 passing) identified 19 hard spe
 
 **T-SIG-08** (split into T-SIG-08a/T-SIG-08b) — implemented with new `signalTrapReport` fixture.
 
-### Batch 6 — Delegation Tests
+### Batch 6 — Delegation Tests ✅ COMPLETE
 
-**File:** `delegation.test.ts`
-**Deps:** `withDelegationSetup`, `createMarkerBinary`
-
-12. **T-DEL-09** — after T-DEL-08, "Empty LOOPX_DELEGATED"
-    - Same pattern as T-DEL-04 (which tests `LOOPX_DELEGATED: "1"`)
-    - `const fixture = await withDelegationSetup()`
-    - Replace `localBinPath` with `createMarkerBinary(localBinPath, localMarkerPath, "delegated")`
-    - `fixture.runGlobal(["version"], { env: { LOOPX_DELEGATED: "" } })`
-    - Assert `existsSync(localMarkerPath) === false` (delegation was skipped — empty string is "set")
-    - Assert `result.exitCode === 0` (version subcommand ran directly)
-
-13. **T-DEL-10** — "Delegation preserves SIGINT exit code"
-    - `const fixture = await withDelegationSetup()`
-    - Create a `.loopx/` script in `fixture.projectDir` using `signalReadyThenSleep(markerPath)`
-    - Replace `localBinPath` with real loopx (copy or symlink `fixture.loopxBinJs` so delegation target is functional)
-    - Spawn `fixture.globalBinPath` manually using `spawn()` (not `fixture.runGlobal`, because we need the child handle for signal delivery and `waitForStderr`)
-    - Implement inline: `const child = spawn(fixture.globalBinPath, ["-n", "1", "sleeper"], { cwd: fixture.projectDir, env: merged, stdio: ["pipe", "pipe", "pipe"] })`
-    - Accumulate stderr, wait for `"ready"`, send `child.kill("SIGINT")`
-    - On `close` event: assert exit code 130
-    - May need to wrap `localBinPath` as `#!/bin/bash\nexec node "${fixture.loopxBinJs}" "$@"` (replicating delegation target)
-
-14. **T-DEL-11** — "Delegation preserves SIGTERM exit code"
-    - Same as T-DEL-10 but send `"SIGTERM"`, assert exit code 143
+**T-DEL-09**, **T-DEL-10**, **T-DEL-11** — all implemented and passing.
+Uses process group signaling (detached spawn + `process.kill(-pid, sig)`) for T-DEL-10/11.
 
 ### Batch 7 — Install Tests
 

@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { withDelegationSetup, type DelegationFixture } from "../helpers/delegation.js";
 import type { CLIResult } from "../helpers/cli.js";
+import { signalReadyThenSleep } from "../helpers/fixture-scripts.js";
 
 // ---------------------------------------------------------------------------
 // Helpers local to delegation tests
@@ -117,8 +118,89 @@ printf '%s' "\$${varname}" > "${markerPath}"
   await chmod(path, 0o755);
 }
 
+/**
+ * Spawn a binary and return handles for signal delivery and stderr monitoring.
+ * Used by delegation signal tests (T-DEL-10, T-DEL-11).
+ */
+function spawnGlobalWithSignal(
+  binPath: string,
+  args: string[],
+  options: { cwd: string; env?: Record<string, string> }
+): {
+  result: Promise<CLIResult>;
+  sendSignal: (sig: NodeJS.Signals) => void;
+  waitForStderr: (pattern: string) => Promise<void>;
+} {
+  const mergedEnv = { ...process.env, ...(options.env ?? {}) };
+
+  const child = spawn(binPath, args, {
+    cwd: options.cwd,
+    env: mergedEnv,
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: true, // Own process group so signals reach all descendants
+  });
+  child.stdin.end();
+
+  let stderr = "";
+  type Listener = { pattern: string; resolve: () => void; reject: (e: Error) => void };
+  const listeners: Listener[] = [];
+
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+    for (const l of [...listeners]) {
+      if (stderr.includes(l.pattern)) {
+        listeners.splice(listeners.indexOf(l), 1);
+        l.resolve();
+      }
+    }
+  });
+
+  const result = new Promise<CLIResult>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("spawnGlobalWithSignal: timed out after 30s"));
+    }, 30_000);
+
+    child.on("close", (code, sig) => {
+      clearTimeout(timer);
+      for (const l of listeners) {
+        l.reject(new Error("Process exited before stderr pattern matched"));
+      }
+      // When killed by a signal, code is null and sig is the signal name.
+      // Compute conventional exit code (128 + signal number).
+      let exitCode = code ?? 1;
+      if (code === null && sig) {
+        const sigNums: Record<string, number> = { SIGINT: 2, SIGTERM: 15, SIGKILL: 9 };
+        exitCode = 128 + (sigNums[sig] ?? 15);
+      }
+      resolve({
+        exitCode,
+        stdout: "",
+        stderr,
+        signal: sig ?? null,
+      });
+    });
+
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+
+  return {
+    result,
+    sendSignal: (sig) => process.kill(-child.pid!, sig),
+    waitForStderr: (pattern) => {
+      if (stderr.includes(pattern)) return Promise.resolve();
+      return new Promise<void>((resolve, reject) => {
+        listeners.push({ pattern, resolve, reject });
+      });
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
-// SPEC: 4.12 CLI Delegation (T-DEL-01 through T-DEL-08)
+// SPEC: 4.12 CLI Delegation (T-DEL-01 through T-DEL-11)
 //
 // These tests exercise the real loopx binary's delegation logic.
 // Without loopx installed, the global binary wrapper fails (cannot find
@@ -131,7 +213,7 @@ printf '%s' "\$${varname}" > "${markerPath}"
 // - Tests verify delegation occurred by checking marker files
 // ---------------------------------------------------------------------------
 
-describe("SPEC: CLI Delegation (T-DEL-01 through T-DEL-08)", () => {
+describe("SPEC: CLI Delegation (T-DEL-01 through T-DEL-11)", () => {
   let fixture: DelegationFixture | null = null;
   let tempDirs: string[] = [];
 
@@ -485,5 +567,92 @@ echo "99.0.0-local"
 
     // The output should be the local binary's version, not the global's
     expect(result.stdout.trim()).toBe("99.0.0-local");
+  });
+
+  // ─────────────────────────────────────────────
+  // T-DEL-09: Empty LOOPX_DELEGATED prevents delegation
+  // ─────────────────────────────────────────────
+
+  it("T-DEL-09: LOOPX_DELEGATED='' (empty string) prevents delegation", async () => {
+    fixture = await withDelegationSetup();
+    const localMarkerPath = join(fixture.projectDir, "del-09-local.txt");
+
+    await createMarkerBinary(fixture.localBinPath, localMarkerPath, "local-ran");
+
+    // Empty string is "set" in POSIX — delegation should be skipped
+    const result = await fixture.runGlobal(["version"], {
+      env: { LOOPX_DELEGATED: "" },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(localMarkerPath)).toBe(false);
+  });
+
+  // ─────────────────────────────────────────────
+  // T-DEL-10: Delegation preserves SIGINT exit code
+  // ─────────────────────────────────────────────
+
+  it("T-DEL-10: delegation preserves SIGINT exit code (130)", async () => {
+    fixture = await withDelegationSetup();
+    const markerPath = join(fixture.projectDir, "pid-marker.txt");
+
+    // Replace local binary with functional loopx wrapper
+    await writeFile(
+      fixture.localBinPath,
+      `#!/bin/bash\nexec node "${fixture.loopxBinJs}" "$@"\n`,
+      "utf-8"
+    );
+    await chmod(fixture.localBinPath, 0o755);
+
+    // Create a script that sleeps and is ready for signals
+    const scriptPath = join(fixture.projectDir, ".loopx", "sleeper.sh");
+    await writeFile(scriptPath, signalReadyThenSleep(markerPath), "utf-8");
+    await chmod(scriptPath, 0o755);
+
+    const { result, sendSignal, waitForStderr } = spawnGlobalWithSignal(
+      fixture.globalBinPath,
+      ["-n", "1", "sleeper"],
+      { cwd: fixture.projectDir }
+    );
+
+    await waitForStderr("ready");
+    sendSignal("SIGINT");
+
+    const outcome = await result;
+    expect(outcome.exitCode).toBe(130);
+  });
+
+  // ─────────────────────────────────────────────
+  // T-DEL-11: Delegation preserves SIGTERM exit code
+  // ─────────────────────────────────────────────
+
+  it("T-DEL-11: delegation preserves SIGTERM exit code (143)", async () => {
+    fixture = await withDelegationSetup();
+    const markerPath = join(fixture.projectDir, "pid-marker.txt");
+
+    // Replace local binary with functional loopx wrapper
+    await writeFile(
+      fixture.localBinPath,
+      `#!/bin/bash\nexec node "${fixture.loopxBinJs}" "$@"\n`,
+      "utf-8"
+    );
+    await chmod(fixture.localBinPath, 0o755);
+
+    // Create a script that sleeps and is ready for signals
+    const scriptPath = join(fixture.projectDir, ".loopx", "sleeper.sh");
+    await writeFile(scriptPath, signalReadyThenSleep(markerPath), "utf-8");
+    await chmod(scriptPath, 0o755);
+
+    const { result, sendSignal, waitForStderr } = spawnGlobalWithSignal(
+      fixture.globalBinPath,
+      ["-n", "1", "sleeper"],
+      { cwd: fixture.projectDir }
+    );
+
+    await waitForStderr("ready");
+    sendSignal("SIGTERM");
+
+    const outcome = await result;
+    expect(outcome.exitCode).toBe(143);
   });
 });
