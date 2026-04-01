@@ -99,12 +99,14 @@ export function executeScript(
 
     let stdout = "";
     let aborted = false;
+    let settled = false;
     let graceTimer: ReturnType<typeof setTimeout> | null = null;
 
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
 
+    child.stdin.on("error", () => {});
     if (input !== undefined && input !== "") {
       child.stdin.write(input);
     }
@@ -122,6 +124,7 @@ export function executeScript(
       graceTimer = setTimeout(() => {
         killProcessGroup(child, "SIGKILL");
       }, 5000);
+      graceTimer.unref();
       // Don't reject immediately — wait for child to actually exit.
       // The loop uses Promise.race with an abortPromise for fast detection.
       // The grace period (SIGTERM → 5s → SIGKILL) needs time to complete.
@@ -132,6 +135,8 @@ export function executeScript(
     }
 
     child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
       if (graceTimer) clearTimeout(graceTimer);
       if (signal) signal.removeEventListener("abort", onAbort);
 
@@ -143,6 +148,8 @@ export function executeScript(
     });
 
     child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
       if (graceTimer) clearTimeout(graceTimer);
       if (signal) signal.removeEventListener("abort", onAbort);
       reject(err);

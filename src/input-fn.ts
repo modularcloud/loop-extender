@@ -36,6 +36,11 @@ export function input(): Promise<string> {
       resolve(cachedInput);
     });
 
+    process.stdin.on("error", () => {
+      cachedInput = "";
+      resolve(cachedInput);
+    });
+
     // Resume stdin in case it's paused
     process.stdin.resume();
   });

@@ -10,34 +10,7 @@ All phases complete:
 - **Phase 22:** Discovery ENOENT vs EACCES, PATH dedup entry-match, `??` for env.PATH, install error diagnostics
 - **Phase 23:** 19 new test specs from post-889/889 audit — all 7 batches implemented and passing
 - **Phase 24:** Post-audit conformance fix — reject extra positional args after `--`
-
----
-
-## Priority 2 (Code Robustness — non-breaking improvements)
-
-1. **Double promise settlement in `executeScript`** — `src/execution.ts:134-149`
-    - Both `close` and `error` events can fire on a child process, causing the promise to be settled twice
-    - Add a `settled` boolean guard to prevent double resolution/rejection
-
-2. **Missing `error` handler on `process.stdin` in `input()`** — `src/input-fn.ts:30-41`
-    - If stdin encounters a read error, the promise hangs forever
-    - Add `process.stdin.on("error", ...)` to resolve with empty string on error
-
-3. **Missing `error` handler on `child.stdin`** — `src/execution.ts:108-111`
-    - If child exits before write completes, an unhandled `error` event may fire
-    - Add `child.stdin.on("error", () => {})` to suppress
-
-4. **Grace timer not `unref()`'d** — `src/execution.ts:122`
-    - The 5s SIGKILL timer can keep the event loop alive unnecessarily
-    - Call `.unref()` on the timer after creation
-
-5. **Clean up stale `dist/paths.*` files**
-    - `dist/paths.js`, `dist/paths.d.ts`, `dist/paths.js.map` are remnants from rename to `bin-path.ts`
-    - No code imports them; should be deleted
-
-6. **Clean up SPEC-PROBLEMS.md** — 4 of 5 documented problems are resolved
-    - F-ENV-04, T-EDGE-04/07, T-EDGE-14, T-API-25 are all fixed in code
-    - Only T-INST-GLOBAL-01a (Bun global install package naming) remains active
+- **Phase 25:** Code robustness — double settlement guard, child.stdin error handler, grace timer unref, input() error handler, stale dist/paths.* cleanup, SPEC-PROBLEMS.md cleanup
 
 ---
 
