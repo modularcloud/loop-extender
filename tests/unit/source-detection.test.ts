@@ -99,6 +99,12 @@ describe("SPEC: classifySource — SSH Git URLs", () => {
     const result = classifySource("git@gitlab.com:org/repo.git");
     expect(result.type).toBe("git");
   });
+
+  it("git@github.com:org/repo (no .git suffix) → git", () => {
+    const result = classifySource("git@github.com:org/repo");
+    expect(result.type).toBe("git");
+    expect(result.url).toBe("git@github.com:org/repo");
+  });
 });
 
 describe("SPEC: classifySource — Generic .git URLs", () => {

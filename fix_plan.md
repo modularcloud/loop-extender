@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 889/889 tests passing (100%).** All tests pass. Full spec audit complete.
+**Status: 890/890 tests passing (100%).** All tests pass. Full spec audit complete.
 
 All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
@@ -16,10 +16,7 @@ _All code quality items resolved._
 
 ### Priority 3 (Edge Cases / UX)
 
-7. **`classify-source.ts`: SSH URL without `.git` silently becomes `single-file`**
-    - `git@github.com:org/repo` (no `.git`) falls through to `single-file` classification
-    - Has a comment acknowledging no test coverage
-    - **Fix:** Treat all `git@` URLs as git type regardless of `.git` suffix
+~~7. SSH URL without `.git` — fixed: all `git@` URLs now classified as `git`~~
 
 8. **Known-git-host URLs not normalized to append `.git`**
     - `https://github.com/org/repo` (known host, no `.git`) is classified as git but the URL is passed directly to `git clone` without appending `.git`

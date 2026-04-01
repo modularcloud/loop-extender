@@ -36,12 +36,7 @@ export function classifySource(source: string): ClassifyResult {
   // Handle SCP-like SSH URLs (git@host:path)
   // These are not valid URLs for the URL constructor
   if (source.startsWith("git@")) {
-    if (source.endsWith(".git")) {
-      return { type: "git", url: source };
-    }
-    // SSH URL without .git — not clearly git, fall through
-    // (no test coverage for this case)
-    return { type: "single-file", url: source };
+    return { type: "git", url: source };
   }
 
   // Parse as URL
