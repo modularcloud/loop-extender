@@ -112,9 +112,9 @@ function checkCollisions(
     return `Destination already exists: ${basename(destPath)}`;
   }
 
-  // Script name collision
+  // Script name collision (check all candidates, including pre-existing collisions)
   const discovery = discoverScripts(loopxDir, "help");
-  if (discovery.scripts.has(name)) {
+  if (discovery.candidateNames.has(name)) {
     return `Script name '${name}' already exists in .loopx/`;
   }
 

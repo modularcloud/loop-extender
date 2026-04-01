@@ -14,28 +14,18 @@ All phases complete:
 
 - **Phase 17:** Code quality improvements — race condition fix, dead code removal, constant deduplication, UX fixes
 
+- **Phase 18:** Install name-collision fix — `checkCollisions` now uses `candidateNames` instead of `scripts` map to detect collisions even when `.loopx/` has pre-existing name collisions
+
 ---
 
 ## Remaining Items
 
 All Priority 1-3 items from the latest audit have been resolved.
 
-### Resolved in Phase 17
+### Resolved in Phase 18
 
 **Priority 1 (Bugs) — FIXED:**
-- ~~input-fn.ts race condition~~: `readableEnded` check moved BEFORE attaching listeners.
-- ~~loader-hook.ts overly broad .loopx/ check~~: Added `!url.includes("/node_modules/")` exclusion.
-- ~~`loopx env` with no sub-action~~: Added explicit missing-subcommand check with clear error message.
-
-**Priority 2 (Dead Code) — FIXED:**
-- ~~handleOutputSubcommand dead code~~: Removed unreachable second empty-output check.
-- ~~deriveRepoName dead code~~: Removed unreachable trailing-slash handler.
-- ~~runInternal dead catch block~~: Removed no-op catch-and-rethrow.
-
-**Priority 3 (Code Quality) — PARTIALLY FIXED:**
-- ~~Duplicated discovery constants~~: `SUPPORTED_EXTENSIONS`, `RESERVED_NAMES`, `NAME_PATTERN` now exported from `discovery.ts`, imported by `install.ts`.
-- ~~Duplicated KEY_PATTERN~~: Now exported from `parse-env.ts`, imported by `env.ts`.
-- `makeAbortError` still duplicated across `loop.ts`, `execution.ts`, `run.ts` — low priority, deferred.
+- ~~Install script-name collision bypass~~: `checkCollisions` in `install.ts` used `discovery.scripts.has(name)` which missed names dropped from the scripts map due to pre-existing collisions. Fixed by adding `candidateNames: Set<string>` to `DiscoveryResult` which tracks ALL candidate names regardless of collisions, and using that in the collision check.
 
 ---
 

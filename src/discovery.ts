@@ -20,6 +20,7 @@ export interface ScriptEntry {
 
 export interface DiscoveryResult {
   scripts: Map<string, ScriptEntry>;
+  candidateNames: Set<string>;
   warnings: string[];
   errors: string[];
 }
@@ -41,7 +42,7 @@ export function discoverScripts(
         "No .loopx/ directory found. Create .loopx/default.ts or specify a script name."
       );
     }
-    return { scripts: new Map(), warnings, errors };
+    return { scripts: new Map(), candidateNames: new Set(), warnings, errors };
   }
 
   for (const entry of dirEntries) {
@@ -124,6 +125,9 @@ export function discoverScripts(
     }
   }
 
+  // Collect all candidate names (including collisions)
+  const candidateNames = new Set<string>(nameGroups.keys());
+
   // Build final script map
   const scripts = new Map<string, ScriptEntry>();
   if (errors.length === 0) {
@@ -134,7 +138,7 @@ export function discoverScripts(
     }
   }
 
-  return { scripts, warnings, errors };
+  return { scripts, candidateNames, warnings, errors };
 }
 
 function validateDirScript(
