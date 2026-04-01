@@ -116,7 +116,7 @@ export async function* runLoop(
     }
 
     // Determine next target
-    if (output.goto) {
+    if (output.goto !== undefined) {
       const gotoScript = scripts.get(output.goto);
       if (!gotoScript) {
         throw new Error(

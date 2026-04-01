@@ -14,58 +14,52 @@ All phases complete:
 
 ### Priority 1 (Spec Violations / Real Bugs)
 
-1. **`goto: ""` silently ignored instead of producing validation error**
-    - In `loop.ts`, `if (output.goto)` uses a truthy check — empty string `""` is falsy
-    - Per spec section 2.3, `goto` must be string (otherwise treated as absent); empty string IS a string
-    - Should proceed to validation step and fail with "Invalid goto target: '' not found"
-    - Fix: change `if (output.goto)` to `if (output.goto !== undefined)`
-
-2. **`parse-env.ts` trims trailing whitespace before quote matching**
+1. **`parse-env.ts` trims trailing whitespace before quote matching**
     - Code trims trailing whitespace (line 55) *before* checking for matched quotes (lines 58-64)
     - For `KEY="value" ` (space after closing quote): code produces `value`, spec says `"value"` (with literal quotes)
     - Spec order: check if wrapped in matching quotes first, then trim trailing whitespace on unquoted values
     - Fix: check for matched quotes on untrimmed value, then trim only if unquoted
 
-3. **`discovery.ts` readdirSync catch treats all errors as "directory not found"**
+2. **`discovery.ts` readdirSync catch treats all errors as "directory not found"**
     - Catch at line 33-41 shows "No .loopx/ directory found" for ANY error including EACCES (permission denied)
     - Spec section 7.2 distinguishes "Missing .loopx/ directory" from other errors
     - Fix: check `err.code === 'ENOENT'` and show appropriate error for other codes
 
 ### Priority 2 (Robustness / UX Issues)
 
-4. **`installGit` catch discards git clone stderr**
+3. **`installGit` catch discards git clone stderr**
     - In `install.ts` lines 251-261, the catch discards the error from `execFileSync`
     - User sees only `Error: git clone failed for <url>` with no diagnostic info
     - Fix: extract and display `err.stderr` from the caught error
 
-5. **Tarball extraction catch discards error details**
+4. **Tarball extraction catch discards error details**
     - In `install.ts` lines 317-323, `tar` errors replaced with generic "Failed to extract tarball"
     - Fix: include the original error message
 
-6. **PATH deduplication uses substring match instead of entry match**
+5. **PATH deduplication uses substring match instead of entry match**
     - In `execution.ts` line 60, `currentPath.includes(LOOPX_BIN_DIR)` is a substring check
     - If PATH contains `/path/to/bin-extra`, it matches `/path/to/bin` incorrectly
     - Fix: split on `:` and check entries, or use a proper path-entry comparison
 
-7. **`||` vs `??` for XDG_CONFIG_HOME and HOME in env.ts**
+6. **`||` vs `??` for XDG_CONFIG_HOME and HOME in env.ts**
     - `process.env.XDG_CONFIG_HOME || ...` treats empty string as unset
     - XDG spec says empty string means "set" and should be used
     - Fix: change to `??`
 
-8. **`||` vs `??` for PATH override in execution.ts**
+7. **`||` vs `??` for PATH override in execution.ts**
     - `env.PATH || process.env.PATH || ""` discards explicit empty-string PATH from env files
     - Violates env precedence rules (section 8.3) where local env file wins
     - Fix: change to `??`
 
 ### Priority 3 (Minor / Decision Items)
 
-9. **Known-git-host URLs not normalized to append `.git`**
+8. **Known-git-host URLs not normalized to append `.git`**
     - **Decision:** Leave as-is — spec does not require normalization
 
-10. **output() function does not validate goto/stop types**
+9. **output() function does not validate goto/stop types**
     - **Decision:** Leave as-is — TEST-SPEC T-MOD-13d/13e/13g explicitly require output() to accept these values; type filtering is done in parseOutput per spec
 
-11. **Weak test assertions for error messages**
+10. **Weak test assertions for error messages**
     - ~16 tests check only exit code where spec describes richer expected behavior
     - Most notable: T-EXEC-13a uses `.not.toBe(0)` instead of `.toBe(1)`; T-CLI-22, T-CLI-10, T-ENV-17a only check stderr is non-empty
     - These are not blocking but reduce confidence in error message quality
