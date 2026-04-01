@@ -8,6 +8,8 @@ import {
   runAPIDriver,
   createEnvFile,
   forEachRuntime,
+  withGlobalEnv,
+  writeEnvFileRaw,
   type TempProject,
 } from "../helpers/index.js";
 import {
@@ -233,6 +235,27 @@ console.log(JSON.stringify(results.length));
       expect(count).toBe(0);
       // Counter file should not exist since script never ran
       expect(existsSync(counterFile)).toBe(false);
+    });
+
+    // T-API-08a: run("nonexistent", { maxIterations: 0 }) still validates
+    it("T-API-08a: run() with nonexistent script and maxIterations: 0 throws on first next()", async () => {
+      project = await createTempProject();
+      await createBashScript(project, "myscript", `printf '{"result":"ok"}'`);
+
+      const driverCode = `
+import { run } from "loopx";
+try {
+  const gen = run("nonexistent", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 0 });
+  await gen.next();
+  console.log(JSON.stringify({ threw: false }));
+} catch (e) {
+  console.log(JSON.stringify({ threw: true, message: e.message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(true);
+      expect(parsed.message).toMatch(/nonexistent/i);
     });
 
     // T-API-09: run() with no name runs default script
@@ -778,6 +801,26 @@ console.log(JSON.stringify(outputs.length));
 
       const count = JSON.parse(result.stdout);
       expect(count).toBe(2);
+    });
+
+    // T-API-14e: runPromise("nonexistent", { maxIterations: 0 }) rejects
+    it("T-API-14e: runPromise() with nonexistent script and maxIterations: 0 rejects", async () => {
+      project = await createTempProject();
+      await createBashScript(project, "myscript", `printf '{"result":"ok"}'`);
+
+      const driverCode = `
+import { runPromise } from "loopx";
+try {
+  await runPromise("nonexistent", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 0 });
+  console.log(JSON.stringify({ threw: false }));
+} catch (e) {
+  console.log(JSON.stringify({ threw: true, message: e.message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(true);
+      expect(parsed.message).toMatch(/nonexistent/i);
     });
   });
 });
@@ -1350,6 +1393,49 @@ console.log("done");
       expect(existsSync(markerPath)).toBe(true);
       const envValue = readFileSync(markerPath, "utf-8");
       expect(envValue).toBe("nocwd-env");
+    });
+
+    // T-API-21c: malformed local env file → warning to stderr via API
+    it("T-API-21c: local env file parse warning forwarded to stderr", async () => {
+      project = await createTempProject();
+      await createBashScript(project, "myscript", `printf '{"result":"ok"}'`);
+
+      const localEnvPath = join(project.dir, "local.env");
+      await writeEnvFileRaw(localEnvPath, "justtext\n");
+
+      const driverCode = `
+import { run } from "loopx";
+for await (const output of run("myscript", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, envFile: "local.env" })) {
+  // consume
+}
+console.log("done");
+`;
+      const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toMatch(/warning/i);
+    });
+
+    // T-API-21d: malformed global env file → warning to stderr via API
+    it("T-API-21d: global env file parse warning forwarded to stderr", async () => {
+      await withGlobalEnv({}, async () => {
+        // Overwrite the global env file with malformed content
+        const globalEnvPath = join(process.env.XDG_CONFIG_HOME!, "loopx", "env");
+        await writeEnvFileRaw(globalEnvPath, "1BAD=val\n");
+
+        project = await createTempProject();
+        await createBashScript(project, "myscript", `printf '{"result":"ok"}'`);
+
+        const driverCode = `
+import { run } from "loopx";
+for await (const output of run("myscript", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })) {
+  // consume
+}
+console.log("done");
+`;
+        const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toMatch(/warning/i);
+      });
     });
   });
 });

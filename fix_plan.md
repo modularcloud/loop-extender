@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 897/897 tests passing (100%).** All tests pass. Full spec audit complete.
+**Status: 901/901 tests passing (100%).** All tests pass. Full spec audit complete.
 
 All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
@@ -23,33 +23,9 @@ An audit of all commits after `0cf85da` (889/889 passing) identified 19 hard spe
 
 **T-ENV-24a**, **T-ENV-24b** — all implemented and passing.
 
-### Batch 3 — Programmatic API Tests
+### Batch 3 — Programmatic API Tests ✅ COMPLETE
 
-**File:** `programmatic-api.test.ts`
-**Deps:** `runAPIDriver`, `createTempProject`, `createBashScript`, `createEnvFile`, `withGlobalEnv`, `writeEnvFileRaw`
-
-6. **T-API-08a** — after T-API-08, inside `run()` section
-   - Create project with NO script matching `"nonexistent"` (but .loopx/ exists with a valid default)
-   - Driver code: `const gen = run("nonexistent", { cwd, maxIterations: 0 }); try { await gen.next(); } catch (e) { console.log(JSON.stringify({ error: e.message })); }`
-   - `runAPIDriver(runtime, driverCode, { cwd })`
-   - Assert `stdout` contains error JSON (generator threw on first `next()`)
-
-7. **T-API-14e** — after T-API-14d, inside `runPromise()` section
-   - Same project setup (no "nonexistent" script)
-   - Driver code: `try { await runPromise("nonexistent", { cwd, maxIterations: 0 }); } catch (e) { console.log(JSON.stringify({ error: e.message })); }`
-   - Assert `stdout` contains error JSON (promise rejected)
-
-8. **T-API-21c** — after T-API-21b, inside `envFile Option` section
-   - Create project with a valid script + malformed local env file (`writeEnvFileRaw(envPath, "justtext\n")`)
-   - Driver code: `const gen = run("myscript", { cwd, maxIterations: 1, envFile }); for await (const o of gen) {}`
-   - `runAPIDriver(runtime, driverCode, { cwd })`
-   - Assert `result.stderr` matches `/warning/i` (env parse warning forwarded)
-
-9. **T-API-21d** — after T-API-21c
-   - Wrap in `withGlobalEnv` that writes malformed content (`writeEnvFileRaw` the global env file with `"1BAD=val\n"`)
-   - Driver code calls `run("myscript", { cwd, maxIterations: 1 })` (no envFile — uses global only)
-   - Assert `result.stderr` matches `/warning/i`
-   - NOTE: Need to pass `XDG_CONFIG_HOME` through to the driver's `env` option so the driver process sees the same global env file
+**T-API-08a**, **T-API-14e**, **T-API-21c**, **T-API-21d** — all implemented and passing.
 
 ### Batch 4 — Execution Test (Bun-specific)
 
