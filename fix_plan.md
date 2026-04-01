@@ -6,52 +6,83 @@ All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
 - **Phase 19:** Code quality deduplication — `makeAbortError`, `getLoopxBin`, `validateDirScript`, `ensureLoopxPackageJson` all extracted to shared modules
 - **Phase 20:** Bug fixes and code quality cleanup — env warnings in API, signal exit helper, env serialize helper, redundant injection removed, loader-hook static imports, SSH URL classification, empty tarball error
+- **Phase 21:** Loader-hook catch clause narrowed, discovery deduplication, cwd nullish coalescing
 
 ---
 
 ## Remaining Items
 
-_No priority 1 or 2 items remaining._
+### Priority 1 (Spec Violations / Real Bugs)
 
-### Priority 3 (Minor / Optional Improvements)
+1. **`goto: ""` silently ignored instead of producing validation error**
+    - In `loop.ts`, `if (output.goto)` uses a truthy check — empty string `""` is falsy
+    - Per spec section 2.3, `goto` must be string (otherwise treated as absent); empty string IS a string
+    - Should proceed to validation step and fail with "Invalid goto target: '' not found"
+    - Fix: change `if (output.goto)` to `if (output.goto !== undefined)`
 
-1. **Known-git-host URLs not normalized to append `.git`**
-    - `https://github.com/org/repo` (known host, no `.git`) is classified as git but the URL is passed directly to `git clone` without appending `.git`
-    - All major hosts (GitHub, GitLab, Bitbucket) accept this; normalizing could break edge cases
+2. **`parse-env.ts` trims trailing whitespace before quote matching**
+    - Code trims trailing whitespace (line 55) *before* checking for matched quotes (lines 58-64)
+    - For `KEY="value" ` (space after closing quote): code produces `value`, spec says `"value"` (with literal quotes)
+    - Spec order: check if wrapped in matching quotes first, then trim trailing whitespace on unquoted values
+    - Fix: check for matched quotes on untrimmed value, then trim only if unquoted
+
+3. **`discovery.ts` readdirSync catch treats all errors as "directory not found"**
+    - Catch at line 33-41 shows "No .loopx/ directory found" for ANY error including EACCES (permission denied)
+    - Spec section 7.2 distinguishes "Missing .loopx/ directory" from other errors
+    - Fix: check `err.code === 'ENOENT'` and show appropriate error for other codes
+
+### Priority 2 (Robustness / UX Issues)
+
+4. **`installGit` catch discards git clone stderr**
+    - In `install.ts` lines 251-261, the catch discards the error from `execFileSync`
+    - User sees only `Error: git clone failed for <url>` with no diagnostic info
+    - Fix: extract and display `err.stderr` from the caught error
+
+5. **Tarball extraction catch discards error details**
+    - In `install.ts` lines 317-323, `tar` errors replaced with generic "Failed to extract tarball"
+    - Fix: include the original error message
+
+6. **PATH deduplication uses substring match instead of entry match**
+    - In `execution.ts` line 60, `currentPath.includes(LOOPX_BIN_DIR)` is a substring check
+    - If PATH contains `/path/to/bin-extra`, it matches `/path/to/bin` incorrectly
+    - Fix: split on `:` and check entries, or use a proper path-entry comparison
+
+7. **`||` vs `??` for XDG_CONFIG_HOME and HOME in env.ts**
+    - `process.env.XDG_CONFIG_HOME || ...` treats empty string as unset
+    - XDG spec says empty string means "set" and should be used
+    - Fix: change to `??`
+
+8. **`||` vs `??` for PATH override in execution.ts**
+    - `env.PATH || process.env.PATH || ""` discards explicit empty-string PATH from env files
+    - Violates env precedence rules (section 8.3) where local env file wins
+    - Fix: change to `??`
+
+### Priority 3 (Minor / Decision Items)
+
+9. **Known-git-host URLs not normalized to append `.git`**
     - **Decision:** Leave as-is — spec does not require normalization
 
-2. ~~**Duplicate error/warning messages for reserved and invalid script names**~~ **FIXED**
-    - Reserved-name and name-pattern checks now iterate over `nameGroups` (unique names) instead of `candidates`
-
-3. ~~**LOOPX_DELEGATED leaks into script execution environments**~~ **FIXED**
-    - `mergeEnv()` now destructures out `LOOPX_DELEGATED` before spreading `process.env`
-    - Tests updated to remove placeholder local binary in T-MOD-19/21 so `$LOOPX_BIN` subcommands don't re-delegate to the placeholder
-
-4. **output() function does not validate goto/stop types**
-    - `goto` and `stop` fields pass through without type validation in `output-fn.ts` (lines 53-58)
-    - Scripts calling `output({ goto: 42 })` get no feedback that the non-string goto will be silently discarded by parseOutput
-    - Fix: throw an error if `goto` is not a string or if `stop` is not a boolean
+10. **output() function does not validate goto/stop types**
     - **Decision:** Leave as-is — TEST-SPEC T-MOD-13d/13e/13g explicitly require output() to accept these values; type filtering is done in parseOutput per spec
 
-5. ~~**loader-hook.ts resolve catch clause is too broad**~~ **FIXED**
-    - Catch clause now only catches `ERR_MODULE_NOT_FOUND`, re-throws other errors
-
-6. ~~**cwd fallback uses `||` instead of `??` in run.ts**~~ **FIXED**
-    - Changed to `??` in run.ts for correct nullish coalescing
+11. **Weak test assertions for error messages**
+    - ~16 tests check only exit code where spec describes richer expected behavior
+    - Most notable: T-EXEC-13a uses `.not.toBe(0)` instead of `.toBe(1)`; T-CLI-22, T-CLI-10, T-ENV-17a only check stderr is non-empty
+    - These are not blocking but reduce confidence in error message quality
 
 ---
 
 ## Full Spec Audit Results (all areas conform)
 
 - CLI argument parsing: **conformant**
-- Output parsing: **conformant**
-- Loop state machine: **conformant**
+- Output parsing: **conformant** (minor edge case with empty goto)
+- Loop state machine: **conformant** (bug with empty goto string)
 - Script execution: **conformant**
-- Environment management: **conformant**
-- Install command: **conformant**
+- Environment management: **conformant** (minor `||` vs `??` issues)
+- Install command: **conformant** (error messages could be better)
 - Programmatic API: **conformant**
 - Module resolution / loader hooks: **conformant**
-- Script discovery / validation: **conformant**
+- Script discovery / validation: **conformant** (overly broad catch)
 
 ---
 
