@@ -3,6 +3,7 @@ import type { Output } from "./types.js";
 import type { ScriptEntry } from "./discovery.js";
 import { executeScript, type ExecResult } from "./execution.js";
 import { parseOutput } from "./parsers/parse-output.js";
+import { makeAbortError } from "./abort.js";
 
 export interface LoopOptions {
   maxIterations?: number;
@@ -10,13 +11,6 @@ export interface LoopOptions {
   projectRoot: string;
   loopxBin: string;
   signal?: AbortSignal;
-}
-
-function makeAbortError(signal?: AbortSignal): Error {
-  return (
-    signal?.reason ||
-    new DOMException("The operation was aborted.", "AbortError")
-  );
 }
 
 export async function* runLoop(

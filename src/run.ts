@@ -6,6 +6,7 @@ import type { Output, RunOptions } from "./types.js";
 import { discoverScripts } from "./discovery.js";
 import { runLoop } from "./loop.js";
 import { loadGlobalEnv, loadLocalEnv, mergeEnv } from "./env.js";
+import { makeAbortError } from "./abort.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -120,10 +121,7 @@ async function* runInternal(
 
   // Check abort signal
   if (signal.aborted) {
-    throw (
-      signal.reason ||
-      new DOMException("The operation was aborted.", "AbortError")
-    );
+    throw makeAbortError(signal);
   }
 
   const loopxDir = join(cwd, ".loopx");
@@ -197,10 +195,7 @@ export async function runPromise(
 ): Promise<Output[]> {
   const signal = options?.signal;
   if (signal?.aborted) {
-    throw (
-      signal.reason ||
-      new DOMException("The operation was aborted.", "AbortError")
-    );
+    throw makeAbortError(signal);
   }
 
   const gen = run(scriptName, options);
@@ -212,19 +207,12 @@ export async function runPromise(
     // reject on the next gen.next() call - even for very fast scripts.
     const abortPromise = new Promise<IteratorResult<Output>>((_, reject) => {
       if (signal.aborted) {
-        reject(
-          signal.reason ||
-            new DOMException("The operation was aborted.", "AbortError")
-        );
+        reject(makeAbortError(signal));
         return;
       }
       signal.addEventListener(
         "abort",
-        () =>
-          reject(
-            signal.reason ||
-              new DOMException("The operation was aborted.", "AbortError")
-          ),
+        () => reject(makeAbortError(signal)),
         { once: true }
       );
     });

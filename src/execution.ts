@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ScriptEntry } from "./discovery.js";
+import { makeAbortError } from "./abort.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -83,10 +84,7 @@ export function executeScript(
 
   return new Promise<ExecResult>((resolvePromise, reject) => {
     if (signal?.aborted) {
-      reject(
-        signal.reason ||
-          new DOMException("The operation was aborted.", "AbortError")
-      );
+      reject(makeAbortError(signal));
       return;
     }
 
@@ -136,10 +134,7 @@ export function executeScript(
       if (signal) signal.removeEventListener("abort", onAbort);
 
       if (aborted) {
-        reject(
-          signal?.reason ||
-            new DOMException("The operation was aborted.", "AbortError")
-        );
+        reject(makeAbortError(signal));
       } else {
         resolvePromise({ stdout, exitCode: code ?? 1 });
       }

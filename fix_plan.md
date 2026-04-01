@@ -22,11 +22,7 @@ All phases complete:
 
 These are internal code quality improvements that do not affect spec conformance. All tests pass as-is.
 
-1. **`makeAbortError` pattern duplicated 6+ times inline**
-   - `loop.ts` has a `makeAbortError()` helper function (line 15)
-   - `execution.ts` has 2 inline copies of `signal.reason || new DOMException(...)` (lines 86-90, 139-141)
-   - `run.ts` has 4 inline copies (lines 122-125, 213-216, 218-222, 224)
-   - **Fix:** Export `makeAbortError` from a shared location and import in all three files
+1. ~~**`makeAbortError` pattern duplicated 6+ times inline**~~ **DONE** — Extracted to `src/abort.ts`, imported in `loop.ts`, `run.ts`, `execution.ts`
 
 2. **`getLoopxBin()` duplicated identically**
    - `run.ts` lines 13-19 and `bin.ts` lines 35-41 have the exact same function
