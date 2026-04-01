@@ -397,7 +397,8 @@ async function main(): Promise<void> {
   let receivedSignal: NodeJS.Signals | null = null;
 
   function exitWithSignal(): never {
-    const sigNum = receivedSignal === "SIGINT" ? 2 : 15;
+    const sigNum =
+      constants.signals[receivedSignal as keyof typeof constants.signals] ?? 15;
     process.exit(128 + sigNum);
   }
 

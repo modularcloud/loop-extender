@@ -15,7 +15,11 @@ const isBun = !!process.versions.bun;
 
 // Add our node_modules/.bin to PATH so tsx is findable regardless of CWD
 const LOOPX_BIN_DIR = resolve(__dirname, "..", "node_modules", ".bin");
+// NODE_PATH entries: loopx's own deps + parent dir (for global installs where
+// the parent node_modules/ contains the loopx package itself)
 const LOOPX_NODE_MODULES = resolve(__dirname, "..", "node_modules");
+const LOOPX_PACKAGE_PARENT = resolve(__dirname, "..", "..");
+const LOOPX_NODE_PATH = `${LOOPX_NODE_MODULES}:${LOOPX_PACKAGE_PARENT}`;
 
 export interface ExecResult {
   stdout: string;
@@ -62,8 +66,8 @@ export function executeScript(
       ? currentPath
       : `${LOOPX_BIN_DIR}:${currentPath}`,
     NODE_PATH: currentNodePath
-      ? `${LOOPX_NODE_MODULES}:${currentNodePath}`
-      : LOOPX_NODE_MODULES,
+      ? `${LOOPX_NODE_PATH}:${currentNodePath}`
+      : LOOPX_NODE_PATH,
   };
 
   let command: string;

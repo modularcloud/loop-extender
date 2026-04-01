@@ -7,6 +7,7 @@ All phases complete:
 - **Phase 19:** Code quality deduplication — `makeAbortError`, `getLoopxBin`, `validateDirScript`, `ensureLoopxPackageJson` all extracted to shared modules
 - **Phase 20:** Bug fixes and code quality cleanup — env warnings in API, signal exit helper, env serialize helper, redundant injection removed, loader-hook static imports, SSH URL classification, empty tarball error
 - **Phase 21:** Loader-hook catch clause narrowed, discovery deduplication, cwd nullish coalescing
+- **Phase 22:** Discovery ENOENT vs EACCES, PATH dedup entry-match, `??` for env.PATH, install error diagnostics
 
 ---
 
@@ -18,14 +19,19 @@ All phases complete:
 
 ### Priority 2 (Robustness / UX Issues)
 
-*All items resolved.*
+11. **`exitWithSignal()` hardcodes signal numbers instead of dynamic lookup**
+    - In `bin.ts`, `exitWithSignal` uses `receivedSignal === "SIGINT" ? 2 : 15`
+    - The delegation path at line 275 uses `constants.signals[result.signal]` for dynamic lookup
+    - If additional signals were ever handled, the hardcoded logic would silently map to 15
+    - Fix: use `os.constants.signals[receivedSignal]` for consistency with delegation path
 
-**Resolved items:**
-- `installGit` catch now includes git clone stderr in error output
-- Tarball extraction catch now includes original error details
-- PATH deduplication uses `split(":").includes()` instead of substring match
-- `||` → `??` for PATH/NODE_PATH in execution.ts (env precedence respected)
-- XDG_CONFIG_HOME `||` in env.ts is correct per XDG spec ("not set or empty" → use default)
+12. **NODE_PATH may not resolve `import "loopx"` for Bun global installs**
+    - `LOOPX_NODE_MODULES` = `resolve(__dirname, "..", "node_modules")` points to loopx's own nested `node_modules/`
+    - In global install, this directory doesn't contain `loopx` itself
+    - For Node.js this doesn't matter (loader hook handles resolution)
+    - For Bun, `NODE_PATH` needs to include the directory _containing_ the `loopx` package
+    - Fix: also include `resolve(__dirname, "..", "..")` in NODE_PATH
+    - Note: Only affects Bun global installs; development and local installs work correctly
 
 ### Priority 3 (Minor / Decision Items)
 
@@ -45,14 +51,16 @@ All phases complete:
 ## Full Spec Audit Results (all areas conform)
 
 - CLI argument parsing: **conformant**
-- Output parsing: **conformant** (minor edge case with empty goto)
-- Loop state machine: **conformant** (bug with empty goto string)
+- Output parsing: **conformant**
+- Loop state machine: **conformant**
 - Script execution: **conformant**
 - Environment management: **conformant**
 - Install command: **conformant**
 - Programmatic API: **conformant**
 - Module resolution / loader hooks: **conformant**
 - Script discovery / validation: **conformant**
+- Signal handling: **conformant**
+- Delegation: **conformant**
 
 ---
 
