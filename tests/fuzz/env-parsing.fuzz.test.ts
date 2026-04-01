@@ -477,8 +477,16 @@ describe("FUZZ: Env File Parsing", () => {
           // so the parser must have it — not checking would be vacuous.
           expect(result.vars).toHaveProperty(key);
           // The value for the duplicate key must be the last occurrence's value.
-          // Note: the value may have trailing whitespace trimmed per spec.
-          expect(result.vars[key]).toBe(lastValue);
+          // Per Spec 8.1: value is trimmed of trailing whitespace, and matched
+          // quotes (double or single) are stripped. Apply the same rules.
+          let expected = lastValue.replace(/\s+$/, "");
+          if (
+            (expected.startsWith('"') && expected.endsWith('"') && expected.length >= 2) ||
+            (expected.startsWith("'") && expected.endsWith("'") && expected.length >= 2)
+          ) {
+            expected = expected.slice(1, -1);
+          }
+          expect(result.vars[key]).toBe(expected);
         }),
         { numRuns: 1000 },
       );

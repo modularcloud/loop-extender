@@ -174,9 +174,8 @@ printf '{"result":"stdout-ok"}'`,
         });
 
         expect(result.exitCode).toBe(0);
-        // stdout should contain the structured output (the JSON result)
-        expect(result.stdout).toContain("stdout-ok");
-        // stderr should contain the message written by the script
+        // Per Spec 7.1: "The CLI does not print result to its own stdout."
+        // So we only assert stderr contains the expected pass-through message.
         expect(result.stderr).toContain("stderr-message-here");
       });
     });
@@ -352,9 +351,9 @@ printf '{"result":"read-done"}'`,
           timeout: 10_000, // Generous timeout — but should complete quickly
         });
 
-        // Should complete without hanging or timing out
+        // Should complete without hanging or timing out.
+        // Per Spec 7.1: CLI does not print result to stdout.
         expect(result.exitCode).toBe(0);
-        expect(result.stdout).toContain("read-done");
       });
     });
   });
@@ -443,7 +442,7 @@ fi
         project = await createTempProject();
 
         // Write an env file with no trailing newline
-        const envPath = join(project.dir, ".loopx", "env");
+        const envPath = join(project.dir, "edge-test.env");
         await writeEnvFileRaw(envPath, "MY_EDGE_KEY=edge_value");
 
         // Script that reads the env var and writes it to a marker file
@@ -455,7 +454,8 @@ fi
           writeEnvToFile("MY_EDGE_KEY", markerPath),
         );
 
-        const result = await runCLI(["-n", "1", "check-env-edge"], {
+        // Use -e flag to load the local env file (Spec 8.2)
+        const result = await runCLI(["-e", "edge-test.env", "-n", "1", "check-env-edge"], {
           cwd: project.dir,
           runtime,
         });
