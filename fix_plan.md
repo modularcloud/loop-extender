@@ -32,9 +32,7 @@ These are internal code quality improvements that do not affect spec conformance
    - Both perform the same checks (package.json, main field, extension, boundary, symlink)
    - **Fix:** Extract shared validation core, wrap with different return types
 
-4. **`.loopx/package.json` auto-creation duplicated**
-   - `run.ts` lines 158-161 and `bin.ts` lines 324-327 have identical code
-   - **Fix:** Extract to a shared function
+4. ~~**`.loopx/package.json` auto-creation duplicated**~~ **DONE** — Extracted `ensureLoopxPackageJson()` to `src/bin-path.ts`, imported in `run.ts` and `bin.ts`
 
 ---
 

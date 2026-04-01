@@ -1,11 +1,10 @@
 import { join, resolve } from "node:path";
-import { existsSync, writeFileSync } from "node:fs";
 import type { Output, RunOptions } from "./types.js";
 import { discoverScripts } from "./discovery.js";
 import { runLoop } from "./loop.js";
 import { loadGlobalEnv, loadLocalEnv, mergeEnv } from "./env.js";
 import { makeAbortError } from "./abort.js";
-import { getLoopxBin } from "./bin-path.js";
+import { getLoopxBin, ensureLoopxPackageJson } from "./bin-path.js";
 
 /**
  * Run a loopx script and yield Output for each iteration.
@@ -139,12 +138,7 @@ async function* runInternal(
 
   const mergedEnv = mergeEnv(globalEnv, localEnv, loopxBin, cwd);
 
-  // Ensure .loopx/package.json exists with "type": "module" so that tsx
-  // treats scripts as ESM (required for top-level await, Spec 6.3).
-  const loopxPkg = join(loopxDir, "package.json");
-  if (!existsSync(loopxPkg)) {
-    writeFileSync(loopxPkg, '{"type":"module"}\n', "utf-8");
-  }
+  ensureLoopxPackageJson(loopxDir);
 
   // Resolve starting target
   const name = scriptName || "default";

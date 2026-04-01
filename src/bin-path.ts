@@ -1,5 +1,5 @@
-import { resolve } from "node:path";
-import { realpathSync } from "node:fs";
+import { resolve, join } from "node:path";
+import { realpathSync, existsSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 
@@ -10,5 +10,12 @@ export function getLoopxBin(): string {
     return realpathSync(resolve(__dirname, "bin.js"));
   } catch {
     return resolve(__dirname, "bin.js");
+  }
+}
+
+export function ensureLoopxPackageJson(loopxDir: string): void {
+  const loopxPkg = join(loopxDir, "package.json");
+  if (!existsSync(loopxPkg)) {
+    writeFileSync(loopxPkg, '{"type":"module"}\n', "utf-8");
   }
 }

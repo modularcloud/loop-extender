@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readFileSync, realpathSync, existsSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, existsSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -15,7 +15,7 @@ import {
   envList,
 } from "./env.js";
 import { installCommand } from "./install.js";
-import { getLoopxBin } from "./bin-path.js";
+import { getLoopxBin, ensureLoopxPackageJson } from "./bin-path.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -311,12 +311,7 @@ async function main(): Promise<void> {
   // Run mode: requires .loopx/
   const discovery = discoverScripts(loopxDir, "run");
 
-  // Ensure .loopx/package.json exists with "type": "module" so that tsx
-  // treats scripts as ESM (required for top-level await, Spec 6.3).
-  const loopxPkg = join(loopxDir, "package.json");
-  if (!existsSync(loopxPkg)) {
-    writeFileSync(loopxPkg, '{"type":"module"}\n', "utf-8");
-  }
+  ensureLoopxPackageJson(loopxDir);
 
   // Print warnings to stderr
   for (const w of discovery.warnings) {
