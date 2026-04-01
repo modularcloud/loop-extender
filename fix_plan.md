@@ -13,14 +13,41 @@ All phases complete:
 
 ---
 
-## Recently Fixed (all resolved)
+## Remaining Spec Gaps (sorted by priority)
 
-| Issue | Fix |
-|-------|-----|
-| T-MOD-03a (shadow resolution) | Loader hook now tries `nextResolve` first, respecting local `node_modules/loopx` per Spec 2.1/3.3 |
-| T-MOD-22 (CJS require test) | Test uses `--no-experimental-require-module` for Node 22.12+ compatibility |
-| T-API-25 (abort timer race) | Increased maxIterations to 10000 and reduced abort delay to 200ms |
-| T-SIG-07 (between-iterations signal) | Added sleep 0.1 to script, increased iterations from 3 to 20 |
+### HIGH — Bun Runtime Support (Spec 1, 6.3)
+
+The spec says "Target runtimes: Node.js >= 20.6, Bun >= 1.0" and Section 6.3 says "When running under Bun, loopx uses Bun's native TypeScript/JSX support instead of tsx." The implementation always uses `tsx` for JS/TS script execution with no Bun detection. Areas affected:
+
+- `src/execution.ts` always uses `tsx` command (line 73-74) — needs Bun runtime detection and `bun` as alternate runner
+- `src/execution.ts` uses `--import` loader flag (Node.js-specific) — Bun uses `NODE_PATH` instead (already set unconditionally)
+- No code path exists for `bun run` or Bun's native TS/JSX support
+- Bun API tests pass because the programmatic API (runPromise/run) still spawns scripts via tsx even when the driver runs under Bun
+
+### MEDIUM — Signal Forwarding Sends Wrong Signal (Spec 7.3)
+
+The spec says "loopx forwards the received signal to the active child process group." Currently, when SIGINT is received, the abort handler in `execution.ts:112` always sends SIGTERM to the child process group instead of forwarding the original signal (SIGINT). Fix: pass signal type through `ac.abort(signalName)` and read `signal.reason` in `onAbort` to forward the correct signal.
+
+### MEDIUM — Stderr Piped Instead of Inherited (Spec 6.2, 6.3)
+
+The spec says "stderr is passed through to the user's terminal." Current implementation uses `stdio: ["pipe", "pipe", "pipe"]` and manually forwards stderr chunks. This causes child processes to lose TTY detection on stderr (`process.stderr.isTTY` is `false`), which disables colored output in child scripts. Fix: use `stdio: ["pipe", "pipe", "inherit"]` instead.
+
+### MEDIUM — installSingleFile Missing Cleanup on Write Failure (Spec 10.3)
+
+`src/install.ts:247` — `writeFileSync(destPath, result.data)` has no try/catch. If the write fails (disk full, permissions), the partially written file is NOT cleaned up. Spec 10.3 says: "Any partially created target file or directory at the destination path is removed before exit." `installGit` and `installTarball` both properly clean up on failure.
+
+### MEDIUM — Install Missing Symlink Boundary Check (Spec 10.2, 5.1)
+
+`src/install.ts:126-171` — The `validateDirScript` function does NOT perform the `realpathSync` symlink boundary check that `discovery.ts:219-233` performs. Spec 10.2 says directory scripts are "validated using the same directory-script rules as section 5.1", which includes symlink resolution checking.
+
+### LOW — Various Minor Issues
+
+- `--` not handled as standard end-of-flags marker (treated as script name)
+- Extra positional arguments after script name silently ignored (last one wins)
+- `LOOPX_DELEGATED=""` (empty string) would not skip delegation due to JS falsiness
+- `output()` JS/TS helper omits trailing newline after JSON (bash helper includes it via console.log)
+- `HOME` fallback uses literal `"~"` (Node.js doesn't expand tildes)
+- Unused `cwd` parameter in `installSingleFile`, `installGit`, `installTarball`
 
 ---
 
