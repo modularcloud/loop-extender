@@ -15,6 +15,7 @@ import {
   envList,
 } from "./env.js";
 import { installCommand } from "./install.js";
+import { getLoopxBin } from "./bin-path.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -28,15 +29,6 @@ function getVersion(): string {
     return pkg.version;
   } catch {
     return "0.0.0";
-  }
-}
-
-// Resolve the effective loopx binary path
-function getLoopxBin(): string {
-  try {
-    return realpathSync(resolve(__dirname, "bin.js"));
-  } catch {
-    return resolve(__dirname, "bin.js");
   }
 }
 

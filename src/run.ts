@@ -1,23 +1,11 @@
 import { join, resolve } from "node:path";
-import { realpathSync, existsSync, writeFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname } from "node:path";
+import { existsSync, writeFileSync } from "node:fs";
 import type { Output, RunOptions } from "./types.js";
 import { discoverScripts } from "./discovery.js";
 import { runLoop } from "./loop.js";
 import { loadGlobalEnv, loadLocalEnv, mergeEnv } from "./env.js";
 import { makeAbortError } from "./abort.js";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-function getLoopxBin(): string {
-  try {
-    return realpathSync(resolve(__dirname, "bin.js"));
-  } catch {
-    return resolve(__dirname, "bin.js");
-  }
-}
+import { getLoopxBin } from "./bin-path.js";
 
 /**
  * Run a loopx script and yield Output for each iteration.

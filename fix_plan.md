@@ -24,9 +24,7 @@ These are internal code quality improvements that do not affect spec conformance
 
 1. ~~**`makeAbortError` pattern duplicated 6+ times inline**~~ **DONE** — Extracted to `src/abort.ts`, imported in `loop.ts`, `run.ts`, `execution.ts`
 
-2. **`getLoopxBin()` duplicated identically**
-   - `run.ts` lines 13-19 and `bin.ts` lines 35-41 have the exact same function
-   - **Fix:** Extract to a shared utility module
+2. ~~**`getLoopxBin()` duplicated identically**~~ **DONE** — Extracted to `src/bin-path.ts`, imported in `run.ts` and `bin.ts`
 
 3. **`validateDirScript()` duplicated with overlapping logic**
    - `discovery.ts` lines 144-248: returns `{ entry?: ScriptEntry; warning?: string }`
