@@ -95,7 +95,7 @@ function parseArgs(argv: string[]): ParsedArgs {
       }
       result.envFile = argv[i];
     } else if (arg === "--") {
-      // End-of-flags marker: next argument (if any) is the script name
+      // End-of-flags marker: remaining arguments are positional
       i++;
       if (i < argv.length) {
         if (result.scriptName) {
@@ -103,6 +103,12 @@ function parseArgs(argv: string[]): ParsedArgs {
           process.exit(1);
         }
         result.scriptName = argv[i];
+        i++;
+      }
+      // Reject any extra positional arguments after --
+      if (i < argv.length) {
+        process.stderr.write(`Error: unexpected argument '${argv[i]}'\n`);
+        process.exit(1);
       }
       break;
     } else if (!arg.startsWith("-")) {

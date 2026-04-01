@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 924/924 tests passing (100%, including fuzz tests).** All tests pass. Full spec audit complete.
+**Status: 924/924 tests passing (100%). Full spec audit complete. Post-audit conformance fixes in progress.**
 
 All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
@@ -9,6 +9,15 @@ All phases complete:
 - **Phase 21:** Loader-hook catch clause narrowed, discovery deduplication, cwd nullish coalescing
 - **Phase 22:** Discovery ENOENT vs EACCES, PATH dedup entry-match, `??` for env.PATH, install error diagnostics
 - **Phase 23:** 19 new test specs from post-889/889 audit — all 7 batches implemented and passing
+
+---
+
+## Priority 1 (Conformance Fixes)
+
+1. **Extra arguments after `--` silently discarded** ✅ FIXED
+    - `loopx -- foo bar` ignored `bar` instead of reporting a usage error
+    - Spec says "Two or more positional arguments are a usage error"
+    - Fixed in `src/bin.ts` — now checks for extra args after `-- <scriptname>`
 
 ---
 
