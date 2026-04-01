@@ -37,8 +37,15 @@ export async function resolve(
     // Try standard resolution first; fall back to CLI's package only if it fails.
     try {
       return await nextResolve(specifier, context);
-    } catch {
-      // No local node_modules/loopx found — provide the CLI's own package.
+    } catch (err: unknown) {
+      // Only fall back for module-not-found; re-throw real errors
+      // (e.g. corrupted package.json in local node_modules/loopx).
+      if (
+        err instanceof Error &&
+        (err as NodeJS.ErrnoException).code !== "ERR_MODULE_NOT_FOUND"
+      ) {
+        throw err;
+      }
     }
 
     if (specifier === "loopx") {

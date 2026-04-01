@@ -33,11 +33,10 @@ _No priority 1 or 2 items remaining._
     - `goto` and `stop` fields pass through without type validation in `output-fn.ts` (lines 53-58)
     - Scripts calling `output({ goto: 42 })` get no feedback that the non-string goto will be silently discarded by parseOutput
     - Fix: throw an error if `goto` is not a string or if `stop` is not a boolean
+    - **Decision:** Leave as-is — TEST-SPEC T-MOD-13d/13e/13g explicitly require output() to accept these values; type filtering is done in parseOutput per spec
 
-5. **loader-hook.ts resolve catch clause is too broad**
-    - The catch block in `loader-hook.ts` catches all errors, not just `ERR_MODULE_NOT_FOUND`
-    - If a local `node_modules/loopx` has a corrupted package.json, the error is silently swallowed and the CLI's own package is used instead
-    - Fix: only catch errors with `code === 'ERR_MODULE_NOT_FOUND'`, re-throw others
+5. ~~**loader-hook.ts resolve catch clause is too broad**~~ **FIXED**
+    - Catch clause now only catches `ERR_MODULE_NOT_FOUND`, re-throws other errors
 
 6. **cwd fallback uses `||` instead of `??` in run.ts**
     - `options?.cwd || process.cwd()` treats empty string `""` as falsy, falling back to process.cwd()
