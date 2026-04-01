@@ -251,9 +251,15 @@ async function main(): Promise<void> {
     const cwd = process.cwd();
     const localBin = findLocalBin(cwd);
     if (localBin) {
+      // Per Spec 3.2: LOOPX_BIN is set to the resolved realpath of the local binary
+      const localBinRealpath = realpathSync(localBin);
       const result = spawnSync(localBin, process.argv.slice(2), {
         cwd,
-        env: { ...process.env, LOOPX_DELEGATED: "1" },
+        env: {
+          ...process.env,
+          LOOPX_DELEGATED: "1",
+          LOOPX_BIN: localBinRealpath,
+        },
         stdio: "inherit",
       });
       process.exit(result.status ?? 1);
