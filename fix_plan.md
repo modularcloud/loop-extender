@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 883/889 tests passing (99.3%).** 6 remaining failures.
+**Status: 884/889 tests passing (99.4%).** 5 remaining failures.
 
 All phases complete:
 - **Phases 1-9:** Scaffolding, parsers, discovery, execution, module resolution, loop, CLI, subcommands, env
@@ -13,13 +13,12 @@ All phases complete:
 
 ---
 
-## Remaining Failures (6 tests, documented, not blocking)
+## Remaining Failures (5 tests, documented, not blocking)
 
 | Area | Count | Details |
 |------|-------|---------|
 | Module resolution | 2 | T-MOD-03a (shadow timeout), T-MOD-22 (CJS `require("loopx")` from outside — package ESM contract, not .loopx/ loader) |
 | Timing | 3 | T-SIG-07 (between-iterations signal), T-API-25 (abort timer race) |
-| CLI delegation | 1 | T-DEL-05 (LOOPX_BIN realpath) |
 
 ---
 
