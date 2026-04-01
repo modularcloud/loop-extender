@@ -5,24 +5,34 @@
 All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
 - **Phase 19:** Code quality deduplication — `makeAbortError`, `getLoopxBin`, `validateDirScript`, `ensureLoopxPackageJson` all extracted to shared modules
+- **Phase 20:** Bug fixes and code quality cleanup — env warnings in API, signal exit helper, env serialize helper, redundant injection removed, loader-hook static imports, SSH URL classification, empty tarball error
 
 ---
 
 ## Remaining Items
 
-### Priority 2 (Code Quality)
+_No priority 1 or 2 items remaining._
 
-_All code quality items resolved._
+### Priority 3 (Minor / Optional)
 
-### Priority 3 (Edge Cases / UX)
-
-~~7. SSH URL without `.git` — fixed: all `git@` URLs now classified as `git`~~
-
-8. **Known-git-host URLs not normalized to append `.git`**
+1. **Known-git-host URLs not normalized to append `.git`**
     - `https://github.com/org/repo` (known host, no `.git`) is classified as git but the URL is passed directly to `git clone` without appending `.git`
-    - GitHub accepts this, but other hosts may not
+    - All major hosts (GitHub, GitLab, Bitbucket) accept this; normalizing could break edge cases
+    - **Decision:** Leave as-is — spec does not require normalization
 
-~~9. Empty tarball — fixed: pre-check for zero entries with clear "archive is empty" error~~
+---
+
+## Full Spec Audit Results (all areas conform)
+
+- CLI argument parsing: **conformant**
+- Output parsing: **conformant**
+- Loop state machine: **conformant**
+- Script execution: **conformant**
+- Environment management: **conformant**
+- Install command: **conformant**
+- Programmatic API: **conformant**
+- Module resolution / loader hooks: **conformant**
+- Script discovery / validation: **conformant**
 
 ---
 

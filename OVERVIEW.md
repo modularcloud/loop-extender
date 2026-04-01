@@ -46,7 +46,7 @@ loopx can easily be invoked from the command line. It can also be invoked from J
 import { run /* or runPromise */ } from "loopx";
 run("myscriptname");
 ```
-Run is a generator that yields each output (TODO: determine if a generator is the proper structure here). runPromise just returns a promise that completes when the loop ends.
+`run()` returns an `AsyncGenerator<Output>` that yields each iteration's output. `runPromise()` collects all outputs into a `Promise<Output[]>`.
 
 ## Reserved Script Names
 Scripts cannot use these names because it would conflict with other functionality. 

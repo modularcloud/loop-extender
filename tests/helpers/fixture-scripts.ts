@@ -31,11 +31,6 @@ export function emitRaw(text: string): string {
   return `#!/bin/bash\nprintf '%s' '${text}'\n`;
 }
 
-/** Outputs text with trailing newline. */
-export function emitRawLn(text: string): string {
-  return `#!/bin/bash\nprintf '%s\\n' '${text}'\n`;
-}
-
 /** Exits with the specified code. */
 export function exitCode(n: number): string {
   return `#!/bin/bash\nexit ${n}\n`;
@@ -163,35 +158,6 @@ export function stdoutWriter(payloadFile: string): string {
   return `import { readFileSync } from "node:fs";
 const data = readFileSync("${payloadFile}");
 process.stdout.write(data);
-`;
-}
-
-/**
- * TS fixture: uses import { output } from "loopx" to emit structured output.
- */
-export function tsOutput(fields: Record<string, unknown>): string {
-  const fieldsStr = JSON.stringify(fields);
-  return `import { output } from "loopx";
-output(${fieldsStr});
-`;
-}
-
-/**
- * TS fixture: reads input(), outputs it as result.
- */
-export function tsInputEcho(): string {
-  return `import { input, output } from "loopx";
-const data = await input();
-output({ result: data });
-`;
-}
-
-/**
- * TS fixture: imports from "loopx", outputs success marker.
- */
-export function tsImportCheck(): string {
-  return `import { output } from "loopx";
-output({ result: "import-ok" });
 `;
 }
 
