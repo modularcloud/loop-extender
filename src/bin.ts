@@ -388,7 +388,7 @@ async function main(): Promise<void> {
 
   const signalHandler = (sig: NodeJS.Signals) => {
     receivedSignal = sig;
-    ac.abort();
+    ac.abort(sig);
   };
   process.on("SIGINT", signalHandler);
   process.on("SIGTERM", signalHandler);

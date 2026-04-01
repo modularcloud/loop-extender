@@ -15,10 +15,6 @@ All phases complete:
 
 ## Remaining Spec Gaps (sorted by priority)
 
-### MEDIUM — Signal Forwarding Sends Wrong Signal (Spec 7.3)
-
-The spec says "loopx forwards the received signal to the active child process group." Currently, when SIGINT is received, the abort handler in `execution.ts:112` always sends SIGTERM to the child process group instead of forwarding the original signal (SIGINT). Fix: pass signal type through `ac.abort(signalName)` and read `signal.reason` in `onAbort` to forward the correct signal.
-
 ### MEDIUM — Stderr Piped Instead of Inherited (Spec 6.2, 6.3)
 
 The spec says "stderr is passed through to the user's terminal." Current implementation uses `stdio: ["pipe", "pipe", "pipe"]` and manually forwards stderr chunks. This causes child processes to lose TTY detection on stderr (`process.stderr.isTTY` is `false`), which disables colored output in child scripts. Fix: use `stdio: ["pipe", "pipe", "inherit"]` instead.

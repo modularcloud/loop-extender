@@ -116,7 +116,13 @@ export function executeScript(
 
     const onAbort = () => {
       aborted = true;
-      killProcessGroup(child, "SIGTERM");
+      // Forward the original signal if provided as abort reason (CLI path),
+      // otherwise default to SIGTERM (programmatic API / AbortSignal path)
+      const forwardSignal: NodeJS.Signals =
+        signal?.reason === "SIGINT" || signal?.reason === "SIGTERM"
+          ? signal.reason
+          : "SIGTERM";
+      killProcessGroup(child, forwardSignal);
       graceTimer = setTimeout(() => {
         killProcessGroup(child, "SIGKILL");
       }, 5000);
