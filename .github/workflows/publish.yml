@@ -4,8 +4,6 @@ on:
   workflow_run:
     workflows: [CI]
     types: [completed]
-    tags:
-      - '[0-9]*'
 
 permissions:
   id-token: write
@@ -14,7 +12,18 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion == 'success'
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      (startsWith(github.event.workflow_run.head_branch, '0') ||
+      startsWith(github.event.workflow_run.head_branch, '1') ||
+      startsWith(github.event.workflow_run.head_branch, '2') ||
+      startsWith(github.event.workflow_run.head_branch, '3') ||
+      startsWith(github.event.workflow_run.head_branch, '4') ||
+      startsWith(github.event.workflow_run.head_branch, '5') ||
+      startsWith(github.event.workflow_run.head_branch, '6') ||
+      startsWith(github.event.workflow_run.head_branch, '7') ||
+      startsWith(github.event.workflow_run.head_branch, '8') ||
+      startsWith(github.event.workflow_run.head_branch, '9'))
     steps:
       - uses: actions/checkout@v4
         with:
