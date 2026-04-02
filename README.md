@@ -63,4 +63,23 @@ npx vitest run tests/fuzz/       # Property-based fuzz tests
 - **Bun** >= 1.0 (alternative runtime)
 - **Platform**: POSIX-only (macOS, Linux)
 
+## AI Agent Skill
+
+loopx ships with an [agent skill](./plugin/skills/loopx/SKILL.md) that helps AI coding agents create loopx workflows from plain English descriptions.
+
+**Install via [skills.sh](https://skills.sh):**
+
+```bash
+npx skills add modularcloud/loop-extender
+```
+
+**Install via Claude Code plugin marketplace:**
+
+```
+/plugin marketplace add modularcloud/loop-extender
+/plugin install loopx@loop-extender
+```
+
+## Documentation
+
 See [SPEC.md](./SPEC.md) for the full product specification and [TEST-SPEC.md](./TEST-SPEC.md) for the test specification.
