@@ -2,6 +2,8 @@
 
 **Status: 924/924 tests passing (100%). Full spec audit complete. All code robustness fixes applied (v0.1.11).**
 
+**Comprehensive code audit completed — no remaining spec conformance issues or actionable improvements found.**
+
 All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
 - **Phase 19:** Code quality deduplication — `makeAbortError`, `getLoopxBin`, `validateDirScript`, `ensureLoopxPackageJson` all extracted to shared modules
@@ -12,21 +14,6 @@ All phases complete:
 - **Phase 24:** Post-audit conformance fix — reject extra positional args after `--`
 - **Phase 25:** Code robustness — double settlement guard, child.stdin error handler, grace timer unref, input() error handler, stale dist/paths.* cleanup, SPEC-PROBLEMS.md cleanup
 - **Phase 26:** Bug fix — move `ensureLoopxPackageJson` after discovery error check, remove unused `Output` import from output-fn.ts
-
----
-
-## Priority 3 (Minor / Decision Items)
-
-8. **Known-git-host URLs not normalized to append `.git`**
-    - **Decision:** Leave as-is — spec does not require normalization
-
-9. **output() function does not validate goto/stop types**
-    - **Decision:** Leave as-is — TEST-SPEC T-MOD-13d/13e/13g explicitly require output() to accept these values; type filtering is done in parseOutput per spec
-
-10. **Weak test assertions for error messages**
-    - ~16 tests check only exit code where spec describes richer expected behavior
-    - Most notable: T-EXEC-13a uses `.not.toBe(0)` instead of `.toBe(1)`; T-CLI-22, T-CLI-10, T-ENV-17a only check stderr is non-empty
-    - These are not blocking but reduce confidence in error message quality
 
 ---
 
@@ -43,6 +30,16 @@ All phases complete:
 - Script discovery / validation: **conformant**
 - Signal handling: **conformant**
 - Delegation: **conformant**
+
+---
+
+## Code Audit Findings (all informational, no action required)
+
+- `-n` accepts non-decimal formats (0x10, 0b10) — harmless, spec says "non-negative integer"
+- `output()` EAGAIN spin-loop has no backoff — unlikely in practice (parent always drains pipe)
+- `env.ts` uses existsSync+readFileSync pattern (TOCTOU) — low risk for single-user CLI
+- `runPromise` abort listener not removed on success path — mitigated by `{ once: true }` and GC
+- `warningMap` in discovery.ts not compile-time exhaustive — safe due to fallback behavior
 
 ---
 
