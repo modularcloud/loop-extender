@@ -48,5 +48,5 @@ jobs:
         run: npm version "${GITHUB_REF_NAME}" --no-git-tag-version
         working-directory: dist
 
-      - run: npm publish --access public
+      - run: npm publish --access public --provenance
         working-directory: dist
