@@ -1,6 +1,6 @@
 # Implementation Plan for loopx
 
-**Status: 924/924 tests passing (100%). Full spec audit complete. Post-audit conformance fix applied (v0.1.9).**
+**Status: 924/924 tests passing (100%). Full spec audit complete. All code robustness fixes applied (v0.1.11).**
 
 All phases complete:
 - **Phases 1-18:** All feature phases done (see git history)
@@ -11,6 +11,7 @@ All phases complete:
 - **Phase 23:** 19 new test specs from post-889/889 audit — all 7 batches implemented and passing
 - **Phase 24:** Post-audit conformance fix — reject extra positional args after `--`
 - **Phase 25:** Code robustness — double settlement guard, child.stdin error handler, grace timer unref, input() error handler, stale dist/paths.* cleanup, SPEC-PROBLEMS.md cleanup
+- **Phase 26:** Bug fix — move `ensureLoopxPackageJson` after discovery error check, remove unused `Output` import from output-fn.ts
 
 ---
 

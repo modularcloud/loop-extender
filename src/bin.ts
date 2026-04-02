@@ -326,8 +326,6 @@ async function main(): Promise<void> {
   // Run mode: requires .loopx/
   const discovery = discoverScripts(loopxDir, "run");
 
-  ensureLoopxPackageJson(loopxDir);
-
   // Print warnings to stderr
   for (const w of discovery.warnings) {
     process.stderr.write(w + "\n");
@@ -340,6 +338,8 @@ async function main(): Promise<void> {
     }
     process.exit(1);
   }
+
+  ensureLoopxPackageJson(loopxDir);
 
   // Load environment
   let globalEnv: Record<string, string> = {};

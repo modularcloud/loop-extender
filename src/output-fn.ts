@@ -1,5 +1,4 @@
 import { writeSync } from "node:fs";
-import type { Output } from "./types.js";
 
 /**
  * Write structured JSON to stdout and terminate the process.
