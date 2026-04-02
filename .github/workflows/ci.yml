@@ -26,7 +26,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: npm run test:unit
+      - run: npx vitest run --project unit
 
   harness:
     runs-on: ubuntu-latest
@@ -41,7 +41,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: npm run test:harness
+      - run: npx vitest run --project harness
 
   e2e:
     runs-on: ubuntu-latest
@@ -56,7 +56,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: npm run test:e2e
+      - run: npx vitest run --project e2e --project signals
 
   fuzz:
     runs-on: ubuntu-latest
@@ -71,7 +71,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: npm run test:fuzz
+      - run: npx vitest run --project fuzz
 
   typecheck:
     runs-on: ubuntu-latest
@@ -86,7 +86,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: npm run test:typecheck
+      - run: npx vitest run --project typecheck
 
   publish:
     needs: [unit, harness, e2e, fuzz, typecheck]
