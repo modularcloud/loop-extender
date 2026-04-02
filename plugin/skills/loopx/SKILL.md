@@ -1,5 +1,5 @@
 ---
-name: loopx-workflows
+name: loopx
 description: "Create looping workflows using the loopx CLI tool (loop-extender). Use this skill whenever the user wants to build a loopx workflow, create .loopx scripts, set up agent loops, chain scripts together with goto/stop logic, or automate repetitive CLI tasks with loopx. Also trigger when the user mentions loopx, loop-extender, .loopx directory, or describes a multi-step agent pipeline that could benefit from loopx's state machine (even if they don't mention loopx by name)."
 ---
 

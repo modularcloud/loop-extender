@@ -1,0 +1,9 @@
+{
+  "name": "loopx",
+  "description": "Build looping workflows with the loopx CLI tool",
+  "version": "1.0.0",
+  "author": {
+    "name": "Modular Cloud"
+  },
+  "repository": "https://github.com/modularcloud/loop-extender"
+}

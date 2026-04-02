@@ -1,0 +1,16 @@
+{
+  "name": "loop-extender",
+  "owner": {
+    "name": "Modular Cloud"
+  },
+  "metadata": {
+    "description": "Plugins for the loopx CLI tool"
+  },
+  "plugins": [
+    {
+      "name": "loopx",
+      "source": "./plugin",
+      "description": "Build looping workflows with the loopx CLI tool. Use when creating .loopx scripts, agent loops, multi-step pipelines, or automating repetitive CLI tasks with loopx."
+    }
+  ]
+}
