@@ -1,8 +1,6 @@
-# loopx
+# Loop Extender (loopx)
 
 [![CI](https://github.com/modularcloud/loop-extender/actions/workflows/ci.yml/badge.svg)](https://github.com/modularcloud/loop-extender/actions/workflows/ci.yml)
-
-**Production Ready** — 924/924 tests passing, full spec conformance verified across all 11 domains (CLI, output parsing, loop state machine, execution, environment, install, API, module resolution, discovery, signals, delegation).
 
 loopx is a CLI tool that automates repeated execution ("loops") of scripts, primarily designed to wrap agent CLIs. It provides a scriptable loop engine with structured output, control flow between scripts, environment variable management, and a script installation mechanism.
 
