@@ -1,0 +1,181 @@
+You’re very close. I would not do a broad rewrite of SIGNING-SPEC.md, but I would make a small patch to TEST-SIGNING-SPEC.md before implementing the full suite.
+
+My verdict:
+ • SIGNING-SPEC.md is stable enough to start building the test harness and most of the suite.
+ • TEST-SIGNING-SPEC.md is already strong, but it still has a few important blind spots and a couple of places where it can accidentally test the wrong thing.
+ • The existing open issues in SIGNING-SPEC-PROBLEMS.md are not blockers for starting the tests.
+
+So: patch the test spec first, then start implementation.
+
+What I would change in TEST-SIGNING-SPEC.md first
+
+1. Fix the client config-mismatch assertions
+
+Right now the client-side mismatch tests compress two different surfaces into one.
+
+SIGNING-SPEC.md distinguishes:
+ • init reason = CONFIG_MISMATCH (§7.2.2)
+ • request-time synthetic response = 503 { error: "CLIENT_INIT_FAILED" } (§11.4)
+
+That means CG-3, AP-20, and AP-21 should explicitly say:
+ • getInitState() may expose an init failure whose underlying reason is CONFIG_MISMATCH
+ • mutating requests fail with synthetic 503 CLIENT_INIT_FAILED
+
+Without that change, a correct implementation can fail those tests for the wrong reason.
+
+2. Strengthen the fresh-session-probe / guest-suppression tests
+
+CA-19, CA-20, DM-14, and AP-28 need to prove the request-time fresh probe from §7.4.2, not just the startup state determination from §7.4.3.
+
+As written, those tests can pass even if the implementation only relies on startup session discovery.
+
+I would change them so they:
+ • start with the SW in "none"
+ • change auth state after startup, without reload
+ • issue the first mutating request
+ • assert both:
+ • the request used managed signing or deferred correctly
+ • no guest wallet was created via getClientSignerAddress() === null
+
+That second assertion is important. Right now some of those tests can pass even if the implementation incorrectly creates a suppressed guest wallet.
+
+3. Add missing pre-signed passthrough exemption tests
+
+The spec is explicit that pre-signed passthrough is exempt from some managed-signing checks:
+ • maxBodySize enforcement exception in §5.4
+ • content-encoding rejection only applies when the auth layer is signing (§5.5, §6.3)
+
+The current suite does not test that.
+
+Add tests for at least server mode:
+ • pre-signed request with Content-Encoding: gzip passes through to sequencer
+ • pre-signed oversized body is not rejected by the auth layer with 413
+
+A client-mode counterpart is useful too, but server mode is the must-have.
+
+4. Add the missing negative accept case
+
+You test mandatory accept: */* injection when accept is in effectiveSignedHeaders (SA-10, SM-18, etc.), but not the inverse.
+
+You should add:
+ • server-mode test: when signedHeaders excludes accept, a request without Accept does not get accept: */* injected
+ • client-mode test: same
+
+Otherwise an implementation that always injects Accept could still go green.
+
+5. Add link-endpoint malformed-request coverage
+
+§7.9.2 step 3 explicitly calls out malformed JSON, missing fields, invalid base64, and invalid address format.
+
+You already cover invalid JSON and non-EIP-55 address, but you should add:
+ • invalid base64 keyMaterial → 400 INVALID_REQUEST
+ • missing guestAddress → 400 INVALID_REQUEST
+ • missing keyMaterial → 400 INVALID_REQUEST
+
+Those are normative and currently uncovered.
+
+6. Add link-protocol sequencing assertions
+
+The linking protocol ordering is one of the most safety-critical parts of the whole spec (§7.9.2), but the suite mostly checks outcomes, not call sequence.
+
+Using the controllable adapter call logs, add tests that verify:
+ • deriveAddress happens before importWallet
+ • assertAddressAvailable happens before importWallet
+ • linkWallet happens after importWallet
+ • on LINK_ADDRESS_MISMATCH, importWallet is not called
+ • on ADDRESS_ALREADY_LINKED from assertAddressAvailable, importWallet is not called
+
+This is one of the biggest remaining “comprehensive coverage” gaps.
+
+7. Check Cache-Control: no-store on error responses too
+The spec says responses from these endpoints must be no-store, not just success responses:
+ • /_chopin-auth/session (§3.1)
+ • /_chopin-auth/sign (§7.8)
+ • /_chopin-auth/link (§7.9.1)
+
+Your current tests mostly verify the 200 path. Extend them to assert no-store on 401/400 responses too.
+
+8. Add auth-origin / dual coverage with no ClientSigner
+
+The spec allows no client signer outside guest-only (§9.2, §10.1), but the current browser profiles almost always include one.
+
+Add tests for:
+ • auth-origin + clientSigner: "none" + valid managed session → managed signing works
+ • auth-origin + clientSigner: "none" + no session → mutating request fails with 401 UNAUTHENTICATED
+ • dual + clientSigner: "none" + managed session → middleware path still works
+
+That closes a real configuration gap.
+
+⸻
+
+What I would add to SIGNING-SPEC-PROBLEMS.md
+
+These do not require immediate changes to SIGNING-SPEC.md, but they are worth tracking so the test suite stays neutral.
+
+New open issue: invalid allowedOrigins config handling is unspecified
+
+§10.1 says entries must not include a trailing slash or path, but it does not say what the implementation must do if they do.
+
+Why it matters:
+ • the suite can test matching behavior
+ • it cannot write a conformance test for invalid-config rejection without a defined failure surface
+
+Recommendation:
+ • track it as open
+ • do not add conformance-core tests for invalid allowedOrigins entries yet
+
+New open issue: mode/topology mismatch is normative, but rejection surface is unspecified
+
+§2.3 says topology and server mode “MUST be paired,” but it does not define whether the client library, server library, or deployment tooling is responsible for detecting a mismatch.
+
+Why it matters:
+ • the suite can verify correct-pair behavior
+ • it should not require runtime rejection of bad pairings unless the spec defines who must reject and how
+
+Recommendation:
+ • keep this out of conformance-core negative tests for now
+
+New open issue: missing/non-JSON Content-Type behavior on /_chopin-auth/sign and /_chopin-auth/link is unspecified
+
+The examples show Content-Type: application/json, but the normative text only says “parse JSON body.”
+
+Why it matters:
+ • the suite should not assert accept-vs-reject behavior for valid JSON bodies with missing or non-JSON Content-Type until the spec says so
+
+Recommendation:
+ • track it as open
+ • keep those cases out of core tests
+
+⸻
+
+What does not need changing right now
+
+I would leave SIGNING-SPEC.md alone for now on these:
+ • session-probe timing window during guest creation
+ • unknown-field behavior on /sign and /link
+ • unexpected internal 5xx mapping during linking
+ • IPv6 canonical-host behavior
+
+Your current SIGNING-SPEC-PROBLEMS.md already handles those responsibly, and the test spec mostly avoids over-asserting them.
+
+⸻
+
+Can you start implementing after that patch?
+
+Yes.
+
+After those test-spec edits, I’d treat the suite as ready enough to implement in this order:
+ 1. Layer 0/1: vectors, harness, controllable adapters, mock sequencer
+ 2. Server mode + managed sign endpoint
+ 3. Guest-only client mode
+ 4. Auth-origin state machine
+ 5. Linking
+ 6. Dual mode
+ 7. Bridge protocol
+ 8. Fuzz / advisory / adapter-integration
+
+Bottom line
+ • Do not pause for a big spec rewrite.
+ • Do make a focused patch to TEST-SIGNING-SPEC.md first.
+ • Do add a few new open issues to SIGNING-SPEC-PROBLEMS.md.
+ • After that, you can start implementing the tests with high confidence that the suite matches the current spec and will catch the most important failures.
