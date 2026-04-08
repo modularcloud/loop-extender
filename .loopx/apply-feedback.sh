@@ -12,7 +12,7 @@ fi
 
 FEEDBACK=$(cat "$FEEDBACK_FILE")
 
-PROMPT="I received the following feedback about TEST-SIGNING-SPEC.md. Incorporate this feedback to improve the specs. If there is any ambiguity about my intentions, ask me clarifying questions. Think critically about this feedback and push back if warranted. If needed, we can work to resolve ambiguities in the core spec SIGNING-SPEC.md too but be sure to be conservative in this respect. Do not modify the core spec in the test spec document as the core spec is the source of truth for the implementation. Keep SIGNING-SPEC-PROBLEMS.md (if it exists) up to date by removing resolved problems and adding new ones that you find, if any. If there are no remaining known problems, delete SIGNING-SPEC-PROBLEMS.md. After you finish, commit and push.
+PROMPT="I received the following feedback about ADR-0002 (run subcommand proposal) and its relationship to SPEC.md as defined by the the process laid out in ADR-0001. Incorporate this feedback to improve ADR-0002. If there is any ambiguity about my intentions, ask me clarifying questions. Think critically about this feedback and push back if warranted. Do not update any file other than ADR-0002. After you finish, commit and push.
 
 Feedback:
 $FEEDBACK"

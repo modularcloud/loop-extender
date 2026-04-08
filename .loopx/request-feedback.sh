@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ROOT="$LOOPX_PROJECT_ROOT"
-SPEC="$ROOT/SIGNING-SPEC.md"
-TEST_SPEC="$ROOT/TEST-SIGNING-SPEC.md"
-SPEC_PROBLEMS="$ROOT/SIGNING-SPEC-PROBLEMS.md"
+ADR_0001="$ROOT/adr/0001-adr-process.md"
+ADR_0002="$ROOT/adr/0002-run-subcommand.md"
+SPEC="$ROOT/SPEC.md"
 FEEDBACK_FILE="$ROOT/.loopx/.feedback.tmp"
 PROMPT_FILE="$ROOT/.loopx/.prompt.tmp"
 
@@ -13,34 +13,33 @@ PROMPT_FILE="$ROOT/.loopx/.prompt.tmp"
 
 TELEGRAM_API="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
 
+if [[ ! -f "$ADR_0001" ]]; then
+  echo "Error: adr/0001-adr-process.md not found" >&2
+  exit 1
+fi
+
+if [[ ! -f "$ADR_0002" ]]; then
+  echo "Error: adr/0002-run-subcommand.md not found" >&2
+  exit 1
+fi
+
 if [[ ! -f "$SPEC" ]]; then
-  echo "Error: SIGNING-SPEC.md not found" >&2
+  echo "Error: SPEC.md not found" >&2
   exit 1
-fi
-
-if [[ ! -f "$TEST_SPEC" ]]; then
-  echo "Error: TEST-SIGNING-SPEC.md not found" >&2
-  exit 1
-fi
-
-if [[ -f "$SPEC_PROBLEMS" ]]; then
-  SPEC_PROBLEMS_CONTENT="$(cat "$SPEC_PROBLEMS")"
-else
-  SPEC_PROBLEMS_CONTENT="No known spec problems have been identified so far."
 fi
 
 # Build the prompt and save to file (too long for a single Telegram message)
 cat <<PROMPT > "$PROMPT_FILE"
-Review SIGNING-SPEC.md and TEST-SIGNING-SPEC.md holistically and let me know if I can start implementing the tests or if I need to modify the test spec. My goal is to be able to comprehensively tests all requirements in the signing spec prior to implementation. Additionally, if there are any known problems in the spec that need to be resolved, they will be included in SIGNING-SPEC-PROBLEMS.md. As part of your holistic plan, help me resolve these and any new issues while keeping in mind my main goal is to only make conservative changes to SIGNING-SPEC.md at this point because I am mainly focused on TEST-SIGNING-SPEC.md.
+Review ADR 0001, ADR 0002, and SPEC.md holistically and let me know if I can start updating SPEC.md or if I need to improve ADR 0002 in any way. Ask me clarifying questions if you have any doubts about my intentions for ADR 0002.
 
-SIGNING-SPEC.md:
+adr/0001-adr-process.md:
+$(cat "$ADR_0001")
+
+adr/0002-run-subcommand.md:
+$(cat "$ADR_0002")
+
+SPEC.md:
 $(cat "$SPEC")
-
-TEST-SIGNING-SPEC.md:
-$(cat "$TEST_SPEC")
-
-SIGNING-SPEC-PROBLEMS.md:
-$SPEC_PROBLEMS_CONTENT
 PROMPT
 
 # Flush old updates to get current offset
