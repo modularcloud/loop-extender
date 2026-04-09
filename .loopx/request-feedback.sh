@@ -30,7 +30,7 @@ fi
 
 # Build the prompt and save to file (too long for a single Telegram message)
 cat <<PROMPT > "$PROMPT_FILE"
-Review ADR 0001, ADR 0002, and SPEC.md holistically and let me know if I can start updating SPEC.md or if I need to improve ADR 0002 in any way. Ask me clarifying questions if you have any doubts about my intentions for ADR 0002.
+Review ADR 0001, ADR 0002, and SPEC.md holistically and let me know if I can mark ADR 0002 as accepted or if I need to improve it further. Ask me clarifying questions if you have any doubts about my intentions for ADR 0002.
 
 adr/0001-adr-process.md:
 $(cat "$ADR_0001")
