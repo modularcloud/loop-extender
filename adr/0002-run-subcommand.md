@@ -49,7 +49,19 @@ Since scripts are always invoked via `loopx run <name>`, there is no ambiguity w
 - `loopx` (no arguments): Shows top-level help (same as `loopx -h`). No script discovery.
 - Unrecognized subcommands (e.g., `loopx foo`) are a usage error — there is no implicit fallback to `run`.
 
-### 5. Programmatic API
+### 5. Command parsing and precedence
+
+- The only top-level option is `-h` / `--help`. Top-level `-n` and `-e` are usage errors (exit code 1).
+- `loopx` with no arguments is equivalent to `loopx -h`.
+- `-n` and `-e` are valid only after `run`. Within `run`, options and `<script-name>` may appear in any order.
+- `loopx run` with no `<script-name>` is a usage error (exit code 1) and does not inspect `.loopx/` or perform any discovery — except when `-h` / `--help` is present, which triggers run help instead.
+- Within `run`, `-h` / `--help` takes precedence over all other arguments: it exits 0, performs non-fatal script discovery, and does not validate env files, require a script name, or execute a script. Specifically:
+  - `loopx run -h foo` — shows run help (script name ignored).
+  - `loopx run -h -e missing.env` — shows run help (env file not validated).
+  - `loopx run -h -n bad` — shows run help (`-n` not validated).
+- Top-level `-h` takes precedence over everything that follows: `loopx -h run foo` shows top-level help (no discovery), not run help.
+
+### 6. Programmatic API
 
 `scriptName` becomes a required parameter:
 
@@ -58,7 +70,7 @@ run(scriptName: string, options?: RunOptions): AsyncGenerator<Output>
 runPromise(scriptName: string, options?: RunOptions): Promise<Output[]>
 ```
 
-Calling `run()` or `runPromise()` without a script name is a type error (compile time). If the type check is bypassed (e.g., `run(undefined as any)`), the existing lazy error behavior is preserved: `run()` still returns a generator without throwing, and the error is raised on first iteration (first `next()` call). `runPromise()` rejects in the normal async path. This is consistent with the current SPEC's error timing semantics (section 9.1).
+In TypeScript, omitting `scriptName` is a static type error. In JavaScript, or when the type check is bypassed (e.g., `run(undefined as any)`), the existing lazy error behavior is preserved: `run()` still returns a generator without throwing, and the error is raised on first iteration (first `next()` call). `runPromise()` rejects in the normal async path. This is consistent with the current SPEC's error timing semantics (section 9.1).
 
 ## Consequences
 
@@ -76,12 +88,14 @@ When this ADR is accepted, the following SPEC sections require updates. This lis
 
 - **2.2 (Loop)** — Remove "or the `default` script" from the definition of starting target. The starting target is always an explicitly named script.
 - **4.1–4.3 (CLI Interface)** — New CLI grammar with `run` subcommand. `loopx [options] [script-name]` becomes `loopx run [options] <script-name>` as the only invocation form. Remove default script fallback. Add `run` to the subcommands table. Unrecognized subcommands are usage errors.
+- **4.2 (Options)** — `-n` and `-e` become `run`-scoped options, not top-level. The only top-level option is `-h` / `--help`. Flag precedence text must be rewritten to reflect the two-level structure (top-level help vs. run help).
 - **5.3 (Reserved Names)** — Remove entirely. Scripts may now use any name that passes name restriction rules.
-- **5.5 (Validation Scope)** — Update the table with new command forms: `loopx run <script>`, `loopx run -h`. Top-level `loopx -h` no longer performs discovery.
-- **7.1 / 7.2 (Loop Execution Flow)** — Starting target is always explicit (no `default` fallback). Add error case for missing script name.
-- **9.1 / 9.2 (Programmatic API)** — `run(scriptName?: string)` and `runPromise(scriptName?: string)` become required-name APIs: `run(scriptName: string)` and `runPromise(scriptName: string)`. Lazy error behavior preserved for type-bypassed calls.
+- **5.5 (Validation Scope)** — Update the table with new command forms: `loopx run <script>`, `loopx run -h`, and `loopx` (no arguments) as equivalent to `loopx -h`. Top-level `loopx -h` no longer performs discovery.
+- **7.1 / 7.2 (Loop Execution Flow)** — Starting target is always explicit (no `default` fallback). Remove reserved-name validation from step 1. Add error case for missing script name.
+- **9.1 / 9.2 (Programmatic API)** — `run(scriptName?: string)` and `runPromise(scriptName?: string)` become required-name APIs: `run(scriptName: string)` and `runPromise(scriptName: string)`. Lazy error behavior preserved for type-bypassed calls. Wording distinguishes TypeScript (static type error) from JavaScript (runtime error).
 - **10.3 (Install Common Rules)** — Remove validation against reserved names. Install should still validate against name restrictions (section 5.4).
 - **11 (Help)** — Split help behavior: top-level help shows CLI structure only (no script discovery); `loopx run -h` performs discovery and lists scripts with non-fatal validation.
+- **12 (Exit Codes)** — Update examples to reflect that `loopx run` with no script name and bare `loopx foo` are usage errors (exit code 1).
 - **13 (Summary of Reserved and Special Values)** — Remove reserved script name rows (`output`, `env`, `install`, `version`). Remove `default` as a special script name.
 
 ## Test Recommendations
@@ -98,3 +112,9 @@ When this ADR is accepted, the following SPEC sections require updates. This lis
 - Verify `loopx -h` does not inspect `.loopx/` or list scripts.
 - Verify `loopx run -h` performs script discovery and lists available scripts.
 - Verify programmatic `run(undefined as any)` returns a generator that throws on first iteration (lazy error).
+- Verify `loopx -n 5 myscript` is a usage error (top-level `-n` rejected).
+- Verify `loopx -e .env myscript` is a usage error (top-level `-e` rejected).
+- Verify `loopx run -h foo` shows run help and exits 0 (script name ignored).
+- Verify `loopx run -h -e missing.env` shows run help and exits 0 (env file not validated).
+- Verify `loopx -h run foo` shows top-level help and exits 0 (not run help).
+- Verify `loopx run` with no script name exits 1 without inspecting `.loopx/`.
