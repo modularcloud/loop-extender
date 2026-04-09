@@ -59,7 +59,7 @@ A loop is a repeated execution cycle modeled as a **state machine**. Each iterat
 - **No `goto`:** the cycle ends and the loop restarts from the **starting target**.
 - **`stop`:** the machine halts.
 
-The **starting target** is the original script specified when loopx was invoked — either a named script or the `default` script. The `goto` mechanism is a **state transition, not a permanent reassignment.** When a target finishes without its own `goto`, execution returns to the starting target. The loop always resets to its initial state after a transition chain completes.
+The **starting target** is the script explicitly named when loopx was invoked (via `loopx run <script-name>`). The `goto` mechanism is a **state transition, not a permanent reassignment.** When a target finishes without its own `goto`, execution returns to the starting target. The loop always resets to its initial state after a transition chain completes.
 
 **Self-referencing goto:** A script may `goto` itself (e.g., script A outputs `{ goto: "A" }`). This is a normal transition and counts as an iteration.
 
@@ -164,28 +164,72 @@ $LOOPX_BIN output --result "done" --goto "next-step"
 ### 4.1 Running Scripts
 
 ```
-loopx [options] [script-name]
+loopx run [options] <script-name>
 ```
 
-- If `script-name` is provided, loopx looks for a script with that base name in `.loopx/`.
-- If `script-name` is omitted, loopx looks for a script named `default` in `.loopx/`.
-- If no `default` script exists and no script name is given, loopx exits with an error message instructing the user to create a script (e.g., "No default script found. Create `.loopx/default.ts` or specify a script name.").
+Scripts are executed exclusively via the `run` subcommand. `run` accepts exactly one positional argument, the `<script-name>`:
+
+- The script name is required. `loopx run` with no script name (e.g., `loopx run` or `loopx run -n 5`) is a usage error (exit code 1). This does not inspect `.loopx/` or perform discovery.
+- More than one positional argument (e.g., `loopx run foo bar`) is a usage error (exit code 1).
 - If `script-name` does not match any script in `.loopx/`, loopx exits with an error.
-- `loopx default` (explicitly naming the default script) is valid and runs the script named `default`, identical to `loopx` with no script name.
+- `loopx` with no arguments shows top-level help (equivalent to `loopx -h`). No script discovery is performed.
+- Unrecognized subcommands (e.g., `loopx foo`) are usage errors (exit code 1). There is no implicit fallback to `run`.
+- `default` is an ordinary script name with no special behavior. `loopx run default` runs the script named `default`.
+- Scripts may be named after built-in subcommands (e.g., `version`, `output`). `loopx run version` runs a script named `version` (not the built-in). `loopx run run` runs a script named `run`.
 
 ### 4.2 Options
+
+The CLI has a two-level option structure: top-level options and `run`-scoped options.
+
+#### Top-level options
+
+| Flag | Description |
+|------|-------------|
+| `-h`, `--help` | Print top-level help (subcommand list, general syntax). Does not inspect `.loopx/` or perform script discovery. |
+
+`-h` / `--help` is the only recognized top-level flag. Any other flag at top level — including `-n`, `-e`, and any unrecognized flag (e.g., `loopx --unknown`, `loopx -n 5 myscript`, `loopx -e .env myscript`) — is a usage error (exit code 1).
+
+**Top-level `-h` precedence:** `loopx -h` takes precedence over everything that follows. `loopx -h run foo` shows top-level help (no discovery), not run help, and exits 0.
+
+An unrecognized token in the subcommand position is an error regardless of what follows: `loopx foo -h` is an unrecognized subcommand error (exit code 1), not top-level help. The top-level `-h` short-circuit only applies when `-h` appears before subcommand dispatch (i.e., as the first argument to `loopx`).
+
+#### `run`-scoped options
 
 | Flag | Description |
 |------|-------------|
 | `-n <count>` | Maximum number of loop iterations (see section 7.1 for counting semantics). Must be a non-negative integer; negative values or non-integers are usage errors. `-n 0` validates the starting target (script discovery, name resolution, env file loading) but executes zero iterations, then exits with code 0. |
-| `-e <path>` | Path to a local env file (`.env` format). The file must exist; a missing file is an error. Variables are merged with global env vars; local values take precedence on conflict. |
-| `-h`, `--help` | Print usage information. Dynamically lists available scripts discovered in `.loopx/`. Performs non-fatal discovery and validation — if `.loopx/` is missing or contains invalid scripts, help is still displayed with warnings appended. |
+| `-e <path>` | Path to a local env file (`.env` format). The file must exist and is validated during execution; a missing file is an error. Variables are merged with global env vars; local values take precedence on conflict. |
+| `-h`, `--help` | Print run help — options (`-n`, `-e`) and dynamically discovered scripts in `.loopx/`. See section 11 for full run help behavior. |
 
-**Flag precedence:** A top-level `-h` / `--help` takes precedence over other top-level arguments and flags, and exits 0 without running scripts or subcommands.
+Within `run`, options and `<script-name>` may appear in any order.
 
-**Duplicate flags:** Repeating `-n` or `-e` (e.g., `-n 5 -n 10` or `-e .env1 -e .env2`) is a usage error. loopx exits with code 1.
+**Duplicate flags:** Repeating `-n` or `-e` within `run` (e.g., `loopx run -n 5 -n 10` or `loopx run -e .env1 -e .env2`) is a usage error (exit code 1) — unless `-h` / `--help` is present (see below).
+
+**Unrecognized flags:** Unrecognized flags within `run` (e.g., `loopx run --unknown myscript`) are usage errors (exit code 1) — unless `-h` / `--help` is present (see below).
+
+**`run -h` short-circuit:** Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows run help, exits 0, and ignores all other run-level arguments unconditionally. This means:
+
+- Script name requirements are suppressed (zero or multiple positionals are not errors).
+- `-n` and `-e` values are not parsed or validated (including duplicates and invalid values).
+- Unknown flags are ignored.
+- Examples:
+  - `loopx run -h foo` — shows run help (script name ignored).
+  - `loopx run myscript -h` — shows run help (`-h` after script name still triggers help short-circuit).
+  - `loopx run -h -e missing.env` — shows run help (env file not validated).
+  - `loopx run -h -n bad` — shows run help (`-n` not validated).
+  - `loopx run -h -n 5 -n 10` — shows run help (duplicate `-n` not rejected).
+  - `loopx run -h foo bar` — shows run help (extra positional not rejected).
+  - `loopx run -h --unknown` — shows run help (unknown flag not rejected).
 
 ### 4.3 Subcommands
+
+#### `loopx run`
+
+Executes a script. This is the only way to run scripts — see section 4.1 for the full grammar and section 4.2 for `run`-scoped options.
+
+```
+loopx run [options] <script-name>
+```
 
 #### `loopx version`
 
@@ -259,42 +303,39 @@ Nested directories that do not contain a valid `package.json` with `main` are ig
 - **Edits to the contents of an already-discovered script file take effect on subsequent iterations**, because the child process reads the file from disk each time it is spawned.
 - **If a discovered script's underlying file or directory is removed or renamed mid-loop**, execution uses the cached entry path and fails at spawn time as a normal child-process launch error. This is treated as a non-zero exit (section 7.2).
 
-**Warnings** (invalid `main` field, unsupported extensions in directories, paths escaping the script directory) are printed to stderr during discovery. Discovery runs at loop start for script mode and during `--help`.
+**Warnings** (invalid `main` field, unsupported extensions in directories, paths escaping the script directory) are printed to stderr during discovery. Discovery runs at loop start for `loopx run <script>` and during `loopx run -h`. Discovery does **not** run for top-level help (`loopx -h` / `loopx --help` / bare `loopx`).
 
 ### 5.2 Name Collision
 
-If multiple entries share the same script name — whether file-to-file (e.g., `example.sh` and `example.js`), or file-to-directory (e.g., `example.ts` and `example/`) — loopx refuses to start and displays an error message listing the conflicting entries.
+If multiple entries share the same script name — whether file-to-file (e.g., `example.sh` and `example.js`), or file-to-directory (e.g., `example.ts` and `example/`) — the behavior depends on the command:
 
-### 5.3 Reserved Names
+- **`loopx run <script>`:** Collisions are fatal. loopx refuses to start and displays an error message listing the conflicting entries.
+- **`loopx run -h`:** Collisions are non-fatal. Run help is displayed with warnings about the conflicting entries.
 
-The following script names are reserved and cannot be used:
-
-- `output`
-- `env`
-- `install`
-- `version`
-
-If any script in `.loopx/` uses a reserved name, loopx refuses to start and displays an error message.
-
-### 5.4 Name Restrictions
+### 5.3 Name Restrictions
 
 - Script names must not begin with `-`.
 - Script names must match the pattern `[a-zA-Z0-9_][a-zA-Z0-9_-]*` (start with alphanumeric or underscore, followed by alphanumerics, underscores, or hyphens).
 
-If any script in `.loopx/` violates these restrictions, the behavior depends on the command: in run mode, loopx refuses to start and displays an error message. In help mode, the invalid script is listed with a non-fatal warning.
+If any script in `.loopx/` violates these restrictions, the behavior depends on the command:
 
-### 5.5 Validation Scope
+- **`loopx run <script>`:** Violations are fatal. loopx refuses to start and displays an error message.
+- **`loopx run -h`:** Violations are non-fatal. The invalid script is listed with a warning; run help is still displayed.
+
+### 5.4 Validation Scope
 
 Not all commands require `.loopx/` to exist or be valid:
 
 | Command | Requires `.loopx/` | Validates scripts |
 |---------|--------------------|--------------------|
+| `loopx` (no arguments) | No | No |
+| `loopx -h` / `loopx --help` | No | No |
 | `loopx version` | No | No |
 | `loopx env *` | No | No |
 | `loopx output` | No | No |
-| `loopx -h` / `--help` | No | Non-fatal (warnings shown) |
-| `loopx install <url>` | No (creates if needed) | No |
-| `loopx [script-name]` | Yes | Yes |
+| `loopx install <source>` | No (creates if needed) | No |
+| `loopx run -h` | No | Non-fatal (warnings shown) |
+| `loopx run <script>` | Yes | Yes (fatal) |
 
 ---
 
@@ -380,9 +421,9 @@ The first script invocation in a loop receives **no input**. Stdin is empty.
 
 ### 7.1 Basic Loop
 
-1. Validate the `.loopx/` directory (check for name collisions, reserved names, name restrictions). Cache the discovery results.
+1. Validate the `.loopx/` directory (check for name collisions and name restrictions). Cache the discovery results.
 2. Load environment variables (global + local via `-e`). Cache the resolved set for the duration of the loop.
-3. Determine the starting target: named script or `default` script.
+3. Resolve the starting target: the script name provided to `loopx run <script-name>`. If the script does not exist in the cached discovery results, exit with an error.
 4. If `-n 0` was specified: exit with code 0 (no iterations executed).
 5. Execute the starting target with no input (first iteration).
 6. Capture stdout. Parse it as structured output per section 2.3.
@@ -405,7 +446,7 @@ The first script invocation in a loop receives **no input**. Stdin is empty.
 
 - **Non-zero exit code from a script:** The loop **stops immediately**. loopx exits with code 1. The script's stderr has already been passed through to the terminal. Any stdout produced by the script before it failed is not parsed as structured output.
 - **Invalid `goto` target:** If `goto` references a script name that does not exist in `.loopx/`, loopx prints an error message to stderr and exits with code 1.
-- **Missing `.loopx/` directory:** When running a named or default script, if `.loopx/` does not exist, loopx exits with an error instructing the user to create it.
+- **Missing `.loopx/` directory:** When executing via `loopx run <script>`, if `.loopx/` does not exist, loopx exits with an error instructing the user to create it.
 
 ### 7.3 Signal Handling
 
@@ -449,7 +490,9 @@ If the directory or file does not exist, loopx treats it as having no global var
 
 ### 8.2 Local Override (`-e`)
 
-When `-e <path>` is specified, the file at `<path>` is read using the same `.env` format rules. If the file does not exist, loopx exits with an error.
+When `-e <path>` is specified during execution (`loopx run <script>` or the programmatic API), the file at `<path>` is read using the same `.env` format rules. If the file does not exist, loopx exits with an error.
+
+**Note:** Under the `loopx run -h` short-circuit, `-e` is not parsed or validated — a missing env file is not an error in that context (see section 4.2).
 
 Local variables are merged with global env vars. Local values take precedence on conflict.
 
@@ -477,7 +520,7 @@ loopx injects the following variables into every script execution:
 
 loopx can be imported and used from TypeScript/JavaScript. **This requires loopx to be installed as a local dependency** (`npm install loopx` or `npm install --save-dev loopx`).
 
-### 9.1 `run(scriptName?: string)`
+### 9.1 `run(scriptName: string)`
 
 ```typescript
 import { run } from "loopx";
@@ -493,7 +536,9 @@ for await (const output of loop) {
 
 Returns an `AsyncGenerator<Output>` that yields the `Output` from each loop iteration. The generator completes when the loop ends via `stop: true` or when `maxIterations` is reached. **The output from the final iteration is always yielded before the generator completes.**
 
-**Error timing:** `run()` snapshots its options and `cwd` at call time, but all errors (validation failures, missing scripts, discovery errors) are surfaced lazily when iteration begins (i.e., on the first `next()` call or equivalent). The `run()` call itself always returns a generator without throwing.
+`scriptName` is a required parameter. In TypeScript, omitting `scriptName` is a static type error. In JavaScript, or when the type check is bypassed, runtime-invalid `scriptName` values (e.g., `undefined`, `null`, `42`, or any non-string) are rejected lazily: `run()` still returns a generator without throwing, and the error is raised on first iteration (first `next()` call). For example, `run(undefined as any)` returns a generator that throws on first iteration.
+
+**Error timing:** `run()` snapshots its options and `cwd` at call time, but all errors (validation failures, missing scripts, discovery errors, invalid `scriptName`) are surfaced lazily when iteration begins (i.e., on the first `next()` call or equivalent). The `run()` call itself always returns a generator without throwing.
 
 Options can be passed as a second argument:
 
@@ -511,7 +556,7 @@ for await (const output of run("myscript", { maxIterations: 10, envFile: ".env" 
 
 - **AbortSignal:** When the `signal` is aborted, loopx terminates the active child process group (if one is running — SIGTERM, then SIGKILL after 5 seconds) and the generator **throws an abort error**. This applies regardless of whether a child process is active — aborting the signal always produces an error, even if it occurs between iterations or before the first `next()` call. This follows conventional JavaScript `AbortSignal` semantics.
 
-### 9.2 `runPromise(scriptName?: string)`
+### 9.2 `runPromise(scriptName: string)`
 
 ```typescript
 import { runPromise } from "loopx";
@@ -520,6 +565,8 @@ const outputs: Output[] = await runPromise("myscript");
 ```
 
 Returns a `Promise<Output[]>` that resolves with an array of all `Output` values when the loop ends. Accepts the same options object as `run()`.
+
+`scriptName` is required, same as `run()`. In JavaScript or when the type check is bypassed, `runPromise(undefined as any)` returns a rejected promise rather than throwing synchronously — the call itself always returns a promise, and the validation error surfaces as a rejection.
 
 ### 9.3 Error Behavior
 
@@ -613,7 +660,7 @@ All install sources share these rules:
 
 - **Destination-path collision:** If any filesystem entry (file or directory, whether or not it is a discovered script) already exists at the destination path in `.loopx/`, loopx displays an error and does not overwrite. The user must manually remove the existing entry first. This includes non-script directories that may exist for shared utilities (see section 2.1).
 - **Script-name collision:** If the derived script name would collide with any existing discovered script in `.loopx/` — even if the destination filesystem path is different — loopx displays an error and does not install. For example, if `.loopx/foo.sh` exists and the install would create `.loopx/foo/`, the install is rejected because both resolve to script name `foo`. This prevents install from creating a state that would fail discovery validation (section 5.2).
-- The script name is validated against reserved name and name restriction rules before being saved.
+- The script name is validated against name restriction rules (section 5.3) before being saved.
 - **loopx does not run `npm install` or `bun install` after cloning/extracting.** For directory scripts with dependencies, the user must install them manually (e.g., `cd .loopx/my-script && npm install`).
 - **Install failure cleanup:** Any install failure (download error, HTTP non-2xx, git clone failure, extraction failure, post-download validation failure) exits with code 1. Any partially created target file or directory at the destination path is removed before exit.
 
@@ -621,13 +668,30 @@ All install sources share these rules:
 
 ## 11. Help
 
-`loopx -h` / `loopx --help` prints usage information including:
+Help has two forms: top-level help and run help.
 
-- General usage syntax
-- Available options and subcommands
+### 11.1 Top-level Help
+
+`loopx -h` / `loopx --help` / `loopx` (no arguments) prints top-level usage information:
+
+- General CLI syntax
+- Available subcommands (`run`, `version`, `output`, `env`, `install`)
+
+Top-level help does **not** inspect `.loopx/` or perform script discovery.
+
+### 11.2 Run Help
+
+`loopx run -h` / `loopx run --help` prints run-specific usage information:
+
+- `run` syntax and options (`-n`, `-e`)
 - A dynamically generated list of scripts discovered in the current `.loopx/` directory (name and file type)
 
-Help performs **non-fatal discovery and validation**: if `.loopx/` does not exist, help is displayed without the script list. If `.loopx/` exists but contains validation errors (name collisions, reserved names), help is displayed with warnings about the invalid scripts.
+Run help performs **non-fatal discovery and validation**:
+
+- If `.loopx/` does not exist, run help is still displayed with a warning that the directory was not found. The discovered-scripts section is omitted.
+- If `.loopx/` exists but contains validation issues (name collisions, name restriction violations, invalid or unreadable `package.json`, missing or non-string `main` field, unsupported `main` extension, `main` path escaping the script directory, `main` pointing to a nonexistent file), run help is displayed with warnings for the problematic entries.
+
+Run help is the only help form that performs script discovery. The `-h` short-circuit within `run` ignores all other run-level arguments (see section 4.2).
 
 ---
 
@@ -635,23 +699,20 @@ Help performs **non-fatal discovery and validation**: if `.loopx/` does not exis
 
 | Code | Meaning |
 |------|---------|
-| 0 | Clean exit: loop ended via `stop: true`, `-n` limit reached (including `-n 0`), or successful subcommand execution. |
-| 1 | Error: script exited non-zero, validation failure, invalid `goto` target, missing script, missing `.loopx/` directory, or usage error (invalid `-n` value, missing `-e` file). |
+| 0 | Clean exit: loop ended via `stop: true`, `-n` limit reached (including `-n 0`), successful subcommand execution, or help display. |
+| 1 | Error: script exited non-zero, validation failure, invalid `goto` target, missing script, missing `.loopx/` directory, or usage error. |
 | 128+N | Interrupted by signal N (e.g., 130 for SIGINT). |
+
+Usage errors (exit code 1) include: `loopx run` with no script name, `loopx run foo bar` (extra positional), `loopx foo` (unrecognized subcommand), `loopx --unknown` (unrecognized top-level flag), `loopx -n 5 myscript` (top-level `-n`), `loopx -e .env myscript` (top-level `-e`), `loopx run --unknown myscript` (unrecognized run flag), and `loopx run -n 5 -n 10 myscript` (duplicate run flag).
 
 Note: A non-zero exit code from any script causes loopx to exit with code 1. Scripts that need error resilience should handle errors internally and exit 0.
 
 ---
 
-## 13. Summary of Reserved and Special Values
+## 13. Summary of Special Values
 
 | Name | Context | Purpose |
 |------|---------|---------|
-| `output` | Script name | Reserved for `loopx output` subcommand |
-| `env` | Script name | Reserved for `loopx env` subcommand |
-| `install` | Script name | Reserved for `loopx install` subcommand |
-| `version` | Script name | Reserved for `loopx version` subcommand |
-| `default` | Script name | The script run when no name is provided |
 | `LOOPX_BIN` | Env variable | Resolved realpath of the effective loopx binary (post-delegation) |
 | `LOOPX_PROJECT_ROOT` | Env variable | Absolute path to the directory where loopx was invoked |
 | `LOOPX_DELEGATED` | Env variable | Set to `1` during delegation to prevent recursion |
