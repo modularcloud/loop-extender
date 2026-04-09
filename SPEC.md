@@ -335,7 +335,7 @@ Not all commands require `.loopx/` to exist or be valid:
 | `loopx output` | No | No |
 | `loopx install <source>` | No (creates if needed) | No |
 | `loopx run -h` | No | Non-fatal (warnings shown) |
-| `loopx run <script>` | Yes | Yes (fatal) |
+| `loopx run <script>` | Yes | Yes — collisions (5.2), name-restriction violations (5.3), and missing requested script are fatal; invalid directory-script entries (5.1) are ignored with warnings |
 
 ---
 
@@ -421,7 +421,7 @@ The first script invocation in a loop receives **no input**. Stdin is empty.
 
 ### 7.1 Basic Loop
 
-1. Validate the `.loopx/` directory (check for name collisions and name restrictions). Cache the discovery results.
+1. Discover scripts in the `.loopx/` directory per section 5.1 (invalid directory-script entries are ignored with warnings). Validate for name collisions (section 5.2) and name restrictions (section 5.3) — these are fatal in run mode. Cache the discovery results.
 2. Load environment variables (global + local via `-e`). Cache the resolved set for the duration of the loop.
 3. Resolve the starting target: the script name provided to `loopx run <script-name>`. If the script does not exist in the cached discovery results, exit with an error.
 4. If `-n 0` was specified: exit with code 0 (no iterations executed).
@@ -520,7 +520,7 @@ loopx injects the following variables into every script execution:
 
 loopx can be imported and used from TypeScript/JavaScript. **This requires loopx to be installed as a local dependency** (`npm install loopx` or `npm install --save-dev loopx`).
 
-### 9.1 `run(scriptName: string)`
+### 9.1 `run(scriptName: string, options?: RunOptions)`
 
 ```typescript
 import { run } from "loopx";
@@ -556,7 +556,7 @@ for await (const output of run("myscript", { maxIterations: 10, envFile: ".env" 
 
 - **AbortSignal:** When the `signal` is aborted, loopx terminates the active child process group (if one is running — SIGTERM, then SIGKILL after 5 seconds) and the generator **throws an abort error**. This applies regardless of whether a child process is active — aborting the signal always produces an error, even if it occurs between iterations or before the first `next()` call. This follows conventional JavaScript `AbortSignal` semantics.
 
-### 9.2 `runPromise(scriptName: string)`
+### 9.2 `runPromise(scriptName: string, options?: RunOptions)`
 
 ```typescript
 import { runPromise } from "loopx";
@@ -703,7 +703,7 @@ Run help is the only help form that performs script discovery. The `-h` short-ci
 | 1 | Error: script exited non-zero, validation failure, invalid `goto` target, missing script, missing `.loopx/` directory, or usage error. |
 | 128+N | Interrupted by signal N (e.g., 130 for SIGINT). |
 
-Usage errors (exit code 1) include: `loopx run` with no script name, `loopx run foo bar` (extra positional), `loopx foo` (unrecognized subcommand), `loopx --unknown` (unrecognized top-level flag), `loopx -n 5 myscript` (top-level `-n`), `loopx -e .env myscript` (top-level `-e`), `loopx run --unknown myscript` (unrecognized run flag), and `loopx run -n 5 -n 10 myscript` (duplicate run flag).
+Usage errors (exit code 1) include: `loopx run` with no script name, `loopx run foo bar` (extra positional), `loopx foo` (unrecognized subcommand), `loopx myscript` (unrecognized subcommand — no implicit fallback to `run`), `loopx --unknown` (unrecognized top-level flag), `loopx -n 5 myscript` (top-level `-n`), `loopx -e .env myscript` (top-level `-e`), `loopx run --unknown myscript` (unrecognized run flag), and `loopx run -n 5 -n 10 myscript` (duplicate run flag).
 
 Note: A non-zero exit code from any script causes loopx to exit with code 1. Scripts that need error resilience should handle errors internally and exit 0.
 
