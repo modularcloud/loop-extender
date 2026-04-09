@@ -30,7 +30,7 @@ fi
 
 # Build the prompt and save to file (too long for a single Telegram message)
 cat <<PROMPT > "$PROMPT_FILE"
-ADR 0002 has been accepted. The next step per ADR 0001 is to update SPEC.md to incorporate the changes described in ADR 0002. Review the current SPEC.md against ADR 0002 and let me know if the SPEC updates look correct and complete, or if anything needs to be changed. ADR 0002 is the source of truth for what should change — do not suggest changes to it.
+ADR 0002 has been accepted. The next step in the process is to update SPEC.md to incorporate the changes described in ADR 0002. Review the current SPEC.md against ADR 0002 and let me know if the SPEC updates look correct and complete, or if anything else in the SPEC needs to be changed.
 
 adr/0002-run-subcommand.md (accepted — do not modify):
 $(cat "$ADR_0002")
