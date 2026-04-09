@@ -20,7 +20,11 @@ The only way to execute scripts becomes:
 loopx run [options] <script-name>
 ```
 
-The script name is required — there is no default script concept.
+`run` accepts exactly one positional argument, the `<script-name>`:
+
+- The script name is required — there is no default script concept.
+- Zero positional arguments (e.g., `loopx run` or `loopx run -n 5`) is a usage error (exit code 1).
+- More than one positional argument (e.g., `loopx run foo bar`) is a usage error (exit code 1).
 
 Options `-n` and `-e` are scoped to the `run` subcommand:
 
@@ -45,7 +49,9 @@ Since scripts are always invoked via `loopx run <name>`, there is no ambiguity w
 ### 4. Help restructuring
 
 - `loopx -h` / `loopx --help`: Top-level help — lists subcommands (`run`, `version`, `output`, `env`, `install`) and general syntax. **Does not inspect `.loopx/` or perform script discovery.**
-- `loopx run -h` / `loopx run --help`: Run-specific help — options (`-n`, `-e`) and dynamically discovered scripts in `.loopx/`. This is the only help form that performs script discovery and non-fatal validation (warnings for invalid scripts, missing `.loopx/`, etc.).
+- `loopx run -h` / `loopx run --help`: Run-specific help — options (`-n`, `-e`) and dynamically discovered scripts in `.loopx/`. This is the only help form that performs script discovery and non-fatal validation:
+  - If `.loopx/` does not exist, run help is still displayed with a warning that the directory was not found. The discovered-scripts section is omitted.
+  - If `.loopx/` exists but contains validation issues (name collisions, name restriction violations), run help is displayed with warnings for the problematic entries.
 - `loopx` (no arguments): Shows top-level help (same as `loopx -h`). No script discovery.
 - Unrecognized subcommands (e.g., `loopx foo`) are a usage error — there is no implicit fallback to `run`.
 
@@ -54,11 +60,19 @@ Since scripts are always invoked via `loopx run <name>`, there is no ambiguity w
 - The only top-level option is `-h` / `--help`. Top-level `-n` and `-e` are usage errors (exit code 1).
 - `loopx` with no arguments is equivalent to `loopx -h`.
 - `-n` and `-e` are valid only after `run`. Within `run`, options and `<script-name>` may appear in any order.
+- Duplicate `-n` or `-e` within `run` (e.g., `loopx run -n 5 -n 10`) is a usage error (exit code 1), consistent with the current SPEC — unless `-h` / `--help` is present (see below).
 - `loopx run` with no `<script-name>` is a usage error (exit code 1) and does not inspect `.loopx/` or perform any discovery — except when `-h` / `--help` is present, which triggers run help instead.
-- Within `run`, `-h` / `--help` takes precedence over all other arguments: it exits 0, performs non-fatal script discovery, and does not validate env files, require a script name, or execute a script. Specifically:
-  - `loopx run -h foo` — shows run help (script name ignored).
-  - `loopx run -h -e missing.env` — shows run help (env file not validated).
-  - `loopx run -h -n bad` — shows run help (`-n` not validated).
+- Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows run help, exits 0, and ignores all other run-level arguments unconditionally. This means:
+  - Script name requirements are suppressed (zero or multiple positionals are not errors).
+  - `-n` and `-e` values are not parsed or validated (including duplicates and invalid values).
+  - Unknown flags are ignored.
+  - Examples:
+    - `loopx run -h foo` — shows run help (script name ignored).
+    - `loopx run -h -e missing.env` — shows run help (env file not validated).
+    - `loopx run -h -n bad` — shows run help (`-n` not validated).
+    - `loopx run -h -n 5 -n 10` — shows run help (duplicate `-n` not rejected).
+    - `loopx run -h foo bar` — shows run help (extra positional not rejected).
+    - `loopx run -h --unknown` — shows run help (unknown flag not rejected).
 - Top-level `-h` takes precedence over everything that follows: `loopx -h run foo` shows top-level help (no discovery), not run help.
 
 ### 6. Programmatic API
@@ -70,7 +84,7 @@ run(scriptName: string, options?: RunOptions): AsyncGenerator<Output>
 runPromise(scriptName: string, options?: RunOptions): Promise<Output[]>
 ```
 
-In TypeScript, omitting `scriptName` is a static type error. In JavaScript, or when the type check is bypassed (e.g., `run(undefined as any)`), the existing lazy error behavior is preserved: `run()` still returns a generator without throwing, and the error is raised on first iteration (first `next()` call). `runPromise()` rejects in the normal async path. This is consistent with the current SPEC's error timing semantics (section 9.1).
+In TypeScript, omitting `scriptName` is a static type error. In JavaScript, or when the type check is bypassed (e.g., `run(undefined as any)`), the existing lazy error behavior is preserved: `run()` still returns a generator without throwing, and the error is raised on first iteration (first `next()` call). `runPromise(undefined as any)` returns a rejected promise rather than throwing synchronously — the call itself always returns a promise, and the validation error surfaces as a rejection. This is consistent with the current SPEC's error timing semantics (section 9.1).
 
 ## Consequences
 
@@ -89,7 +103,10 @@ When this ADR is accepted, the following SPEC sections require updates. This lis
 - **2.2 (Loop)** — Remove "or the `default` script" from the definition of starting target. The starting target is always an explicitly named script.
 - **4.1–4.3 (CLI Interface)** — New CLI grammar with `run` subcommand. `loopx [options] [script-name]` becomes `loopx run [options] <script-name>` as the only invocation form. Remove default script fallback. Add `run` to the subcommands table. Unrecognized subcommands are usage errors.
 - **4.2 (Options)** — `-n` and `-e` become `run`-scoped options, not top-level. The only top-level option is `-h` / `--help`. Flag precedence text must be rewritten to reflect the two-level structure (top-level help vs. run help).
+- **5.1 (Discovery)** — Update the discovery timing statement. The current text says discovery runs "during `--help`," which is no longer accurate: discovery now runs only during `loopx run -h`, not during top-level `loopx -h` / `loopx --help`.
+- **5.2 (Name Collision)** — Distinguish fatal validation (`loopx run <script>`: refuses to start) from non-fatal validation (`loopx run -h`: collisions are reported as warnings, help is still displayed).
 - **5.3 (Reserved Names)** — Remove entirely. Scripts may now use any name that passes name restriction rules.
+- **5.4 (Name Restrictions)** — Update the "run mode" vs "help mode" distinction to reference `loopx run <script>` and `loopx run -h` specifically, rather than the generic terms.
 - **5.5 (Validation Scope)** — Update the table with new command forms: `loopx run <script>`, `loopx run -h`, and `loopx` (no arguments) as equivalent to `loopx -h`. Top-level `loopx -h` no longer performs discovery.
 - **7.1 / 7.2 (Loop Execution Flow)** — Starting target is always explicit (no `default` fallback). Remove reserved-name validation from step 1. Add error case for missing script name.
 - **9.1 / 9.2 (Programmatic API)** — `run(scriptName?: string)` and `runPromise(scriptName?: string)` become required-name APIs: `run(scriptName: string)` and `runPromise(scriptName: string)`. Lazy error behavior preserved for type-bypassed calls. Wording distinguishes TypeScript (static type error) from JavaScript (runtime error).
@@ -111,10 +128,18 @@ When this ADR is accepted, the following SPEC sections require updates. This lis
 - Verify `loopx myscript` is a usage error (unrecognized subcommand, no implicit `run` fallback).
 - Verify `loopx -h` does not inspect `.loopx/` or list scripts.
 - Verify `loopx run -h` performs script discovery and lists available scripts.
+- Verify `loopx run -h` with no `.loopx/` directory shows run help with a warning (not an error).
+- Verify `loopx run -h` with name collisions in `.loopx/` shows run help with warnings for the collisions.
 - Verify programmatic `run(undefined as any)` returns a generator that throws on first iteration (lazy error).
+- Verify programmatic `runPromise(undefined as any)` returns a rejected promise (not a synchronous throw).
 - Verify `loopx -n 5 myscript` is a usage error (top-level `-n` rejected).
 - Verify `loopx -e .env myscript` is a usage error (top-level `-e` rejected).
+- Verify `loopx run foo bar` is a usage error (more than one positional).
+- Verify `loopx run -n 5 -n 10 myscript` is a usage error (duplicate `-n`).
 - Verify `loopx run -h foo` shows run help and exits 0 (script name ignored).
 - Verify `loopx run -h -e missing.env` shows run help and exits 0 (env file not validated).
+- Verify `loopx run -h -n 5 -n 10` shows run help and exits 0 (duplicate `-n` not rejected under help).
+- Verify `loopx run -h foo bar` shows run help and exits 0 (extra positional not rejected under help).
+- Verify `loopx run -h --unknown` shows run help and exits 0 (unknown flag not rejected under help).
 - Verify `loopx -h run foo` shows top-level help and exits 0 (not run help).
 - Verify `loopx run` with no script name exits 1 without inspecting `.loopx/`.
