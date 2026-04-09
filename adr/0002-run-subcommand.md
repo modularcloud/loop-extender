@@ -51,29 +51,33 @@ Since scripts are always invoked via `loopx run <name>`, there is no ambiguity w
 - `loopx -h` / `loopx --help`: Top-level help — lists subcommands (`run`, `version`, `output`, `env`, `install`) and general syntax. **Does not inspect `.loopx/` or perform script discovery.**
 - `loopx run -h` / `loopx run --help`: Run-specific help — options (`-n`, `-e`) and dynamically discovered scripts in `.loopx/`. This is the only help form that performs script discovery and non-fatal validation:
   - If `.loopx/` does not exist, run help is still displayed with a warning that the directory was not found. The discovered-scripts section is omitted.
-  - If `.loopx/` exists but contains validation issues (name collisions, name restriction violations), run help is displayed with warnings for the problematic entries.
+  - If `.loopx/` exists but contains validation issues, run help is displayed with warnings for the problematic entries. All existing non-fatal discovery warnings from the current SPEC (section 5.1) are preserved in this mode — this includes name collisions, name restriction violations, invalid or unreadable `package.json`, missing or non-string `main` field, unsupported `main` extension, `main` path escaping the script directory, and `main` pointing to a nonexistent file.
 - `loopx` (no arguments): Shows top-level help (same as `loopx -h`). No script discovery.
 - Unrecognized subcommands (e.g., `loopx foo`) are a usage error — there is no implicit fallback to `run`.
 
 ### 5. Command parsing and precedence
 
-- The only top-level option is `-h` / `--help`. Top-level `-n` and `-e` are usage errors (exit code 1).
+- The only recognized top-level flag is `-h` / `--help`. Any other flag at top level — including `-n`, `-e`, and any unrecognized flag (e.g., `loopx --unknown`) — is a usage error (exit code 1).
 - `loopx` with no arguments is equivalent to `loopx -h`.
 - `-n` and `-e` are valid only after `run`. Within `run`, options and `<script-name>` may appear in any order.
 - Duplicate `-n` or `-e` within `run` (e.g., `loopx run -n 5 -n 10`) is a usage error (exit code 1), consistent with the current SPEC — unless `-h` / `--help` is present (see below).
+- Unrecognized flags within `run` (e.g., `loopx run --unknown myscript`) are usage errors (exit code 1) — unless `-h` / `--help` is present (see below).
 - `loopx run` with no `<script-name>` is a usage error (exit code 1) and does not inspect `.loopx/` or perform any discovery — except when `-h` / `--help` is present, which triggers run help instead.
+- `loopx run -n 0 <script-name>` is valid: discovery and validation run normally, zero iterations are executed, and the process exits 0. This preserves the current `-n 0` semantics.
 - Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows run help, exits 0, and ignores all other run-level arguments unconditionally. This means:
   - Script name requirements are suppressed (zero or multiple positionals are not errors).
   - `-n` and `-e` values are not parsed or validated (including duplicates and invalid values).
   - Unknown flags are ignored.
   - Examples:
     - `loopx run -h foo` — shows run help (script name ignored).
+    - `loopx run myscript -h` — shows run help (`-h` after script name still triggers help short-circuit).
     - `loopx run -h -e missing.env` — shows run help (env file not validated).
     - `loopx run -h -n bad` — shows run help (`-n` not validated).
     - `loopx run -h -n 5 -n 10` — shows run help (duplicate `-n` not rejected).
     - `loopx run -h foo bar` — shows run help (extra positional not rejected).
     - `loopx run -h --unknown` — shows run help (unknown flag not rejected).
 - Top-level `-h` takes precedence over everything that follows: `loopx -h run foo` shows top-level help (no discovery), not run help.
+- Conversely, an unrecognized token in the subcommand position is an error regardless of what follows: `loopx foo -h` is an unrecognized subcommand error (exit code 1), not top-level help. The top-level `-h` short-circuit only applies when `-h` appears before subcommand dispatch (i.e., as the first argument to `loopx`).
 
 ### 6. Programmatic API
 
@@ -84,7 +88,7 @@ run(scriptName: string, options?: RunOptions): AsyncGenerator<Output>
 runPromise(scriptName: string, options?: RunOptions): Promise<Output[]>
 ```
 
-In TypeScript, omitting `scriptName` is a static type error. In JavaScript, or when the type check is bypassed (e.g., `run(undefined as any)`), the existing lazy error behavior is preserved: `run()` still returns a generator without throwing, and the error is raised on first iteration (first `next()` call). `runPromise(undefined as any)` returns a rejected promise rather than throwing synchronously — the call itself always returns a promise, and the validation error surfaces as a rejection. This is consistent with the current SPEC's error timing semantics (section 9.1).
+In TypeScript, omitting `scriptName` is a static type error. In JavaScript, or when the type check is bypassed, runtime-invalid `scriptName` values (e.g., `undefined`, `null`, `42`, or any non-string) are rejected lazily: `run()` still returns a generator without throwing, and the error is raised on first iteration (first `next()` call). `runPromise(undefined as any)` returns a rejected promise rather than throwing synchronously — the call itself always returns a promise, and the validation error surfaces as a rejection. This is consistent with the current SPEC's error timing semantics (section 9.1).
 
 ## Consequences
 
@@ -143,3 +147,9 @@ When this ADR is accepted, the following SPEC sections require updates. This lis
 - Verify `loopx run -h --unknown` shows run help and exits 0 (unknown flag not rejected under help).
 - Verify `loopx -h run foo` shows top-level help and exits 0 (not run help).
 - Verify `loopx run` with no script name exits 1 without inspecting `.loopx/`.
+- Verify `loopx --unknown` is a usage error (exit code 1).
+- Verify `loopx run --unknown myscript` is a usage error (exit code 1).
+- Verify `loopx foo -h` is a usage error (unrecognized subcommand, exit code 1 — not top-level help).
+- Verify `loopx run myscript -h` shows run help and exits 0 (`-h` after script name triggers help short-circuit).
+- Verify `loopx run -h` with a directory script that has an invalid `main` field shows run help with a non-fatal discovery warning (not just collisions/name restrictions).
+- Verify `loopx run -n 0 myscript` performs discovery/validation, executes zero iterations, and exits 0.
