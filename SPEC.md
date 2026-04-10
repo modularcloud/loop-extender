@@ -303,7 +303,7 @@ Nested directories that do not contain a valid `package.json` with `main` are ig
 - **Edits to the contents of an already-discovered script file take effect on subsequent iterations**, because the child process reads the file from disk each time it is spawned.
 - **If a discovered script's underlying file or directory is removed or renamed mid-loop**, execution uses the cached entry path and fails at spawn time as a normal child-process launch error. This is treated as a non-zero exit (section 7.2).
 
-**Warnings** (invalid `main` field, unsupported extensions in directories, paths escaping the script directory) are printed to stderr during discovery. Discovery runs at loop start for `loopx run <script>` and during `loopx run -h`. Discovery does **not** run for top-level help (`loopx -h` / `loopx --help` / bare `loopx`).
+The discovery warnings described above are printed to stderr during discovery. Discovery runs at loop start for `loopx run <script>` and during `loopx run -h`. Discovery does **not** run for top-level help (`loopx -h` / `loopx --help` / bare `loopx`).
 
 ### 5.2 Name Collision
 
@@ -421,7 +421,7 @@ The first script invocation in a loop receives **no input**. Stdin is empty.
 
 ### 7.1 Basic Loop
 
-1. Discover scripts in the `.loopx/` directory per section 5.1 (invalid directory-script entries are ignored with warnings). Validate for name collisions (section 5.2) and name restrictions (section 5.3) — these are fatal in run mode. Cache the discovery results.
+1. A `<script-name>` is required. If none was provided, this is a usage error (exit code 1) — see section 4.1. Discover scripts in the `.loopx/` directory per section 5.1 (invalid directory-script entries are ignored with warnings). Validate for name collisions (section 5.2) and name restrictions (section 5.3) — these are fatal in run mode. Cache the discovery results.
 2. Load environment variables (global + local via `-e`). Cache the resolved set for the duration of the loop.
 3. Resolve the starting target: the script name provided to `loopx run <script-name>`. If the script does not exist in the cached discovery results, exit with an error.
 4. If `-n 0` was specified: exit with code 0 (no iterations executed).
