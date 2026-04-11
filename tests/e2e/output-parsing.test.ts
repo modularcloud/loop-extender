@@ -70,18 +70,26 @@ describe("SPEC: Structured Output Parsing (T-PARSE-01 through T-PARSE-29)", () =
       expect(output.goto).toBe("next");
     });
 
-    it("T-PARSE-03: {\"stop\":true} halts the loop", async () => {
+    it("T-PARSE-03: {\"stop\":true} halts the loop, exit code 0", async () => {
       project = await createTempProject();
       await createBashScript(project, "myscript", `printf '{"stop":true}'`);
 
-      const { outputs } = await runParseTest(project, "myscript");
+      // Use maxIterations > 1 so the loop *could* continue if stop didn't halt it
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("myscript", { cwd: "${project.dir}", maxIterations: 5 });
+console.log(JSON.stringify(outputs));
+`;
+      const result = await runAPIDriver("node", driverCode, { cwd: project.dir });
 
+      expect(result.exitCode).toBe(0);
+      const outputs = JSON.parse(result.stdout);
       expect(outputs).toHaveLength(1);
       const output = outputs[0] as Record<string, unknown>;
       expect(output.stop).toBe(true);
     });
 
-    it("T-PARSE-04: {\"result\":\"x\",\"goto\":\"next\",\"stop\":true} stop takes priority", async () => {
+    it("T-PARSE-04: {\"result\":\"x\",\"goto\":\"next\",\"stop\":true} stop takes priority, exit code 0", async () => {
       project = await createTempProject();
       await createBashScript(
         project,
@@ -89,8 +97,16 @@ describe("SPEC: Structured Output Parsing (T-PARSE-01 through T-PARSE-29)", () =
         `printf '{"result":"x","goto":"next","stop":true}'`
       );
 
-      const { outputs } = await runParseTest(project, "myscript");
+      // Use maxIterations > 1 so the loop *could* follow goto if stop didn't halt it
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("myscript", { cwd: "${project.dir}", maxIterations: 5 });
+console.log(JSON.stringify(outputs));
+`;
+      const result = await runAPIDriver("node", driverCode, { cwd: project.dir });
 
+      expect(result.exitCode).toBe(0);
+      const outputs = JSON.parse(result.stdout);
       expect(outputs).toHaveLength(1);
       const output = outputs[0] as Record<string, unknown>;
       expect(output.stop).toBe(true);
@@ -323,23 +339,31 @@ describe("SPEC: Structured Output Parsing (T-PARSE-01 through T-PARSE-29)", () =
       expect(Object.keys(output)).toHaveLength(0);
     });
 
-    it('T-PARSE-20a: {"goto":""} empty string goto preserved, not discarded → error', async () => {
+    it('T-PARSE-20a: {"goto":""} empty string goto preserved, not discarded → error via run() generator', async () => {
       project = await createTempProject();
       await createBashScript(project, "myscript", `printf '{"goto":""}'`);
 
+      // Use the run() generator API: iterate with for-await, expect an error
+      // on the second iteration when the empty goto is processed.
       const driverCode = `
-import { runPromise } from "loopx";
+import { run } from "loopx";
+let iterationCount = 0;
+let threw = false;
+let errorMessage = "";
 try {
-  await runPromise("myscript", { cwd: "${project.dir}", maxIterations: 2 });
-  console.log(JSON.stringify({ threw: false }));
+  for await (const output of run("myscript", { cwd: "${project.dir}", maxIterations: 2 })) {
+    iterationCount++;
+  }
 } catch (e) {
-  console.log(JSON.stringify({ threw: true, message: e.message }));
+  threw = true;
+  errorMessage = e.message;
 }
+console.log(JSON.stringify({ threw, iterationCount, message: errorMessage }));
 `;
       const result = await runAPIDriver("node", driverCode, { cwd: project.dir });
       const parsed = JSON.parse(result.stdout);
       // Empty string goto IS a string, so parser preserves it (unlike null/true/42)
-      // The loop then fails because "" is not a valid script name
+      // The generator should throw on the second iteration because "" is not a valid script name
       expect(parsed.threw).toBe(true);
       expect(parsed.message).toMatch(/goto/i);
     });

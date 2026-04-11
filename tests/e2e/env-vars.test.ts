@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { readFileSync, existsSync } from "node:fs";
-import { mkdir, chmod } from "node:fs/promises";
+import { readFileSync, existsSync, unlinkSync } from "node:fs";
+import { mkdir, chmod, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createTempProject,
@@ -101,14 +102,28 @@ describe("SPEC: Global Env File", () => {
 
     // T-ENV-03: XDG_CONFIG_HOME respected
     it("T-ENV-03: XDG_CONFIG_HOME is respected for global env file location", async () => {
-      await withGlobalEnv({ XDG_TEST_VAR: "xdg-works" }, async () => {
+      // Create a fresh temp dir for XDG_CONFIG_HOME (no pre-existing env file)
+      const customConfig = await mkdtemp(join(tmpdir(), "loopx-xdg-"));
+      const originalXdg = process.env.XDG_CONFIG_HOME;
+      process.env.XDG_CONFIG_HOME = customConfig;
+
+      try {
+        // Run `loopx env set X Y` — this should create the file at $XDG_CONFIG_HOME/loopx/env
+        const setResult = await runCLI(["env", "set", "X", "Y"], { runtime });
+        expect(setResult.exitCode).toBe(0);
+
+        // Verify the file exists at the XDG-directed path
+        const envFilePath = join(customConfig, "loopx", "env");
+        expect(existsSync(envFilePath)).toBe(true);
+
+        // Optionally verify the variable is accessible to scripts
         project = await createTempProject();
         const markerPath = join(project.dir, "xdg-marker.txt");
         await createScript(
           project,
           "check-xdg",
           ".sh",
-          writeEnvToFile("XDG_TEST_VAR", markerPath),
+          writeEnvToFile("X", markerPath),
         );
 
         const result = await runCLI(["run", "-n", "1", "check-xdg"], {
@@ -119,8 +134,15 @@ describe("SPEC: Global Env File", () => {
         expect(result.exitCode).toBe(0);
         expect(existsSync(markerPath)).toBe(true);
         const content = readFileSync(markerPath, "utf-8");
-        expect(content).toBe("xdg-works");
-      });
+        expect(content).toBe("Y");
+      } finally {
+        if (originalXdg === undefined) {
+          delete process.env.XDG_CONFIG_HOME;
+        } else {
+          process.env.XDG_CONFIG_HOME = originalXdg;
+        }
+        await rm(customConfig, { recursive: true, force: true });
+      }
     });
 
     // T-ENV-04: Fallback to ~/.config when XDG_CONFIG_HOME unset
@@ -701,9 +723,9 @@ describe("SPEC: Injection Precedence", () => {
         expect(result.exitCode).toBe(0);
         expect(existsSync(markerPath)).toBe(true);
         const content = readFileSync(markerPath, "utf-8");
-        // LOOPX_BIN should NOT be the env file value; the runtime injects the real one
         expect(content).not.toBe("env-file-bin-path");
         expect(content.length).toBeGreaterThan(0);
+        expect(content).toMatch(/loopx|bin/i);
       });
     });
 
@@ -728,9 +750,9 @@ describe("SPEC: Injection Precedence", () => {
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
       const content = readFileSync(markerPath, "utf-8");
-      // LOOPX_BIN should NOT be the system env value; the runtime injects the real one
       expect(content).not.toBe("system-env-bin-path");
       expect(content.length).toBeGreaterThan(0);
+      expect(content).toMatch(/loopx|bin/i);
     });
 
     // T-ENV-21: LOOPX_PROJECT_ROOT overrides env file value
@@ -839,66 +861,69 @@ describe("SPEC: Injection Precedence", () => {
       });
     });
 
-    // T-ENV-24: Full precedence chain
-    it("T-ENV-24: full precedence chain: LOOPX_BIN/LOOPX_PROJECT_ROOT > local -e > global > system env", async () => {
-      await withGlobalEnv({
-        LOOPX_PROJECT_ROOT: "/fake/global/root",
-        LAYER_VAR: "from-global",
-        GLOBAL_ONLY_VAR: "global-only-value",
-      }, async () => {
+    // T-ENV-24: Full precedence chain with peel-off
+    it("T-ENV-24: full precedence chain: local wins, then global wins, then system wins", async () => {
+      // Manually manage XDG_CONFIG_HOME so we can remove the global env file mid-test
+      const tempConfigHome = await mkdtemp(join(tmpdir(), "loopx-config-"));
+      const loopxConfigDir = join(tempConfigHome, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const globalEnvPath = join(loopxConfigDir, "env");
+      await createEnvFile(globalEnvPath, { VAR: "from-global" });
+
+      const originalXdg = process.env.XDG_CONFIG_HOME;
+      process.env.XDG_CONFIG_HOME = tempConfigHome;
+
+      try {
         project = await createTempProject();
-
         const localEnvPath = join(project.dir, "local.env");
-        await createEnvFile(localEnvPath, {
-          LAYER_VAR: "from-local",
-          LOCAL_ONLY_VAR: "local-only-value",
-        });
+        await createEnvFile(localEnvPath, { VAR: "from-local" });
 
-        const rootMarker = join(project.dir, "root.txt");
-        const layerMarker = join(project.dir, "layer.txt");
-        const globalOnlyMarker = join(project.dir, "global-only.txt");
-        const localOnlyMarker = join(project.dir, "local-only.txt");
-        const systemOnlyMarker = join(project.dir, "system-only.txt");
+        const markerPath = join(project.dir, "var-marker.txt");
 
-        const scriptContent = `#!/bin/bash
-printf '%s' "$LOOPX_PROJECT_ROOT" > "${rootMarker}"
-printf '%s' "$LAYER_VAR" > "${layerMarker}"
-printf '%s' "$GLOBAL_ONLY_VAR" > "${globalOnlyMarker}"
-printf '%s' "$LOCAL_ONLY_VAR" > "${localOnlyMarker}"
-printf '%s' "$SYSTEM_ONLY_VAR" > "${systemOnlyMarker}"
-`;
-        await createScript(project, "precedence", ".sh", scriptContent);
-
-        const result = await runCLI(
-          ["run", "-e", "local.env", "-n", "1", "precedence"],
-          {
-            cwd: project.dir,
-            runtime,
-            env: {
-              LOOPX_PROJECT_ROOT: "/fake/system/root",
-              LAYER_VAR: "from-system",
-              SYSTEM_ONLY_VAR: "system-only-value",
-            },
-          },
+        await createScript(
+          project,
+          "check-var",
+          ".sh",
+          writeEnvToFile("VAR", markerPath),
         );
 
-        expect(result.exitCode).toBe(0);
+        const systemEnv = { VAR: "from-system" };
 
-        // LOOPX_PROJECT_ROOT: runtime-injected > all others
-        expect(readFileSync(rootMarker, "utf-8")).toBe(project!.dir);
+        // --- Step 1: all three levels present -> local wins ---
+        const r1 = await runCLI(
+          ["run", "-e", "local.env", "-n", "1", "check-var"],
+          { cwd: project.dir, runtime, env: systemEnv },
+        );
+        expect(r1.exitCode).toBe(0);
+        expect(readFileSync(markerPath, "utf-8")).toBe("from-local");
 
-        // LAYER_VAR: local -e > global > system
-        expect(readFileSync(layerMarker, "utf-8")).toBe("from-local");
+        // --- Step 2: remove local env file -> global wins ---
+        unlinkSync(localEnvPath);
 
-        // GLOBAL_ONLY_VAR: global env wins (no local or system override)
-        expect(readFileSync(globalOnlyMarker, "utf-8")).toBe("global-only-value");
+        const r2 = await runCLI(
+          ["run", "-n", "1", "check-var"],
+          { cwd: project.dir, runtime, env: systemEnv },
+        );
+        expect(r2.exitCode).toBe(0);
+        expect(readFileSync(markerPath, "utf-8")).toBe("from-global");
 
-        // LOCAL_ONLY_VAR: local -e file
-        expect(readFileSync(localOnlyMarker, "utf-8")).toBe("local-only-value");
+        // --- Step 3: remove global env file -> system wins ---
+        unlinkSync(globalEnvPath);
 
-        // SYSTEM_ONLY_VAR: system env visible (no env file override)
-        expect(readFileSync(systemOnlyMarker, "utf-8")).toBe("system-only-value");
-      });
+        const r3 = await runCLI(
+          ["run", "-n", "1", "check-var"],
+          { cwd: project.dir, runtime, env: systemEnv },
+        );
+        expect(r3.exitCode).toBe(0);
+        expect(readFileSync(markerPath, "utf-8")).toBe("from-system");
+      } finally {
+        if (originalXdg === undefined) {
+          delete process.env.XDG_CONFIG_HOME;
+        } else {
+          process.env.XDG_CONFIG_HOME = originalXdg;
+        }
+        await rm(tempConfigHome, { recursive: true, force: true });
+      }
     });
 
     // T-ENV-24a: LOOPX_DELEGATED not visible to scripts

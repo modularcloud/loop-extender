@@ -160,7 +160,6 @@ console.log(JSON.stringify({ result: outputs[0]?.result }));
       it("T-EDGE-04: stdout is structured output, stderr contains expected message", async () => {
         project = await createTempProject();
 
-        // Script writes to both stdout and stderr
         await createBashScript(
           project,
           "mixed-io",
@@ -174,9 +173,20 @@ printf '{"result":"stdout-ok"}'`,
         });
 
         expect(result.exitCode).toBe(0);
-        // Per Spec 7.1: "The CLI does not print result to its own stdout."
-        // So we only assert stderr contains the expected pass-through message.
+        expect(result.stdout).toBe("");
         expect(result.stderr).toContain("stderr-message-here");
+
+        const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("mixed-io", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+console.log(JSON.stringify({ result: outputs[0]?.result }));
+`;
+        const apiResult = await runAPIDriver(runtime, driverCode, {
+          cwd: project.dir,
+        });
+        expect(apiResult.exitCode).toBe(0);
+        const parsed = JSON.parse(apiResult.stdout);
+        expect(parsed.result).toBe("stdout-ok");
       });
     });
   });
