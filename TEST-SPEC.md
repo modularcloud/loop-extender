@@ -451,6 +451,7 @@ The spec says `-h` / `--help` within `run` is a full short-circuit that ignores 
 - **T-CLI-76**: `loopx run foo bar -h` shows run help and exits 0. Multiple positionals would be a usage error, but `-h` suppresses the positional count check. *(Spec 4.2)*
 - **T-CLI-77**: `loopx run -n bad -h` shows run help and exits 0. The invalid `-n` value would be a usage error, but `-h` suppresses `-n` validation. *(Spec 4.2)*
 - **T-CLI-78**: `loopx run --unknown --help` shows run help and exits 0. Same as T-CLI-73 but with the `--help` long form, verifying both spellings work when preceded by invalid args. *(Spec 4.2)*
+- **T-CLI-84**: `loopx run -e a.env -e b.env -h` shows run help and exits 0. Duplicate `-e` would be a usage error, but `-h` appearing later triggers the help short-circuit, suppressing the duplicate check. This is the symmetric counterpart to T-CLI-75 (duplicate `-n` before `-h`). *(Spec 4.2)*
 
 - **T-CLI-55**: `loopx run -h` with `.loopx/` containing a directory script with an unreadable `package.json` (e.g., `chmod 000`) prints run help with a non-fatal warning on stderr about the unreadable file. Help still exits 0. **This test is conditional on `process.getuid() !== 0`.** *(Spec 5.1, 11.2)*
 - **T-CLI-55a**: `loopx run -h` with `.loopx/` containing a directory script whose `package.json` has no `main` field (e.g., `{"name": "foo"}`) prints run help with a non-fatal warning on stderr about the missing `main`. Help still exits 0. *(Spec 5.1, 11.2)*
@@ -485,6 +486,9 @@ The spec says `-h` / `--help` within `run` is a full short-circuit that ignores 
 - **T-CLI-31**: `loopx run version` with `.loopx/version.sh` runs the script named `version`, not the built-in subcommand. Assert via marker file that the script executed and the output is the script's, not the version string. *(Spec 4.1)*
 - **T-CLI-32**: `loopx run run` with `.loopx/run.sh` runs the script named `run`. Assert via marker file. *(Spec 4.1)*
 - **T-CLI-66**: `loopx version` with `.loopx/version.sh` present still prints the CLI version string and exits 0. Assert that stdout matches the package version (bare version string + newline) AND assert via marker file that the script did not run. Top-level subcommand dispatch is not affected by same-named scripts in `.loopx/` — scripts are only reachable via `loopx run <name>`. *(Spec 4.1, 4.3)*
+- **T-CLI-80**: `loopx output --result "x"` with `.loopx/output.sh` present still runs the built-in `output` subcommand, not the script. Assert that stdout is valid JSON with `result: "x"` AND assert via marker file that the script did not run. *(Spec 4.1, 4.3)*
+- **T-CLI-81**: `loopx env list` with `.loopx/env.ts` present still runs the built-in `env` subcommand, not the script. Assert exit code 0 AND assert via marker file that the script did not run. Also verify `loopx env set FOO bar` with `.loopx/env.ts` present writes the variable (assert via subsequent `loopx env list` showing `FOO=bar`) and the script's marker file does not exist. *(Spec 4.1, 4.3)*
+- **T-CLI-82**: `loopx install <source>` with `.loopx/install.js` present still runs the built-in `install` subcommand, not the script. Use a local HTTP server to serve a valid `.ts` file. Assert exit code 0 AND assert the installed file appears in `.loopx/` AND assert via marker file that the existing `install.js` script did not run. *(Spec 4.1, 4.3)*
 
 #### Option Order
 
@@ -492,6 +496,7 @@ Within `run`, options and `<script-name>` may appear in any order. The following
 
 - **T-CLI-57**: `loopx run myscript -n 1` (script name before `-n`) runs the script for exactly 1 iteration. Assert via counter file that the script ran exactly once. This proves that options after the script name are accepted during normal execution, not just under the `-h` short-circuit. *(Spec 4.2)*
 - **T-CLI-58**: `loopx run myscript -e local.env -n 1` (script name before both `-e` and `-n`) runs the script with the env file loaded. Assert via marker file that the env variable from `local.env` is visible to the script. *(Spec 4.2)*
+- **T-CLI-83**: `loopx run -e local.env myscript -n 1` (options on both sides of the script name) runs the script for exactly 1 iteration with the env file loaded. Assert via counter file that the script ran exactly once AND assert via marker file that the env variable from `local.env` is visible to the script. This covers a truly interleaved option order — `-e` before the script name, `-n` after it. *(Spec 4.2)*
 
 #### CLI `-n` Option
 
@@ -994,9 +999,9 @@ These tests verify `LOOPX_BIN` through loop behavior and side-effect files — n
 
 #### `runPromise()` with Invalid `scriptName`
 
-- **T-API-14a**: `runPromise(undefined as any)` returns a rejected promise (not a synchronous throw). The call itself always returns a promise, and the validation error surfaces as a rejection. *(Spec 9.2)*
-- **T-API-14a2**: `runPromise(null as any)` returns a rejected promise. *(Spec 9.2)*
-- **T-API-14a3**: `runPromise(42 as any)` returns a rejected promise. *(Spec 9.2)*
+- **T-API-14a**: `runPromise(undefined as any)` returns a rejected promise (not a synchronous throw). The call itself always returns a promise, and the validation error surfaces as a rejection. The test must explicitly verify: (1) the `runPromise(...)` call does not throw synchronously — wrap it in a variable assignment and assert no exception is thrown at call time, and (2) the returned value is a `Promise` (e.g., `instanceof Promise` or has a `.then` method), and (3) awaiting the promise rejects with an error about the invalid scriptName. All three assertions are required to prove the ADR-0002 contract. *(Spec 9.2)*
+- **T-API-14a2**: `runPromise(null as any)` returns a rejected promise (not a synchronous throw). Same three-part assertion as T-API-14a: no synchronous throw, returns a Promise, rejects on await. *(Spec 9.2)*
+- **T-API-14a3**: `runPromise(42 as any)` returns a rejected promise (not a synchronous throw). Same three-part assertion as T-API-14a: no synchronous throw, returns a Promise, rejects on await. *(Spec 9.2)*
 
 #### `runPromise()` Snapshot & Options
 
@@ -1444,9 +1449,9 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 3.2 | CLI Delegation | T-DEL-01–11 |
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21 |
-| 4.1 | Running Scripts (run subcommand) | T-CLI-11–13, T-CLI-27–33, T-CLI-59–60, T-CLI-64–66, T-DISC-22–26, T-DISC-52 |
-| 4.2 | Options (-n, -e, run -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–79 |
-| 4.3 | Subcommands | T-SUB-01–19, T-SUB-06a–06b, T-SUB-14a–14k, T-CLI-66, T-DISC-46a–46b |
+| 4.1 | Running Scripts (run subcommand) | T-CLI-11–13, T-CLI-27–33, T-CLI-59–60, T-CLI-64–66, T-CLI-80–82, T-DISC-22–26, T-DISC-52 |
+| 4.2 | Options (-n, -e, run -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–84 |
+| 4.3 | Subcommands | T-SUB-01–19, T-SUB-06a–06b, T-SUB-14a–14k, T-CLI-66, T-CLI-80–82, T-DISC-46a–46b |
 | 5.1 | Discovery | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38b, T-DISC-47–53, T-CLI-55–55d, T-CLI-60 |
 | 5.2 | Name Collision | T-DISC-18–21, T-CLI-22b, T-CLI-43 |
 | 5.3 | Name Restrictions | T-DISC-27–32, T-DISC-30a–30b, T-CLI-44, T-CLI-22d, T-EDGE-05 |
@@ -1474,5 +1479,6 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 10.2 | Source Type Details | T-INST-09–26b, T-INST-28a, T-INST-34–39e |
 | 10.3 | Common Install Rules | T-INST-27–27d, T-INST-28–28a, T-INST-29–33a, T-INST-31b |
 | 11.1 | Top-Level Help | T-CLI-02–06, T-CLI-07e–07g, T-CLI-07j, T-CLI-28, T-CLI-39, T-CLI-61, T-CLI-65 |
-| 11.2 | Run Help | T-CLI-40–55d, T-CLI-62, T-CLI-67–78, T-DISC-51, T-DISC-53 |
+| 11.2 | Run Help | T-CLI-40–55d, T-CLI-62, T-CLI-67–78, T-CLI-84, T-DISC-51, T-DISC-53 |
 | 12 | Exit Codes | T-EXIT-01–16 |
+| 13 | Summary of Special Values | *(Summary-only section — no unique behavior. LOOPX_BIN covered by T-MOD-19–21, T-ENV-20, T-ENV-20a, T-DEL-05; LOOPX_PROJECT_ROOT covered by T-EXEC-03–04, T-ENV-21, T-ENV-21a; LOOPX_DELEGATED covered by T-DEL-04, T-DEL-07, T-DEL-09, T-ENV-24a)* |
