@@ -1612,11 +1612,12 @@ printf '{"result":"%s"}' "$COUNT"
         expect(result.exitCode).toBe(1);
       });
 
-      it("T-CLI-22d: `loopx run -n 0 myscript` with invalid script name -> exit 1", async () => {
+      it("T-CLI-22d: `loopx run -n 0 myscript` with invalid script name in .loopx/ -> exit 1", async () => {
         project = await createTempProject();
+        await createBashScript(project, "myscript", emitResult("ok"));
         await createScript(project, "-bad", ".sh", emitResult("x"));
 
-        const result = await runCLI(["run", "-n", "0", "-bad"], {
+        const result = await runCLI(["run", "-n", "0", "myscript"], {
           cwd: project.dir,
           runtime,
         });

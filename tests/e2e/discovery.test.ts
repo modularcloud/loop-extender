@@ -9,7 +9,7 @@ import {
   type TempProject,
 } from "../helpers/fixtures.js";
 import { runCLI } from "../helpers/cli.js";
-import { writeValueToFile } from "../helpers/fixture-scripts.js";
+import { writeValueToFile, emitResult } from "../helpers/fixture-scripts.js";
 
 describe("SPEC: Script Discovery & Validation", () => {
   let project: TempProject | null = null;
@@ -952,18 +952,18 @@ describe("SPEC: Script Discovery & Validation", () => {
       expect(result.stderr).not.toMatch(/collision|conflict|reserved|warning/i);
     });
 
-    it("T-DISC-42: loopx run mode when .loopx/ does not exist exits with error", async () => {
+    it("T-DISC-42: `loopx` (no args) shows top-level help and exits 0, even without .loopx/", async () => {
       project = await createTempProject({ withLoopxDir: false });
 
       const result = await runCLI([], { cwd: project.dir });
 
-      expect(result.exitCode).toBe(1);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.length).toBeGreaterThan(0);
     });
 
-    it("T-DISC-43: loopx version works when .loopx/ has collisions or reserved names (no validation)", async () => {
+    it("T-DISC-43: loopx version works when .loopx/ has collisions (no validation)", async () => {
       project = await createTempProject();
-      // Create name collision and reserved name
-      await createBashScript(project, "output", "echo hello");
+      // Create name collision
       await createBashScript(project, "example", "echo hello");
       await createScript(project, "example", ".ts", `console.log("hello");\n`);
 
@@ -990,10 +990,10 @@ describe("SPEC: Script Discovery & Validation", () => {
       expect(listResult.stderr).not.toMatch(/collision|conflict|reserved|warning/i);
     });
 
-    it("T-DISC-45: loopx output --result works when .loopx/ has reserved names (no validation)", async () => {
+    it("T-DISC-45: loopx output --result works when .loopx/ has name restriction violations (no validation)", async () => {
       project = await createTempProject();
-      await createBashScript(project, "output", "echo hello");
-      await createBashScript(project, "env", "echo hello");
+      await createScript(project, "-bad", ".sh", emitResult("x"));
+      await createScript(project, ".dotfile", ".sh", emitResult("x"));
 
       const result = await runCLI(["output", "--result", "x"], { cwd: project.dir });
 
