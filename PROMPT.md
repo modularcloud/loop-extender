@@ -2,7 +2,7 @@
 
 0b. study @SPEC.md for context about the project
 
-0c. study ADR 0002 in @adr/ to understand the recent change that was made to SPEC.md and TEST-SPEC.md as per the process defined in ADR 0001.
+0c. study ADR 0002 in @adr to understand the recent change that was made to SPEC.md and TEST-SPEC.md as per the process defined in ADR 0001.
 
 0d. study the existing source code in this repo
 
