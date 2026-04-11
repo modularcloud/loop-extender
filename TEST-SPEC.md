@@ -240,7 +240,7 @@ Test parameterization helper. Runs a test block once for each available runtime 
 ```typescript
 forEachRuntime((runtime) => {
   it("runs a bash script", async () => {
-    const result = await runCLI(["-n", "1", "myscript"], { cwd: project.dir, runtime });
+    const result = await runCLI(["run", "-n", "1", "myscript"], { cwd: project.dir, runtime });
     expect(result.exitCode).toBe(0);
   });
 });
@@ -392,73 +392,107 @@ Each test is identified by a unique ID (`T-<SECTION>-<NUMBER>`), references a SP
 
 ### 4.1 CLI Basics
 
-**Spec refs:** 4.1, 4.2, 11
+**Spec refs:** 4.1, 4.2, 4.3, 11.1, 11.2
 
 #### Help & Version
 
-- **T-CLI-01**: `loopx version` prints the bare package version string followed by a newline, exits 0. Assert exact stdout is `${version}\n` — the spec requires a trailing newline, so assert against the untrimmed stdout, not a trimmed comparison. No additional text or labels. Does not require `.loopx/` to exist. *(Spec 4.3, 5.5)*
-- **T-CLI-02**: `loopx -h` prints usage text containing "loopx" and "usage" (case-insensitive), exits 0. *(Spec 4.2)*
-- **T-CLI-03**: `loopx --help` produces the same output as `-h`. *(Spec 4.2)*
-- **T-CLI-04**: `loopx -h` with `.loopx/` containing scripts lists discovered script names in output. *(Spec 11)*
-- **T-CLI-05**: `loopx -h` without `.loopx/` directory still prints help (no error), script list section is absent or empty. *(Spec 5.5, 11)*
-- **T-CLI-06**: `loopx -h` with `.loopx/` containing name collisions prints help with warnings on stderr. *(Spec 11)*
-- **T-CLI-07**: `loopx -h` with `.loopx/` containing reserved names prints help with warnings on stderr. *(Spec 11)*
-- **T-CLI-07d**: `loopx -h` with `.loopx/` containing a script with an invalid name (e.g., `-startswithdash.sh`) prints help with a non-fatal warning on stderr about the invalid name. The invalid script is still listed in the help output (section 5.4 says invalid-name scripts are listed with a warning in help mode). Help still exits 0. *(Spec 5.4, 11)*
-- **T-CLI-07a**: `loopx -h` with `.loopx/` containing scripts lists script names and includes type information for each. Assert that each discovered script name appears in the output and that the output contains the file type (e.g., "ts", "sh") somewhere in the help text. Do not assert proximity between the name and type text, and do not assert an exact rendering format — only that both the name and its type are present. *(Spec 11)*
-- **T-CLI-07b**: `loopx -n 5 -h` prints help and exits 0 (help flag takes precedence over other flags). *(Spec 4.2)*
-- **T-CLI-07c**: `loopx myscript -h` prints help and exits 0 (help flag takes precedence over script name). *(Spec 4.2)*
-- **T-CLI-07e**: `loopx -h version` prints help and exits 0 (help flag takes precedence over subcommand). The `version` subcommand does not execute. *(Spec 4.2)*
-- **T-CLI-07f**: `loopx -h env set FOO bar` prints help and exits 0 (help flag takes precedence over `env` subcommand). *(Spec 4.2)*
-- **T-CLI-07g**: `loopx -h --invalid-flag` prints help and exits 0 (help flag takes precedence over invalid flags). *(Spec 4.2)*
-- **T-CLI-07j**: `loopx -h -e nonexistent.env` prints help and exits 0 (help flag takes precedence over `-e`). The nonexistent env file is not read or validated. *(Spec 4.2)*
-- **T-CLI-07h**: `loopx -h` with `.loopx/` containing a directory script with a bad `package.json` (invalid JSON) prints help with a non-fatal warning on stderr about the invalid directory script. Help still exits 0. The invalid directory script is not listed in the script listing. *(Spec 5.1, 11)*
-- **T-CLI-07i**: `loopx -h` with `.loopx/` containing a directory script whose `main` escapes the directory (e.g., `"main": "../escape.ts"`) prints help with a non-fatal warning on stderr. Help still exits 0. *(Spec 5.1, 11)*
+- **T-CLI-01**: `loopx version` prints the bare package version string followed by a newline, exits 0. Assert exact stdout is `${version}\n` — the spec requires a trailing newline, so assert against the untrimmed stdout, not a trimmed comparison. No additional text or labels. Does not require `.loopx/` to exist. *(Spec 4.3, 5.4)*
 
-#### Default Script Invocation
+#### Top-Level Help
 
-- **T-CLI-08**: `loopx -n 1` (no script name) with a `default.ts` script in `.loopx/` runs the default script. Assert: script's output is observed (e.g., use a counter file fixture to prove it ran). *(Spec 4.1)*
-- **T-CLI-09**: `loopx` (no script name) with no `default` script in `.loopx/` exits with code 1. Stderr contains a message mentioning "default" and suggesting script creation. *(Spec 4.1)*
-- **T-CLI-10**: `loopx` with `.loopx/` directory missing entirely exits with code 1 and provides a helpful error message. *(Spec 7.2)*
+- **T-CLI-02**: `loopx -h` prints usage text containing "loopx" and "usage" (case-insensitive), exits 0. Does not list scripts — top-level help performs no script discovery. *(Spec 4.2, 11.1)*
+- **T-CLI-03**: `loopx --help` produces the same output as `-h`. *(Spec 4.2, 11.1)*
+- **T-CLI-04**: `loopx -h` with `.loopx/` containing scripts does NOT list discovered script names in output. Top-level help performs no discovery. Assert that stdout does not contain any of the script names. *(Spec 4.2, 11.1)*
+- **T-CLI-05**: `loopx -h` without `.loopx/` directory still prints help (no error). No script list, no warnings. *(Spec 4.2, 11.1)*
+- **T-CLI-06**: `loopx -h` with `.loopx/` containing name collisions does NOT print warnings on stderr. Top-level help performs no validation. *(Spec 4.2, 11.1)*
+- **T-CLI-07e**: `loopx -h version` prints top-level help and exits 0 (top-level `-h` takes precedence over everything that follows). The `version` subcommand does not execute. *(Spec 4.2)*
+- **T-CLI-07f**: `loopx -h env set FOO bar` prints top-level help and exits 0 (top-level `-h` takes precedence over `env` subcommand). *(Spec 4.2)*
+- **T-CLI-07g**: `loopx -h --invalid-flag` prints top-level help and exits 0 (top-level `-h` takes precedence over invalid flags). *(Spec 4.2)*
+- **T-CLI-07j**: `loopx -h -e nonexistent.env` prints top-level help and exits 0 (top-level `-h` takes precedence over `-e`). The nonexistent env file is not read or validated. *(Spec 4.2)*
+- **T-CLI-39**: `loopx -h run foo` shows top-level help (not run help) and exits 0. Top-level `-h` takes precedence over everything that follows, including `run` subcommand dispatch. *(Spec 4.2)*
 
-#### Named Script Invocation
+#### Run Help
 
-- **T-CLI-11**: `loopx -n 1 myscript` with `.loopx/myscript.sh` runs the script. Assert via counter file. *(Spec 4.1)*
-- **T-CLI-12**: `loopx nonexistent` with `.loopx/` existing but no matching script exits with code 1. *(Spec 4.1)*
-- **T-CLI-13**: `loopx -n 1 default` (explicitly naming the default script) runs the default script, same as `loopx -n 1` with no name. *(Spec 4.1)*
+- **T-CLI-40**: `loopx run -h` with `.loopx/` containing scripts prints run-specific help listing discovered script names. Exits 0. *(Spec 4.2, 11.2)*
+- **T-CLI-41**: `loopx run --help` produces the same output as `loopx run -h`. *(Spec 4.2, 11.2)*
+- **T-CLI-42**: `loopx run -h` without `.loopx/` directory still prints run help with a warning that the directory was not found. The discovered-scripts section is omitted. Exits 0. *(Spec 11.2)*
+- **T-CLI-43**: `loopx run -h` with `.loopx/` containing name collisions prints run help with warnings on stderr about the conflicting entries. Exits 0. *(Spec 5.2, 11.2)*
+- **T-CLI-44**: `loopx run -h` with `.loopx/` containing a script with an invalid name (e.g., `-startswithdash.sh`) prints run help with a non-fatal warning on stderr about the invalid name. The invalid script is still listed in the help output (section 5.3 says invalid-name scripts are listed with a warning in help mode). Help still exits 0. *(Spec 5.3, 11.2)*
+- **T-CLI-45**: `loopx run -h` with `.loopx/` containing scripts lists script names and includes type information for each. Assert that each discovered script name appears in the output and that the output contains the file type (e.g., "ts", "sh") somewhere in the help text. Do not assert proximity between the name and type text, and do not assert an exact rendering format — only that both the name and its type are present. *(Spec 11.2)*
+- **T-CLI-46**: `loopx run -h` with `.loopx/` containing a directory script with a bad `package.json` (invalid JSON) prints run help with a non-fatal warning on stderr about the invalid directory script. Help still exits 0. The invalid directory script is not listed in the script listing. *(Spec 5.1, 11.2)*
+- **T-CLI-47**: `loopx run -h` with `.loopx/` containing a directory script whose `main` escapes the directory (e.g., `"main": "../escape.ts"`) prints run help with a non-fatal warning on stderr. Help still exits 0. *(Spec 5.1, 11.2)*
+
+#### Run Help Short-Circuit
+
+Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows run help, exits 0, and ignores all other run-level arguments unconditionally.
+
+- **T-CLI-48**: `loopx run -h foo` shows run help and exits 0 (script name ignored). *(Spec 4.2)*
+- **T-CLI-49**: `loopx run myscript -h` shows run help and exits 0 (`-h` after script name still triggers help short-circuit). *(Spec 4.2)*
+- **T-CLI-50**: `loopx run -h -e missing.env` shows run help and exits 0 (env file not validated). *(Spec 4.2)*
+- **T-CLI-51**: `loopx run -h -n bad` shows run help and exits 0 (`-n` not validated). *(Spec 4.2)*
+- **T-CLI-52**: `loopx run -h -n 5 -n 10` shows run help and exits 0 (duplicate `-n` not rejected under help). *(Spec 4.2)*
+- **T-CLI-53**: `loopx run -h foo bar` shows run help and exits 0 (extra positional not rejected under help). *(Spec 4.2)*
+- **T-CLI-54**: `loopx run -h --unknown` shows run help and exits 0 (unknown flag not rejected under help). *(Spec 4.2)*
+- **T-CLI-55**: `loopx run -h` with a directory script that has an invalid `main` field shows run help with a non-fatal discovery warning (not just collisions/name restrictions). *(Spec 5.1, 11.2)*
+
+#### Bare Invocation & Top-Level Parsing Errors
+
+- **T-CLI-28**: `loopx` with no arguments shows top-level help (equivalent to `loopx -h`). Exits 0. No script discovery is performed. *(Spec 4.1, 4.2)*
+- **T-CLI-33**: `loopx myscript` is a usage error (unrecognized subcommand, no implicit fallback to `run`). Exit code 1. *(Spec 4.1)*
+- **T-CLI-34**: `loopx --unknown` is a usage error (unrecognized top-level flag). Exit code 1. *(Spec 4.2)*
+- **T-CLI-36**: `loopx -n 5 myscript` is a usage error (top-level `-n` rejected — only `-h` is recognized at top level). Exit code 1. *(Spec 4.2)*
+- **T-CLI-37**: `loopx -e .env myscript` is a usage error (top-level `-e` rejected). Exit code 1. *(Spec 4.2)*
+- **T-CLI-07b**: `loopx -n 5 -h` is a usage error (exit code 1). The first argument is `-n`, which is not `-h` and not a recognized subcommand, so top-level parsing fails before `-h` is reached. The top-level `-h` short-circuit only applies when `-h` is the first argument. *(Spec 4.2)*
+- **T-CLI-07c**: `loopx myscript -h` is a usage error (exit code 1). `myscript` is an unrecognized token in the subcommand position — error regardless of what follows. *(Spec 4.2)*
+- **T-CLI-38**: `loopx foo -h` is a usage error (unrecognized subcommand, exit code 1 — not top-level help). The top-level `-h` short-circuit only applies when `-h` appears before subcommand dispatch. *(Spec 4.2)*
+
+#### Script Invocation via `run`
+
+- **T-CLI-30**: `loopx run -n 1 myscript` with `.loopx/myscript.sh` runs the script. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 4.1)*
+- **T-CLI-11**: `loopx run -n 1 myscript` with `.loopx/myscript.sh` runs the script. Assert via counter file. *(Spec 4.1)*
+- **T-CLI-12**: `loopx run nonexistent` with `.loopx/` existing but no matching script exits with code 1. *(Spec 4.1)*
+- **T-CLI-13**: `loopx run default` runs a script named `default` as an ordinary script — `default` has no special behavior. Assert via marker file. *(Spec 4.1)*
+- **T-CLI-29**: `loopx run` with no script name is a usage error (exit code 1). This does not inspect `.loopx/` or perform discovery. *(Spec 4.1)*
+- **T-CLI-31**: `loopx run version` with `.loopx/version.sh` runs the script named `version`, not the built-in subcommand. Assert via marker file that the script executed and the output is the script's, not the version string. *(Spec 4.1)*
+- **T-CLI-32**: `loopx run run` with `.loopx/run.sh` runs the script named `run`. Assert via marker file. *(Spec 4.1)*
 
 #### CLI `-n` Option
 
-- **T-CLI-14**: `loopx -n 3 myscript` with a counter fixture runs exactly 3 iterations. Assert counter file contains 3 marks. *(Spec 4.2, 7.1)*
-- **T-CLI-15**: `loopx -n 0 myscript` exits 0 without running the script. Assert counter file does not exist or is empty. *(Spec 4.2, 7.1)*
-- **T-CLI-16**: `loopx -n -1 myscript` exits with code 1 (usage error). *(Spec 4.2)*
-- **T-CLI-17**: `loopx -n 1.5 myscript` exits with code 1 (usage error). *(Spec 4.2)*
-- **T-CLI-18**: `loopx -n abc myscript` exits with code 1 (usage error). *(Spec 4.2)*
-- **T-CLI-19**: `loopx -n 0` with a missing script still exits with code 1 (validation occurs before `-n 0` short-circuit). Stderr contains an error about the missing script. *(Spec 4.2, 7.1)*
-- **T-CLI-19a**: `loopx -n 0` with `.loopx/` directory missing entirely → exits with code 1 (validation occurs before `-n 0` short-circuit). Stderr contains an error about the missing `.loopx/` directory. *(Spec 4.2, 7.1, 7.2)*
-- **T-CLI-20**: `loopx -n 1 myscript` runs exactly 1 iteration even if the script produces no `stop`. *(Spec 4.2)*
+- **T-CLI-14**: `loopx run -n 3 myscript` with a counter fixture runs exactly 3 iterations. Assert counter file contains 3 marks. *(Spec 4.2, 7.1)*
+- **T-CLI-15**: `loopx run -n 0 myscript` exits 0 without running the script. Assert counter file does not exist or is empty. *(Spec 4.2, 7.1)*
+- **T-CLI-16**: `loopx run -n -1 myscript` exits with code 1 (usage error). *(Spec 4.2)*
+- **T-CLI-17**: `loopx run -n 1.5 myscript` exits with code 1 (usage error). *(Spec 4.2)*
+- **T-CLI-18**: `loopx run -n abc myscript` exits with code 1 (usage error). *(Spec 4.2)*
+- **T-CLI-19**: `loopx run -n 0 nonexistent` with `.loopx/` existing but no script named `nonexistent` — exits with code 1 (validation occurs before `-n 0` short-circuit). Stderr contains an error about the missing script. *(Spec 4.2, 7.1)*
+- **T-CLI-19a**: `loopx run -n 0 myscript` with `.loopx/` directory missing entirely → exits with code 1 (validation occurs before `-n 0` short-circuit). Stderr contains an error about the missing `.loopx/` directory. *(Spec 4.2, 7.1, 7.2)*
+- **T-CLI-20**: `loopx run -n 1 myscript` runs exactly 1 iteration even if the script produces no `stop`. *(Spec 4.2)*
+- **T-CLI-56**: `loopx run -n 0 myscript` with a valid script performs discovery and validation (script must exist), then executes zero iterations, and exits 0. Assert the counter file does not exist or is empty (script never ran). *(Spec 4.2, 7.1)*
 
 #### Duplicate Flags
 
-- **T-CLI-20a**: `loopx -n 3 -n 5 myscript` exits with code 1 (duplicate `-n` is a usage error). *(Spec 4.2)*
-- **T-CLI-20b**: `loopx -e .env1 -e .env2 myscript` exits with code 1 (duplicate `-e` is a usage error). *(Spec 4.2)*
+- **T-CLI-20a**: `loopx run -n 3 -n 5 myscript` exits with code 1 (duplicate `-n` is a usage error). *(Spec 4.2)*
+- **T-CLI-20b**: `loopx run -e .env1 -e .env2 myscript` exits with code 1 (duplicate `-e` is a usage error). *(Spec 4.2)*
+
+#### Unrecognized Run Flags
+
+- **T-CLI-35**: `loopx run --unknown myscript` exits with code 1 (unrecognized flag within `run` is a usage error). *(Spec 4.2)*
 
 #### CLI `-e` Option
 
-- **T-CLI-21**: `loopx -e .env -n 1 myscript` with a valid `.env` file makes its variables available in the script. Use `write-env-to-file` fixture: the script writes the env var value to a marker file. Assert the marker file contains the expected value. *(Spec 4.2)*
-- **T-CLI-22**: `loopx -e nonexistent.env myscript` exits with code 1. Stderr mentions the missing file. *(Spec 4.2)*
-- **T-CLI-22a**: `loopx -n 0 -e nonexistent.env myscript` exits with code 1 (env file validation happens before `-n 0` short-circuit). *(Spec 4.2, 7.1)*
-- **T-CLI-22b**: `loopx -n 0` with `.loopx/` containing a name collision → exits with code 1 (validation occurs before `-n 0` short-circuit). *(Spec 4.2, 5.2, 7.1)*
-- **T-CLI-22c**: `loopx -n 0` with `.loopx/` containing a reserved name → exits with code 1. *(Spec 4.2, 5.3, 7.1)*
-- **T-CLI-22d**: `loopx -n 0` with `.loopx/` containing an invalid script name (e.g., `-bad.sh`) → exits with code 1. *(Spec 4.2, 5.4, 7.1)*
+- **T-CLI-21**: `loopx run -e .env -n 1 myscript` with a valid `.env` file makes its variables available in the script. Use `write-env-to-file` fixture: the script writes the env var value to a marker file. Assert the marker file contains the expected value. *(Spec 4.2)*
+- **T-CLI-22**: `loopx run -e nonexistent.env myscript` exits with code 1. Stderr mentions the missing file. *(Spec 4.2)*
+- **T-CLI-22a**: `loopx run -n 0 -e nonexistent.env myscript` exits with code 1 (env file validation happens before `-n 0` short-circuit). *(Spec 4.2, 7.1)*
+- **T-CLI-22b**: `loopx run -n 0 myscript` with `.loopx/` containing a name collision → exits with code 1 (validation occurs before `-n 0` short-circuit). *(Spec 4.2, 5.2, 7.1)*
+- **T-CLI-22d**: `loopx run -n 0 myscript` with `.loopx/` containing an invalid script name (e.g., `-bad.sh`) → exits with code 1. *(Spec 4.2, 5.3, 7.1)*
 
 #### CLI Stdout Silence
 
-- **T-CLI-23**: `loopx -n 1 myscript` where `myscript` outputs `{"result":"hello"}` and writes a marker file — the CLI's own stdout is empty (result is not printed), AND the marker file exists (proving the script actually ran). Both assertions are required to prevent vacuous passes. *(Spec 7.1)*
-- **T-CLI-27**: `loopx script1 script2` (two positional arguments) exits with code 1. Stderr contains an error about unexpected arguments. The CLI grammar is `loopx [options] [script-name]` — singular. Only zero or one positional argument is accepted. *(Spec 4.1)*
+- **T-CLI-23**: `loopx run -n 1 myscript` where `myscript` outputs `{"result":"hello"}` and writes a marker file — the CLI's own stdout is empty (result is not printed), AND the marker file exists (proving the script actually ran). Both assertions are required to prevent vacuous passes. *(Spec 7.1)*
+- **T-CLI-27**: `loopx run script1 script2` (two positional arguments within `run`) exits with code 1. Stderr contains an error about unexpected arguments. `run` accepts exactly one positional argument. *(Spec 4.1)*
 
 ### 4.2 Subcommands
 
-**Spec refs:** 4.3, 5.5
+**Spec refs:** 4.3, 5.4
 
 #### `loopx output`
 
@@ -467,7 +501,7 @@ Each test is identified by a unique ID (`T-<SECTION>-<NUMBER>`), references a SP
 - **T-SUB-03**: `loopx output --stop` prints valid JSON to stdout, exits 0. Parse stdout as JSON and assert `stop === true`. *(Spec 4.3)*
 - **T-SUB-04**: `loopx output --result "x" --goto "y" --stop` prints valid JSON to stdout. Parse as JSON and assert all three fields present with correct values. *(Spec 4.3)*
 - **T-SUB-05**: `loopx output` with no flags exits with code 1 (error). *(Spec 4.3)*
-- **T-SUB-06**: `loopx output --result "x"` works without `.loopx/` directory existing. *(Spec 5.5)*
+- **T-SUB-06**: `loopx output --result "x"` works without `.loopx/` directory existing. *(Spec 5.4)*
 - **T-SUB-06a**: `loopx output --result 'value with "quotes" and \\backslashes'` → stdout is valid JSON with the value correctly escaped. Parse stdout as JSON and assert `result` equals the literal string `value with "quotes" and \backslashes`. *(Spec 4.3)*
 - **T-SUB-06b**: `loopx output --result $'line1\nline2'` (value containing a literal newline byte, passed as an array element to the process) → stdout is valid JSON with the newline correctly escaped as `\n` in the JSON string. Parse stdout as JSON and assert `result` equals `"line1\nline2"` (two-line string). *(Spec 4.3)*
 
@@ -482,7 +516,7 @@ Each test is identified by a unique ID (`T-<SECTION>-<NUMBER>`), references a SP
 
 - **T-SUB-11**: `loopx env set -DASH val` exits with code 1 (invalid name). *(Spec 4.3)*
 - **T-SUB-12**: `loopx env set FOO bar` then `loopx env set FOO baz` then `loopx env list` shows `FOO=baz` (overwrite). *(Spec 4.3)*
-- **T-SUB-13**: `loopx env set FOO bar` in a directory with no `.loopx/` → exits 0 AND `loopx env list` subsequently shows `FOO=bar`. Assert both success and the actual side effect, not just exit code. Also assert stderr does not contain script-validation warnings. *(Spec 5.5)*
+- **T-SUB-13**: `loopx env set FOO bar` in a directory with no `.loopx/` → exits 0 AND `loopx env list` subsequently shows `FOO=bar`. Assert both success and the actual side effect, not just exit code. Also assert stderr does not contain script-validation warnings. *(Spec 5.4)*
 - **T-SUB-14**: `loopx env set` creates the config directory (`$XDG_CONFIG_HOME/loopx/`) if it doesn't exist. *(Spec 8.1)*
 - **T-SUB-14a**: `loopx env set KEY "value with spaces"` → `loopx env list` shows `KEY=value with spaces`. Value round-trips correctly. *(Spec 4.3)*
 - **T-SUB-14b**: `loopx env set KEY "value#hash"` → value preserved including `#`. *(Spec 4.3)*
@@ -510,20 +544,20 @@ These tests verify the actual bytes written to the env file, not just round-trip
 
 - **T-SUB-17**: With no variables set, `loopx env list` produces no stdout output, exits 0. *(Spec 4.3)*
 - **T-SUB-18**: With variables `ZEBRA=z`, `ALPHA=a`, `MIDDLE=m` set, `loopx env list` outputs them sorted: `ALPHA=a`, `MIDDLE=m`, `ZEBRA=z`. *(Spec 4.3)*
-- **T-SUB-19**: `loopx env list` in a directory with no `.loopx/` → exits 0 and produces no stdout output (since no vars are set). Assert both the exit code and that stdout is empty. Also assert stderr does not contain script-validation warnings. *(Spec 5.5)*
+- **T-SUB-19**: `loopx env list` in a directory with no `.loopx/` → exits 0 and produces no stdout output (since no vars are set). Assert both the exit code and that stdout is empty. Also assert stderr does not contain script-validation warnings. *(Spec 5.4)*
 
 ### 4.3 Script Discovery & Validation
 
-**Spec refs:** 5.1–5.5
+**Spec refs:** 5.1–5.4
 
 #### File Script Discovery
 
-- **T-DISC-01**: `.loopx/myscript.sh` is discoverable. `loopx -n 1 myscript` runs it. Assert via marker file (use `write-value-to-file` fixture): the script writes a known value to a marker file, and the marker file exists with the expected content after execution. Exit code 0 alone is not sufficient. *(Spec 5.1)*
-- **T-DISC-02**: `.loopx/myscript.js` is discoverable. `loopx -n 1 myscript` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.1)*
-- **T-DISC-03**: `.loopx/myscript.jsx` is discoverable. `loopx -n 1 myscript` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.1)*
-- **T-DISC-04**: `.loopx/myscript.ts` is discoverable. `loopx -n 1 myscript` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.1)*
-- **T-DISC-05**: `.loopx/myscript.tsx` is discoverable. `loopx -n 1 myscript` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.1)*
-- **T-DISC-06**: `.loopx/myscript.mjs` is NOT discoverable. `loopx -n 1 myscript` fails with "not found." *(Spec 2.1, 5.1)*
+- **T-DISC-01**: `.loopx/myscript.sh` is discoverable. `loopx run -n 1 myscript` runs it. Assert via marker file (use `write-value-to-file` fixture): the script writes a known value to a marker file, and the marker file exists with the expected content after execution. Exit code 0 alone is not sufficient. *(Spec 5.1)*
+- **T-DISC-02**: `.loopx/myscript.js` is discoverable. `loopx run -n 1 myscript` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.1)*
+- **T-DISC-03**: `.loopx/myscript.jsx` is discoverable. `loopx run -n 1 myscript` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.1)*
+- **T-DISC-04**: `.loopx/myscript.ts` is discoverable. `loopx run -n 1 myscript` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.1)*
+- **T-DISC-05**: `.loopx/myscript.tsx` is discoverable. `loopx run -n 1 myscript` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.1)*
+- **T-DISC-06**: `.loopx/myscript.mjs` is NOT discoverable. `loopx run -n 1 myscript` fails with "not found." *(Spec 2.1, 5.1)*
 - **T-DISC-07**: `.loopx/myscript.cjs` is NOT discoverable. *(Spec 2.1, 5.1)*
 - **T-DISC-08**: `.loopx/myscript.txt` is NOT discoverable. *(Spec 5.1)*
 - **T-DISC-09**: `.loopx/myscript` (no extension) is NOT discoverable. *(Spec 5.1)*
@@ -531,17 +565,17 @@ These tests verify the actual bytes written to the env file, not just round-trip
 
 #### Directory Script Discovery
 
-- **T-DISC-11**: `.loopx/mypipe/` with `package.json` (`"main": "index.ts"`) and `index.ts` → discoverable as `mypipe`. `loopx -n 1 mypipe` runs it. Assert via marker file or `runPromise({ maxIterations: 1 })`: the entry point executes and produces an observable output. *(Spec 2.1, 5.1)*
+- **T-DISC-11**: `.loopx/mypipe/` with `package.json` (`"main": "index.ts"`) and `index.ts` → discoverable as `mypipe`. `loopx run -n 1 mypipe` runs it. Assert via marker file or `runPromise("mypipe", { maxIterations: 1 })`: the entry point executes and produces an observable output. *(Spec 2.1, 5.1)*
 - **T-DISC-11a**: `.loopx/mypipe/` with `package.json` (`"main": "src/index.ts"`) and `src/index.ts` → discoverable as `mypipe`. This verifies that `main` can point to a subpath within the directory, not just a top-level file. *(Spec 2.1, 5.1)*
-- **T-DISC-12**: `.loopx/nopackage/` directory with no `package.json` → ignored. `loopx -n 1 nopackage` fails. *(Spec 2.1, 5.1)*
+- **T-DISC-12**: `.loopx/nopackage/` directory with no `package.json` → ignored. `loopx run -n 1 nopackage` fails. *(Spec 2.1, 5.1)*
 - **T-DISC-13**: `.loopx/nomain/` with `package.json` that has no `main` field → ignored. *(Spec 2.1, 5.1)*
-- **T-DISC-14**: `.loopx/mypipe/` with `"main": "index.sh"` → discoverable (bash entry point). `loopx -n 1 mypipe` runs it. Assert via marker file: the entry point executes and writes a known value to a marker file. *(Spec 5.1)*
-- **T-DISC-14a**: `.loopx/mypipe/` with `"main": "index.js"` → discoverable (JS entry point). `loopx -n 1 mypipe` runs it. Assert via marker file: the entry point executes and writes a known value. *(Spec 5.1)*
-- **T-DISC-14b**: `.loopx/mypipe/` with `"main": "index.jsx"` → discoverable (JSX entry point). `loopx -n 1 mypipe` runs it. Assert via marker file: the entry point executes and writes a known value. *(Spec 5.1)*
-- **T-DISC-14c**: `.loopx/mypipe/` with `"main": "index.tsx"` → discoverable (TSX entry point). `loopx -n 1 mypipe` runs it. Assert via marker file: the entry point executes and writes a known value. *(Spec 5.1)*
+- **T-DISC-14**: `.loopx/mypipe/` with `"main": "index.sh"` → discoverable (bash entry point). `loopx run -n 1 mypipe` runs it. Assert via marker file: the entry point executes and writes a known value to a marker file. *(Spec 5.1)*
+- **T-DISC-14a**: `.loopx/mypipe/` with `"main": "index.js"` → discoverable (JS entry point). `loopx run -n 1 mypipe` runs it. Assert via marker file: the entry point executes and writes a known value. *(Spec 5.1)*
+- **T-DISC-14b**: `.loopx/mypipe/` with `"main": "index.jsx"` → discoverable (JSX entry point). `loopx run -n 1 mypipe` runs it. Assert via marker file: the entry point executes and writes a known value. *(Spec 5.1)*
+- **T-DISC-14c**: `.loopx/mypipe/` with `"main": "index.tsx"` → discoverable (TSX entry point). `loopx run -n 1 mypipe` runs it. Assert via marker file: the entry point executes and writes a known value. *(Spec 5.1)*
 - **T-DISC-15**: `.loopx/mypipe/` with `"main": "index.py"` → warning on stderr, directory ignored. *(Spec 5.1)*
 - **T-DISC-16**: `.loopx/mypipe/` with `"main": "../escape.ts"` → warning on stderr, directory ignored. *(Spec 5.1)*
-- **T-DISC-16a**: `.loopx/mypipe/` with `package.json` containing invalid JSON (e.g., `{invalid}`) → warning on stderr, directory ignored. `loopx -n 1 mypipe` fails. *(Spec 5.1)*
+- **T-DISC-16a**: `.loopx/mypipe/` with `package.json` containing invalid JSON (e.g., `{invalid}`) → warning on stderr, directory ignored. `loopx run -n 1 mypipe` fails. *(Spec 5.1)*
 - **T-DISC-16b**: `.loopx/mypipe/` with unreadable `package.json` (e.g., no read permissions) → warning on stderr, directory ignored. **This test is conditional on `process.getuid() !== 0`** — root can read any file, so the test is skipped when running as root (e.g., in some CI containers). *(Spec 5.1)*
 - **T-DISC-16c**: `.loopx/mypipe/` with `package.json` where `main` is not a string (e.g., `{"main": 42}`) → warning on stderr, directory ignored. *(Spec 5.1)*
 - **T-DISC-16d**: `.loopx/mypipe/` with `package.json` where `main` points to a file that does not exist (e.g., `{"main": "missing.ts"}`) → warning on stderr, directory ignored. *(Spec 5.1)*
@@ -549,29 +583,31 @@ These tests verify the actual bytes written to the env file, not just round-trip
 
 #### Name Collisions
 
-- **T-DISC-18**: `.loopx/example.sh` and `.loopx/example.ts` both exist → loopx refuses to start with error listing the conflicting entries. Exit code 1. *(Spec 5.2)*
+- **T-DISC-18**: `.loopx/example.sh` and `.loopx/example.ts` both exist → `loopx run -n 1 example` refuses to start with error listing the conflicting entries. Exit code 1. *(Spec 5.2)*
 - **T-DISC-19**: `.loopx/example.ts` and `.loopx/example/` (valid directory script) → collision error. *(Spec 5.2)*
 - **T-DISC-20**: Three-way collision (`.loopx/example.sh`, `.loopx/example.js`, `.loopx/example/`) → error lists all conflicting entries. *(Spec 5.2)*
-- **T-DISC-21**: Non-conflicting scripts with different names → no error. `.loopx/alpha.sh` and `.loopx/beta.ts` coexist. Run `loopx -n 1 alpha` and assert via marker file that `alpha` executed successfully. *(Spec 5.2)*
+- **T-DISC-21**: Non-conflicting scripts with different names → no error. `.loopx/alpha.sh` and `.loopx/beta.ts` coexist. Run `loopx run -n 1 alpha` and assert via marker file that `alpha` executed successfully. *(Spec 5.2)*
 
-#### Reserved Names
+#### Previously Reserved Names (Now Allowed)
 
-- **T-DISC-22**: `.loopx/output.sh` → loopx refuses to start with error mentioning "reserved." *(Spec 5.3)*
-- **T-DISC-23**: `.loopx/env.ts` → same error. *(Spec 5.3)*
-- **T-DISC-24**: `.loopx/install.js` → same error. *(Spec 5.3)*
-- **T-DISC-25**: `.loopx/version.sh` → same error. *(Spec 5.3)*
-- **T-DISC-26**: Reserved name as directory script (`.loopx/output/` with valid package.json) → same error. *(Spec 5.3)*
+Scripts may now use any name that passes name restriction rules (section 5.3). The reserved names list (`output`, `env`, `install`, `version`) was eliminated by ADR-0002 — scripts are always invoked via `loopx run <name>`, so there is no ambiguity with built-in subcommands.
+
+- **T-DISC-22**: `.loopx/output.sh` is discoverable. `loopx run -n 1 output` runs the script (not the built-in `output` subcommand). Assert via marker file. *(Spec 4.1, 5.1)*
+- **T-DISC-23**: `.loopx/env.ts` is discoverable. `loopx run -n 1 env` runs the script. Assert via marker file. *(Spec 5.1)*
+- **T-DISC-24**: `.loopx/install.js` is discoverable. `loopx run -n 1 install` runs the script. Assert via marker file. *(Spec 5.1)*
+- **T-DISC-25**: `.loopx/version.sh` is discoverable. `loopx run -n 1 version` runs the script (not the built-in `version` subcommand). Assert via marker file. *(Spec 4.1, 5.1)*
+- **T-DISC-26**: `.loopx/run.sh` is discoverable. `loopx run -n 1 run` runs the script named `run`. Assert via marker file. *(Spec 4.1, 5.1)*
 
 #### Name Restrictions
 
-- **T-DISC-27**: `.loopx/-startswithdash.sh` → error. *(Spec 5.4)*
-- **T-DISC-28**: `.loopx/my-script.sh` (hyphen in middle) → valid. Run `loopx -n 1 my-script` and assert via marker file that the script executed. *(Spec 5.4)*
-- **T-DISC-29**: `.loopx/_underscore.sh` → valid. Run `loopx -n 1 _underscore` and assert via marker file that the script executed. *(Spec 5.4)*
-- **T-DISC-30**: `.loopx/ABC123.sh` → valid. Run `loopx -n 1 ABC123` and assert via marker file that the script executed. *(Spec 5.4)*
-- **T-DISC-30a**: `.loopx/1start.sh` → valid (digits are allowed as the first character of a script name per `[a-zA-Z0-9_]`). `loopx -n 1 1start` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.4)*
-- **T-DISC-30b**: `.loopx/42.sh` → valid (all-digit script name). `loopx -n 1 42` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.4)*
-- **T-DISC-31**: `.loopx/has space.sh` → error (space not in allowed pattern). *(Spec 5.4)*
-- **T-DISC-32**: `.loopx/has.dot.sh` — the base name is `has.dot` (everything before `.sh`). This contains a `.` which is not in `[a-zA-Z0-9_-]`. → error. *(Spec 5.4)*
+- **T-DISC-27**: `.loopx/-startswithdash.sh` → error. *(Spec 5.3)*
+- **T-DISC-28**: `.loopx/my-script.sh` (hyphen in middle) → valid. Run `loopx run -n 1 my-script` and assert via marker file that the script executed. *(Spec 5.3)*
+- **T-DISC-29**: `.loopx/_underscore.sh` → valid. Run `loopx run -n 1 _underscore` and assert via marker file that the script executed. *(Spec 5.3)*
+- **T-DISC-30**: `.loopx/ABC123.sh` → valid. Run `loopx run -n 1 ABC123` and assert via marker file that the script executed. *(Spec 5.3)*
+- **T-DISC-30a**: `.loopx/1start.sh` → valid (digits are allowed as the first character of a script name per `[a-zA-Z0-9_]`). `loopx run -n 1 1start` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.3)*
+- **T-DISC-30b**: `.loopx/42.sh` → valid (all-digit script name). `loopx run -n 1 42` runs it. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 5.3)*
+- **T-DISC-31**: `.loopx/has space.sh` → error (space not in allowed pattern). *(Spec 5.3)*
+- **T-DISC-32**: `.loopx/has.dot.sh` — the base name is `has.dot` (everything before `.sh`). This contains a `.` which is not in `[a-zA-Z0-9_-]`. → error. *(Spec 5.3)*
 
 #### Symlinks
 
@@ -589,25 +625,25 @@ These tests verify the actual bytes written to the env file, not just round-trip
 
 #### Run-Mode Discovery Warnings
 
-- **T-DISC-50**: `.loopx/` contains a valid script `good.sh` and an invalid directory script `bad/` (with malformed `package.json`). `loopx -n 1 good` runs the valid script successfully (assert via marker file) AND stderr contains a warning about the invalid directory script. This verifies that discovery warnings are emitted in run mode, not just help mode. *(Spec 5.1)*
+- **T-DISC-50**: `.loopx/` contains a valid script `good.sh` and an invalid directory script `bad/` (with malformed `package.json`). `loopx run -n 1 good` runs the valid script successfully (assert via marker file) AND stderr contains a warning about the invalid directory script. This verifies that discovery warnings are emitted in run mode, not just help mode. *(Spec 5.1)*
 
 #### Validation Scope
 
-- **T-DISC-39**: `loopx version` works when `.loopx/` doesn't exist. *(Spec 5.5)*
-- **T-DISC-40**: `loopx env set X Y` when `.loopx/` doesn't exist → exits 0, AND `loopx env list` subsequently shows `X=Y`. Assert stderr does not contain script-validation warnings. *(Spec 5.5)*
-- **T-DISC-41**: `loopx output --result "x"` when `.loopx/` doesn't exist → exits 0, AND stdout contains valid JSON with `result: "x"`. Assert stderr does not contain script-validation warnings. *(Spec 5.5)*
-- **T-DISC-42**: `loopx` (run mode) when `.loopx/` doesn't exist → error, exit 1. *(Spec 5.5)*
-- **T-DISC-43**: `loopx version` when `.loopx/` exists and contains name collisions or reserved names → exits 0 with a version string on stdout. Assert stderr does not contain script-validation warnings (validation not performed). *(Spec 5.5)*
-- **T-DISC-44**: `loopx env set X Y` when `.loopx/` exists and contains collisions → exits 0, AND `loopx env list` subsequently shows `X=Y`. Assert stderr does not contain script-validation warnings. *(Spec 5.5)*
-- **T-DISC-45**: `loopx output --result "x"` when `.loopx/` exists and contains reserved names → exits 0, AND stdout contains valid JSON with `result: "x"`. Assert stderr does not contain script-validation warnings. *(Spec 5.5)*
-- **T-DISC-46**: `loopx install <source>` when `.loopx/` exists and contains collisions → the install succeeds (exits 0, installed script present in `.loopx/`). Assert stderr does not contain script-validation warnings about existing scripts. *(Spec 5.5)*
-- **T-DISC-46a**: `loopx env remove X` when `.loopx/` doesn't exist → exits 0 (silent no-op, since there is no variable to remove). Assert stderr does not contain script-validation warnings. *(Spec 5.5, 4.3)*
-- **T-DISC-46b**: `loopx env remove X` when `.loopx/` exists and contains name collisions → exits 0 (the `env remove` subcommand does not trigger script validation). Assert stderr does not contain script-validation warnings. *(Spec 5.5, 4.3)*
+- **T-DISC-39**: `loopx version` works when `.loopx/` doesn't exist. *(Spec 5.4)*
+- **T-DISC-40**: `loopx env set X Y` when `.loopx/` doesn't exist → exits 0, AND `loopx env list` subsequently shows `X=Y`. Assert stderr does not contain script-validation warnings. *(Spec 5.4)*
+- **T-DISC-41**: `loopx output --result "x"` when `.loopx/` doesn't exist → exits 0, AND stdout contains valid JSON with `result: "x"`. Assert stderr does not contain script-validation warnings. *(Spec 5.4)*
+- **T-DISC-42**: `loopx` (no arguments) shows top-level help and exits 0 — even when `.loopx/` doesn't exist. No script discovery is performed. *(Spec 4.1, 5.4)*
+- **T-DISC-43**: `loopx version` when `.loopx/` exists and contains name collisions → exits 0 with a version string on stdout. Assert stderr does not contain script-validation warnings (validation not performed). *(Spec 5.4)*
+- **T-DISC-44**: `loopx env set X Y` when `.loopx/` exists and contains collisions → exits 0, AND `loopx env list` subsequently shows `X=Y`. Assert stderr does not contain script-validation warnings. *(Spec 5.4)*
+- **T-DISC-45**: `loopx output --result "x"` when `.loopx/` exists and contains name restriction violations → exits 0, AND stdout contains valid JSON with `result: "x"`. Assert stderr does not contain script-validation warnings. *(Spec 5.4)*
+- **T-DISC-46**: `loopx install <source>` when `.loopx/` exists and contains collisions → the install succeeds (exits 0, installed script present in `.loopx/`). Assert stderr does not contain script-validation warnings about existing scripts. *(Spec 5.4)*
+- **T-DISC-46a**: `loopx env remove X` when `.loopx/` doesn't exist → exits 0 (silent no-op, since there is no variable to remove). Assert stderr does not contain script-validation warnings. *(Spec 5.4, 4.3)*
+- **T-DISC-46b**: `loopx env remove X` when `.loopx/` exists and contains name collisions → exits 0 (the `env remove` subcommand does not trigger script validation). Assert stderr does not contain script-validation warnings. *(Spec 5.4, 4.3)*
 
 #### Discovery Scope
 
-- **T-DISC-47**: A parent directory has `.loopx/` with scripts, but the current working directory does not have `.loopx/`. `loopx myscript` in the child directory fails — parent `.loopx/` is not discovered. *(Spec 5.1)*
-- **T-DISC-49**: `.loopx/subdir/nested.ts` (a `.ts` file nested inside a non-script subdirectory within `.loopx/`) is NOT discovered. `loopx -n 1 nested` fails. Discovery is top-level only — subdirectories without a valid `package.json` and their contents are ignored. *(Spec 5.1)*
+- **T-DISC-47**: A parent directory has `.loopx/` with scripts, but the current working directory does not have `.loopx/`. `loopx run myscript` in the child directory fails — parent `.loopx/` is not discovered. *(Spec 5.1)*
+- **T-DISC-49**: `.loopx/subdir/nested.ts` (a `.ts` file nested inside a non-script subdirectory within `.loopx/`) is NOT discovered. `loopx run -n 1 nested` fails. Discovery is top-level only — subdirectories without a valid `package.json` and their contents are ignored. *(Spec 5.1)*
 
 #### Cached `package.json` `main`
 
@@ -626,26 +662,26 @@ These tests verify the actual bytes written to the env file, not just round-trip
 
 #### Bash Scripts
 
-- **T-EXEC-05**: A `.sh` script runs successfully and its stdout is captured as structured output. Observe via `runPromise({ maxIterations: 1 })`: the yielded Output contains the expected `result`. *(Spec 6.2)*
+- **T-EXEC-05**: A `.sh` script runs successfully and its stdout is captured as structured output. Observe via `runPromise("myscript", { maxIterations: 1 })`: the yielded Output contains the expected `result`. *(Spec 6.2)*
 - **T-EXEC-06**: A `.sh` script's stderr appears on the CLI's stderr (pass-through). Assert by writing a known string to stderr and checking CLI stderr. *(Spec 6.2)*
 - **T-EXEC-07**: A `.sh` script that lacks `#!/bin/bash` still runs (loopx invokes via `/bin/bash` explicitly, not via shebang). Assert actual execution via marker file: the script writes a known value to a marker file, confirming it ran despite having no shebang. *(Spec 6.2)*
 
 #### JS/TS Scripts
 
-- **T-EXEC-08**: `.ts` script runs and produces structured output. Observe via `runPromise({ maxIterations: 1 })`: the yielded Output has the expected `result`. *(Spec 6.3)*
-- **T-EXEC-09**: `.js` script runs and produces structured output. Observe via `runPromise({ maxIterations: 1 })`. *(Spec 6.3)*
-- **T-EXEC-10**: `.tsx` script runs and produces structured output. Observe via `runPromise({ maxIterations: 1 })`. The fixture **must use actual TSX syntax** to verify that the runtime handles JSX transformation, not just extension acceptance. Use a self-contained JSX pragma that does not depend on React: e.g., `/** @jsxImportSource ./jsx-shim */` where the shim's `jsx()` function returns a plain string, or use `React.createElement = (tag: string) => tag;` and write `const el = <div/>;`. The script outputs `{ result: String(el) }`. This proves the TSX-to-JS compilation actually ran. *(Spec 6.3)*
-- **T-EXEC-11**: `.jsx` script runs and produces structured output. Observe via `runPromise({ maxIterations: 1 })`. Same approach as T-EXEC-10 — the fixture **must use actual JSX syntax** (e.g., `const el = <div/>;` with a custom pragma or shim) to verify JSX transformation works, not just that the extension is accepted. *(Spec 6.3)*
+- **T-EXEC-08**: `.ts` script runs and produces structured output. Observe via `runPromise("myscript", { maxIterations: 1 })`: the yielded Output has the expected `result`. *(Spec 6.3)*
+- **T-EXEC-09**: `.js` script runs and produces structured output. Observe via `runPromise("myscript", { maxIterations: 1 })`. *(Spec 6.3)*
+- **T-EXEC-10**: `.tsx` script runs and produces structured output. Observe via `runPromise("myscript", { maxIterations: 1 })`. The fixture **must use actual TSX syntax** to verify that the runtime handles JSX transformation, not just extension acceptance. Use a self-contained JSX pragma that does not depend on React: e.g., `/** @jsxImportSource ./jsx-shim */` where the shim's `jsx()` function returns a plain string, or use `React.createElement = (tag: string) => tag;` and write `const el = <div/>;`. The script outputs `{ result: String(el) }`. This proves the TSX-to-JS compilation actually ran. *(Spec 6.3)*
+- **T-EXEC-11**: `.jsx` script runs and produces structured output. Observe via `runPromise("myscript", { maxIterations: 1 })`. Same approach as T-EXEC-10 — the fixture **must use actual JSX syntax** (e.g., `const el = <div/>;` with a custom pragma or shim) to verify JSX transformation works, not just that the extension is accepted. *(Spec 6.3)*
 - **T-EXEC-12**: JS/TS script stderr passes through to CLI stderr. *(Spec 6.3)*
 - **T-EXEC-13**: JS/TS script can use TypeScript type annotations (verifies tsx handles TS syntax under Node.js). `[Node]` *(Spec 6.3)*
 - **T-EXEC-13b**: JS/TS script can use TypeScript type annotations under Bun (verifies Bun's native TS support). `[Bun]` *(Spec 6.3)*
 - **T-EXEC-13a**: A `.js` script that uses `require()` (CJS) fails with an error. CJS is not supported. *(Spec 6.3)*
-- **T-EXEC-14**: `[Bun]` When running under Bun, JS/TS scripts are executed via Bun's native runtime, not `tsx`. Create a `.ts` fixture script that writes `JSON.stringify({ bunVersion: process.versions.bun })` as its result. Observe via `runPromise({ maxIterations: 1 })`: the yielded Output's `result` parsed as JSON has a truthy `bunVersion` string, confirming the child process ran under Bun (not Node.js/tsx). The spec requires: "When running under Bun, loopx uses Bun's native TypeScript/JSX support instead of tsx." *(Spec 6.3)*
+- **T-EXEC-14**: `[Bun]` When running under Bun, JS/TS scripts are executed via Bun's native runtime, not `tsx`. Create a `.ts` fixture script that writes `JSON.stringify({ bunVersion: process.versions.bun })` as its result. Observe via `runPromise("myscript", { maxIterations: 1 })`: the yielded Output's `result` parsed as JSON has a truthy `bunVersion` string, confirming the child process ran under Bun (not Node.js/tsx). The spec requires: "When running under Bun, loopx uses Bun's native TypeScript/JSX support instead of tsx." *(Spec 6.3)*
 
 #### Directory Scripts
 
-- **T-EXEC-15**: Directory script with `"main": "index.ts"` → `index.ts` is executed. Observe via `runPromise({ maxIterations: 1 })`: the yielded Output has the expected `result`. *(Spec 6.4)*
-- **T-EXEC-16**: Directory script with `"main": "run.sh"` → `run.sh` is executed via bash. Observe via `runPromise({ maxIterations: 1 })`. *(Spec 6.4)*
+- **T-EXEC-15**: Directory script with `"main": "index.ts"` → `index.ts` is executed. Observe via `runPromise("mypipe", { maxIterations: 1 })`: the yielded Output has the expected `result`. *(Spec 6.4)*
+- **T-EXEC-16**: Directory script with `"main": "run.sh"` → `run.sh` is executed via bash. Observe via `runPromise("mypipe", { maxIterations: 1 })`. *(Spec 6.4)*
 - **T-EXEC-17**: Directory script can import from its own `node_modules/`. Setup: create a directory script with a local dependency (a simple `.js` file in `node_modules/`). Script writes a marker file confirming the import succeeded. *(Spec 2.1)*
 - **T-EXEC-18**: Directory script CWD is its own directory. Script writes `process.cwd()` to a marker file. Assert marker content matches the script's directory. *(Spec 6.1)*
 - **T-EXEC-18a**: Directory script that imports a package not present in its `node_modules/` (e.g., `import "nonexistent-pkg"`) — loopx does not auto-install dependencies. The script fails with a module resolution error from the active runtime, and loopx exits with code 1. *(Spec 2.1)*
@@ -658,49 +694,49 @@ These tests use bash fixture scripts that echo specific strings to stdout. **Par
 
 #### Valid Structured Output
 
-- **T-PARSE-01**: Script outputs `{"result":"hello"}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output is `{ result: "hello" }` — no `goto` or `stop` properties present. *(Spec 2.3)*
+- **T-PARSE-01**: Script outputs `{"result":"hello"}`. Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output is `{ result: "hello" }` — no `goto` or `stop` properties present. *(Spec 2.3)*
 - **T-PARSE-02**: Script outputs `{"goto":"next"}` → loopx transitions to script `next`. *(Spec 2.3)*
 - **T-PARSE-03**: Script outputs `{"stop":true}` → loop halts, exit code 0. *(Spec 2.3)*
 - **T-PARSE-04**: Script outputs `{"result":"x","goto":"next","stop":true}` → stop takes priority, loop halts. *(Spec 2.3)*
-- **T-PARSE-05**: Script outputs `{"result":"x","extra":"ignored"}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "x"` and no `extra` property. *(Spec 2.3)*
+- **T-PARSE-05**: Script outputs `{"result":"x","extra":"ignored"}`. Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "x"` and no `extra` property. *(Spec 2.3)*
 
 #### Fallback to Raw Result
 
-- **T-PARSE-06**: Script outputs `{"unknown":"field"}` (valid JSON object, no known fields). Assert via `runPromise({ maxIterations: 1 })`: yielded Output is `{ result: '{"unknown":"field"}' }` — entire stdout becomes the raw result string, not an empty object. *(Spec 2.3)*
-- **T-PARSE-07**: Script outputs `[1,2,3]` (JSON array). Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "[1,2,3]"`. *(Spec 2.3)*
-- **T-PARSE-08**: Script outputs `"hello"` (JSON string). Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: '"hello"'` (the raw stdout, including the quotes). *(Spec 2.3)*
-- **T-PARSE-09**: Script outputs `42` (JSON number). Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "42"` (raw stdout string, not a parsed number). *(Spec 2.3)*
-- **T-PARSE-10**: Script outputs `true` (JSON boolean). Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "true"` (raw stdout string). *(Spec 2.3)*
-- **T-PARSE-11**: Script outputs `null` (JSON null). Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "null"` (raw stdout string). *(Spec 2.3)*
-- **T-PARSE-12**: Script outputs `not json at all`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "not json at all"`. *(Spec 2.3)*
-- **T-PARSE-12a**: Raw fallback preserves exact stdout including trailing newline. Script outputs `hello\n` (using `emit-raw-ln("hello")` fixture — `printf '%s\n' 'hello'`). Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "hello\n"` — the trailing newline is part of the raw result, not stripped. *(Spec 2.3)*
-- **T-PARSE-13**: Script produces empty stdout (no output). Assert via `runPromise({ maxIterations: 1 })`: yielded Output is `{ result: "" }` — not an empty object `{}`. *(Spec 2.3)*
+- **T-PARSE-06**: Script outputs `{"unknown":"field"}` (valid JSON object, no known fields). Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output is `{ result: '{"unknown":"field"}' }` — entire stdout becomes the raw result string, not an empty object. *(Spec 2.3)*
+- **T-PARSE-07**: Script outputs `[1,2,3]` (JSON array). Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "[1,2,3]"`. *(Spec 2.3)*
+- **T-PARSE-08**: Script outputs `"hello"` (JSON string). Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: '"hello"'` (the raw stdout, including the quotes). *(Spec 2.3)*
+- **T-PARSE-09**: Script outputs `42` (JSON number). Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "42"` (raw stdout string, not a parsed number). *(Spec 2.3)*
+- **T-PARSE-10**: Script outputs `true` (JSON boolean). Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "true"` (raw stdout string). *(Spec 2.3)*
+- **T-PARSE-11**: Script outputs `null` (JSON null). Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "null"` (raw stdout string). *(Spec 2.3)*
+- **T-PARSE-12**: Script outputs `not json at all`. Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "not json at all"`. *(Spec 2.3)*
+- **T-PARSE-12a**: Raw fallback preserves exact stdout including trailing newline. Script outputs `hello\n` (using `emit-raw-ln("hello")` fixture — `printf '%s\n' 'hello'`). Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "hello\n"` — the trailing newline is part of the raw result, not stripped. *(Spec 2.3)*
+- **T-PARSE-13**: Script produces empty stdout (no output). Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output is `{ result: "" }` — not an empty object `{}`. *(Spec 2.3)*
 
 #### Type Coercion
 
-- **T-PARSE-14**: `{"result": 42}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "42"` (coerced via `String()`). *(Spec 2.3)*
-- **T-PARSE-15**: `{"result": true}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "true"`. *(Spec 2.3)*
-- **T-PARSE-16**: `{"result": {"nested": "obj"}}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "[object Object]"`. *(Spec 2.3)*
-- **T-PARSE-17**: `{"result": null}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "null"`. *(Spec 2.3)*
-- **T-PARSE-18**: `{"goto": 42}` (goto is not a string). Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}` — an empty object with no `result`, `goto`, or `stop` properties. The output is parsed as structured (it is a JSON object with a known field), but the invalid-typed `goto` is discarded. This is distinct from raw fallback, which would yield `{ result: '{"goto":42}' }`. *(Spec 2.3)*
-- **T-PARSE-19**: `{"goto": true}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
-- **T-PARSE-20**: `{"goto": null}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
-- **T-PARSE-21**: `{"stop": "true"}` (string, not boolean). Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. Loop continues (does not halt). *(Spec 2.3)*
-- **T-PARSE-22**: `{"stop": 1}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
-- **T-PARSE-23**: `{"stop": false}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
-- **T-PARSE-24**: `{"stop": "false"}`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
-- **T-PARSE-20a**: `{"goto":""}` (empty string goto). An empty string IS a string (`typeof "" === "string"`), so the parser must preserve it — it is NOT treated as absent. Assert via `run()`: the generator throws an error on the first iteration (because `""` is not a valid script name), confirming the empty string was forwarded to the goto validation logic rather than silently discarded. This is distinct from T-PARSE-18/19/20 which test non-string goto values that are discarded. *(Spec 2.3)*
+- **T-PARSE-14**: `{"result": 42}`. Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "42"` (coerced via `String()`). *(Spec 2.3)*
+- **T-PARSE-15**: `{"result": true}`. Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "true"`. *(Spec 2.3)*
+- **T-PARSE-16**: `{"result": {"nested": "obj"}}`. Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "[object Object]"`. *(Spec 2.3)*
+- **T-PARSE-17**: `{"result": null}`. Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "null"`. *(Spec 2.3)*
+- **T-PARSE-18**: `{"goto": 42}` (goto is not a string). Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output is exactly `{}` — an empty object with no `result`, `goto`, or `stop` properties. The output is parsed as structured (it is a JSON object with a known field), but the invalid-typed `goto` is discarded. This is distinct from raw fallback, which would yield `{ result: '{"goto":42}' }`. *(Spec 2.3)*
+- **T-PARSE-19**: `{"goto": true}`. Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
+- **T-PARSE-20**: `{"goto": null}`. Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
+- **T-PARSE-21**: `{"stop": "true"}` (string, not boolean). Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output is exactly `{}`. Loop continues (does not halt). *(Spec 2.3)*
+- **T-PARSE-22**: `{"stop": 1}`. Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
+- **T-PARSE-23**: `{"stop": false}`. Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
+- **T-PARSE-24**: `{"stop": "false"}`. Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output is exactly `{}`. *(Spec 2.3)*
+- **T-PARSE-20a**: `{"goto":""}` (empty string goto). An empty string IS a string (`typeof "" === "string"`), so the parser must preserve it — it is NOT treated as absent. Assert via `run("myscript")`: the generator throws an error on the first iteration (because `""` is not a valid script name), confirming the empty string was forwarded to the goto validation logic rather than silently discarded. This is distinct from T-PARSE-18/19/20 which test non-string goto values that are discarded. *(Spec 2.3)*
 
 #### Mixed Valid/Invalid Fields
 
-- **T-PARSE-28**: `{"result":"x","goto":42}` (valid result + invalid goto). Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{ result: "x" }` — the valid `result` is preserved, the invalid-typed `goto` is discarded. No `goto` or `stop` properties present. *(Spec 2.3)*
-- **T-PARSE-29**: `{"result":"x","stop":"true"}` (valid result + invalid stop). Assert via `runPromise({ maxIterations: 1 })`: yielded Output is exactly `{ result: "x" }` — the valid `result` is preserved, the invalid-typed `stop` is discarded. Loop continues (does not halt). *(Spec 2.3)*
+- **T-PARSE-28**: `{"result":"x","goto":42}` (valid result + invalid goto). Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output is exactly `{ result: "x" }` — the valid `result` is preserved, the invalid-typed `goto` is discarded. No `goto` or `stop` properties present. *(Spec 2.3)*
+- **T-PARSE-29**: `{"result":"x","stop":"true"}` (valid result + invalid stop). Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output is exactly `{ result: "x" }` — the valid `result` is preserved, the invalid-typed `stop` is discarded. Loop continues (does not halt). *(Spec 2.3)*
 
 #### Whitespace & Formatting
 
-- **T-PARSE-25**: Script outputs JSON with trailing newline `{"result":"x"}\n`. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "x"` (parsed correctly, not raw fallback). *(Spec 2.3)*
-- **T-PARSE-26**: Script outputs pretty-printed JSON (with newlines and indentation). Assert via `runPromise({ maxIterations: 1 })`: yielded Output has the expected fields (parsed correctly). *(Spec 2.3)*
-- **T-PARSE-27**: Script outputs JSON with leading whitespace. Assert via `runPromise({ maxIterations: 1 })`: yielded Output has the expected fields (parsed correctly). *(Spec 2.3)*
+- **T-PARSE-25**: Script outputs JSON with trailing newline `{"result":"x"}\n`. Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "x"` (parsed correctly, not raw fallback). *(Spec 2.3)*
+- **T-PARSE-26**: Script outputs pretty-printed JSON (with newlines and indentation). Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has the expected fields (parsed correctly). *(Spec 2.3)*
+- **T-PARSE-27**: Script outputs JSON with leading whitespace. Assert via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has the expected fields (parsed correctly). *(Spec 2.3)*
 
 ### 4.6 Loop State Machine
 
@@ -724,11 +760,11 @@ These tests use bash fixture scripts that echo specific strings to stdout. **Par
 
 #### Input Piping
 
-- **T-LOOP-11**: A outputs `{"result":"payload","goto":"B"}`. B reads stdin (via `cat-stdin` fixture) and outputs the received value as its result. Observe via `runPromise({ maxIterations: 2 })`: the second yielded Output has `result: "payload"`. *(Spec 6.7)*
-- **T-LOOP-12**: A outputs `{"goto":"B"}` (no result). B reads stdin and outputs it as result. Observe via `runPromise({ maxIterations: 2 })`: the second yielded Output has `result: ""` (empty string). *(Spec 2.3, 6.7)*
-- **T-LOOP-13**: A outputs `{"result":"payload"}` (no goto). Loop resets to A. A reads stdin and outputs it as result. Observe via `runPromise({ maxIterations: 2 })`: the second yielded Output has `result: ""` (result not piped on reset). *(Spec 6.7)*
-- **T-LOOP-14**: First iteration (starting target) receives empty stdin. Script reads stdin and outputs it as result. Observe via `runPromise({ maxIterations: 1 })`: yielded Output has `result: ""`. *(Spec 6.8)*
-- **T-LOOP-15**: A → `goto:"B"` with result → B → `goto:"C"` with result → C reads stdin and outputs it as result. Observe via `runPromise({ maxIterations: 3 })`: the third yielded Output has `result` equal to B's result, not A's. *(Spec 6.7)*
+- **T-LOOP-11**: A outputs `{"result":"payload","goto":"B"}`. B reads stdin (via `cat-stdin` fixture) and outputs the received value as its result. Observe via `runPromise("A", { maxIterations: 2 })`: the second yielded Output has `result: "payload"`. *(Spec 6.7)*
+- **T-LOOP-12**: A outputs `{"goto":"B"}` (no result). B reads stdin and outputs it as result. Observe via `runPromise("A", { maxIterations: 2 })`: the second yielded Output has `result: ""` (empty string). *(Spec 2.3, 6.7)*
+- **T-LOOP-13**: A outputs `{"result":"payload"}` (no goto). Loop resets to A. A reads stdin and outputs it as result. Observe via `runPromise("A", { maxIterations: 2 })`: the second yielded Output has `result: ""` (result not piped on reset). *(Spec 6.7)*
+- **T-LOOP-14**: First iteration (starting target) receives empty stdin. Script reads stdin and outputs it as result. Observe via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: ""`. *(Spec 6.8)*
+- **T-LOOP-15**: A → `goto:"B"` with result → B → `goto:"C"` with result → C reads stdin and outputs it as result. Observe via `runPromise("A", { maxIterations: 3 })`: the third yielded Output has `result` equal to B's result, not A's. *(Spec 6.7)*
 
 #### Goto Behavior
 
@@ -744,7 +780,7 @@ These tests use bash fixture scripts that echo specific strings to stdout. **Par
 - **T-LOOP-21**: Script exits with code 2 → same behavior (any non-zero is an error). *(Spec 7.2)*
 - **T-LOOP-22**: Script fails on iteration 3 of 5 (`-n 5`). Assert exactly 3 iterations ran (loop stopped at failure). *(Spec 7.2)*
 - **T-LOOP-23**: Script's stderr output on failure is visible on CLI stderr. *(Spec 7.2)*
-- **T-LOOP-24**: Script's stdout on failure is NOT parsed as structured output. Use a script that prints `{"result":"should-not-appear","stop":true}` to stdout then exits 1. Observe via `run()`: the generator should throw on the failing iteration without yielding any `Output` for that iteration. If the JSON were parsed, it would yield a result and halt cleanly — the throw with no yield proves it was not parsed. *(Spec 7.2)*
+- **T-LOOP-24**: Script's stdout on failure is NOT parsed as structured output. Use a script that prints `{"result":"should-not-appear","stop":true}` to stdout then exits 1. Observe via `run("myscript")`: the generator should throw on the failing iteration without yielding any `Output` for that iteration. If the JSON were parsed, it would yield a result and halt cleanly — the throw with no yield proves it was not parsed. *(Spec 7.2)*
 
 #### Final Iteration Output
 
@@ -763,7 +799,7 @@ All env tests use `withGlobalEnv` to isolate from the real user config.
 - **T-ENV-03**: `XDG_CONFIG_HOME` is respected. Set `XDG_CONFIG_HOME=/tmp/custom`, run `loopx env set X Y`, verify file exists at `/tmp/custom/loopx/env`. *(Spec 8.1)*
 - **T-ENV-04**: When `XDG_CONFIG_HOME` is unset, default is `~/.config`. Use `withIsolatedHome` (not `withGlobalEnv`) to safely verify the fallback path without touching the real home directory. *(Spec 8.1)*
 - **T-ENV-05**: Config directory created on first `env set`. Start with no directory, run `env set`, verify directory was created. *(Spec 8.1)*
-- **T-ENV-05a**: Unreadable global env file. Create the global env file, then `chmod 000` it. Run `loopx -n 1 myscript` → exits with code 1 and an error message about the unreadable file. **This test is conditional on `process.getuid() !== 0`** — root can read any file, so the test is skipped when running as root. *(Spec 8.1)*
+- **T-ENV-05a**: Unreadable global env file. Create the global env file, then `chmod 000` it. Run `loopx run -n 1 myscript` → exits with code 1 and an error message about the unreadable file. **This test is conditional on `process.getuid() !== 0`** — root can read any file, so the test is skipped when running as root. *(Spec 8.1)*
 - **T-ENV-05b**: Unreadable global env file via programmatic API. Same setup as T-ENV-05a (`chmod 000`). `run("myscript")` returns a generator; on the first `next()`, the generator throws an error about the unreadable file. **Conditional on `process.getuid() !== 0`.** *(Spec 8.1, 9.3)*
 - **T-ENV-05c**: Unreadable global env file with `loopx env list`. Create the global env file with content, then `chmod 000`. Run `loopx env list` → exits with code 1 and an error message about the unreadable file. **Conditional on `process.getuid() !== 0`.** *(Spec 8.1)*
 - **T-ENV-05d**: Unreadable global env file with `loopx env set`. Create the global env file with content, then `chmod 000`. Run `loopx env set KEY val` → exits with code 1 and an error message about the unreadable file. The `env set` command must read the existing file before writing (to preserve other entries), so an unreadable file is an error. **Conditional on `process.getuid() !== 0`.** *(Spec 8.1)*
@@ -794,7 +830,7 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 
 - **T-ENV-16**: `-e local.env` loads variables into script environment. Script writes the env var to a marker file. Assert marker file contains the expected value. *(Spec 8.2)*
 - **T-ENV-17**: `-e nonexistent.env` → error, exit 1. *(Spec 8.2)*
-- **T-ENV-17a**: `-e unreadable.env` → error, exit 1. Create a local env file, then `chmod 000` it. Run `loopx -e unreadable.env -n 1 myscript` → exits with code 1 and an error message. Behavior is identical to an unreadable global env file (Spec 8.1). **This test is conditional on `process.getuid() !== 0`.** *(Spec 8.2)*
+- **T-ENV-17a**: `-e unreadable.env` → error, exit 1. Create a local env file, then `chmod 000` it. Run `loopx run -e unreadable.env -n 1 myscript` → exits with code 1 and an error message. Behavior is identical to an unreadable global env file (Spec 8.1). **This test is conditional on `process.getuid() !== 0`.** *(Spec 8.2)*
 - **T-ENV-18**: Global has `X=global`, local has `X=local`. Script writes `$X` to a marker file → marker contains `local`. *(Spec 8.2)*
 - **T-ENV-19**: Global has `A=1`, local has `B=2`. Script writes both to marker files → `A=1` and `B=2` both present. *(Spec 8.2)*
 
@@ -821,9 +857,9 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 
 #### `import from "loopx"` Resolution
 
-- **T-MOD-01**: A TS script with `import { output } from "loopx"` runs successfully under Node.js. The script calls `output({ result: "resolved" })`. Observe via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "resolved"`. `[Node]` *(Spec 3.3)*
+- **T-MOD-01**: A TS script with `import { output } from "loopx"` runs successfully under Node.js. The script calls `output({ result: "resolved" })`. Observe via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "resolved"`. `[Node]` *(Spec 3.3)*
 - **T-MOD-02**: Same import works under Bun. The script calls `output({ result: "resolved" })`. Observe via `runAPIDriver("bun", ...)`: yielded Output has `result: "resolved"`. `[Bun]` *(Spec 3.3)*
-- **T-MOD-03**: A JS script with `import { output } from "loopx"` also works. The script calls `output({ result: "resolved" })`. Observe via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "resolved"`. *(Spec 3.3)*
+- **T-MOD-03**: A JS script with `import { output } from "loopx"` also works. The script calls `output({ result: "resolved" })`. Observe via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "resolved"`. *(Spec 3.3)*
 - **T-MOD-03a**: A directory script that has its own `node_modules/loopx` (a different version) resolves `import from "loopx"` to the **local** package, not the running CLI's package. Standard module resolution applies — the closest `node_modules` wins. The local shadow package exports an `output()` function that writes a distinctive marker to a marker file before writing JSON to stdout. The test asserts that the shadow's marker file **exists** (proving the local package was resolved). This verifies the spec's "standard module resolution applies" behavior (Spec 2.1, 3.3). *(Spec 3.3, 2.1)*
 
 #### `output()` Function
@@ -831,9 +867,9 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 These tests observe `output()` behavior via the programmatic API (`run()` / `runPromise()`) or side-effect files — not by inspecting CLI stdout, because the CLI never prints `result` to its own stdout (Spec 7.1).
 
 - **T-MOD-04**: Script uses `output({ result: "hello" })`. Observe via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "hello"`. *(Spec 6.5)*
-- **T-MOD-05**: Script uses `output({ result: "x", goto: "y" })`. Observe via `run()`: yielded Output has both `result: "x"` and `goto: "y"`, and loopx transitions to script `y`. *(Spec 6.5)*
-- **T-MOD-06**: Script uses `output({ stop: true })`. Observe via `runPromise()`: loop completes after one iteration, yielded Output has `stop: true`. *(Spec 6.5)*
-- **T-MOD-07**: Script uses `output({})` (no known fields). Script crashes with non-zero exit code. `runPromise()` rejects. *(Spec 6.5)*
+- **T-MOD-05**: Script uses `output({ result: "x", goto: "y" })`. Observe via `run("myscript")`: yielded Output has both `result: "x"` and `goto: "y"`, and loopx transitions to script `y`. *(Spec 6.5)*
+- **T-MOD-06**: Script uses `output({ stop: true })`. Observe via `runPromise("myscript")`: loop completes after one iteration, yielded Output has `stop: true`. *(Spec 6.5)*
+- **T-MOD-07**: Script uses `output({})` (no known fields). Script crashes with non-zero exit code. `runPromise("myscript")` rejects. *(Spec 6.5)*
 - **T-MOD-08**: Script uses `output(null)`. Script crashes with non-zero exit code. *(Spec 6.5)*
 - **T-MOD-09**: Script uses `output(undefined)`. Script crashes with non-zero exit code. *(Spec 6.5)*
 - **T-MOD-10**: Script uses `output("string")`. Observe via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "string"`. *(Spec 6.5)*
@@ -843,10 +879,10 @@ These tests observe `output()` behavior via the programmatic API (`run()` / `run
 - **T-MOD-13a**: Script uses `output([1, 2, 3])` (array, no known fields). Script crashes with non-zero exit code. *(Spec 6.5)*
 - **T-MOD-13c**: Script uses `output({ foo: "bar" })` (object with no known fields — `foo` is not `result`, `goto`, or `stop`). Script crashes with non-zero exit code. This is distinct from T-MOD-07 (`output({})`) — it verifies that an object must have at least one *known* field, not just any field. *(Spec 6.5)*
 - **T-MOD-13b**: Script uses `output({ result: undefined, goto: undefined, stop: undefined })`. All known fields are `undefined`, which are omitted during JSON serialization — equivalent to `output({})`. Script crashes with non-zero exit code (no known fields with defined values). *(Spec 6.5)*
-- **T-MOD-13d**: Script uses `output({ stop: false })`. The `stop` field has a defined value (`false`), which is a known field — so `output()` accepts the object (it has at least one known field with a defined value). The emitted JSON `{"stop":false}` is then parsed by the loop engine, where `stop` must be exactly `true` (boolean) to take effect. Observe via `runPromise({ maxIterations: 2 })`: the first yielded Output is `{}` (the `stop: false` is discarded during parsing), and the loop continues to a second iteration rather than halting. *(Spec 6.5, 2.3)*
-- **T-MOD-13e**: Script uses `output({ goto: 42 })`. The `goto` field has a defined value (`42`), which is a known field — so `output()` accepts the object. The emitted JSON `{"goto":42}` is then parsed by the loop engine, where `goto` must be a string. Observe via `runPromise({ maxIterations: 2 })`: the first yielded Output is `{}` (the non-string `goto` is discarded during parsing), and the loop resets to the starting target rather than transitioning. *(Spec 6.5, 2.3)*
-- **T-MOD-13f**: Script uses `output({ result: null })`. The `result` field has a defined value (`null`), which is a known field — so `output()` accepts the object. The emitted JSON `{"result":null}` is then parsed by the loop engine, where non-string `result` is coerced via `String()`. Observe via `runPromise({ maxIterations: 1 })`: yielded Output has `result: "null"`. *(Spec 6.5, 2.3)*
-- **T-MOD-13g**: Script uses `output({ goto: null })`. The `goto` field has a defined value (`null`), which is a known field — so `output()` accepts the object. The emitted JSON `{"goto":null}` is then parsed by the loop engine, where `goto` must be a string. Observe via `runPromise({ maxIterations: 2 })`: the first yielded Output is `{}` (the null `goto` is discarded during parsing), and the loop resets to the starting target. *(Spec 6.5, 2.3)*
+- **T-MOD-13d**: Script uses `output({ stop: false })`. The `stop` field has a defined value (`false`), which is a known field — so `output()` accepts the object (it has at least one known field with a defined value). The emitted JSON `{"stop":false}` is then parsed by the loop engine, where `stop` must be exactly `true` (boolean) to take effect. Observe via `runPromise("myscript", { maxIterations: 2 })`: the first yielded Output is `{}` (the `stop: false` is discarded during parsing), and the loop continues to a second iteration rather than halting. *(Spec 6.5, 2.3)*
+- **T-MOD-13e**: Script uses `output({ goto: 42 })`. The `goto` field has a defined value (`42`), which is a known field — so `output()` accepts the object. The emitted JSON `{"goto":42}` is then parsed by the loop engine, where `goto` must be a string. Observe via `runPromise("myscript", { maxIterations: 2 })`: the first yielded Output is `{}` (the non-string `goto` is discarded during parsing), and the loop resets to the starting target rather than transitioning. *(Spec 6.5, 2.3)*
+- **T-MOD-13f**: Script uses `output({ result: null })`. The `result` field has a defined value (`null`), which is a known field — so `output()` accepts the object. The emitted JSON `{"result":null}` is then parsed by the loop engine, where non-string `result` is coerced via `String()`. Observe via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has `result: "null"`. *(Spec 6.5, 2.3)*
+- **T-MOD-13g**: Script uses `output({ goto: null })`. The `goto` field has a defined value (`null`), which is a known field — so `output()` accepts the object. The emitted JSON `{"goto":null}` is then parsed by the loop engine, where `goto` must be a string. Observe via `runPromise("myscript", { maxIterations: 2 })`: the first yielded Output is `{}` (the null `goto` is discarded during parsing), and the loop resets to the starting target. *(Spec 6.5, 2.3)*
 - **T-MOD-14**: Code after `output()` does not execute. Script: `output({ result: "a" }); writeFileSync("/tmp/marker", "ran")`. Assert marker file does not exist. *(Spec 6.5)*
 - **T-MOD-14a**: Large-payload flush: Script uses `output({ result: "x".repeat(1_000_000) })` (1 MB result). Observe via `runPromise("myscript", { maxIterations: 1 })`: yielded Output has the full 1 MB string without truncation. This exercises the flush-before-exit guarantee in section 6.5. *(Spec 6.5)*
 
@@ -878,7 +914,7 @@ These tests verify `LOOPX_BIN` through loop behavior and side-effect files — n
 #### `run()` (AsyncGenerator)
 
 - **T-API-01**: `run("myscript")` returns an async generator. Calling `next()` yields an `Output` object. *(Spec 9.1)*
-- **T-API-02**: Generator yields one `Output` per iteration. With `-n 3`, collect all yields → array of 3 outputs. *(Spec 9.1)*
+- **T-API-02**: Generator yields one `Output` per iteration. With `maxIterations: 3`, collect all yields → array of 3 outputs. *(Spec 9.1)*
 - **T-API-03**: Generator completes (returns `{ done: true }`) when script outputs `stop: true`. *(Spec 9.1)*
 - **T-API-04**: Generator completes when `maxIterations` is reached. *(Spec 9.1)*
 - **T-API-05**: The output from the final iteration is yielded before the generator completes. *(Spec 9.1)*
@@ -886,8 +922,18 @@ These tests verify `LOOPX_BIN` through loop behavior and side-effect files — n
 - **T-API-07**: `run("myscript", { cwd: "/path/to/project" })` resolves scripts relative to the given cwd. *(Spec 9.5)*
 - **T-API-08**: `run("myscript", { maxIterations: 0 })` → generator completes immediately with no yields. *(Spec 9.5)*
 - **T-API-08a**: `run("nonexistent", { maxIterations: 0 })` → `run()` returns a generator. On the first `next()`, the generator throws because the script does not exist. Even with `maxIterations: 0`, validation (discovery, script resolution, env file loading) runs before the zero-iteration short-circuit. This mirrors CLI `-n 0` behavior (T-CLI-19). *(Spec 9.1, 9.5, 7.1)*
-- **T-API-09**: `run()` with no script name runs the `default` script. *(Spec 9.1)*
-- **T-API-09b**: `run()` cwd snapshot timing. Create two temp projects, each with a `default` script that writes a unique marker. Call `run()` while `process.cwd()` is project A (no explicit `cwd` option). Then change `process.cwd()` to project B before calling `next()`. Assert the generator executes project A's script, not project B's — proving `cwd` was snapshotted at `run()` call time. *(Spec 9.1, 9.5)*
+
+#### `run()` with Invalid `scriptName`
+
+`scriptName` is a required parameter. In TypeScript, omitting it is a static type error. In JavaScript, or when the type check is bypassed, runtime-invalid `scriptName` values are rejected lazily.
+
+- **T-API-09**: `run(undefined as any)` returns a generator without throwing. On the first `next()`, the generator throws an error (invalid scriptName). No child process is spawned. *(Spec 9.1)*
+- **T-API-20h**: `run(null as any)` returns a generator without throwing. On the first `next()`, the generator throws (invalid scriptName). *(Spec 9.1)*
+- **T-API-20i**: `run(42 as any)` returns a generator without throwing. On the first `next()`, the generator throws (non-string scriptName). *(Spec 9.1)*
+
+#### `run()` Snapshot & Cancellation
+
+- **T-API-09b**: `run()` cwd snapshot timing. Create two temp projects, each with a script named `myscript` that writes a unique marker. Call `run("myscript")` while `process.cwd()` is project A (no explicit `cwd` option). Then change `process.cwd()` to project B before calling `next()`. Assert the generator executes project A's script, not project B's — proving `cwd` was snapshotted at `run()` call time. *(Spec 9.1, 9.5)*
 - **T-API-09a**: Manual iterator cancellation during a pending `next()`. Use the `write-pid-to-file` fixture (a TS script that writes its PID to a marker file, writes `"ready"` to stderr, then blocks). Obtain the async iterator, call `iterator.next()` to start the first iteration. Wait for the child to be ready (e.g., poll the marker file or observe stderr). Then call `iterator.return()` while `next()` is still pending. Assert: (1) the child process / process group is terminated (read PID from marker file, verify it is no longer running), and (2) the generator completes with no further yields. *(Spec 9.1)*
 - **T-API-09c**: `run()` options snapshot — mutating `maxIterations` after call. Create a `RunOptions` object with `maxIterations: 2`. Call `run("myscript", opts)` to obtain the generator. Then mutate `opts.maxIterations = 100`. Iterate the generator to completion. Assert exactly 2 outputs are yielded — proving the options were snapshotted at `run()` call time and the mutation had no effect. *(Spec 9.1)*
 
@@ -901,22 +947,30 @@ These tests verify `LOOPX_BIN` through loop behavior and side-effect files — n
 #### `runPromise()`
 
 - **T-API-11**: `runPromise("myscript", { maxIterations: 3 })` resolves with an array of 3 `Output` objects. *(Spec 9.2)*
-- **T-API-12**: `runPromise()` resolves when `stop: true` is output. *(Spec 9.2)*
-- **T-API-13**: `runPromise()` rejects when a script exits non-zero. *(Spec 9.3)*
+- **T-API-12**: `runPromise("myscript")` resolves when `stop: true` is output. *(Spec 9.2)*
+- **T-API-13**: `runPromise("myscript")` rejects when a script exits non-zero. *(Spec 9.3)*
 - **T-API-14**: `runPromise("myscript", { maxIterations: 3, envFile: "local.env", cwd: project.dir })` resolves with correct outputs using all option fields. The env file variable is visible to the script (via marker file), `cwd` is respected (script runs in the correct project), and exactly 3 iterations are collected. *(Spec 9.2, 9.5)*
-- **T-API-14a**: `runPromise()` with no script name runs the `default` script. *(Spec 9.2, 9.1)*
+
+#### `runPromise()` with Invalid `scriptName`
+
+- **T-API-14a**: `runPromise(undefined as any)` returns a rejected promise (not a synchronous throw). The call itself always returns a promise, and the validation error surfaces as a rejection. *(Spec 9.2)*
+- **T-API-14a2**: `runPromise(null as any)` returns a rejected promise. *(Spec 9.2)*
+- **T-API-14a3**: `runPromise(42 as any)` returns a rejected promise. *(Spec 9.2)*
+
+#### `runPromise()` Snapshot & Options
+
 - **T-API-14b**: `runPromise("myscript", { maxIterations: 0 })` resolves with an empty array `[]`. *(Spec 9.2, 9.5)*
-- **T-API-14c**: `runPromise()` cwd snapshot timing. Create two temp projects, each with a `default` script that writes a unique marker. Call `runPromise()` while `process.cwd()` is project A (no explicit `cwd` option). Change `process.cwd()` to project B before the promise resolves. Assert the promise resolves with outputs from project A's script, not project B's — proving `cwd` was snapshotted at `runPromise()` call time. *(Spec 9.2, 9.5)*
+- **T-API-14c**: `runPromise()` cwd snapshot timing. Create two temp projects, each with a script named `myscript` that writes a unique marker. Call `runPromise("myscript")` while `process.cwd()` is project A (no explicit `cwd` option). Change `process.cwd()` to project B before the promise resolves. Assert the promise resolves with outputs from project A's script, not project B's — proving `cwd` was snapshotted at `runPromise()` call time. *(Spec 9.2, 9.5)*
 - **T-API-14d**: `runPromise()` options snapshot — mutating `maxIterations` after call. Create a `RunOptions` object with `maxIterations: 2`. Call `runPromise("myscript", opts)` to obtain the promise. Then mutate `opts.maxIterations = 100`. Await the promise. Assert exactly 2 outputs are returned — proving the options were snapshotted at `runPromise()` call time. *(Spec 9.2, 9.1)*
 - **T-API-14e**: `runPromise("nonexistent", { maxIterations: 0 })` rejects because the script does not exist. Even with `maxIterations: 0`, validation (discovery, script resolution) runs before the zero-iteration short-circuit. This mirrors CLI `-n 0` behavior (T-CLI-19). *(Spec 9.2, 9.5, 7.1)*
 
 #### Error Behavior
 
-- **T-API-15**: Programmatic API never prints `result` to stdout. Use `runAPIDriver()` to spawn a driver process that calls `run()` and collects outputs. Assert the driver's stdout contains only the driver's own JSON output — no `result` values from scripts leak to stdout. *(Spec 9.3)*
-- **T-API-16**: Non-zero script exit causes `run()` generator to throw. *(Spec 9.3)*
-- **T-API-17**: Invalid goto target causes `run()` generator to throw. *(Spec 9.3)*
+- **T-API-15**: Programmatic API never prints `result` to stdout. Use `runAPIDriver()` to spawn a driver process that calls `run("myscript")` and collects outputs. Assert the driver's stdout contains only the driver's own JSON output — no `result` values from scripts leak to stdout. *(Spec 9.3)*
+- **T-API-16**: Non-zero script exit causes `run("myscript")` generator to throw. *(Spec 9.3)*
+- **T-API-17**: Invalid goto target causes `run("myscript")` generator to throw. *(Spec 9.3)*
 - **T-API-18**: Script stderr is forwarded to the calling process's stderr. *(Spec 9.3)*
-- **T-API-19**: When `run()` throws, previously yielded outputs are preserved (the caller already consumed them). Test: collect outputs in an array, handle the throw, verify array has the partial results. *(Spec 9.3)*
+- **T-API-19**: When `run("myscript")` throws, previously yielded outputs are preserved (the caller already consumed them). Test: collect outputs in an array, handle the throw, verify array has the partial results. *(Spec 9.3)*
 - ~~**T-API-20**~~: *Removed.* "Partial outputs are not available" from `runPromise()` rejection is not meaningfully observable beyond the promise rejecting. The relevant surface is already covered by T-API-13 (rejection on non-zero exit), T-API-15 (no stdout leakage), and T-API-19 (partial outputs preserved with `run()`). *(Spec 9.3)*
 - **T-API-20a**: `run("nonexistent")` — `run()` returns a generator without throwing. On the first `next()`, the generator throws because the script does not exist. No child process is spawned (use a counter file in `.loopx/` to verify no script ran). *(Spec 9.1, 9.3)*
 - **T-API-20b**: `runPromise("nonexistent")` — rejects because the script does not exist. *(Spec 9.3)*
@@ -925,8 +979,6 @@ These tests verify `LOOPX_BIN` through loop behavior and side-effect files — n
 - **T-API-20e**: `runPromise("myscript", { envFile: "nonexistent.env" })` — rejects because the env file does not exist. *(Spec 9.3, 9.5)*
 - **T-API-20f**: `run("myscript", { cwd: dirWithoutLoopx })` — `run()` returns a generator without throwing. On the first `next()`, the generator throws because `.loopx/` does not exist in the specified `cwd`. *(Spec 9.1, 9.3)*
 - **T-API-20g**: `runPromise("myscript", { cwd: dirWithoutLoopx })` — rejects because `.loopx/` does not exist. *(Spec 9.3)*
-- **T-API-20h**: `run(undefined, { cwd: dirWithLoopxButNoDefault })` — `run()` returns a generator. On the first `next()`, the generator throws because no `default` script exists. *(Spec 9.1, 9.3)*
-- **T-API-20i**: `runPromise(undefined, { cwd: dirWithLoopxButNoDefault })` — rejects because no `default` script exists. *(Spec 9.3)*
 
 #### `envFile` Option
 
@@ -990,7 +1042,7 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 - **T-INST-18**: Repo name derived from URL without `.git` suffix (e.g., github.com known host). *(Spec 10.2)*
 - **T-INST-19**: Cloned repo must have `package.json` with `main`. If missing → clone removed, error displayed. *(Spec 10.2)*
 - **T-INST-20**: Cloned repo has `package.json` with `main` pointing to unsupported extension → clone removed, error. *(Spec 10.2)*
-- **T-INST-21**: Successful git install → directory script is runnable via `loopx -n 1 <name>`. *(Spec 10.2)*
+- **T-INST-21**: Successful git install → directory script is runnable via `loopx run -n 1 <name>`. *(Spec 10.2)*
 
 #### Tarball Install
 
@@ -1009,7 +1061,7 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 - **T-INST-27b**: Script-name collision across different path types. `.loopx/foo.sh` exists (file script named `foo`), install a git repo that would clone to `.loopx/foo/` — different destination path, but same derived script name `foo`. → error, existing script untouched, no `.loopx/foo/` directory created. *(Spec 10.3, 5.2)*
 - **T-INST-27c**: Script-name collision across different file extensions. `.loopx/foo.ts` exists (file script named `foo`), install a single-file URL for `foo.sh` → error. Both resolve to script name `foo`. The existing `.loopx/foo.ts` is untouched and no `.loopx/foo.sh` is created. *(Spec 10.3, 5.2)*
 - **T-INST-27d**: Script-name collision when target name already has a pre-existing collision in `.loopx/`. Setup: `.loopx/foo.sh` and `.loopx/foo.ts` both exist (pre-existing name collision on `foo`). Attempt to install a git repo that would clone to `.loopx/foo/`. Assert: exit code 1, error on stderr mentioning name collision, no `.loopx/foo/` directory created, both `.loopx/foo.sh` and `.loopx/foo.ts` untouched. This is distinct from T-INST-27b/27c: those test single-entry collisions where the name is in the scripts map; this tests that install detects the name even when it is already involved in a pre-existing collision (and therefore excluded from the scripts map during discovery). *(Spec 10.3, 5.2)*
-- **T-INST-28**: Installing a script with a reserved name (e.g., `output.ts`) → error, nothing saved. *(Spec 10.3)*
+- **T-INST-28**: Installing a script named after a former reserved name (e.g., `output.ts`) succeeds. The script is placed in `.loopx/` and is discoverable. Reserved names no longer exist — all names that pass name restriction rules (section 5.3) are allowed. *(Spec 10.3, 5.3)*
 - **T-INST-29**: Installing a script with invalid name (e.g., `-invalid.ts`) → error, nothing saved. *(Spec 10.3)*
 - **T-INST-30**: No automatic `npm install` / `bun install` after clone/extract. Verify `node_modules/` does not appear in installed directory script. *(Spec 10.3)*
 - **T-INST-31**: HTTP 404 during single-file download → error, exit code 1, no partial file left in `.loopx/`. *(Spec 10.3)*
@@ -1036,8 +1088,8 @@ These tests verify that git/tarball installs apply the same validation as discov
 
 #### Global Install Smoke Test
 
-- **T-INST-GLOBAL-01**: Full global install lifecycle. `npm pack` the built loopx package, install the resulting tarball into an isolated global prefix (using `npm install -g --prefix <tempdir>`), create a fixture project with a `.loopx/default.ts` script, run `<tempdir>/bin/loopx -n 1` against the fixture project, and assert the script ran (via marker file) and exit code is 0. This exercises the full Spec 3.1 workflow: global binary on PATH, module resolution for `import from "loopx"`, and script execution. *(Spec 3.1)*
-- **T-INST-GLOBAL-01a**: `[Bun]` Full global install lifecycle under Bun. Same workflow as T-INST-GLOBAL-01 but the fixture script is run via Bun: install globally, create a fixture project with a `.loopx/default.ts` script that uses `import { output } from "loopx"`, invoke the global `loopx` binary under Bun (`bun <global-bin>/loopx -n 1`). Assert the script ran (via marker file) and `import from "loopx"` resolved correctly. This exercises the `NODE_PATH`-based module resolution path that Bun uses for global installs (Spec 3.3). *(Spec 3.1, 3.3)*
+- **T-INST-GLOBAL-01**: Full global install lifecycle. `npm pack` the built loopx package, install the resulting tarball into an isolated global prefix (using `npm install -g --prefix <tempdir>`), create a fixture project with a `.loopx/myscript.ts` script, run `<tempdir>/bin/loopx run -n 1 myscript` against the fixture project, and assert the script ran (via marker file) and exit code is 0. This exercises the full Spec 3.1 workflow: global binary on PATH, module resolution for `import from "loopx"`, and script execution. *(Spec 3.1)*
+- **T-INST-GLOBAL-01a**: `[Bun]` Full global install lifecycle under Bun. Same workflow as T-INST-GLOBAL-01 but the fixture script is run via Bun: install globally, create a fixture project with a `.loopx/myscript.ts` script that uses `import { output } from "loopx"`, invoke the global `loopx` binary under Bun (`bun <global-bin>/loopx run -n 1 myscript`). Assert the script ran (via marker file) and `import from "loopx"` resolved correctly. This exercises the `NODE_PATH`-based module resolution path that Bun uses for global installs (Spec 3.3). *(Spec 3.1, 3.3)*
 
 ### 4.11 Signal Handling
 
@@ -1100,11 +1152,14 @@ These tests consolidate exit code assertions. Many are also verified in other se
 - **T-EXIT-06**: Validation failure (name collision) → code 1. *(Spec 12)*
 - **T-EXIT-07**: Invalid goto target → code 1. *(Spec 12)*
 - **T-EXIT-08**: Missing script → code 1. *(Spec 12)*
-- **T-EXIT-09**: Missing `.loopx/` directory → code 1. *(Spec 12)*
+- **T-EXIT-09**: Missing `.loopx/` directory (during `loopx run <script>`) → code 1. *(Spec 12)*
 - **T-EXIT-10**: Usage error (invalid `-n`) → code 1. *(Spec 12)*
 - **T-EXIT-11**: Missing `-e` file → code 1. *(Spec 12)*
 - **T-EXIT-12**: SIGINT → code 130. *(Spec 12)*
 - **T-EXIT-13**: SIGTERM → code 143. *(Spec 12)*
+- **T-EXIT-14**: `loopx run` with no script name → code 1 (usage error). *(Spec 12)*
+- **T-EXIT-15**: `loopx myscript` (unrecognized subcommand) → code 1 (usage error). *(Spec 12)*
+- **T-EXIT-16**: `loopx --unknown` (unrecognized top-level flag) → code 1 (usage error). *(Spec 12)*
 
 ---
 
@@ -1249,7 +1304,7 @@ Ordinary `vitest run` on `types.test.ts` is **not sufficient** as the sole verif
 - **T-TYPE-04**: `run()` returns `AsyncGenerator<Output>`. Assert that `import { run } from "loopx"` compiles and the return type is assignable to `AsyncGenerator<Output>`. *(Spec 9.1, 9.5)*
 - **T-TYPE-05**: `runPromise()` returns `Promise<Output[]>`. Assert the return type is assignable to `Promise<Output[]>`. *(Spec 9.2, 9.5)*
 - **T-TYPE-06**: `run()` and `runPromise()` accept an optional `RunOptions` second argument. *(Spec 9.1, 9.2, 9.5)*
-- **T-TYPE-07**: `run()` and `runPromise()` accept an optional script name as the first argument (`string | undefined`). *(Spec 9.1, 9.2, 9.5)*
+- **T-TYPE-07**: `run()` and `runPromise()` require `scriptName` as the first argument (`string`). Omitting `scriptName` is a static type error. Assert via `expectTypeOf` or `tsd` that calling `run()` with zero arguments or `runPromise()` with zero arguments fails the typecheck. *(Spec 9.1, 9.2, 9.5)*
 
 ---
 
@@ -1261,14 +1316,14 @@ These tests specifically target boundary conditions that could reveal implementa
 - **T-EDGE-02**: Result containing JSON-special characters (quotes, backslashes, newlines). Verify correct JSON serialization/deserialization. *(Spec 2.3)*
 - **T-EDGE-03**: Script that writes stdout in multiple `write()` calls (partial writes). Assert the full output is captured and parsed as a unit. *(Spec 2.3)*
 - **T-EDGE-04**: Script that writes to both stdout and stderr. Assert stdout captured as output, stderr passed through. No interleaving issues. *(Spec 6.2, 6.3)*
-- **T-EDGE-05**: Unicode in result values and env values is preserved correctly. Unicode in script names (e.g., `.loopx/café.sh`) is rejected — script names are ASCII-only per the `[a-zA-Z0-9_][a-zA-Z0-9_-]*` pattern. Assert that a unicode-named script produces a validation error. *(Spec 2.3, 5.4, 8.1)*
+- **T-EDGE-05**: Unicode in result values and env values is preserved correctly. Unicode in script names (e.g., `.loopx/café.sh`) is rejected — script names are ASCII-only per the `[a-zA-Z0-9_][a-zA-Z0-9_-]*` pattern. Assert that a unicode-named script produces a validation error. *(Spec 2.3, 5.3, 8.1)*
 - **T-EDGE-06**: Deeply nested goto chain (A → B → C → D → E → ... → Z). Assert correct execution order and iteration counting. *(Spec 7.1)*
 - **T-EDGE-07**: Script that produces output on stdout but also reads from stdin when no input is available. Assert no deadlock. *(Spec 6.8)*
 - ~~**T-EDGE-08**~~: *Moved to robustness suite.* Concurrent loopx invocations — not direct spec conformance.
 - ~~**T-EDGE-09**~~: *Moved to robustness suite.* Large script count discovery performance — not direct spec conformance.
 - ~~**T-EDGE-10**~~: *Moved to robustness suite.* Maximum-length script name — filesystem limit, not direct spec conformance.
 - **T-EDGE-11**: `-n` with very large value (e.g., `999999`). Assert no integer overflow or similar. Script should `stop` after a few iterations. *(Spec 4.2)*
-- **T-EDGE-12**: Empty `.loopx/` directory (exists but no scripts). `loopx` → error (no default script). `loopx myscript` → error (not found). *(Spec 4.1)*
+- **T-EDGE-12**: Empty `.loopx/` directory (exists but no scripts). `loopx run myscript` → error (script not found). `loopx run -h` → run help displayed with no scripts listed (empty directory is not an error for run help). *(Spec 4.1, 11.2)*
 - ~~**T-EDGE-13**~~: *Moved to robustness suite.* Long-running script patience — not direct spec conformance.
 - **T-EDGE-14**: Env file with no newline at end of file. Assert last line is still parsed. *(Spec 8.1)*
 - **T-EDGE-15**: Env file that is completely empty (0 bytes). Assert no error, no variables loaded. *(Spec 8.1)*
@@ -1318,7 +1373,7 @@ CI should test against:
 
 This section tracks any tests that are blocked by unresolved spec ambiguities. If a test's assertions depend on a spec decision that has not been made, it is listed here so it cannot be accidentally treated as an authoritative failure.
 
-All previously identified spec problems (SP-15 through SP-30) have been resolved. SP-31 (install name-collision across different destination paths) was identified and resolved during this revision.
+All previously identified spec problems (SP-15 through SP-31) have been resolved.
 
 **Currently pending:**
 - SP-32 (SSH/SCP URL classification — commit d6cdb2c classifies all `git@`-prefixed URLs as git sources, but SPEC.md section 10.1 does not mention SSH or SCP-style URLs. The five ordered source detection rules are written entirely in terms of `http(s)://` URLs and the `org/repo` shorthand. Either the spec should be updated to add a rule for `git@` URLs, or the implementation should be narrowed to only handle known-host patterns consistent with Rule 2. No tests are added for this behavior until the spec ambiguity is resolved.)
@@ -1347,14 +1402,13 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 3.2 | CLI Delegation | T-DEL-01–11 |
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21 |
-| 4.1 | Running Scripts | T-CLI-08–13, T-CLI-27 |
-| 4.2 | Options (-n, -e, -h) | T-CLI-02–07j, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b |
+| 4.1 | Running Scripts (run subcommand) | T-CLI-11–13, T-CLI-27–33, T-DISC-22–26 |
+| 4.2 | Options (-n, -e, run -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–56 |
 | 4.3 | Subcommands | T-SUB-01–19, T-SUB-06a–06b, T-SUB-14a–14k, T-DISC-46a–46b |
 | 5.1 | Discovery | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38b, T-DISC-47–50 |
 | 5.2 | Name Collision | T-DISC-18–21, T-CLI-22b |
-| 5.3 | Reserved Names | T-DISC-22–26, T-CLI-22c |
-| 5.4 | Name Restrictions | T-DISC-27–32, T-DISC-30a–30b, T-CLI-07d, T-CLI-22d, T-EDGE-05 |
-| 5.5 | Validation Scope | T-DISC-39–46b, T-SUB-06, T-SUB-13, T-SUB-19 |
+| 5.3 | Name Restrictions | T-DISC-27–32, T-DISC-30a–30b, T-CLI-44, T-CLI-22d, T-EDGE-05 |
+| 5.4 | Validation Scope | T-DISC-39–46b, T-SUB-06, T-SUB-13, T-SUB-19 |
 | 6.1 | Working Directory | T-EXEC-01–04 |
 | 6.2 | Bash Scripts | T-EXEC-05–07 |
 | 6.3 | JS/TS Scripts | T-EXEC-08–14 |
@@ -1369,13 +1423,14 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-05a–05e, T-ENV-25–25a, F-ENV-01–05 |
 | 8.2 | Local Env Override | T-ENV-16–19, T-ENV-17a, T-ENV-25a |
 | 8.3 | Env Injection Precedence | T-ENV-20–24, T-ENV-20a, T-ENV-21a, T-ENV-24a, T-ENV-24b |
-| 9.1 | run() | T-API-01–09c, T-API-08a, T-API-10–10c, T-TYPE-04, T-TYPE-06–07 |
-| 9.2 | runPromise() | T-API-11–14e, T-API-25–25b, T-TYPE-05–07 |
-| 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20i, T-API-21c–21d |
+| 9.1 | run() | T-API-01–09c, T-API-08a, T-API-09–09, T-API-10–10c, T-API-20h–20i, T-TYPE-04, T-TYPE-06–07 |
+| 9.2 | runPromise() | T-API-11–14e, T-API-14a–14a3, T-API-25–25b, T-TYPE-05–07 |
+| 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20g, T-API-21c–21d |
 | 9.4 | output() and input() (script-side) | T-MOD-04–14a, T-MOD-13a–13g (output()), T-MOD-15–18 (input()) — these are the same tests listed under 6.5/6.6; 9.4 references them |
 | 9.5 | Types / RunOptions | T-API-07–08, T-API-10–10c, T-API-20d–20e, T-API-21–21b, T-API-22–25b, T-API-23a, T-API-24a–24b, T-TYPE-01–07 |
 | 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08d |
 | 10.2 | Source Type Details | T-INST-09–26b, T-INST-34–39e |
 | 10.3 | Common Install Rules | T-INST-27–27d, T-INST-28–33a, T-INST-31b |
-| 11 | Help | T-CLI-02–07j |
-| 12 | Exit Codes | T-EXIT-01–13 |
+| 11.1 | Top-Level Help | T-CLI-02–06, T-CLI-07e–07g, T-CLI-07j, T-CLI-28, T-CLI-39 |
+| 11.2 | Run Help | T-CLI-40–55 |
+| 12 | Exit Codes | T-EXIT-01–16 |
