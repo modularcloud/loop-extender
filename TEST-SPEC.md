@@ -436,6 +436,10 @@ Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows
 - **T-CLI-53**: `loopx run -h foo bar` shows run help and exits 0 (extra positional not rejected under help). *(Spec 4.2)*
 - **T-CLI-54**: `loopx run -h --unknown` shows run help and exits 0 (unknown flag not rejected under help). *(Spec 4.2)*
 - **T-CLI-63**: `loopx run -h -e a.env -e b.env` shows run help and exits 0 (duplicate `-e` not rejected under help). *(Spec 4.2)*
+- **T-CLI-67**: `loopx run myscript -h --unknown` shows run help and exits 0. The `-h` after the script name triggers the help short-circuit, suppressing the unknown flag error. This covers the combined case: `-h` after positional + invalid trailing args. *(Spec 4.2)*
+- **T-CLI-68**: `loopx run myscript -h -e missing.env` shows run help and exits 0. The `-h` after the script name triggers the help short-circuit, suppressing env file validation. *(Spec 4.2)*
+- **T-CLI-69**: `loopx run --help --unknown` shows run help and exits 0. Verifies that the `--help` long form inherits the full ignore-everything-else short-circuit semantics, not just help display. *(Spec 4.2)*
+- **T-CLI-70**: `loopx run myscript --help -e missing.env` shows run help and exits 0. Verifies that the `--help` long form after a script name suppresses env file validation identically to `-h`. *(Spec 4.2)*
 - **T-CLI-55**: `loopx run -h` with `.loopx/` containing a directory script with an unreadable `package.json` (e.g., `chmod 000`) prints run help with a non-fatal warning on stderr about the unreadable file. Help still exits 0. **This test is conditional on `process.getuid() !== 0`.** *(Spec 5.1, 11.2)*
 - **T-CLI-55a**: `loopx run -h` with `.loopx/` containing a directory script whose `package.json` has no `main` field (e.g., `{"name": "foo"}`) prints run help with a non-fatal warning on stderr about the missing `main`. Help still exits 0. *(Spec 5.1, 11.2)*
 - **T-CLI-55b**: `loopx run -h` with `.loopx/` containing a directory script whose `package.json` has a non-string `main` (e.g., `{"main": 42}`) prints run help with a non-fatal warning on stderr about the invalid `main` type. Help still exits 0. *(Spec 5.1, 11.2)*
@@ -445,8 +449,9 @@ Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows
 #### Bare Invocation & Top-Level Parsing Errors
 
 - **T-CLI-28**: `loopx` with no arguments shows top-level help (equivalent to `loopx -h`). Exits 0. Assert that stdout is identical to `loopx -h` output and that no script discovery is performed — when `.loopx/` contains scripts, assert stdout does not contain any script names and stderr does not contain discovery warnings. *(Spec 4.1, 4.2)*
-- **T-CLI-33**: `loopx myscript` is a usage error (unrecognized subcommand, no implicit fallback to `run`). Exit code 1. *(Spec 4.1)*
+- **T-CLI-33**: `loopx myscript` is a usage error (unrecognized subcommand, no implicit fallback to `run`). Create `.loopx/myscript.sh` that writes a known value to a marker file. Assert exit code 1 AND assert the marker file does not exist (proving the script was not executed despite being present). Without the marker-file assertion, an implementation that falls back to implicit script execution when a matching script exists could pass on exit code alone. *(Spec 4.1)*
 - **T-CLI-34**: `loopx --unknown` is a usage error (unrecognized top-level flag). Exit code 1. *(Spec 4.2)*
+- **T-CLI-71**: `loopx -x` is a usage error (unrecognized top-level short flag). Exit code 1. This covers the short-flag parser surface alongside `--unknown` (long flag). *(Spec 4.2)*
 - **T-CLI-36**: `loopx -n 5 myscript` is a usage error (top-level `-n` rejected — only `-h` is recognized at top level). Exit code 1. *(Spec 4.2)*
 - **T-CLI-37**: `loopx -e .env myscript` is a usage error (top-level `-e` rejected). Exit code 1. *(Spec 4.2)*
 - **T-CLI-07b**: `loopx -n 5 -h` is a usage error (exit code 1). The first argument is `-n`, which is not `-h` and not a recognized subcommand, so top-level parsing fails before `-h` is reached. The top-level `-h` short-circuit only applies when `-h` is the first argument. *(Spec 4.2)*
@@ -460,10 +465,13 @@ Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows
 - **T-CLI-12**: `loopx run nonexistent` with `.loopx/` existing but no matching script exits with code 1. *(Spec 4.1)*
 - **T-CLI-13**: `loopx run default` runs a script named `default` as an ordinary script — `default` has no special behavior. Assert via marker file. *(Spec 4.1)*
 - **T-CLI-29**: `loopx run` with no script name is a usage error (exit code 1). This does not inspect `.loopx/` or perform discovery. *(Spec 4.1)*
+- **T-CLI-64**: `loopx run` with no script name, with `.loopx/default.sh` present — still exits 1. The `default` script is not executed. Assert exit code 1 AND assert via marker file that the script did not run. `default` has no special behavior; omitting the script name is always an error regardless of what scripts exist. *(Spec 4.1)*
+- **T-CLI-65**: `loopx` (bare invocation) with `.loopx/default.sh` present — shows top-level help and exits 0. The `default` script is not executed. Assert that stdout matches `loopx -h` output AND assert via marker file that the script did not run. There is no implicit default script concept. *(Spec 4.1, 4.2, 11.1)*
 - **T-CLI-59**: `loopx run -n 5` (options present but no script name) is a usage error (exit code 1). ADR-0002 explicitly calls out this form as an error — zero positional arguments after options is not valid. *(Spec 4.1)*
 - **T-CLI-60**: `loopx run` with `.loopx/` containing a name collision and an invalid directory script (broken `package.json`) — still exits with code 1 as a usage error (missing script name), AND stderr does not contain any discovery or validation warnings. This proves that the no-script-name error is raised before `.loopx/` is inspected. *(Spec 4.1, 5.1)*
 - **T-CLI-31**: `loopx run version` with `.loopx/version.sh` runs the script named `version`, not the built-in subcommand. Assert via marker file that the script executed and the output is the script's, not the version string. *(Spec 4.1)*
 - **T-CLI-32**: `loopx run run` with `.loopx/run.sh` runs the script named `run`. Assert via marker file. *(Spec 4.1)*
+- **T-CLI-66**: `loopx version` with `.loopx/version.sh` present still prints the CLI version string and exits 0. Assert that stdout matches the package version (bare version string + newline) AND assert via marker file that the script did not run. Top-level subcommand dispatch is not affected by same-named scripts in `.loopx/` — scripts are only reachable via `loopx run <name>`. *(Spec 4.1, 4.3)*
 
 #### Option Order
 
@@ -492,6 +500,7 @@ Within `run`, options and `<script-name>` may appear in any order. The following
 #### Unrecognized Run Flags
 
 - **T-CLI-35**: `loopx run --unknown myscript` exits with code 1 (unrecognized flag within `run` is a usage error). *(Spec 4.2)*
+- **T-CLI-72**: `loopx run -x myscript` exits with code 1 (unrecognized short flag within `run` is a usage error). This covers the short-flag parser surface alongside `--unknown` (long flag). *(Spec 4.2)*
 
 #### CLI `-e` Option
 
@@ -613,6 +622,7 @@ Scripts may now use any name that passes name restriction rules (section 5.3). T
 - **T-DISC-24**: `.loopx/install.js` is discoverable. `loopx run -n 1 install` runs the script. Assert via marker file. *(Spec 5.1)*
 - **T-DISC-25**: `.loopx/version.sh` is discoverable. `loopx run -n 1 version` runs the script (not the built-in `version` subcommand). Assert via marker file. *(Spec 4.1, 5.1)*
 - **T-DISC-26**: `.loopx/run.sh` is discoverable. `loopx run -n 1 run` runs the script named `run`. Assert via marker file. *(Spec 4.1, 5.1)*
+- **T-DISC-51**: `loopx run -h` with `.loopx/` containing scripts named `version.sh`, `output.sh`, `env.ts`, `install.js`, and `run.sh` lists all five scripts in the help output and stderr contains no warnings about reserved names. Assert: (a) each of the five names appears in stdout, and (b) stderr does not contain the substring "reserved" (case-insensitive). This directly verifies that the reserved names list was removed entirely — these names are treated as completely ordinary scripts with no special-case warnings. *(Spec 5.1, 11.2)*
 
 #### Name Restrictions
 
@@ -1418,10 +1428,10 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 3.2 | CLI Delegation | T-DEL-01–11 |
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21 |
-| 4.1 | Running Scripts (run subcommand) | T-CLI-11–13, T-CLI-27–33, T-CLI-59–60, T-DISC-22–26 |
-| 4.2 | Options (-n, -e, run -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–63 |
-| 4.3 | Subcommands | T-SUB-01–19, T-SUB-06a–06b, T-SUB-14a–14k, T-DISC-46a–46b |
-| 5.1 | Discovery | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38b, T-DISC-47–50, T-CLI-55–55d, T-CLI-60 |
+| 4.1 | Running Scripts (run subcommand) | T-CLI-11–13, T-CLI-27–33, T-CLI-59–60, T-CLI-64–66, T-DISC-22–26 |
+| 4.2 | Options (-n, -e, run -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–72 |
+| 4.3 | Subcommands | T-SUB-01–19, T-SUB-06a–06b, T-SUB-14a–14k, T-CLI-66, T-DISC-46a–46b |
+| 5.1 | Discovery | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38b, T-DISC-47–51, T-CLI-55–55d, T-CLI-60 |
 | 5.2 | Name Collision | T-DISC-18–21, T-CLI-22b |
 | 5.3 | Name Restrictions | T-DISC-27–32, T-DISC-30a–30b, T-CLI-44, T-CLI-22d, T-EDGE-05 |
 | 5.4 | Validation Scope | T-DISC-39–46b, T-SUB-06, T-SUB-13, T-SUB-19 |
@@ -1439,7 +1449,7 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-05a–05e, T-ENV-25–25a, F-ENV-01–05 |
 | 8.2 | Local Env Override | T-ENV-16–19, T-ENV-17a, T-ENV-25a |
 | 8.3 | Env Injection Precedence | T-ENV-20–24, T-ENV-20a, T-ENV-21a, T-ENV-24a, T-ENV-24b |
-| 9.1 | run() | T-API-01–09c, T-API-08a, T-API-09–09, T-API-10–10c, T-API-20h–20i, T-TYPE-04, T-TYPE-06–07 |
+| 9.1 | run() | T-API-01–09c, T-API-08a, T-API-10–10c, T-API-20h–20i, T-TYPE-04, T-TYPE-06–07 |
 | 9.2 | runPromise() | T-API-11–14e, T-API-14a–14a3, T-API-25–25b, T-TYPE-05–07 |
 | 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20g, T-API-21c–21d |
 | 9.4 | output() and input() (script-side) | T-MOD-04–14a, T-MOD-13a–13g (output()), T-MOD-15–18 (input()) — these are the same tests listed under 6.5/6.6; 9.4 references them |
@@ -1447,6 +1457,6 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08d |
 | 10.2 | Source Type Details | T-INST-09–26b, T-INST-34–39e |
 | 10.3 | Common Install Rules | T-INST-27–27d, T-INST-28–33a, T-INST-31b |
-| 11.1 | Top-Level Help | T-CLI-02–06, T-CLI-07e–07g, T-CLI-07j, T-CLI-28, T-CLI-39, T-CLI-61 |
-| 11.2 | Run Help | T-CLI-40–55d, T-CLI-62 |
+| 11.1 | Top-Level Help | T-CLI-02–06, T-CLI-07e–07g, T-CLI-07j, T-CLI-28, T-CLI-39, T-CLI-61, T-CLI-65 |
+| 11.2 | Run Help | T-CLI-40–55d, T-CLI-62, T-CLI-67–70, T-DISC-51 |
 | 12 | Exit Codes | T-EXIT-01–16 |
