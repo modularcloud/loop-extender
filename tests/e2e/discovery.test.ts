@@ -424,9 +424,9 @@ describe("SPEC: Script Discovery & Validation", () => {
 
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toMatch(/example/i);
-      // The error should list all conflicting entries
       expect(result.stderr).toMatch(/\.sh/);
       expect(result.stderr).toMatch(/\.js/);
+      expect(result.stderr).toMatch(/example\//i);
     });
 
     it("T-DISC-21: non-conflicting scripts with different names coexist", async () => {

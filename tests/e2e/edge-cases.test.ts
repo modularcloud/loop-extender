@@ -425,8 +425,8 @@ fi
         });
 
         expect(result.exitCode).toBe(0);
-        // Help output should be shown on stdout
         expect(result.stdout.length).toBeGreaterThan(0);
+        expect(result.stdout.toLowerCase()).not.toMatch(/mybash|myscript|example/i);
       });
     });
   });

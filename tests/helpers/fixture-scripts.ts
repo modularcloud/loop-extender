@@ -31,6 +31,11 @@ export function emitRaw(text: string): string {
   return `#!/bin/bash\nprintf '%s' '${text}'\n`;
 }
 
+/** Outputs exact bytes with trailing newline. */
+export function emitRawLn(text: string): string {
+  return `#!/bin/bash\nprintf '%s\\n' '${text}'\n`;
+}
+
 /** Exits with the specified code. */
 export function exitCode(n: number): string {
   return `#!/bin/bash\nexit ${n}\n`;
@@ -184,5 +189,33 @@ export function writePidToFile(markerPath: string): string {
 writeFileSync("${markerPath}", String(process.pid));
 process.stderr.write("ready\\n");
 setTimeout(() => {}, 999999);
+`;
+}
+
+/**
+ * TS fixture: uses import { output } from "loopx" to emit structured output.
+ */
+export function tsOutput(fields: Record<string, unknown>): string {
+  return `import { output } from "loopx";
+output(${JSON.stringify(fields)});
+`;
+}
+
+/**
+ * TS fixture: reads input(), outputs it as result.
+ */
+export function tsInputEcho(): string {
+  return `import { input, output } from "loopx";
+const data = await input();
+output({ result: data });
+`;
+}
+
+/**
+ * TS fixture: imports from "loopx", outputs success marker.
+ */
+export function tsImportCheck(): string {
+  return `import { output, input } from "loopx";
+output({ result: "loopx-import-ok" });
 `;
 }

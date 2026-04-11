@@ -321,7 +321,7 @@ describe("SPEC: CLI Basics (T-CLI-01 through T-CLI-100)", () => {
         expect(longResult.stderr).toBe(shortResult.stderr);
       });
 
-      it("T-CLI-42: `loopx run -h` without `.loopx/` prints run help with warning", async () => {
+      it("T-CLI-42: `loopx run -h` without `.loopx/` prints run help with warning, no scripts section", async () => {
         project = await createTempProject({ withLoopxDir: false });
 
         const result = await runCLI(["run", "-h"], {
@@ -333,9 +333,9 @@ describe("SPEC: CLI Basics (T-CLI-01 through T-CLI-100)", () => {
         const lower = result.stdout.toLowerCase();
         expect(lower).toMatch(/-n/);
         expect(lower).toMatch(/-e/);
-        // Warning that directory was not found
         const combined = (result.stdout + result.stderr).toLowerCase();
         expect(combined).toMatch(/\.loopx|not found|directory/);
+        expect(lower).not.toMatch(/available scripts|scripts:/i);
       });
 
       it("T-CLI-43: `loopx run -h` with name collisions prints warnings on stderr", async () => {
@@ -365,6 +365,7 @@ describe("SPEC: CLI Basics (T-CLI-01 through T-CLI-100)", () => {
 
         expect(result.exitCode).toBe(0);
         expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stdout).toMatch(/-startswithdash/);
       });
 
       it("T-CLI-45: `loopx run -h` lists scripts with type info", async () => {
@@ -1016,8 +1017,8 @@ printf '{"stop":true}'
         });
 
         expect(result.exitCode).toBe(1);
-        // No discovery/validation warnings (error raised before .loopx/ inspection)
         expect(result.stderr).not.toMatch(/collision|conflict|duplicate/i);
+        expect(result.stderr).not.toMatch(/warning|invalid.*json|package\.json|malformed/i);
       });
 
       it("T-CLI-60: `loopx run` with collision/invalid scripts still exits 1, no warnings", async () => {
@@ -1035,6 +1036,7 @@ printf '{"stop":true}'
 
         expect(result.exitCode).toBe(1);
         expect(result.stderr).not.toMatch(/collision|conflict|duplicate/i);
+        expect(result.stderr).not.toMatch(/warning|invalid.*json|package\.json|malformed/i);
       });
 
       it("T-CLI-85: `loopx run -e missing.env` (no script name) exits 1, name takes precedence", async () => {
@@ -1331,6 +1333,7 @@ printf '{"result":"%s"}' "$COUNT"
 
         expect(result.exitCode).toBe(1);
         expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr.toLowerCase()).toMatch(/nonexistent|not found|no such/i);
       });
 
       it("T-CLI-19a: `loopx run -n 0 myscript` with .loopx/ missing -> exit 1", async () => {
@@ -1343,6 +1346,7 @@ printf '{"result":"%s"}' "$COUNT"
 
         expect(result.exitCode).toBe(1);
         expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr.toLowerCase()).toMatch(/\.loopx|directory/i);
       });
 
       it("T-CLI-20: `loopx run -n 1 myscript` runs exactly 1 iteration", async () => {
@@ -1587,6 +1591,7 @@ printf '{"result":"%s"}' "$COUNT"
 
         expect(result.exitCode).toBe(1);
         expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr.toLowerCase()).toMatch(/nonexistent\.env|not found|no such/i);
       });
 
       it("T-CLI-22a: `loopx run -n 0 -e nonexistent.env myscript` -> exit 1", async () => {
