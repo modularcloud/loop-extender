@@ -442,6 +442,10 @@ Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows
 - **T-CLI-68**: `loopx run myscript -h -e missing.env` shows run help and exits 0. The `-h` after the script name triggers the help short-circuit, suppressing env file validation. *(Spec 4.2)*
 - **T-CLI-69**: `loopx run --help --unknown` shows run help and exits 0. Verifies that the `--help` long form inherits the full ignore-everything-else short-circuit semantics, not just help display. *(Spec 4.2)*
 - **T-CLI-70**: `loopx run myscript --help -e missing.env` shows run help and exits 0. Verifies that the `--help` long form after a script name suppresses env file validation identically to `-h`. *(Spec 4.2)*
+- **T-CLI-92**: `loopx run -h -n` shows run help and exits 0 (missing `-n` operand not rejected under help). The `-h` short-circuit fires before the parser attempts to consume an operand for `-n`, so the dangling `-n` with no value is simply ignored. *(Spec 4.2)*
+- **T-CLI-93**: `loopx run -h -e` shows run help and exits 0 (missing `-e` operand not rejected under help). Same principle as T-CLI-92 — the `-h` short-circuit suppresses all further argument parsing including operand consumption. *(Spec 4.2)*
+- **T-CLI-94**: `loopx run --help -n` shows run help and exits 0 (long-form help, missing `-n` operand not rejected). Verifies that the `--help` long form has identical short-circuit semantics to `-h` when followed by a flag with a missing operand. *(Spec 4.2)*
+- **T-CLI-95**: `loopx run --help -e` shows run help and exits 0 (long-form help, missing `-e` operand not rejected). *(Spec 4.2)*
 
 #### Late-Help Short-Circuit (Invalid Args Before `-h`)
 
@@ -527,6 +531,13 @@ Within `run`, options and `<script-name>` may appear in any order. The following
 - **T-CLI-88**: `loopx run myscript -n 1 -n 2` exits with code 1 (duplicate `-n` after script name). Create `.loopx/myscript.sh` that writes a known value to a marker file. Assert exit code 1 AND assert the marker file does not exist. Complements T-CLI-20a by proving duplicate detection works regardless of positional argument order. *(Spec 4.2)*
 - **T-CLI-89**: `loopx run myscript -e a.env -e b.env` exits with code 1 (duplicate `-e` after script name). Create `.loopx/myscript.sh` that writes a known value to a marker file and create `a.env` as a valid env file. Assert exit code 1 AND assert the marker file does not exist. Complements T-CLI-20b. *(Spec 4.2)*
 
+#### Missing Flag Operands
+
+- **T-CLI-97**: `loopx run -n` (no operand for `-n`, no script name) exits with code 1 (usage error). *(Spec 4.2)*
+- **T-CLI-98**: `loopx run -e` (no operand for `-e`, no script name) exits with code 1 (usage error). *(Spec 4.2)*
+- **T-CLI-99**: `loopx run myscript -n` (missing `-n` operand after script name) exits with code 1 (usage error). Create `.loopx/myscript.sh` that writes a known value to a marker file. Assert exit code 1 AND assert the marker file does not exist (proving the script was not executed). *(Spec 4.2)*
+- **T-CLI-100**: `loopx run myscript -e` (missing `-e` operand after script name) exits with code 1 (usage error). Create `.loopx/myscript.sh` that writes a known value to a marker file. Assert exit code 1 AND assert the marker file does not exist (proving the script was not executed). *(Spec 4.2)*
+
 #### CLI `-e` Option
 
 - **T-CLI-21**: `loopx run -e .env -n 1 myscript` with a valid `.env` file makes its variables available in the script. Use `write-env-to-file` fixture: the script writes the env var value to a marker file. Assert the marker file contains the expected value. *(Spec 4.2)*
@@ -539,6 +550,7 @@ Within `run`, options and `<script-name>` may appear in any order. The following
 
 - **T-CLI-23**: `loopx run -n 1 myscript` where `myscript` outputs `{"result":"hello"}` and writes a marker file — the CLI's own stdout is empty (result is not printed), AND the marker file exists (proving the script actually ran). Both assertions are required to prevent vacuous passes. *(Spec 7.1)*
 - **T-CLI-27**: `loopx run script1 script2` (two positional arguments within `run`) exits with code 1. Stderr contains an error about unexpected arguments. `run` accepts exactly one positional argument. *(Spec 4.1)*
+- **T-CLI-96**: `loopx run foo -n 1 bar` exits with code 1 (extra positional argument interleaved with options). Create `.loopx/foo.sh` that writes a known value to a marker file. Assert exit code 1 AND assert the marker file does not exist (proving the script was not executed despite `foo` being a valid script). This complements T-CLI-27 (`loopx run script1 script2` — adjacent extra positionals) by testing the interleaved form, which a parser can mishandle if it stops checking for extra positionals after consuming options. *(Spec 4.1)*
 
 ### 4.2 Subcommands
 
@@ -1456,8 +1468,8 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 3.2 | CLI Delegation | T-DEL-01–11 |
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21 |
-| 4.1 | Running Scripts (run subcommand) | T-CLI-11–13, T-CLI-27–33, T-CLI-59–60, T-CLI-64–66, T-CLI-80–82, T-CLI-85, T-DISC-22–26, T-DISC-52 |
-| 4.2 | Options (-n, -e, run -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–91 |
+| 4.1 | Running Scripts (run subcommand) | T-CLI-11–13, T-CLI-27–33, T-CLI-59–60, T-CLI-64–66, T-CLI-80–82, T-CLI-85, T-CLI-96, T-DISC-22–26, T-DISC-52 |
+| 4.2 | Options (-n, -e, run -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–100 |
 | 4.3 | Subcommands | T-SUB-01–19, T-SUB-06a–06b, T-SUB-14a–14k, T-CLI-66, T-CLI-80–82, T-DISC-46a–46b |
 | 5.1 | Discovery | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38b, T-DISC-47–53, T-CLI-42–43, T-CLI-46–47, T-CLI-55–55d, T-CLI-59–60, T-CLI-85 |
 | 5.2 | Name Collision | T-DISC-18–21, T-CLI-22b, T-CLI-43 |
@@ -1486,6 +1498,6 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 10.2 | Source Type Details | T-INST-09–26b, T-INST-28a, T-INST-34–39e |
 | 10.3 | Common Install Rules | T-INST-27–27d, T-INST-28–28a, T-INST-29–33a, T-INST-31b |
 | 11.1 | Top-Level Help | T-CLI-02–06, T-CLI-07e–07g, T-CLI-07j, T-CLI-28, T-CLI-39, T-CLI-61, T-CLI-65, T-CLI-90–91 |
-| 11.2 | Run Help | T-CLI-40–55d, T-CLI-62, T-CLI-67–78, T-CLI-84, T-DISC-51, T-DISC-53 |
+| 11.2 | Run Help | T-CLI-40–55d, T-CLI-62, T-CLI-67–78, T-CLI-84, T-CLI-92–95, T-DISC-51, T-DISC-53 |
 | 12 | Exit Codes | T-EXIT-01–16 |
 | 13 | Summary of Special Values | *(Summary-only section — no unique behavior. LOOPX_BIN covered by T-MOD-19–21, T-ENV-20, T-ENV-20a, T-DEL-05; LOOPX_PROJECT_ROOT covered by T-EXEC-03–04, T-ENV-21, T-ENV-21a; LOOPX_DELEGATED covered by T-DEL-04, T-DEL-07, T-DEL-09, T-ENV-24a)* |
