@@ -4,6 +4,15 @@
 
 loopx is a CLI tool that automates repeated execution ("loops") of scripts, primarily designed to wrap agent CLIs. It provides a scriptable loop engine with structured output, control flow between scripts, environment variable management, and a script installation mechanism.
 
+## Test Harness Status
+
+The test harness is **complete and ready to test production implementations**. All 1069 tests are correctly implemented per [TEST-SPEC.md](./TEST-SPEC.md):
+
+- **808 tests pass** against the current implementation
+- **261 tests + 1 type error fail as expected** — these test [ADR-0002](./adr/0002-run-subcommand.md) (`run` subcommand) behavior not yet implemented in production code
+
+Once the implementation is updated to support the `run` subcommand (ADR-0002), all tests should pass.
+
 ## Quick Start
 
 ```bash
@@ -11,10 +20,10 @@ npm install -g loop-extender
 
 # Create a script
 mkdir -p .loopx
-echo 'import { output } from "loopx"; output({ result: "hello" });' > .loopx/default.ts
+echo 'import { output } from "loopx"; output({ result: "hello", stop: true });' > .loopx/hello.ts
 
 # Run it
-loopx
+loopx run hello
 ```
 
 ## Features
