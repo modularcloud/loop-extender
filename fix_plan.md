@@ -1,85 +1,69 @@
 # Implementation Plan for loopx
 
-**Status: ADR-0002 Test Migration Complete -- Tests Written & Verified (tag 0.1.16)**
+**Status: ADR-0002 Test Migration -- Audit & Fix Phase**
 
-ADR-0002 ("Introduce `run` Subcommand and Remove Default Script") has been accepted. SPEC.md and TEST-SPEC.md have been updated. Tests have been migrated and verified. 1071 total tests: 819 pass, 252 fail (all failures are expected -- they test `run` subcommand behavior not yet implemented).
+ADR-0002 ("Introduce `run` Subcommand and Remove Default Script") has been accepted. SPEC.md and TEST-SPEC.md have been updated. Tests have been migrated and verified. 1071 total tests: 816 pass, 255 fail (all failures are expected -- they test `run` subcommand behavior not yet implemented).
 
-## ADR-0002 Test Migration Tasks
+## Critical Issues (tests assert OPPOSITE of spec)
 
-### Phase A: CLI Syntax Migration (add `run` subcommand to all CLI invocations)
-Every test that invokes `loopx` to run a script needs `run` inserted as the first argument.
-Affected files:
-- [x] tests/e2e/cli-basics.test.ts — ~22 tests need `run` added + 9 removed + 65 new tests
-- [x] tests/e2e/discovery.test.ts — all script execution calls need `run`
-- [x] tests/e2e/execution.test.ts — all script execution calls need `run`
-- [x] tests/e2e/output-parsing.test.ts — no changes needed - uses runAPIDriver only
-- [x] tests/e2e/loop-state.test.ts — all script execution calls need `run`
-- [x] tests/e2e/env-vars.test.ts — all script execution calls need `run`
-- [x] tests/e2e/module-resolution.test.ts — all script execution calls need `run`
-- [x] tests/e2e/programmatic-api.test.ts — no changes needed - uses API driver
-- [x] tests/e2e/install.test.ts — install + run verification calls need `run`
-- [x] tests/e2e/signals.test.ts — signal tests need `run`
-- [x] tests/e2e/delegation.test.ts — delegation tests need `run`
-- [x] tests/e2e/subcommands.test.ts — no changes needed - all subcommand calls
-- [x] tests/e2e/exit-codes.test.ts — exit code tests need `run` + new tests T-EXIT-14/15/16
-- [x] tests/e2e/edge-cases.test.ts — edge case tests need `run`
+### Priority 1: Programmatic API scriptName-required tests (T-API-09, T-API-14a, T-API-20h, T-API-20i, T-TYPE-07)
 
-### Phase B: cli-basics.test.ts Semantic Changes
-- [x] Remove T-CLI-07 (reserved names in help — concept eliminated)
-- [x] Remove T-CLI-07a (script listing in top-level help — moved to run help)
-- [x] Remove T-CLI-07d (invalid name warning in top-level help — moved to run help)
-- [x] Remove T-CLI-07h (bad package.json warning in top-level help — moved to run help)
-- [x] Remove T-CLI-07i (escaping main warning in top-level help — moved to run help)
-- [x] Remove T-CLI-08 (default script invocation — concept eliminated)
-- [x] Remove T-CLI-09 (no default script fallback — concept eliminated)
-- [x] Remove T-CLI-10 (.loopx/ missing for bare invocation — changed to show help)
-- [x] Remove T-CLI-22c (reserved name with -n 0 — concept eliminated)
-- [x] Update T-CLI-02 (add subcommand listing assertions, negative assertions for old syntax)
-- [x] Update T-CLI-03 (run in fixture with collision + invalid dir script, compare -h vs --help)
-- [x] Update T-CLI-04 (INVERT: assert scripts NOT listed in top-level help)
-- [x] Update T-CLI-05 (add no-warnings assertion)
-- [x] Update T-CLI-06 (INVERT: assert NO collision warnings on stderr)
-- [x] Update T-CLI-07b (CHANGE: now a usage error, exit 1, not help display)
-- [x] Update T-CLI-07c (CHANGE: now a usage error, exit 1, not help display)
-- [x] Update T-CLI-11 (use `run` syntax, test stop:true self-termination)
-- [x] Update T-CLI-12 (use `run nonexistent`)
-- [x] Update T-CLI-13 (use `run -n 1 default`)
-- [x] Update T-CLI-19 (use `run -n 0 nonexistent` with explicit script name)
-- [x] Update T-CLI-19a (use `run -n 0 myscript` with .loopx/ missing)
-- [x] Update T-CLI-22b (use `run -n 0 myscript` with name collision)
-- [x] Update T-CLI-22d (use `run -n 0 myscript` with invalid script name)
-- [x] Update T-CLI-27 (use `run script1 script2`)
+ADR-0002 made `scriptName` a required parameter. These tests still test old "default script" behavior:
 
-### Phase C: New Tests in cli-basics.test.ts (65 tests)
-- [x] T-CLI-28: bare `loopx` shows top-level help
-- [x] T-CLI-29: `loopx run` no script name → exit 1
-- [x] T-CLI-30: `loopx run -n 1 myscript` runs script (marker file)
-- [x] T-CLI-31: `loopx run -n 1 version` runs script not built-in
-- [x] T-CLI-32: `loopx run -n 1 run` runs script named "run"
-- [x] T-CLI-33: `loopx myscript` is usage error + marker file
-- [x] T-CLI-34: `loopx --unknown` is usage error
-- [x] T-CLI-35: `loopx run --unknown myscript` exits 1
-- [x] T-CLI-36: `loopx -n 5 myscript` is usage error
-- [x] T-CLI-37: `loopx -e .env myscript` is usage error
-- [x] T-CLI-38: `loopx foo -h` is usage error
-- [x] T-CLI-39 through T-CLI-100: See TEST-SPEC.md section 4.1
-  - Run help tests (T-CLI-40–47, T-CLI-55–55d, T-CLI-62)
-  - Run help short-circuit (T-CLI-48–54, T-CLI-63, T-CLI-67–70, T-CLI-92–95)
-  - Late-help short-circuit (T-CLI-73–78, T-CLI-84)
-  - Option order (T-CLI-57, T-CLI-58, T-CLI-83)
-  - Unrecognized run flags (T-CLI-72, T-CLI-86–89)
-  - Missing flag operands (T-CLI-97–100)
-  - Script/subcommand disambiguation (T-CLI-64–66, T-CLI-80–82, T-CLI-85)
-  - Top-level help variants (T-CLI-39, T-CLI-61, T-CLI-71, T-CLI-79, T-CLI-90, T-CLI-91)
+- [ ] T-API-09: Spec says `run(undefined as any)` should return generator that throws on first `next()`. Implementation expects it to successfully run a "default" script.
+- [ ] T-API-14a: Spec says `runPromise(undefined as any)` should return rejected promise. Implementation expects it to successfully run a "default" script.
+- [ ] T-API-20h: Spec says `run(null as any)` throws on first `next()`. Implementation passes `undefined` (not `null`) and expects failure because no default script exists (wrong reason).
+- [ ] T-API-20i: Spec says `run(42 as any)` throws on first `next()`. Implementation tests `runPromise(undefined)` instead (wrong function, wrong arg).
+- [ ] T-API-14a2: MISSING -- `runPromise(null as any)` returns rejected promise.
+- [ ] T-API-14a3: MISSING -- `runPromise(42 as any)` returns rejected promise.
+- [ ] T-TYPE-07: Spec says omitting `scriptName` is a static type error. Implementation asserts the opposite (scriptName is optional).
 
-### Phase D: Other Test File Updates
-- [x] discovery.test.ts — update for removed reserved names, add T-DISC-22–26, T-DISC-51–53
-- [ ] subcommands.test.ts — verify no reserved name tests remain
-- [x] exit-codes.test.ts — add T-EXIT-14, T-EXIT-15, T-EXIT-16
-- [ ] All remaining test files — add `run` to CLI invocations
+### Priority 2: Other incorrect test assertions
 
-### Phase E: Verification
-- [x] Build and run full test suite -- 1071 total tests, 819 pass, 252 fail
-- [x] Verify tests that should pass (given implementation not yet updated for ADR-0002) do pass -- harness 221/221, unit/fuzz/typecheck pass, subcommands 32/32 pass
-- [x] Verify tests that should fail (testing new ADR-0002 behavior) do fail -- 252 tests fail as expected — all test `run` subcommand behavior
-- [x] Advance ADR-0002 status to "Tested" -- ADR-0002 status advanced to Tested, tag 0.1.16 created
+- [ ] T-CLI-22d: Runs `["run", "-n", "0", "-bad"]` (passing invalid name as script arg). Spec says run `["run", "-n", "0", "myscript"]` with a VALID script plus an invalid-named file also in `.loopx/`.
+- [ ] T-DISC-42: Implementation asserts exit code 1. Spec says `loopx` (no args) shows top-level help and exits 0.
+- [ ] T-DISC-45: Fixture uses formerly-reserved names (`output`, `env`) instead of name restriction violations (e.g., `has space.sh`, `.dotfile.sh`). Spec requires testing that `loopx output` works even when `.loopx/` contains scripts with invalid names.
+
+### Priority 3: Weak/missing assertions
+
+- [ ] T-CLI-44: Missing assertion that invalid script name appears in stdout help output.
+- [ ] T-CLI-22: Weak assertion -- only checks `stderr.length > 0`, should check that stderr mentions the missing file.
+- [ ] T-CLI-19: Weak assertion -- only checks `stderr.length > 0`, should check stderr mentions missing script.
+- [ ] T-CLI-19a: Weak assertion -- only checks `stderr.length > 0`, should check stderr mentions `.loopx/`.
+- [ ] T-CLI-42: Missing negative assertion that scripts section is omitted from run help when `.loopx/` doesn't exist.
+- [ ] T-CLI-59/60: Incomplete negative assertions -- only check for collision keywords, not all discovery warnings (e.g., broken package.json).
+- [ ] T-DISC-20: Incomplete assertion -- doesn't verify all three collision entries (sh, js, directory) are listed in error.
+- [ ] T-PARSE-03/04: Missing verification that loop halts and exit code is 0.
+- [ ] T-PARSE-20a: Uses `runPromise` instead of spec-prescribed `run()` generator API.
+- [ ] T-ENV-03: Tests reading from XDG path but not writing via `env set` to that path (spec requires both).
+- [ ] T-ENV-20/20a: Only negative assertions (not the fake value), no positive assertion that content is a real binary path.
+- [ ] T-ENV-24: Missing "peel-off" portion -- spec requires removing local to prove global wins, then removing global to prove system wins.
+- [ ] T-EDGE-04: Missing stdout/structured-output assertion (only checks stderr pass-through).
+- [ ] T-EDGE-12b: Missing "no scripts listed" assertion.
+
+### Priority 4: Missing fixtures
+
+- [ ] `emit-raw-ln(text)` -- `printf '%s\n' '<text>'` (with trailing newline). Not in fixture-scripts.ts.
+- [ ] `ts-output(fields)` -- TS fixture using `import { output } from "loopx"` to emit structured output. Not in fixture-scripts.ts.
+- [ ] `ts-input-echo()` -- TS fixture that reads `input()`, outputs as result. Not in fixture-scripts.ts.
+- [ ] `ts-import-check()` -- TS fixture that imports from "loopx", outputs success marker. Not in fixture-scripts.ts.
+
+### Priority 5: Extra tests not in spec (to evaluate)
+
+- [ ] T-API-20j, T-API-20k, T-API-20l: Extra tests for reserved names, invalid names, name collisions. These test old "reserved names" concept eliminated by ADR-0002. Need to evaluate if they should be removed or updated.
+- [ ] T-INST-31a: Extra HTTP 500 test not in spec. Evaluate if it should be kept or removed.
+
+### Priority 6: Minor issues
+
+- [ ] T-SIG-04: Uses delay=1 instead of spec's delay=2 for signal-trap-exit fixture.
+- [ ] SSH URL tests in source-detection.test.ts: Spec section 9 (SP-32) says no tests for SSH URLs until spec ambiguity resolved. Tests exist.
+
+## Completed Tasks
+
+- [x] Phase A: CLI Syntax Migration (add `run` subcommand to all CLI invocations)
+- [x] Phase B: cli-basics.test.ts Semantic Changes
+- [x] Phase C: New Tests in cli-basics.test.ts (65 tests)
+- [x] Phase D: Other Test File Updates
+- [x] Phase E: Verification
+- [x] subcommands.test.ts — verify no reserved name tests remain (verified: none present)
+- [x] All remaining test files — add `run` to CLI invocations (fixed 3 old-syntax calls in module-resolution.test.ts T-MOD-19/20/21)

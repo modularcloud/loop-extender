@@ -258,26 +258,40 @@ try {
       expect(parsed.message).toMatch(/nonexistent/i);
     });
 
-    // T-API-09: run() with no name runs default script
-    it("T-API-09: run() with no name runs default script", async () => {
+    // T-API-09: run(undefined as any) returns generator that throws on first next() (Spec 9.1)
+    it("T-API-09: run(undefined as any) returns generator without throwing, throws on first next()", async () => {
       project = await createTempProject();
-      await createScript(project, "default", ".sh", emitResult("default-output"));
+      await createScript(project, "myscript", ".sh", emitResult("ok"));
 
       const driverCode = `
 import { run } from "loopx";
 
-const results = [];
-for await (const output of run(undefined, { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })) {
-  results.push(output);
+let syncThrew = false;
+let gen;
+try {
+  gen = run(undefined, { cwd: ${JSON.stringify(project.dir)} });
+} catch (e) {
+  syncThrew = true;
 }
-console.log(JSON.stringify(results));
+
+let nextThrew = false;
+let errorMsg = "";
+if (!syncThrew && gen) {
+  try {
+    await gen.next();
+  } catch (e) {
+    nextThrew = true;
+    errorMsg = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ syncThrew, nextThrew, errorMsg }));
 `;
       const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
       expect(result.exitCode).toBe(0);
 
-      const outputs = JSON.parse(result.stdout);
-      expect(outputs).toHaveLength(1);
-      expect(outputs[0].result).toBe("default-output");
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.syncThrew).toBe(false);
+      expect(parsed.nextThrew).toBe(true);
     });
 
     // T-API-09a: Manual return() during pending next() kills child (write-pid-to-file fixture)
@@ -709,23 +723,121 @@ console.log(JSON.stringify(outputs));
       expect(envValue).toBe("env-loaded");
     });
 
-    // T-API-14a: runPromise() with default script
-    it("T-API-14a: runPromise() with no name runs default script", async () => {
+    // T-API-14a: runPromise(undefined as any) returns rejected promise, not sync throw (Spec 9.2)
+    it("T-API-14a: runPromise(undefined as any) returns rejected promise (not sync throw)", async () => {
       project = await createTempProject();
-      await createScript(project, "default", ".sh", emitResult("default-via-promise"));
+      await createScript(project, "myscript", ".sh", emitResult("ok"));
 
       const driverCode = `
 import { runPromise } from "loopx";
 
-const outputs = await runPromise(undefined, { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
-console.log(JSON.stringify(outputs));
+let syncThrew = false;
+let returnValue;
+try {
+  returnValue = runPromise(undefined, { cwd: ${JSON.stringify(project.dir)} });
+} catch (e) {
+  syncThrew = true;
+}
+
+const isPromise = returnValue != null && (returnValue instanceof Promise || typeof returnValue.then === "function");
+
+let rejected = false;
+let errorMsg = "";
+if (!syncThrew && isPromise) {
+  try {
+    await returnValue;
+  } catch (e) {
+    rejected = true;
+    errorMsg = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ syncThrew, isPromise, rejected, errorMsg }));
 `;
       const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
       expect(result.exitCode).toBe(0);
 
-      const outputs = JSON.parse(result.stdout);
-      expect(outputs).toHaveLength(1);
-      expect(outputs[0].result).toBe("default-via-promise");
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.syncThrew).toBe(false);
+      expect(parsed.isPromise).toBe(true);
+      expect(parsed.rejected).toBe(true);
+    });
+
+    // T-API-14a2: runPromise(null as any) returns rejected promise (Spec 9.2)
+    it("T-API-14a2: runPromise(null as any) returns rejected promise (not sync throw)", async () => {
+      project = await createTempProject();
+      await createScript(project, "myscript", ".sh", emitResult("ok"));
+
+      const driverCode = `
+import { runPromise } from "loopx";
+
+let syncThrew = false;
+let returnValue;
+try {
+  returnValue = runPromise(null, { cwd: ${JSON.stringify(project.dir)} });
+} catch (e) {
+  syncThrew = true;
+}
+
+const isPromise = returnValue != null && (returnValue instanceof Promise || typeof returnValue.then === "function");
+
+let rejected = false;
+let errorMsg = "";
+if (!syncThrew && isPromise) {
+  try {
+    await returnValue;
+  } catch (e) {
+    rejected = true;
+    errorMsg = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ syncThrew, isPromise, rejected, errorMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
+      expect(result.exitCode).toBe(0);
+
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.syncThrew).toBe(false);
+      expect(parsed.isPromise).toBe(true);
+      expect(parsed.rejected).toBe(true);
+    });
+
+    // T-API-14a3: runPromise(42 as any) returns rejected promise (Spec 9.2)
+    it("T-API-14a3: runPromise(42 as any) returns rejected promise (not sync throw)", async () => {
+      project = await createTempProject();
+      await createScript(project, "myscript", ".sh", emitResult("ok"));
+
+      const driverCode = `
+import { runPromise } from "loopx";
+
+let syncThrew = false;
+let returnValue;
+try {
+  returnValue = runPromise(42, { cwd: ${JSON.stringify(project.dir)} });
+} catch (e) {
+  syncThrew = true;
+}
+
+const isPromise = returnValue != null && (returnValue instanceof Promise || typeof returnValue.then === "function");
+
+let rejected = false;
+let errorMsg = "";
+if (!syncThrew && isPromise) {
+  try {
+    await returnValue;
+  } catch (e) {
+    rejected = true;
+    errorMsg = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ syncThrew, isPromise, rejected, errorMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
+      expect(result.exitCode).toBe(0);
+
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.syncThrew).toBe(false);
+      expect(parsed.isPromise).toBe(true);
+      expect(parsed.rejected).toBe(true);
     });
 
     // T-API-14b: maxIterations: 0 -> empty array
@@ -1088,88 +1200,40 @@ console.log(JSON.stringify({ threwError, errorMsg }));
       expect(parsed.threwError).toBe(true);
     });
 
-    // T-API-20h: no default script throws on first next() (Spec 9.1, 9.3)
-    it("T-API-20h: no default script throws on first next()", async () => {
+    // T-API-20h: run(null as any) returns generator that throws on first next() (Spec 9.1)
+    it("T-API-20h: run(null as any) throws on first next()", async () => {
       project = await createTempProject();
-      // .loopx exists but has no default script
-      await createScript(project, "other", ".sh", emitResult("not-default"));
+      await createScript(project, "myscript", ".sh", emitResult("ok"));
 
       const driverCode = `
 import { run } from "loopx";
 
-const gen = run(undefined, { cwd: ${JSON.stringify(project.dir)} });
-
-let threwError = false;
-let errorMsg = "";
+let syncThrew = false;
+let gen;
 try {
-  await gen.next();
+  gen = run(null, { cwd: ${JSON.stringify(project.dir)} });
 } catch (e) {
-  threwError = true;
-  errorMsg = e.message || String(e);
+  syncThrew = true;
 }
-console.log(JSON.stringify({ threwError, errorMsg }));
+
+let nextThrew = false;
+let errorMsg = "";
+if (!syncThrew && gen) {
+  try {
+    await gen.next();
+  } catch (e) {
+    nextThrew = true;
+    errorMsg = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ syncThrew, nextThrew, errorMsg }));
 `;
       const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
       expect(result.exitCode).toBe(0);
 
       const parsed = JSON.parse(result.stdout);
-      expect(parsed.threwError).toBe(true);
-    });
-
-    // T-API-20j: reserved name script throws on first next() (extra, extends Spec 9.3 + 5.3)
-    it("T-API-20j: reserved name script throws on first next()", async () => {
-      project = await createTempProject();
-      // "output" is a reserved name per Spec 5.3
-      await createScript(project, "output", ".sh", emitResult("reserved"));
-
-      const driverCode = `
-import { run } from "loopx";
-
-const gen = run("output", { cwd: ${JSON.stringify(project.dir)} });
-
-let threwError = false;
-let errorMsg = "";
-try {
-  await gen.next();
-} catch (e) {
-  threwError = true;
-  errorMsg = e.message || String(e);
-}
-console.log(JSON.stringify({ threwError, errorMsg }));
-`;
-      const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
-      expect(result.exitCode).toBe(0);
-
-      const parsed = JSON.parse(result.stdout);
-      expect(parsed.threwError).toBe(true);
-    });
-
-    // T-API-20k: invalid name script throws on first next() (extra, extends Spec 9.3 + 5.4)
-    it("T-API-20k: invalid name script throws on first next()", async () => {
-      project = await createTempProject();
-      // Script name starting with "-" is invalid per Spec 5.4
-      await createScript(project, "-invalid", ".sh", emitResult("bad-name"));
-
-      const driverCode = `
-import { run } from "loopx";
-
-const gen = run("-invalid", { cwd: ${JSON.stringify(project.dir)} });
-
-let threwError = false;
-let errorMsg = "";
-try {
-  await gen.next();
-} catch (e) {
-  threwError = true;
-  errorMsg = e.message || String(e);
-}
-console.log(JSON.stringify({ threwError, errorMsg }));
-`;
-      const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
-      expect(result.exitCode).toBe(0);
-
-      const parsed = JSON.parse(result.stdout);
-      expect(parsed.threwError).toBe(true);
+      expect(parsed.syncThrew).toBe(false);
+      expect(parsed.nextThrew).toBe(true);
     });
 
     // T-API-20b: nonexistent script with runPromise rejects (Spec 9.3)
@@ -1181,29 +1245,6 @@ import { runPromise } from "loopx";
 
 try {
   await runPromise("nonexistent", { cwd: ${JSON.stringify(project.dir)} });
-  console.log(JSON.stringify({ rejected: false }));
-} catch (e) {
-  console.log(JSON.stringify({ rejected: true, error: e.message || String(e) }));
-}
-`;
-      const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
-      expect(result.exitCode).toBe(0);
-
-      const parsed = JSON.parse(result.stdout);
-      expect(parsed.rejected).toBe(true);
-    });
-
-    // T-API-20l: name collision with runPromise rejects (extra, extends Spec 9.3 + 5.2)
-    it("T-API-20l: name collision with runPromise rejects", async () => {
-      project = await createTempProject();
-      await createScript(project, "myscript", ".sh", emitResult("sh-version"));
-      await createScript(project, "myscript", ".ts", 'process.stdout.write(JSON.stringify({ result: "ts-version" }));\n');
-
-      const driverCode = `
-import { runPromise } from "loopx";
-
-try {
-  await runPromise("myscript", { cwd: ${JSON.stringify(project.dir)} });
   console.log(JSON.stringify({ rejected: false }));
 } catch (e) {
   console.log(JSON.stringify({ rejected: true, error: e.message || String(e) }));
@@ -1259,27 +1300,40 @@ try {
       expect(parsed.rejected).toBe(true);
     });
 
-    // T-API-20i: runPromise with no default script rejects (Spec 9.3)
-    it("T-API-20i: no default script with runPromise rejects", async () => {
+    // T-API-20i: run(42 as any) returns generator that throws on first next() (Spec 9.1)
+    it("T-API-20i: run(42 as any) throws on first next()", async () => {
       project = await createTempProject();
-      // .loopx exists but has no default script
-      await createScript(project, "other", ".sh", emitResult("not-default"));
+      await createScript(project, "myscript", ".sh", emitResult("ok"));
 
       const driverCode = `
-import { runPromise } from "loopx";
+import { run } from "loopx";
 
+let syncThrew = false;
+let gen;
 try {
-  await runPromise(undefined, { cwd: ${JSON.stringify(project.dir)} });
-  console.log(JSON.stringify({ rejected: false }));
+  gen = run(42, { cwd: ${JSON.stringify(project.dir)} });
 } catch (e) {
-  console.log(JSON.stringify({ rejected: true, error: e.message || String(e) }));
+  syncThrew = true;
 }
+
+let nextThrew = false;
+let errorMsg = "";
+if (!syncThrew && gen) {
+  try {
+    await gen.next();
+  } catch (e) {
+    nextThrew = true;
+    errorMsg = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ syncThrew, nextThrew, errorMsg }));
 `;
       const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
       expect(result.exitCode).toBe(0);
 
       const parsed = JSON.parse(result.stdout);
-      expect(parsed.rejected).toBe(true);
+      expect(parsed.syncThrew).toBe(false);
+      expect(parsed.nextThrew).toBe(true);
     });
   });
 });

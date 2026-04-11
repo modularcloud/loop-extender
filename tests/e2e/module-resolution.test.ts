@@ -902,7 +902,7 @@ describe("SPEC: LOOPX_BIN in Bash Scripts (T-MOD-19 through T-MOD-21)", () => {
 
     // Skip delegation (the placeholder local binary is removed above).
     // These tests exercise LOOPX_BIN functionality, not delegation.
-    const result = await fixture.runGlobal(["-n", "2", "sender"], {
+    const result = await fixture.runGlobal(["run", "-n", "2", "sender"], {
       env: { LOOPX_DELEGATED: "1" },
     });
 
@@ -929,7 +929,7 @@ describe("SPEC: LOOPX_BIN in Bash Scripts (T-MOD-19 through T-MOD-21)", () => {
       writeEnvToFile("LOOPX_BIN", markerPath),
     );
 
-    await fixture.runGlobal(["-n", "1", "myscript"], {
+    await fixture.runGlobal(["run", "-n", "1", "myscript"], {
       env: { LOOPX_DELEGATED: "1" },
     });
 
@@ -964,7 +964,7 @@ describe("SPEC: LOOPX_BIN in Bash Scripts (T-MOD-19 through T-MOD-21)", () => {
       `$LOOPX_BIN version > "${markerPath}"`,
     );
 
-    await fixture.runGlobal(["-n", "1", "myscript"], {
+    await fixture.runGlobal(["run", "-n", "1", "myscript"], {
       env: { LOOPX_DELEGATED: "1" },
     });
 

@@ -88,9 +88,8 @@ describe("SPEC: Type Surface Verification", () => {
     expectTypeOf<RunPromiseReturn>().toMatchTypeOf<Promise<Output[]>>();
   });
 
-  // T-TYPE-06: Both accept optional RunOptions
+  // T-TYPE-06: Both accept optional RunOptions as second argument
   it("T-TYPE-06: run() and runPromise() accept optional RunOptions as second argument", () => {
-    // Verify that calling with (string, RunOptions) is valid
     type RunParams = Parameters<typeof run>;
     type RunPromiseParams = Parameters<typeof runPromise>;
 
@@ -103,32 +102,29 @@ describe("SPEC: Type Surface Verification", () => {
       NonNullable<RunPromiseParams[1]>
     >();
 
-    // Second parameter should be optional (the function accepts 0, 1, or 2 args)
-    // Verify by checking that the parameter tuple length allows omission
-    expectTypeOf<[]>().toMatchTypeOf<RunParams>();
-    expectTypeOf<[]>().toMatchTypeOf<RunPromiseParams>();
+    // Calling with just scriptName (no options) should be valid
+    expectTypeOf<[string]>().toMatchTypeOf<RunParams>();
+    expectTypeOf<[string]>().toMatchTypeOf<RunPromiseParams>();
+
+    // Calling with scriptName + options should be valid
+    expectTypeOf<[string, RunOptions]>().toMatchTypeOf<RunParams>();
+    expectTypeOf<[string, RunOptions]>().toMatchTypeOf<RunPromiseParams>();
   });
 
-  // T-TYPE-07: Both accept optional script name as first argument
-  it("T-TYPE-07: run() and runPromise() accept optional script name (string | undefined)", () => {
+  // T-TYPE-07: scriptName is required (omitting is a static type error)
+  it("T-TYPE-07: run() and runPromise() require scriptName as first argument (string)", () => {
     type RunParams = Parameters<typeof run>;
     type RunPromiseParams = Parameters<typeof runPromise>;
 
     expectTypeOf<RunParams>().not.toBeAny();
     expectTypeOf<RunPromiseParams>().not.toBeAny();
 
-    // First parameter should accept string
-    expectTypeOf<string>().toMatchTypeOf<NonNullable<RunParams[0]>>();
-    expectTypeOf<string>().toMatchTypeOf<
-      NonNullable<RunPromiseParams[0]>
-    >();
+    // First parameter must be string
+    expectTypeOf<string>().toMatchTypeOf<RunParams[0]>();
+    expectTypeOf<string>().toMatchTypeOf<RunPromiseParams[0]>();
 
-    // First parameter should be optional
-    expectTypeOf<[string]>().toMatchTypeOf<RunParams>();
-    expectTypeOf<[string]>().toMatchTypeOf<RunPromiseParams>();
-
-    // Should also accept undefined
-    expectTypeOf<[undefined]>().toMatchTypeOf<RunParams>();
-    expectTypeOf<[undefined]>().toMatchTypeOf<RunPromiseParams>();
+    // Calling with zero arguments should NOT be valid (scriptName is required)
+    expectTypeOf<[]>().not.toMatchTypeOf<RunParams>();
+    expectTypeOf<[]>().not.toMatchTypeOf<RunPromiseParams>();
   });
 });
