@@ -14,14 +14,18 @@ FEEDBACK=$(cat "$FEEDBACK_FILE")
 
 ADR_0002=$(cat "$ROOT/adr/0002-run-subcommand.md")
 SPEC=$(cat "$ROOT/SPEC.md")
+TEST_SPEC=$(cat "$ROOT/TEST-SPEC.md")
 
-PROMPT="ADR-0002 has been accepted and I am now updating SPEC.md to incorporate its changes (per the ADR process in ADR-0001). I received the following feedback on the current state of SPEC.md. Apply this feedback by updating SPEC.md only. ADR-0002 is the authoritative reference for what should change — do not modify it. If there is any ambiguity about my intentions, ask me clarifying questions. Think critically about this feedback and push back if warranted. After you finish, commit and push.
+PROMPT="ADR-0002 has been accepted and SPEC.md has already been updated to incorporate its changes (per the ADR process in ADR-0001). I am now updating TEST-SPEC.md to cover the new and changed spec behavior introduced by ADR-0002. I received the following feedback on the current state of TEST-SPEC.md. Apply this feedback by updating TEST-SPEC.md only — do not modify SPEC.md or ADR-0002, they are read-only references in this cycle. ADR-0002 and the updated SPEC.md are the authoritative sources for what TEST-SPEC.md should cover. If there is any ambiguity about my intentions, ask me clarifying questions. Think critically about this feedback and push back if warranted. After you finish, commit and push.
 
 adr/0002-run-subcommand.md (accepted — read-only reference):
 $ADR_0002
 
-Current SPEC.md:
+SPEC.md (already updated for ADR-0002 — read-only reference):
 $SPEC
+
+Current TEST-SPEC.md (target of updates):
+$TEST_SPEC
 
 Feedback:
 $FEEDBACK"
