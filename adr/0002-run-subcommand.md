@@ -1,6 +1,6 @@
 # ADR-0002: Introduce `run` Subcommand and Remove Default Script
 
-**Status:** Spec Updated
+**Status:** Test Specified
 
 ---
 
