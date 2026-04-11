@@ -55,7 +55,7 @@ describe("SPEC: Global Env File", () => {
           writeEnvToFile("MY_GLOBAL_VAR", markerPath),
         );
 
-        const result = await runCLI(["-n", "1", "check-env"], {
+        const result = await runCLI(["run", "-n", "1", "check-env"], {
           cwd: project.dir,
           runtime,
         });
@@ -87,7 +87,7 @@ describe("SPEC: Global Env File", () => {
           observeEnv("EPHEMERAL_VAR", markerPath),
         );
 
-        const result = await runCLI(["-n", "1", "observe"], {
+        const result = await runCLI(["run", "-n", "1", "observe"], {
           cwd: project.dir,
           runtime,
         });
@@ -111,7 +111,7 @@ describe("SPEC: Global Env File", () => {
           writeEnvToFile("XDG_TEST_VAR", markerPath),
         );
 
-        const result = await runCLI(["-n", "1", "check-xdg"], {
+        const result = await runCLI(["run", "-n", "1", "check-xdg"], {
           cwd: project.dir,
           runtime,
         });
@@ -143,7 +143,7 @@ describe("SPEC: Global Env File", () => {
           writeEnvToFile("FALLBACK_VAR", markerPath),
         );
 
-        const result = await runCLI(["-n", "1", "check-fallback"], {
+        const result = await runCLI(["run", "-n", "1", "check-fallback"], {
           cwd: project.dir,
           runtime,
         });
@@ -199,7 +199,7 @@ describe("SPEC: Global Env File", () => {
           writeEnvToFile("SOME_VAR", markerPath),
         );
 
-        const result = await runCLI(["-n", "1"], {
+        const result = await runCLI(["run", "-n", "1", "default"], {
           cwd: project.dir,
           runtime,
         });
@@ -355,7 +355,7 @@ describe("SPEC: Env File Parsing", () => {
         observeEnv(varname, markerPath),
       );
 
-      const result = await runCLI(["-n", "1", "observe"], {
+      const result = await runCLI(["run", "-n", "1", "observe"], {
         cwd: localProject.dir,
         runtime,
       });
@@ -551,7 +551,7 @@ describe("SPEC: Local Env Override", () => {
         writeEnvToFile("LOCAL_VAR", markerPath),
       );
 
-      const result = await runCLI(["-e", "local.env", "-n", "1", "check-local"], {
+      const result = await runCLI(["run", "-e", "local.env", "-n", "1", "check-local"], {
         cwd: project.dir,
         runtime,
       });
@@ -572,7 +572,7 @@ describe("SPEC: Local Env Override", () => {
         "#!/bin/bash\necho ok\n",
       );
 
-      const result = await runCLI(["-e", "does-not-exist.env", "-n", "1"], {
+      const result = await runCLI(["run", "-e", "does-not-exist.env", "-n", "1", "default"], {
         cwd: project.dir,
         runtime,
       });
@@ -599,7 +599,7 @@ describe("SPEC: Local Env Override", () => {
         "#!/bin/bash\necho ok\n",
       );
 
-      const result = await runCLI(["-e", "unreadable.env", "-n", "1"], {
+      const result = await runCLI(["run", "-e", "unreadable.env", "-n", "1", "default"], {
         cwd: project.dir,
         runtime,
       });
@@ -623,7 +623,7 @@ describe("SPEC: Local Env Override", () => {
         );
 
         const result = await runCLI(
-          ["-e", "local.env", "-n", "1", "check-conflict"],
+          ["run", "-e", "local.env", "-n", "1", "check-conflict"],
           { cwd: project.dir, runtime },
         );
 
@@ -651,7 +651,7 @@ printf '%s' "$LOCAL_ONLY" > "${localMarker}"
         await createScript(project, "check-both", ".sh", scriptContent);
 
         const result = await runCLI(
-          ["-e", "local.env", "-n", "1", "check-both"],
+          ["run", "-e", "local.env", "-n", "1", "check-both"],
           { cwd: project.dir, runtime },
         );
 
@@ -693,7 +693,7 @@ describe("SPEC: Injection Precedence", () => {
           writeEnvToFile("LOOPX_BIN", markerPath),
         );
 
-        const result = await runCLI(["-n", "1", "check-bin"], {
+        const result = await runCLI(["run", "-n", "1", "check-bin"], {
           cwd: project.dir,
           runtime,
         });
@@ -719,7 +719,7 @@ describe("SPEC: Injection Precedence", () => {
         writeEnvToFile("LOOPX_BIN", markerPath),
       );
 
-      const result = await runCLI(["-n", "1", "check-bin-sys"], {
+      const result = await runCLI(["run", "-n", "1", "check-bin-sys"], {
         cwd: project.dir,
         runtime,
         env: { LOOPX_BIN: "system-env-bin-path" },
@@ -746,7 +746,7 @@ describe("SPEC: Injection Precedence", () => {
           writeEnvToFile("LOOPX_PROJECT_ROOT", markerPath),
         );
 
-        const result = await runCLI(["-n", "1", "check-root"], {
+        const result = await runCLI(["run", "-n", "1", "check-root"], {
           cwd: project.dir,
           runtime,
         });
@@ -772,7 +772,7 @@ describe("SPEC: Injection Precedence", () => {
         writeEnvToFile("LOOPX_PROJECT_ROOT", markerPath),
       );
 
-      const result = await runCLI(["-n", "1", "check-root-sys"], {
+      const result = await runCLI(["run", "-n", "1", "check-root-sys"], {
         cwd: project.dir,
         runtime,
         env: { LOOPX_PROJECT_ROOT: "/fake/system/path" },
@@ -799,7 +799,7 @@ describe("SPEC: Injection Precedence", () => {
           writeEnvToFile("OVERRIDE_ME", markerPath),
         );
 
-        const result = await runCLI(["-n", "1", "check-override"], {
+        const result = await runCLI(["run", "-n", "1", "check-override"], {
           cwd: project.dir,
           runtime,
           env: { OVERRIDE_ME: "from-system-env" },
@@ -826,7 +826,7 @@ describe("SPEC: Injection Precedence", () => {
           writeEnvToFile("SYSTEM_ONLY_VAR", markerPath),
         );
 
-        const result = await runCLI(["-n", "1", "check-sysenv"], {
+        const result = await runCLI(["run", "-n", "1", "check-sysenv"], {
           cwd: project.dir,
           runtime,
           env: { SYSTEM_ONLY_VAR: "from-system" },
@@ -870,7 +870,7 @@ printf '%s' "$SYSTEM_ONLY_VAR" > "${systemOnlyMarker}"
         await createScript(project, "precedence", ".sh", scriptContent);
 
         const result = await runCLI(
-          ["-e", "local.env", "-n", "1", "precedence"],
+          ["run", "-e", "local.env", "-n", "1", "precedence"],
           {
             cwd: project.dir,
             runtime,
@@ -913,7 +913,7 @@ printf '%s' "$SYSTEM_ONLY_VAR" > "${systemOnlyMarker}"
         observeEnv("LOOPX_DELEGATED", markerPath),
       );
 
-      const result = await runCLI(["-n", "1", "observe"], {
+      const result = await runCLI(["run", "-n", "1", "observe"], {
         cwd: project.dir,
         runtime,
         env: { LOOPX_DELEGATED: "1" },
@@ -940,7 +940,7 @@ printf '%s' "$SYSTEM_ONLY_VAR" > "${systemOnlyMarker}"
           observeEnv("MY_VAR", markerPath),
         );
 
-        const result = await runCLI(["-e", "local.env", "-n", "1", "observe"], {
+        const result = await runCLI(["run", "-e", "local.env", "-n", "1", "observe"], {
           cwd: project.dir,
           runtime,
           env: { MY_VAR: "system-value" },
@@ -999,7 +999,7 @@ fi
 `;
         await createScript(project, "cache-test", ".sh", scriptContent);
 
-        const result = await runCLI(["-n", "2", "cache-test"], {
+        const result = await runCLI(["run", "-n", "2", "cache-test"], {
           cwd: project.dir,
           runtime,
         });
@@ -1040,7 +1040,7 @@ fi
       await createScript(project, "local-cache-test", ".sh", scriptContent);
 
       const result = await runCLI(
-        ["-e", "local.env", "-n", "2", "local-cache-test"],
+        ["run", "-e", "local.env", "-n", "2", "local-cache-test"],
         { cwd: project.dir, runtime },
       );
 

@@ -30,7 +30,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       const marker = join(project.dir, "marker-01.txt");
       await createScript(project, "myscript", ".sh", writeValueToFile("disc01", marker));
 
-      const result = await runCLI(["-n", "1", "myscript"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "myscript"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -47,7 +47,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "disc02");\n`
       );
 
-      const result = await runCLI(["-n", "1", "myscript"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "myscript"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -64,7 +64,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "disc03");\n`
       );
 
-      const result = await runCLI(["-n", "1", "myscript"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "myscript"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -81,7 +81,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "disc04");\n`
       );
 
-      const result = await runCLI(["-n", "1", "myscript"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "myscript"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -98,7 +98,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "disc05");\n`
       );
 
-      const result = await runCLI(["-n", "1", "myscript"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "myscript"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -114,7 +114,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         `import { writeFileSync } from "node:fs";\nwriteFileSync("/dev/null", "should-not-run");\n`
       );
 
-      const result = await runCLI(["-n", "1", "myscript"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "myscript"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toMatch(/not found/i);
@@ -129,7 +129,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         `const fs = require("node:fs");\nfs.writeFileSync("/dev/null", "should-not-run");\n`
       );
 
-      const result = await runCLI(["-n", "1", "myscript"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "myscript"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(1);
     });
@@ -138,7 +138,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       project = await createTempProject();
       await createScript(project, "myscript", ".txt", "some text content\n");
 
-      const result = await runCLI(["-n", "1", "myscript"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "myscript"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(1);
     });
@@ -148,7 +148,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       // createScript with empty ext creates a file with no extension
       await createScript(project, "myscript", "", "#!/bin/bash\necho hello\n");
 
-      const result = await runCLI(["-n", "1", "myscript"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "myscript"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(1);
     });
@@ -164,7 +164,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       );
 
       // Invoke by base name (no extension)
-      const result = await runCLI(["-n", "1", "my-script"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "my-script"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -183,7 +183,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         "index.ts": `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "disc11");\n`,
       });
 
-      const result = await runCLI(["-n", "1", "mypipe"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "mypipe"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -197,7 +197,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         "src/index.ts": `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "disc11a");\n`,
       });
 
-      const result = await runCLI(["-n", "1", "mypipe"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "mypipe"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -210,7 +210,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       mkdirSync(dirPath, { recursive: true });
       writeFileSync(join(dirPath, "index.ts"), `console.log("hello");\n`);
 
-      const result = await runCLI(["-n", "1", "nopackage"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "nopackage"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(1);
     });
@@ -222,7 +222,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       writeFileSync(join(dirPath, "package.json"), JSON.stringify({ name: "nomain" }));
       writeFileSync(join(dirPath, "index.ts"), `console.log("hello");\n`);
 
-      const result = await runCLI(["-n", "1", "nomain"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "nomain"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(1);
     });
@@ -234,7 +234,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         "index.sh": writeValueToFile("disc14", marker),
       });
 
-      const result = await runCLI(["-n", "1", "mypipe"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "mypipe"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -248,7 +248,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         "index.js": `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "disc14a");\n`,
       });
 
-      const result = await runCLI(["-n", "1", "mypipe"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "mypipe"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -262,7 +262,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         "index.jsx": `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "disc14b");\n`,
       });
 
-      const result = await runCLI(["-n", "1", "mypipe"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "mypipe"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -276,7 +276,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         "index.tsx": `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "disc14c");\n`,
       });
 
-      const result = await runCLI(["-n", "1", "mypipe"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "mypipe"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -289,7 +289,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         "index.py": `print("hello")\n`,
       });
 
-      const result = await runCLI(["-h"], { cwd: project.dir });
+      const result = await runCLI(["run", "-h"], { cwd: project.dir });
 
       expect(result.stderr).toMatch(/mypipe|\.py|unsupported|warning/i);
     });
@@ -302,7 +302,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         // No files needed inside the dir for this test
       });
 
-      const result = await runCLI(["-h"], { cwd: project.dir });
+      const result = await runCLI(["run", "-h"], { cwd: project.dir });
 
       expect(result.stderr).toMatch(/mypipe|escape|warning|boundary/i);
     });
@@ -313,12 +313,12 @@ describe("SPEC: Script Discovery & Validation", () => {
       mkdirSync(dirPath, { recursive: true });
       writeFileSync(join(dirPath, "package.json"), "{invalid}");
 
-      const result = await runCLI(["-n", "1", "mypipe"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "mypipe"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(1);
 
       // Also check that help mode emits a warning
-      const helpResult = await runCLI(["-h"], { cwd: project.dir });
+      const helpResult = await runCLI(["run", "-h"], { cwd: project.dir });
       expect(helpResult.stderr).toMatch(/mypipe|invalid|warning|parse|json/i);
     });
 
@@ -336,7 +336,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       // Remove read permissions
       chmodSync(join(dirPath, "package.json"), 0o000);
 
-      const result = await runCLI(["-h"], { cwd: project.dir });
+      const result = await runCLI(["run", "-h"], { cwd: project.dir });
 
       expect(result.stderr).toMatch(/mypipe|unreadable|warning|permission/i);
 
@@ -350,7 +350,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       mkdirSync(dirPath, { recursive: true });
       writeFileSync(join(dirPath, "package.json"), JSON.stringify({ main: 42 }));
 
-      const result = await runCLI(["-h"], { cwd: project.dir });
+      const result = await runCLI(["run", "-h"], { cwd: project.dir });
 
       expect(result.stderr).toMatch(/mypipe|main|warning|string/i);
     });
@@ -361,7 +361,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       mkdirSync(dirPath, { recursive: true });
       writeFileSync(join(dirPath, "package.json"), JSON.stringify({ main: "missing.ts" }));
 
-      const result = await runCLI(["-h"], { cwd: project.dir });
+      const result = await runCLI(["run", "-h"], { cwd: project.dir });
 
       expect(result.stderr).toMatch(/mypipe|missing|warning|not found|exist/i);
     });
@@ -374,7 +374,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       });
 
       // Invoke by directory name
-      const result = await runCLI(["-n", "1", "my-pipeline"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "my-pipeline"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -391,7 +391,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       await createBashScript(project, "example", "echo hello");
       await createScript(project, "example", ".ts", `console.log("hello");\n`);
 
-      const result = await runCLI(["-n", "1", "example"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "example"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toMatch(/example/i);
@@ -405,7 +405,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         "index.ts": `console.log("hello dir");\n`,
       });
 
-      const result = await runCLI(["-n", "1", "example"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "example"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toMatch(/example/i);
@@ -420,7 +420,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         "index.ts": `console.log("hello dir");\n`,
       });
 
-      const result = await runCLI(["-n", "1", "example"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "example"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toMatch(/example/i);
@@ -435,7 +435,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       await createScript(project, "alpha", ".sh", writeValueToFile("disc21", marker));
       await createScript(project, "beta", ".ts", `console.log("beta");\n`);
 
-      const result = await runCLI(["-n", "1", "alpha"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "alpha"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -444,59 +444,134 @@ describe("SPEC: Script Discovery & Validation", () => {
   });
 
   // =========================================================================
-  // Reserved Names (T-DISC-22 through T-DISC-26)
+  // Formerly Reserved Names (T-DISC-22 through T-DISC-26)
+  // ADR-0002: reserved names eliminated — these are now ordinary scripts
   // =========================================================================
-  describe("SPEC: Reserved Names", () => {
-    it("T-DISC-22: output.sh is rejected as reserved", async () => {
+  describe("SPEC: Formerly Reserved Names", () => {
+    it("T-DISC-22: output.sh is discoverable and runs via loopx run", async () => {
       project = await createTempProject();
-      await createBashScript(project, "output", "echo hello");
+      const marker = join(project.dir, "marker-22.txt");
+      await createScript(project, "output", ".sh", writeValueToFile("disc22", marker));
 
-      const result = await runCLI(["-n", "1", "output"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "output"], { cwd: project.dir });
 
-      expect(result.exitCode).toBe(1);
-      expect(result.stderr).toMatch(/reserved/i);
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, "utf-8")).toBe("disc22");
     });
 
-    it("T-DISC-23: env.ts is rejected as reserved", async () => {
+    it("T-DISC-23: env.ts is discoverable and runs via loopx run", async () => {
       project = await createTempProject();
-      await createScript(project, "env", ".ts", `console.log("hello");\n`);
+      const marker = join(project.dir, "marker-23.txt");
+      await createScript(
+        project,
+        "env",
+        ".ts",
+        `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "disc23");\n`
+      );
 
-      const result = await runCLI(["-n", "1", "env"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "env"], { cwd: project.dir });
 
-      expect(result.exitCode).toBe(1);
-      expect(result.stderr).toMatch(/reserved/i);
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, "utf-8")).toBe("disc23");
     });
 
-    it("T-DISC-24: install.js is rejected as reserved", async () => {
+    it("T-DISC-24: install.js is discoverable and runs via loopx run", async () => {
       project = await createTempProject();
-      await createScript(project, "install", ".js", `console.log("hello");\n`);
+      const marker = join(project.dir, "marker-24.txt");
+      await createScript(
+        project,
+        "install",
+        ".js",
+        `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "disc24");\n`
+      );
 
-      const result = await runCLI(["-n", "1", "install"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "install"], { cwd: project.dir });
 
-      expect(result.exitCode).toBe(1);
-      expect(result.stderr).toMatch(/reserved/i);
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, "utf-8")).toBe("disc24");
     });
 
-    it("T-DISC-25: version.sh is rejected as reserved", async () => {
+    it("T-DISC-25: version.sh is discoverable and runs via loopx run", async () => {
       project = await createTempProject();
-      await createBashScript(project, "version", "echo 1.0.0");
+      const marker = join(project.dir, "marker-25.txt");
+      await createScript(project, "version", ".sh", writeValueToFile("disc25", marker));
 
-      const result = await runCLI(["-n", "1", "version"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "version"], { cwd: project.dir });
 
-      expect(result.exitCode).toBe(1);
-      expect(result.stderr).toMatch(/reserved/i);
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, "utf-8")).toBe("disc25");
     });
 
-    it("T-DISC-26: reserved name as directory script is rejected", async () => {
+    it("T-DISC-26: run.sh is discoverable and runs via loopx run", async () => {
       project = await createTempProject();
-      await createDirScript(project, "output", "index.ts", {
-        "index.ts": `console.log("hello");\n`,
+      const marker = join(project.dir, "marker-26.txt");
+      await createScript(project, "run", ".sh", writeValueToFile("disc26", marker));
+
+      const result = await runCLI(["run", "-n", "1", "run"], { cwd: project.dir });
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, "utf-8")).toBe("disc26");
+    });
+
+    it("T-DISC-51: loopx run -h with only formerly-reserved-named scripts lists all five, stderr empty", async () => {
+      project = await createTempProject();
+      await createScript(project, "version", ".sh", writeValueToFile("v", join(project.dir, "m.txt")));
+      await createScript(project, "output", ".sh", writeValueToFile("o", join(project.dir, "m.txt")));
+      await createScript(
+        project,
+        "env",
+        ".ts",
+        `import { writeFileSync } from "node:fs";\nwriteFileSync("/dev/null", "e");\n`
+      );
+      await createScript(
+        project,
+        "install",
+        ".js",
+        `import { writeFileSync } from "node:fs";\nwriteFileSync("/dev/null", "i");\n`
+      );
+      await createScript(project, "run", ".sh", writeValueToFile("r", join(project.dir, "m.txt")));
+
+      const result = await runCLI(["run", "-h"], { cwd: project.dir });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toMatch(/version/);
+      expect(result.stdout).toMatch(/output/);
+      expect(result.stdout).toMatch(/env/);
+      expect(result.stdout).toMatch(/install/);
+      expect(result.stdout).toMatch(/run/);
+      expect(result.stderr).toBe("");
+    });
+
+    it("T-DISC-52: directory script named version is discoverable and runs via loopx run", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "marker-52.txt");
+      await createDirScript(project, "version", "index.ts", {
+        "index.ts": `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "disc52");\n`,
       });
 
-      const result = await runCLI(["-n", "1", "output"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "version"], { cwd: project.dir });
 
-      expect(result.exitCode).toBe(1);
-      expect(result.stderr).toMatch(/reserved/i);
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, "utf-8")).toBe("disc52");
+    });
+
+    it("T-DISC-53: loopx run -h with only version/ directory script lists it, stderr empty", async () => {
+      project = await createTempProject();
+      await createDirScript(project, "version", "index.ts", {
+        "index.ts": `import { writeFileSync } from "node:fs";\nwriteFileSync("/dev/null", "disc53");\n`,
+      });
+
+      const result = await runCLI(["run", "-h"], { cwd: project.dir });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toMatch(/version/);
+      expect(result.stderr).toBe("");
     });
   });
 
@@ -508,7 +583,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       project = await createTempProject();
       await createBashScript(project, "-startswithdash", "echo hello");
 
-      const result = await runCLI(["-n", "1", "-startswithdash"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "-startswithdash"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(1);
     });
@@ -518,7 +593,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       const marker = join(project.dir, "marker-28.txt");
       await createScript(project, "my-script", ".sh", writeValueToFile("disc28", marker));
 
-      const result = await runCLI(["-n", "1", "my-script"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "my-script"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -530,7 +605,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       const marker = join(project.dir, "marker-29.txt");
       await createScript(project, "_underscore", ".sh", writeValueToFile("disc29", marker));
 
-      const result = await runCLI(["-n", "1", "_underscore"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "_underscore"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -542,7 +617,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       const marker = join(project.dir, "marker-30.txt");
       await createScript(project, "ABC123", ".sh", writeValueToFile("disc30", marker));
 
-      const result = await runCLI(["-n", "1", "ABC123"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "ABC123"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -554,7 +629,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       const marker = join(project.dir, "marker-30a.txt");
       await createScript(project, "1start", ".sh", writeValueToFile("disc30a", marker));
 
-      const result = await runCLI(["-n", "1", "1start"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "1start"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -566,7 +641,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       const marker = join(project.dir, "marker-30b.txt");
       await createScript(project, "42", ".sh", writeValueToFile("disc30b", marker));
 
-      const result = await runCLI(["-n", "1", "42"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "42"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -577,7 +652,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       project = await createTempProject();
       await createBashScript(project, "has space", "echo hello");
 
-      const result = await runCLI(["-n", "1", "has space"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "has space"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(1);
     });
@@ -587,7 +662,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       // The base name "has.dot" (from "has.dot.sh") contains a dot which is not allowed
       await createBashScript(project, "has.dot", "echo hello");
 
-      const result = await runCLI(["-n", "1", "has.dot"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "has.dot"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(1);
     });
@@ -611,7 +686,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       // Create a symlink in .loopx/ pointing to it
       symlinkSync(realFile, join(project.loopxDir, "linked.ts"));
 
-      const result = await runCLI(["-n", "1", "linked"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "linked"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -637,7 +712,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       // Create a symlink in .loopx/ pointing to it
       symlinkSync(realDir, join(project.loopxDir, "linked-pipe"));
 
-      const result = await runCLI(["-n", "1", "linked-pipe"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "linked-pipe"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -666,7 +741,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       // Create symlink from entry.ts -> real-entry.ts (within the directory)
       symlinkSync(realFile, join(dirPath, "entry.ts"));
 
-      const result = await runCLI(["-n", "1", "mypipe"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "mypipe"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -691,7 +766,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       // Create symlink from entry.ts -> outside file (escapes directory)
       symlinkSync(outsideFile, join(dirPath, "entry.ts"));
 
-      const result = await runCLI(["-h"], { cwd: project.dir });
+      const result = await runCLI(["run", "-h"], { cwd: project.dir });
 
       expect(result.stderr).toMatch(/mypipe|warning|outside|escape|boundary/i);
     });
@@ -728,7 +803,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       await createBashScript(project, "scripta", scriptABody);
 
       // Run with -n 3 so there are enough iterations for goto
-      const result = await runCLI(["-n", "3", "scripta"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "3", "scripta"], { cwd: project.dir });
 
       // The goto to "newscript" should fail because it was not in the cached discovery
       expect(result.exitCode).toBe(1);
@@ -766,7 +841,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       writeFileSync(scriptPath, initialBody + "\n");
       chmodSync(scriptPath, 0o755);
 
-      const result = await runCLI(["-n", "2", "mutator"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "2", "mutator"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       // The second iteration should have used the mutated content
@@ -787,7 +862,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       await createBashScript(project, "scripta", scriptABody);
       await createBashScript(project, "scriptb", `printf '{"result":"b-ran"}'`);
 
-      const result = await runCLI(["-n", "3", "scripta"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "3", "scripta"], { cwd: project.dir });
 
       // When loopx tries to spawn scriptb, the file is gone
       expect(result.exitCode).toBe(1);
@@ -807,7 +882,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       await createBashScript(project, "scripta", scriptABody);
       await createBashScript(project, "scriptb", `printf '{"result":"b-ran"}'`);
 
-      const result = await runCLI(["-n", "3", "scripta"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "3", "scripta"], { cwd: project.dir });
 
       // The cached path for "scriptb" no longer exists
       expect(result.exitCode).toBe(1);
@@ -830,7 +905,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       mkdirSync(badDir, { recursive: true });
       writeFileSync(join(badDir, "package.json"), "{invalid json}");
 
-      const result = await runCLI(["-n", "1", "good"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "good"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(marker)).toBe(true);
@@ -983,7 +1058,7 @@ describe("SPEC: Script Discovery & Validation", () => {
       mkdirSync(childDir, { recursive: true });
 
       // Run loopx from the child directory
-      const result = await runCLI(["-n", "1", "myscript"], { cwd: childDir });
+      const result = await runCLI(["run", "-n", "1", "myscript"], { cwd: childDir });
 
       // The parent's .loopx/ should not be found
       expect(result.exitCode).toBe(1);
@@ -999,7 +1074,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         `import { writeFileSync } from "node:fs";\nwriteFileSync("/dev/null", "should-not-run");\n`
       );
 
-      const result = await runCLI(["-n", "1", "nested"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "1", "nested"], { cwd: project.dir });
 
       // "nested" should not be discoverable
       expect(result.exitCode).toBe(1);
@@ -1051,7 +1126,7 @@ describe("SPEC: Script Discovery & Validation", () => {
         `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker2)}, "changed-ran");\n`
       );
 
-      const result = await runCLI(["-n", "2", "mypipe"], { cwd: project.dir });
+      const result = await runCLI(["run", "-n", "2", "mypipe"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(0);
       // The original entry point should have run both times (cached)

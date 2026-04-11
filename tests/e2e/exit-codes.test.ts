@@ -44,7 +44,7 @@ describe("SPEC: Exit Codes", () => {
         project = await createTempProject();
         await createScript(project, "stopper", ".sh", emitStop());
 
-        const result = await runCLI(["stopper"], {
+        const result = await runCLI(["run", "stopper"], {
           cwd: project.dir,
           runtime,
         });
@@ -57,7 +57,7 @@ describe("SPEC: Exit Codes", () => {
         const counterFile = join(project.dir, "counter.txt");
         await createScript(project, "counting", ".sh", counter(counterFile));
 
-        const result = await runCLI(["-n", "3", "counting"], {
+        const result = await runCLI(["run", "-n", "3", "counting"], {
           cwd: project.dir,
           runtime,
         });
@@ -69,7 +69,7 @@ describe("SPEC: Exit Codes", () => {
         project = await createTempProject();
         await createScript(project, "myscript", ".sh", emitResult("x"));
 
-        const result = await runCLI(["-n", "0", "myscript"], {
+        const result = await runCLI(["run", "-n", "0", "myscript"], {
           cwd: project.dir,
           runtime,
         });
@@ -101,7 +101,7 @@ describe("SPEC: Exit Codes", () => {
         project = await createTempProject();
         await createScript(project, "fail", ".sh", exitCode(42));
 
-        const result = await runCLI(["-n", "1", "fail"], {
+        const result = await runCLI(["run", "-n", "1", "fail"], {
           cwd: project.dir,
           runtime,
         });
@@ -115,7 +115,7 @@ describe("SPEC: Exit Codes", () => {
         await createScript(project, "example", ".sh", emitResult("from-sh"));
         await createScript(project, "example", ".ts", emitResult("from-ts"));
 
-        const result = await runCLI(["example"], {
+        const result = await runCLI(["run", "example"], {
           cwd: project.dir,
           runtime,
         });
@@ -129,7 +129,7 @@ describe("SPEC: Exit Codes", () => {
         // Script emits a goto to a target that does not exist
         await createScript(project, "bad-goto", ".sh", emitGoto("nonexistent"));
 
-        const result = await runCLI(["-n", "2", "bad-goto"], {
+        const result = await runCLI(["run", "-n", "2", "bad-goto"], {
           cwd: project.dir,
           runtime,
         });
@@ -142,7 +142,7 @@ describe("SPEC: Exit Codes", () => {
         project = await createTempProject();
         // .loopx/ exists but requested script does not
 
-        const result = await runCLI(["does-not-exist"], {
+        const result = await runCLI(["run", "does-not-exist"], {
           cwd: project.dir,
           runtime,
         });
@@ -153,7 +153,7 @@ describe("SPEC: Exit Codes", () => {
       it("T-EXIT-09: missing .loopx/ -> exit 1", async () => {
         project = await createTempProject({ withLoopxDir: false });
 
-        const result = await runCLI([], {
+        const result = await runCLI(["run", "anyscript"], {
           cwd: project.dir,
           runtime,
         });
@@ -166,7 +166,7 @@ describe("SPEC: Exit Codes", () => {
         project = await createTempProject();
         await createScript(project, "myscript", ".sh", emitResult("x"));
 
-        const result = await runCLI(["-n", "abc", "myscript"], {
+        const result = await runCLI(["run", "-n", "abc", "myscript"], {
           cwd: project.dir,
           runtime,
         });
@@ -179,9 +179,45 @@ describe("SPEC: Exit Codes", () => {
         await createScript(project, "myscript", ".sh", emitResult("x"));
 
         const result = await runCLI(
-          ["-e", "nonexistent.env", "myscript"],
+          ["run", "-e", "nonexistent.env", "myscript"],
           { cwd: project.dir, runtime },
         );
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+      });
+
+      it("T-EXIT-14: run with no script name -> exit 1", async () => {
+        project = await createTempProject();
+
+        const result = await runCLI(["run"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+      });
+
+      it("T-EXIT-15: unrecognized subcommand -> exit 1", async () => {
+        project = await createTempProject();
+
+        const result = await runCLI(["myscript"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+      });
+
+      it("T-EXIT-16: unrecognized top-level flag -> exit 1", async () => {
+        project = await createTempProject();
+
+        const result = await runCLI(["--unknown"], {
+          cwd: project.dir,
+          runtime,
+        });
 
         expect(result.exitCode).toBe(1);
         expect(result.stderr.length).toBeGreaterThan(0);
@@ -209,7 +245,7 @@ describe("SPEC: Exit Codes", () => {
         );
 
         const { result, sendSignal, waitForStderr } = runCLIWithSignal(
-          ["sleeper"],
+          ["run", "sleeper"],
           { cwd: project.dir, runtime, timeout: 15_000 },
         );
 
@@ -236,7 +272,7 @@ describe("SPEC: Exit Codes", () => {
         );
 
         const { result, sendSignal, waitForStderr } = runCLIWithSignal(
-          ["sleeper"],
+          ["run", "sleeper"],
           { cwd: project.dir, runtime, timeout: 15_000 },
         );
 

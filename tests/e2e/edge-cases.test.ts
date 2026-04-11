@@ -168,7 +168,7 @@ console.log(JSON.stringify({ result: outputs[0]?.result }));
 printf '{"result":"stdout-ok"}'`,
         );
 
-        const result = await runCLI(["-n", "1", "mixed-io"], {
+        const result = await runCLI(["run", "-n", "1", "mixed-io"], {
           cwd: project.dir,
           runtime,
         });
@@ -229,7 +229,7 @@ console.log(JSON.stringify({ result: outputs[0]?.result }));
         );
 
         // Attempting to run it should produce an error (invalid name)
-        const result = await runCLI(["-n", "1", "caf\u00e9"], {
+        const result = await runCLI(["run", "-n", "1", "caf\u00e9"], {
           cwd: project.dir,
           runtime,
         });
@@ -254,7 +254,7 @@ console.log(JSON.stringify({ result: outputs[0]?.result }));
           writeEnvToFile("UNICODE_VAR", markerPath),
         );
 
-        const result = await runCLI(["-e", envPath, "-n", "1", "check-env"], {
+        const result = await runCLI(["run", "-e", envPath, "-n", "1", "check-env"], {
           cwd: project.dir,
           runtime,
         });
@@ -306,7 +306,7 @@ printf '{"goto":"${nextLetter}"}'`,
           }
         }
 
-        const result = await runCLI(["-n", "26", "a"], {
+        const result = await runCLI(["run", "-n", "26", "a"], {
           cwd: project.dir,
           runtime,
           timeout: 60_000,
@@ -345,7 +345,7 @@ printf '{"goto":"${nextLetter}"}'`,
 printf '{"result":"read-done"}'`,
         );
 
-        const result = await runCLI(["-n", "1", "stdin-reader"], {
+        const result = await runCLI(["run", "-n", "1", "stdin-reader"], {
           cwd: project.dir,
           runtime,
           timeout: 10_000, // Generous timeout — but should complete quickly
@@ -381,7 +381,7 @@ fi
 `;
         await createScript(project, "stop-later", ".sh", scriptBody);
 
-        const result = await runCLI(["-n", "999999", "stop-later"], {
+        const result = await runCLI(["run", "-n", "999999", "stop-later"], {
           cwd: project.dir,
           runtime,
         });
@@ -396,31 +396,16 @@ fi
   });
 
   // =========================================================================
-  // T-EDGE-12: Empty .loopx/ dir -- no default, named not found
+  // T-EDGE-12: Empty .loopx/ dir -- run errors, run -h shows no scripts
   // =========================================================================
 
   describe("SPEC: Empty .loopx/ directory", () => {
     forEachRuntime((runtime) => {
-      it("T-EDGE-12a: empty .loopx/ with no args -> exit 1 (no default)", async () => {
+      it("T-EDGE-12a: empty .loopx/ with `run myscript` -> exit 1 (not found)", async () => {
         project = await createTempProject();
         // .loopx/ exists but is empty (no scripts at all)
 
-        const result = await runCLI([], {
-          cwd: project.dir,
-          runtime,
-        });
-
-        expect(result.exitCode).toBe(1);
-        // Stderr should mention something about the missing default script
-        const stderrLower = result.stderr.toLowerCase();
-        expect(stderrLower).toContain("default");
-      });
-
-      it("T-EDGE-12b: empty .loopx/ with named script -> exit 1 (not found)", async () => {
-        project = await createTempProject();
-        // .loopx/ exists but is empty
-
-        const result = await runCLI(["myscript"], {
+        const result = await runCLI(["run", "myscript"], {
           cwd: project.dir,
           runtime,
         });
@@ -428,6 +413,20 @@ fi
         expect(result.exitCode).toBe(1);
         // Stderr should mention the script was not found
         expect(result.stderr.length).toBeGreaterThan(0);
+      });
+
+      it("T-EDGE-12b: empty .loopx/ with `run -h` -> run help displayed, no scripts", async () => {
+        project = await createTempProject();
+        // .loopx/ exists but is empty
+
+        const result = await runCLI(["run", "-h"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        // Help output should be shown on stdout
+        expect(result.stdout.length).toBeGreaterThan(0);
       });
     });
   });
@@ -455,7 +454,7 @@ fi
         );
 
         // Use -e flag to load the local env file (Spec 8.2)
-        const result = await runCLI(["-e", "edge-test.env", "-n", "1", "check-env-edge"], {
+        const result = await runCLI(["run", "-e", "edge-test.env", "-n", "1", "check-env-edge"], {
           cwd: project.dir,
           runtime,
         });
@@ -491,7 +490,7 @@ fi
           writeEnvToFile("NONEXISTENT_VAR", markerPath),
         );
 
-        const result = await runCLI(["-n", "1", "check-no-env"], {
+        const result = await runCLI(["run", "-n", "1", "check-no-env"], {
           cwd: project.dir,
           runtime,
         });

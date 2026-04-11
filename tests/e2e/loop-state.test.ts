@@ -54,7 +54,7 @@ describe("SPEC: Loop state machine (§2.2, §7.1, §7.2)", () => {
           `printf '1' >> "${counterFile}"`
         );
 
-        const result = await runCLI(["-n", "3", "noop"], {
+        const result = await runCLI(["run", "-n", "3", "noop"], {
           cwd: project.dir,
           runtime,
         });
@@ -83,7 +83,7 @@ describe("SPEC: Loop state machine (§2.2, §7.1, §7.2)", () => {
           `printf 'B' >> "${orderFile}"`
         );
 
-        const result = await runCLI(["-n", "4", "A"], {
+        const result = await runCLI(["run", "-n", "4", "A"], {
           cwd: project.dir,
           runtime,
         });
@@ -119,7 +119,7 @@ describe("SPEC: Loop state machine (§2.2, §7.1, §7.2)", () => {
           `printf 'C' >> "${orderFile}"`
         );
 
-        const result = await runCLI(["-n", "4", "A"], {
+        const result = await runCLI(["run", "-n", "4", "A"], {
           cwd: project.dir,
           runtime,
         });
@@ -141,7 +141,7 @@ describe("SPEC: Loop state machine (§2.2, §7.1, §7.2)", () => {
           `printf '1' >> "${counterFile}"\nprintf '{"stop":true}'`
         );
 
-        const result = await runCLI(["stopper"], {
+        const result = await runCLI(["run", "stopper"], {
           cwd: project.dir,
           runtime,
         });
@@ -167,7 +167,7 @@ if [ "$COUNT" -ge 4 ]; then
 fi`
         );
 
-        const result = await runCLI(["conditional-stop"], {
+        const result = await runCLI(["run", "conditional-stop"], {
           cwd: project.dir,
           runtime,
         });
@@ -192,7 +192,7 @@ fi`
 
         await createScript(project, "count", ".sh", counter(counterFile));
 
-        const result = await runCLI(["-n", "1", "count"], {
+        const result = await runCLI(["run", "-n", "1", "count"], {
           cwd: project.dir,
           runtime,
         });
@@ -209,7 +209,7 @@ fi`
 
         await createScript(project, "count", ".sh", counter(counterFile));
 
-        const result = await runCLI(["-n", "3", "count"], {
+        const result = await runCLI(["run", "-n", "3", "count"], {
           cwd: project.dir,
           runtime,
         });
@@ -236,7 +236,7 @@ fi`
           `printf 'B' >> "${orderFile}"`
         );
 
-        const result = await runCLI(["-n", "3", "A"], {
+        const result = await runCLI(["run", "-n", "3", "A"], {
           cwd: project.dir,
           runtime,
         });
@@ -263,7 +263,7 @@ fi`
           `printf 'B' >> "${orderFile}"`
         );
 
-        const result = await runCLI(["-n", "2", "A"], {
+        const result = await runCLI(["run", "-n", "2", "A"], {
           cwd: project.dir,
           runtime,
         });
@@ -280,7 +280,7 @@ fi`
 
         await createScript(project, "count", ".sh", counter(counterFile));
 
-        const result = await runCLI(["-n", "0", "count"], {
+        const result = await runCLI(["run", "-n", "0", "count"], {
           cwd: project.dir,
           runtime,
         });
@@ -472,7 +472,7 @@ console.log(JSON.stringify(outputs));
           `printf 'B' >> "${orderFile}"`
         );
 
-        const result = await runCLI(["-n", "3", "A"], {
+        const result = await runCLI(["run", "-n", "3", "A"], {
           cwd: project.dir,
           runtime,
         });
@@ -495,7 +495,7 @@ console.log(JSON.stringify(outputs));
           `printf '1' >> "${counterFile}"\nprintf '{"goto":"A"}'`
         );
 
-        const result = await runCLI(["-n", "2", "A"], {
+        const result = await runCLI(["run", "-n", "2", "A"], {
           cwd: project.dir,
           runtime,
         });
@@ -516,7 +516,7 @@ console.log(JSON.stringify(outputs));
           `printf '{"goto":"nonexistent"}'`
         );
 
-        const result = await runCLI(["-n", "2", "A"], {
+        const result = await runCLI(["run", "-n", "2", "A"], {
           cwd: project.dir,
           runtime,
         });
@@ -530,7 +530,7 @@ console.log(JSON.stringify(outputs));
         project = await createTempProject();
         await createBashScript(project, "A", `printf '{"goto":""}'`);
 
-        const result = await runCLI(["-n", "2", "A"], {
+        const result = await runCLI(["run", "-n", "2", "A"], {
           cwd: project.dir,
           runtime,
         });
@@ -558,7 +558,7 @@ console.log(JSON.stringify(outputs));
           'console.log(JSON.stringify({ result: "found" }));\n'
         );
 
-        const result = await runCLI(["-n", "2", "A"], {
+        const result = await runCLI(["run", "-n", "2", "A"], {
           cwd: project.dir,
           runtime,
         });
@@ -580,7 +580,7 @@ console.log(JSON.stringify(outputs));
 
         await createScript(project, "fail", ".sh", exitCode(1));
 
-        const result = await runCLI(["-n", "5", "fail"], {
+        const result = await runCLI(["run", "-n", "5", "fail"], {
           cwd: project.dir,
           runtime,
         });
@@ -594,7 +594,7 @@ console.log(JSON.stringify(outputs));
 
         await createScript(project, "fail2", ".sh", exitCode(2));
 
-        const result = await runCLI(["-n", "5", "fail2"], {
+        const result = await runCLI(["run", "-n", "5", "fail2"], {
           cwd: project.dir,
           runtime,
         });
@@ -619,7 +619,7 @@ fi
 printf '{"result":"ok"}'`
         );
 
-        const result = await runCLI(["-n", "5", "fail-on-3"], {
+        const result = await runCLI(["run", "-n", "5", "fail-on-3"], {
           cwd: project.dir,
           runtime,
         });
@@ -635,7 +635,7 @@ printf '{"result":"ok"}'`
 
         await createScript(project, "stderr-script", ".sh", writeStderr("custom-error-msg"));
 
-        const result = await runCLI(["-n", "1", "stderr-script"], {
+        const result = await runCLI(["run", "-n", "1", "stderr-script"], {
           cwd: project.dir,
           runtime,
         });

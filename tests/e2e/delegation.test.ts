@@ -611,7 +611,7 @@ echo "99.0.0-local"
 
     const { result, sendSignal, waitForStderr } = spawnGlobalWithSignal(
       fixture.globalBinPath,
-      ["-n", "1", "sleeper"],
+      ["run", "-n", "1", "sleeper"],
       { cwd: fixture.projectDir }
     );
 
@@ -645,7 +645,7 @@ echo "99.0.0-local"
 
     const { result, sendSignal, waitForStderr } = spawnGlobalWithSignal(
       fixture.globalBinPath,
-      ["-n", "1", "sleeper"],
+      ["run", "-n", "1", "sleeper"],
       { cwd: fixture.projectDir }
     );
 

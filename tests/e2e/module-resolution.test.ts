@@ -203,7 +203,7 @@ export async function input() {
 `,
     });
 
-    const result = await runCLI(["-n", "1", "shadow-test"], { cwd: project.dir });
+    const result = await runCLI(["run", "-n", "1", "shadow-test"], { cwd: project.dir });
 
     // The shadow package's marker file must exist, proving local resolution
     expect(existsSync(markerPath)).toBe(true);

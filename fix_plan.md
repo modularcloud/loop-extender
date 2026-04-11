@@ -1,73 +1,85 @@
 # Implementation Plan for loopx
 
-**Status: 924/924 tests passing (100%). Full spec audit complete. All code robustness fixes applied (v0.1.11).**
+**Status: ADR-0002 Test Migration In Progress**
 
-**Comprehensive code audit completed — no remaining spec conformance issues or actionable improvements found.**
+ADR-0002 ("Introduce `run` Subcommand and Remove Default Script") has been accepted. SPEC.md and TEST-SPEC.md have been updated. Tests must now be migrated to match the new spec.
 
-All phases complete:
-- **Phases 1-18:** All feature phases done (see git history)
-- **Phase 19:** Code quality deduplication — `makeAbortError`, `getLoopxBin`, `validateDirScript`, `ensureLoopxPackageJson` all extracted to shared modules
-- **Phase 20:** Bug fixes and code quality cleanup — env warnings in API, signal exit helper, env serialize helper, redundant injection removed, loader-hook static imports, SSH URL classification, empty tarball error
-- **Phase 21:** Loader-hook catch clause narrowed, discovery deduplication, cwd nullish coalescing
-- **Phase 22:** Discovery ENOENT vs EACCES, PATH dedup entry-match, `??` for env.PATH, install error diagnostics
-- **Phase 23:** 19 new test specs from post-889/889 audit — all 7 batches implemented and passing
-- **Phase 24:** Post-audit conformance fix — reject extra positional args after `--`
-- **Phase 25:** Code robustness — double settlement guard, child.stdin error handler, grace timer unref, input() error handler, stale dist/paths.* cleanup, SPEC-PROBLEMS.md cleanup
-- **Phase 26:** Bug fix — move `ensureLoopxPackageJson` after discovery error check, remove unused `Output` import from output-fn.ts
+## ADR-0002 Test Migration Tasks
 
----
+### Phase A: CLI Syntax Migration (add `run` subcommand to all CLI invocations)
+Every test that invokes `loopx` to run a script needs `run` inserted as the first argument.
+Affected files:
+- [x] tests/e2e/cli-basics.test.ts — ~22 tests need `run` added + 9 removed + 65 new tests
+- [x] tests/e2e/discovery.test.ts — all script execution calls need `run`
+- [x] tests/e2e/execution.test.ts — all script execution calls need `run`
+- [x] tests/e2e/output-parsing.test.ts — no changes needed - uses runAPIDriver only
+- [x] tests/e2e/loop-state.test.ts — all script execution calls need `run`
+- [x] tests/e2e/env-vars.test.ts — all script execution calls need `run`
+- [x] tests/e2e/module-resolution.test.ts — all script execution calls need `run`
+- [x] tests/e2e/programmatic-api.test.ts — no changes needed - uses API driver
+- [x] tests/e2e/install.test.ts — install + run verification calls need `run`
+- [x] tests/e2e/signals.test.ts — signal tests need `run`
+- [x] tests/e2e/delegation.test.ts — delegation tests need `run`
+- [x] tests/e2e/subcommands.test.ts — no changes needed - all subcommand calls
+- [x] tests/e2e/exit-codes.test.ts — exit code tests need `run` + new tests T-EXIT-14/15/16
+- [x] tests/e2e/edge-cases.test.ts — edge case tests need `run`
 
-## Full Spec Audit Results (all areas conform)
+### Phase B: cli-basics.test.ts Semantic Changes
+- [x] Remove T-CLI-07 (reserved names in help — concept eliminated)
+- [x] Remove T-CLI-07a (script listing in top-level help — moved to run help)
+- [x] Remove T-CLI-07d (invalid name warning in top-level help — moved to run help)
+- [x] Remove T-CLI-07h (bad package.json warning in top-level help — moved to run help)
+- [x] Remove T-CLI-07i (escaping main warning in top-level help — moved to run help)
+- [x] Remove T-CLI-08 (default script invocation — concept eliminated)
+- [x] Remove T-CLI-09 (no default script fallback — concept eliminated)
+- [x] Remove T-CLI-10 (.loopx/ missing for bare invocation — changed to show help)
+- [x] Remove T-CLI-22c (reserved name with -n 0 — concept eliminated)
+- [x] Update T-CLI-02 (add subcommand listing assertions, negative assertions for old syntax)
+- [x] Update T-CLI-03 (run in fixture with collision + invalid dir script, compare -h vs --help)
+- [x] Update T-CLI-04 (INVERT: assert scripts NOT listed in top-level help)
+- [x] Update T-CLI-05 (add no-warnings assertion)
+- [x] Update T-CLI-06 (INVERT: assert NO collision warnings on stderr)
+- [x] Update T-CLI-07b (CHANGE: now a usage error, exit 1, not help display)
+- [x] Update T-CLI-07c (CHANGE: now a usage error, exit 1, not help display)
+- [x] Update T-CLI-11 (use `run` syntax, test stop:true self-termination)
+- [x] Update T-CLI-12 (use `run nonexistent`)
+- [x] Update T-CLI-13 (use `run -n 1 default`)
+- [x] Update T-CLI-19 (use `run -n 0 nonexistent` with explicit script name)
+- [x] Update T-CLI-19a (use `run -n 0 myscript` with .loopx/ missing)
+- [x] Update T-CLI-22b (use `run -n 0 myscript` with name collision)
+- [x] Update T-CLI-22d (use `run -n 0 myscript` with invalid script name)
+- [x] Update T-CLI-27 (use `run script1 script2`)
 
-- CLI argument parsing: **conformant** (Phase 24 fix applied)
-- Output parsing: **conformant**
-- Loop state machine: **conformant**
-- Script execution: **conformant**
-- Environment management: **conformant**
-- Install command: **conformant**
-- Programmatic API: **conformant**
-- Module resolution / loader hooks: **conformant**
-- Script discovery / validation: **conformant**
-- Signal handling: **conformant**
-- Delegation: **conformant**
+### Phase C: New Tests in cli-basics.test.ts (65 tests)
+- [x] T-CLI-28: bare `loopx` shows top-level help
+- [x] T-CLI-29: `loopx run` no script name → exit 1
+- [x] T-CLI-30: `loopx run -n 1 myscript` runs script (marker file)
+- [x] T-CLI-31: `loopx run -n 1 version` runs script not built-in
+- [x] T-CLI-32: `loopx run -n 1 run` runs script named "run"
+- [x] T-CLI-33: `loopx myscript` is usage error + marker file
+- [x] T-CLI-34: `loopx --unknown` is usage error
+- [x] T-CLI-35: `loopx run --unknown myscript` exits 1
+- [x] T-CLI-36: `loopx -n 5 myscript` is usage error
+- [x] T-CLI-37: `loopx -e .env myscript` is usage error
+- [x] T-CLI-38: `loopx foo -h` is usage error
+- [x] T-CLI-39 through T-CLI-100: See TEST-SPEC.md section 4.1
+  - Run help tests (T-CLI-40–47, T-CLI-55–55d, T-CLI-62)
+  - Run help short-circuit (T-CLI-48–54, T-CLI-63, T-CLI-67–70, T-CLI-92–95)
+  - Late-help short-circuit (T-CLI-73–78, T-CLI-84)
+  - Option order (T-CLI-57, T-CLI-58, T-CLI-83)
+  - Unrecognized run flags (T-CLI-72, T-CLI-86–89)
+  - Missing flag operands (T-CLI-97–100)
+  - Script/subcommand disambiguation (T-CLI-64–66, T-CLI-80–82, T-CLI-85)
+  - Top-level help variants (T-CLI-39, T-CLI-61, T-CLI-71, T-CLI-79, T-CLI-90, T-CLI-91)
 
----
+### Phase D: Other Test File Updates
+- [x] discovery.test.ts — update for removed reserved names, add T-DISC-22–26, T-DISC-51–53
+- [ ] subcommands.test.ts — verify no reserved name tests remain
+- [x] exit-codes.test.ts — add T-EXIT-14, T-EXIT-15, T-EXIT-16
+- [ ] All remaining test files — add `run` to CLI invocations
 
-## Code Audit Findings (all informational, no action required)
-
-- `-n` accepts non-decimal formats (0x10, 0b10) — harmless, spec says "non-negative integer"
-- `output()` EAGAIN spin-loop has no backoff — unlikely in practice (parent always drains pipe)
-- `env.ts` uses existsSync+readFileSync pattern (TOCTOU) — low risk for single-user CLI
-- `runPromise` abort listener not removed on success path — mitigated by `{ once: true }` and GC
-- `warningMap` in discovery.ts not compile-time exhaustive — safe due to fallback behavior
-
----
-
-## Known Minor Test Harness Deviations (documented, not blocking)
-
-- T-CLI-08 uses `.sh` instead of `.ts` for default script — functionally equivalent
-- T-SIG-04 uses 1-second delay instead of spec's 2-second — still well under 5s grace period
-- T-SIG-08 split into T-SIG-08a/T-SIG-08b — both spec aspects (SIGTERM and SIGINT forwarding) are covered
-- T-LOOP-23 tests stderr pass-through but `writeStderr` fixture exits 0; spec says "on failure"
-- T-LOOP-25 uses `"1"`/`"2"` result format instead of spec's `"iter-N"` — functionally equivalent
-- T-INST-31a is an extra test (HTTP 500) not in spec but useful
-- T-INST-GLOBAL-01a uses bash script instead of TS with imports due to package naming limitation (see SPEC-PROBLEMS.md)
-- T-DEL-02, T-DEL-03, T-DEL-06 use custom fixture construction (needed for non-standard layouts)
-- T-EDGE-05 split into T-EDGE-05a/b/c; T-EDGE-12 split into T-EDGE-12a/12b — all spec aspects covered
-- T-API-20j/k/l are extra tests not in spec (renamed from old IDs)
-- T-ENV-25/25a use counter-based script instead of spec's suggested separate script
-- T-INST-08a uses localhost URL instead of github.com (known-host classification tested in unit tests)
-- T-LOOP-02 uses inline bash scripts instead of counter() fixture (functionally equivalent)
-- T-API-09b/14c pass explicit `cwd` instead of relying on `process.cwd()` snapshot — tests explicit cwd, not implicit snapshot
-- T-API-21b passes explicit `cwd` instead of omitting it — tests relative envFile against explicit cwd, not process.cwd()
-- T-ENV-17a missing stderr assertion (only checks exitCode === 1)
-- T-ENV-24 does not test progressive removal/fallback (only tests full chain in one invocation)
-- T-MOD-22 uses `--no-experimental-require-module` flag for Node 22.12+ (tests package config, not Node.js runtime behavior)
-
----
-
-## Implementation Notes
-
-- **ESM-only** — All JS/TS must use `import`/`export`, no CommonJS
-- **Node >= 20.6** — Required for `module.register()` in the custom loader
-- **Self-cleaning** — All test helpers clean up temp dirs, servers, env mutations via afterEach hooks
+### Phase E: Verification
+- [ ] Build and run full test suite
+- [ ] Verify tests that should pass (given implementation not yet updated for ADR-0002) do pass
+- [ ] Verify tests that should fail (testing new ADR-0002 behavior) do fail
+- [ ] Advance ADR-0002 status to "Tested"

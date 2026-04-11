@@ -830,7 +830,7 @@ describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
             expect(installResult.exitCode).toBe(0);
 
             // Now run the installed script
-            const runResult = await runCLI(["-n", "1", "runnable"], {
+            const runResult = await runCLI(["run", "-n", "1", "runnable"], {
               cwd: project!.dir,
               runtime,
             });
@@ -1191,38 +1191,100 @@ describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
           async () => {
             const result = await runCLI(
               ["install", "testorg/foo"],
-              { cwd: project.dir, runtime },
+              { cwd: project!.dir, runtime },
             );
 
             expect(result.exitCode).toBe(1);
             expect(result.stderr.length).toBeGreaterThan(0);
             // No directory created for the install
-            expect(existsSync(join(project.loopxDir, "foo"))).toBe(false);
+            expect(existsSync(join(project!.loopxDir, "foo"))).toBe(false);
             // Both pre-existing files still intact
-            expect(existsSync(join(project.loopxDir, "foo.sh"))).toBe(true);
-            expect(existsSync(join(project.loopxDir, "foo.ts"))).toBe(true);
+            expect(existsSync(join(project!.loopxDir, "foo.sh"))).toBe(true);
+            expect(existsSync(join(project!.loopxDir, "foo.ts"))).toBe(true);
           },
         );
       });
 
-      it("T-INST-28: reserved name (output.ts) -> error, nothing saved", async () => {
-        httpServer = await startLocalHTTPServer([
+      it("T-INST-28: formerly reserved names (output, env, install, version, run) install and run successfully", async () => {
+        const formerlyReserved = ["output", "env", "install", "version", "run"];
+
+        for (const name of formerlyReserved) {
+          project = await createTempProject();
+          const markerFile = join(project.dir, `marker-${name}.txt`);
+          const scriptBody = [
+            `import { writeFileSync } from "node:fs";`,
+            `writeFileSync(${JSON.stringify(markerFile)}, "ran-${name}");`,
+            `console.log(JSON.stringify({ result: "${name}-ok" }));`,
+          ].join("\n") + "\n";
+
+          httpServer = await startLocalHTTPServer([
+            {
+              path: `/${name}.ts`,
+              contentType: "text/plain",
+              body: scriptBody,
+            },
+          ]);
+
+          const installResult = await runCLI(
+            ["install", `${httpServer.url}/${name}.ts`],
+            { cwd: project.dir, runtime },
+          );
+
+          expect(installResult.exitCode, `expected "${name}.ts" to install successfully`).toBe(0);
+          expect(existsSync(join(project.loopxDir, `${name}.ts`))).toBe(true);
+
+          // Verify the installed script is runnable
+          const runResult = await runCLI(["run", "-n", "1", name], {
+            cwd: project.dir,
+            runtime,
+          });
+          expect(runResult.exitCode, `expected "loopx run -n 1 ${name}" to succeed`).toBe(0);
+          expect(existsSync(markerFile)).toBe(true);
+          expect(readFileSync(markerFile, "utf-8")).toBe(`ran-${name}`);
+
+          await httpServer.close();
+          httpServer = null;
+          await project.cleanup();
+          project = null;
+        }
+      });
+
+      it("T-INST-28a: directory script named after formerly reserved name installs and runs successfully", async () => {
+        project = await createTempProject();
+        const markerFile = join(project.dir, "marker-version-dir.txt");
+        const scriptBody = [
+          `import { writeFileSync } from "node:fs";`,
+          `writeFileSync(${JSON.stringify(markerFile)}, "ran-version-dir");`,
+          `console.log(JSON.stringify({ result: "version-dir-ok" }));`,
+        ].join("\n") + "\n";
+
+        gitServer = await startLocalGitServer([
           {
-            path: "/output.ts",
-            contentType: "text/plain",
-            body: `console.log("should not install");\n`,
+            name: "version",
+            files: {
+              "package.json": validPackageJson("index.ts"),
+              "index.ts": scriptBody,
+            },
           },
         ]);
 
-        project = await createTempProject();
-        const result = await runCLI(
-          ["install", `${httpServer.url}/output.ts`],
+        const installResult = await runCLI(
+          ["install", `${gitServer.url}/version.git`],
           { cwd: project.dir, runtime },
         );
 
-        expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        expect(existsSync(join(project.loopxDir, "output.ts"))).toBe(false);
+        expect(installResult.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "version"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "version", "package.json"))).toBe(true);
+
+        // Verify the installed directory script is runnable
+        const runResult = await runCLI(["run", "-n", "1", "version"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(runResult.exitCode).toBe(0);
+        expect(existsSync(markerFile)).toBe(true);
+        expect(readFileSync(markerFile, "utf-8")).toBe("ran-version-dir");
       });
 
       it("T-INST-29: invalid name (-invalid.ts) -> error, nothing saved", async () => {
@@ -1850,7 +1912,7 @@ printf '{"result":"global-ok"}'
 
         // 4. Run loopx from the global prefix
         const binPath = join(globalPrefix, "bin", "loopx");
-        const result = execSync(`"${binPath}" -n 1`, {
+        const result = execSync(`"${binPath}" run -n 1`, {
           cwd: fixtureDir,
           stdio: "pipe",
           env: {
@@ -1927,7 +1989,7 @@ printf '{"result":"bun-global-done"}'
           const loopxPkg = JSON.parse(readFileSync(join(loopxPkgDir, "package.json"), "utf-8"));
           const pkgName = loopxPkg.name as string;
           const binJsPath = join(globalPrefix, "lib", "node_modules", pkgName, "bin.js");
-          execSync(`bun "${binJsPath}" -n 1`, {
+          execSync(`bun "${binJsPath}" run -n 1`, {
             cwd: fixtureDir,
             stdio: "pipe",
             env: {

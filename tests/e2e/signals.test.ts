@@ -129,7 +129,7 @@ describe("SPEC: Signal Handling", () => {
     );
 
     const { result, sendSignal, waitForStderr } = runCLIWithSignal(
-      ["-n", "1", "sig-sleep"],
+      ["run", "-n", "1", "sig-sleep"],
       { cwd: project.dir, timeout: 30_000 },
     );
 
@@ -158,7 +158,7 @@ describe("SPEC: Signal Handling", () => {
     );
 
     const { result, sendSignal, waitForStderr } = runCLIWithSignal(
-      ["-n", "1", "sig-sleep"],
+      ["run", "-n", "1", "sig-sleep"],
       { cwd: project.dir, timeout: 30_000 },
     );
 
@@ -186,7 +186,7 @@ describe("SPEC: Signal Handling", () => {
     );
 
     const { result, sendSignal, waitForStderr } = runCLIWithSignal(
-      ["-n", "1", "sig-sleep"],
+      ["run", "-n", "1", "sig-sleep"],
       { cwd: project.dir, timeout: 30_000 },
     );
 
@@ -224,7 +224,7 @@ describe("SPEC: Signal Handling", () => {
     );
 
     const { result, sendSignal, waitForStderr } = runCLIWithSignal(
-      ["-n", "1", "sig-trap-exit"],
+      ["run", "-n", "1", "sig-trap-exit"],
       { cwd: project.dir, timeout: 30_000 },
     );
 
@@ -256,7 +256,7 @@ describe("SPEC: Signal Handling", () => {
       );
 
       const { result, sendSignal, waitForStderr } = runCLIWithSignal(
-        ["-n", "1", "sig-trap-ignore"],
+        ["run", "-n", "1", "sig-trap-ignore"],
         { cwd: project.dir, timeout: 30_000 },
       );
 
@@ -298,7 +298,7 @@ describe("SPEC: Signal Handling", () => {
     );
 
     const { result, sendSignal, waitForStderr } = runCLIWithSignal(
-      ["-n", "1", "sig-grandchild"],
+      ["run", "-n", "1", "sig-grandchild"],
       { cwd: project.dir, timeout: 30_000 },
     );
 
@@ -351,7 +351,7 @@ printf '{"result":"%s"}' "$COUNT"
       await createScript(project, "iter-counter", ".sh", scriptContent);
 
       const { result, sendSignal } = runCLIWithSignal(
-        ["-n", "20", "iter-counter"],
+        ["run", "-n", "20", "iter-counter"],
         { cwd: project.dir, timeout: 30_000 },
       );
 
@@ -394,7 +394,7 @@ printf '{"result":"%s"}' "$COUNT"
     );
 
     const { result, sendSignal, waitForStderr } = runCLIWithSignal(
-      ["-n", "1", "sig-report"],
+      ["run", "-n", "1", "sig-report"],
       { cwd: project.dir, timeout: 30_000 },
     );
 
@@ -422,7 +422,7 @@ printf '{"result":"%s"}' "$COUNT"
     );
 
     const { result, sendSignal, waitForStderr } = runCLIWithSignal(
-      ["-n", "1", "sig-report"],
+      ["run", "-n", "1", "sig-report"],
       { cwd: project.dir, timeout: 30_000 },
     );
 
