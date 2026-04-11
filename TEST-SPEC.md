@@ -461,7 +461,7 @@ The spec says `-h` / `--help` within `run` is a full short-circuit that ignores 
 
 #### Bare Invocation & Top-Level Parsing Errors
 
-- **T-CLI-28**: `loopx` with no arguments shows top-level help (equivalent to `loopx -h`). Exits 0. Assert that stdout is identical to `loopx -h` output and that no script discovery is performed — when `.loopx/` contains scripts, assert stdout does not contain any script names and stderr does not contain discovery warnings. *(Spec 4.1, 4.2)*
+- **T-CLI-28**: `loopx` with no arguments shows top-level help (equivalent to `loopx -h`). Exits 0. Set up `.loopx/` containing a name collision (e.g., `example.sh` and `example.ts`) and an invalid directory script (broken `package.json`). Assert that stdout is identical to `loopx -h` output, that stdout does not contain any script names, and that stderr does not contain any discovery or validation warnings (no collision warnings, no invalid-directory-script warnings). This proves bare `loopx` truly behaves as top-level help and does not inspect `.loopx/`. *(Spec 4.1, 4.2, 5.4)*
 - **T-CLI-33**: `loopx myscript` is a usage error (unrecognized subcommand, no implicit fallback to `run`). Create `.loopx/myscript.sh` that writes a known value to a marker file. Assert exit code 1 AND assert the marker file does not exist (proving the script was not executed despite being present). Without the marker-file assertion, an implementation that falls back to implicit script execution when a matching script exists could pass on exit code alone. *(Spec 4.1)*
 - **T-CLI-34**: `loopx --unknown` is a usage error (unrecognized top-level flag). Exit code 1. *(Spec 4.2)*
 - **T-CLI-71**: `loopx -x` is a usage error (unrecognized top-level short flag). Exit code 1. This covers the short-flag parser surface alongside `--unknown` (long flag). *(Spec 4.2)*
@@ -475,7 +475,7 @@ The spec says `-h` / `--help` within `run` is a full short-circuit that ignores 
 #### Script Invocation via `run`
 
 - **T-CLI-30**: `loopx run -n 1 myscript` with `.loopx/myscript.sh` runs the script. Assert via marker file: the script writes a known value to a marker file, confirming execution. *(Spec 4.1)*
-- **T-CLI-11**: `loopx run -n 1 myscript` with `.loopx/myscript.sh` runs the script. Assert via counter file. *(Spec 4.1)*
+- **T-CLI-11**: `loopx run myscript` (no `-n`, no `-e`) with `.loopx/myscript.sh` that outputs `{"stop":true}` on the first iteration. Assert via marker file that the script executed AND assert exit code 0. This is the canonical ADR-0002 invocation form with no options — proving that `loopx run <script-name>` works as a self-contained command when the script self-terminates. *(Spec 4.1)*
 - **T-CLI-12**: `loopx run nonexistent` with `.loopx/` existing but no matching script exits with code 1. *(Spec 4.1)*
 - **T-CLI-13**: `loopx run -n 1 default` runs a script named `default` as an ordinary script — `default` has no special behavior. Assert via marker file. *(Spec 4.1)*
 - **T-CLI-29**: `loopx run` with no script name is a usage error (exit code 1). This does not inspect `.loopx/` or perform discovery. *(Spec 4.1)*
@@ -520,6 +520,10 @@ Within `run`, options and `<script-name>` may appear in any order. The following
 
 - **T-CLI-35**: `loopx run --unknown myscript` exits with code 1 (unrecognized flag within `run` is a usage error). *(Spec 4.2)*
 - **T-CLI-72**: `loopx run -x myscript` exits with code 1 (unrecognized short flag within `run` is a usage error). This covers the short-flag parser surface alongside `--unknown` (long flag). *(Spec 4.2)*
+- **T-CLI-86**: `loopx run myscript --unknown` exits with code 1 (unrecognized long flag after script name is still a usage error). Create `.loopx/myscript.sh` that writes a known value to a marker file. Assert exit code 1 AND assert the marker file does not exist (proving the script was not executed). This complements T-CLI-35 by proving post-positional flags are also rejected in normal mode, not just under the `-h` short-circuit. *(Spec 4.2)*
+- **T-CLI-87**: `loopx run myscript -x` exits with code 1 (unrecognized short flag after script name). Create `.loopx/myscript.sh` that writes a known value to a marker file. Assert exit code 1 AND assert the marker file does not exist. Complements T-CLI-72. *(Spec 4.2)*
+- **T-CLI-88**: `loopx run myscript -n 1 -n 2` exits with code 1 (duplicate `-n` after script name). Create `.loopx/myscript.sh` that writes a known value to a marker file. Assert exit code 1 AND assert the marker file does not exist. Complements T-CLI-20a by proving duplicate detection works regardless of positional argument order. *(Spec 4.2)*
+- **T-CLI-89**: `loopx run myscript -e a.env -e b.env` exits with code 1 (duplicate `-e` after script name). Create `.loopx/myscript.sh` that writes a known value to a marker file and create `a.env` as a valid env file. Assert exit code 1 AND assert the marker file does not exist. Complements T-CLI-20b. *(Spec 4.2)*
 
 #### CLI `-e` Option
 
@@ -1451,12 +1455,12 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21 |
 | 4.1 | Running Scripts (run subcommand) | T-CLI-11–13, T-CLI-27–33, T-CLI-59–60, T-CLI-64–66, T-CLI-80–82, T-CLI-85, T-DISC-22–26, T-DISC-52 |
-| 4.2 | Options (-n, -e, run -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–85 |
+| 4.2 | Options (-n, -e, run -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–89 |
 | 4.3 | Subcommands | T-SUB-01–19, T-SUB-06a–06b, T-SUB-14a–14k, T-CLI-66, T-CLI-80–82, T-DISC-46a–46b |
-| 5.1 | Discovery | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38b, T-DISC-47–53, T-CLI-55–55d, T-CLI-59–60, T-CLI-85 |
+| 5.1 | Discovery | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38b, T-DISC-47–53, T-CLI-42–43, T-CLI-46–47, T-CLI-55–55d, T-CLI-59–60, T-CLI-85 |
 | 5.2 | Name Collision | T-DISC-18–21, T-CLI-22b, T-CLI-43 |
 | 5.3 | Name Restrictions | T-DISC-27–32, T-DISC-30a–30b, T-CLI-44, T-CLI-22d, T-EDGE-05 |
-| 5.4 | Validation Scope | T-DISC-39–46b, T-SUB-06, T-SUB-13, T-SUB-19 |
+| 5.4 | Validation Scope | T-DISC-39–46b, T-SUB-06, T-SUB-13, T-SUB-19, T-CLI-28 |
 | 6.1 | Working Directory | T-EXEC-01–04 |
 | 6.2 | Bash Scripts | T-EXEC-05–07 |
 | 6.3 | JS/TS Scripts | T-EXEC-08–14 |
