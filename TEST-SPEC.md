@@ -400,7 +400,7 @@ Each test is identified by a unique ID (`T-<SECTION>-<NUMBER>`), references a SP
 
 #### Top-Level Help
 
-- **T-CLI-02**: `loopx -h` prints usage text containing "loopx" and "usage" (case-insensitive), exits 0. Does not list scripts — top-level help performs no script discovery. *(Spec 4.2, 11.1)*
+- **T-CLI-02**: `loopx -h` prints usage text containing "loopx" and "usage" (case-insensitive), exits 0. Assert that the output lists the available subcommands: `run`, `version`, `output`, `env`, and `install` must all appear in the help text. Does not list scripts — top-level help performs no script discovery. *(Spec 4.2, 11.1)*
 - **T-CLI-03**: `loopx --help` produces the same output as `-h`. *(Spec 4.2, 11.1)*
 - **T-CLI-04**: `loopx -h` with `.loopx/` containing scripts does NOT list discovered script names in output. Top-level help performs no discovery. Assert that stdout does not contain any of the script names. *(Spec 4.2, 11.1)*
 - **T-CLI-05**: `loopx -h` without `.loopx/` directory still prints help (no error). No script list, no warnings. *(Spec 4.2, 11.1)*
@@ -410,10 +410,11 @@ Each test is identified by a unique ID (`T-<SECTION>-<NUMBER>`), references a SP
 - **T-CLI-07g**: `loopx -h --invalid-flag` prints top-level help and exits 0 (top-level `-h` takes precedence over invalid flags). *(Spec 4.2)*
 - **T-CLI-07j**: `loopx -h -e nonexistent.env` prints top-level help and exits 0 (top-level `-h` takes precedence over `-e`). The nonexistent env file is not read or validated. *(Spec 4.2)*
 - **T-CLI-39**: `loopx -h run foo` shows top-level help (not run help) and exits 0. Top-level `-h` takes precedence over everything that follows, including `run` subcommand dispatch. *(Spec 4.2)*
+- **T-CLI-61**: `loopx --help run foo` shows top-level help (not run help) and exits 0. Same behavior as `loopx -h run foo` — verifies that the `--help` long form has identical precedence semantics to `-h` when followed by additional arguments. *(Spec 4.2)*
 
 #### Run Help
 
-- **T-CLI-40**: `loopx run -h` with `.loopx/` containing scripts prints run-specific help listing discovered script names. Exits 0. *(Spec 4.2, 11.2)*
+- **T-CLI-40**: `loopx run -h` with `.loopx/` containing scripts prints run-specific help that includes: (a) run syntax, (b) the `-n` and `-e` options with descriptions, and (c) a list of discovered script names. Assert that all three are present in the output. Exits 0. *(Spec 4.2, 11.2)*
 - **T-CLI-41**: `loopx run --help` produces the same output as `loopx run -h`. *(Spec 4.2, 11.2)*
 - **T-CLI-42**: `loopx run -h` without `.loopx/` directory still prints run help with a warning that the directory was not found. The discovered-scripts section is omitted. Exits 0. *(Spec 11.2)*
 - **T-CLI-43**: `loopx run -h` with `.loopx/` containing name collisions prints run help with warnings on stderr about the conflicting entries. Exits 0. *(Spec 5.2, 11.2)*
@@ -421,6 +422,7 @@ Each test is identified by a unique ID (`T-<SECTION>-<NUMBER>`), references a SP
 - **T-CLI-45**: `loopx run -h` with `.loopx/` containing scripts lists script names and includes type information for each. Assert that each discovered script name appears in the output and that the output contains the file type (e.g., "ts", "sh") somewhere in the help text. Do not assert proximity between the name and type text, and do not assert an exact rendering format — only that both the name and its type are present. *(Spec 11.2)*
 - **T-CLI-46**: `loopx run -h` with `.loopx/` containing a directory script with a bad `package.json` (invalid JSON) prints run help with a non-fatal warning on stderr about the invalid directory script. Help still exits 0. The invalid directory script is not listed in the script listing. *(Spec 5.1, 11.2)*
 - **T-CLI-47**: `loopx run -h` with `.loopx/` containing a directory script whose `main` escapes the directory (e.g., `"main": "../escape.ts"`) prints run help with a non-fatal warning on stderr. Help still exits 0. *(Spec 5.1, 11.2)*
+- **T-CLI-62**: `loopx run myscript --help` shows run help and exits 0. Same behavior as `loopx run myscript -h` — verifies that the `--help` long form triggers the run-help short-circuit identically to `-h` when appearing after a script name. *(Spec 4.2, 11.2)*
 
 #### Run Help Short-Circuit
 
@@ -433,11 +435,16 @@ Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows
 - **T-CLI-52**: `loopx run -h -n 5 -n 10` shows run help and exits 0 (duplicate `-n` not rejected under help). *(Spec 4.2)*
 - **T-CLI-53**: `loopx run -h foo bar` shows run help and exits 0 (extra positional not rejected under help). *(Spec 4.2)*
 - **T-CLI-54**: `loopx run -h --unknown` shows run help and exits 0 (unknown flag not rejected under help). *(Spec 4.2)*
-- **T-CLI-55**: `loopx run -h` with a directory script that has an invalid `main` field shows run help with a non-fatal discovery warning (not just collisions/name restrictions). *(Spec 5.1, 11.2)*
+- **T-CLI-63**: `loopx run -h -e a.env -e b.env` shows run help and exits 0 (duplicate `-e` not rejected under help). *(Spec 4.2)*
+- **T-CLI-55**: `loopx run -h` with `.loopx/` containing a directory script with an unreadable `package.json` (e.g., `chmod 000`) prints run help with a non-fatal warning on stderr about the unreadable file. Help still exits 0. **This test is conditional on `process.getuid() !== 0`.** *(Spec 5.1, 11.2)*
+- **T-CLI-55a**: `loopx run -h` with `.loopx/` containing a directory script whose `package.json` has no `main` field (e.g., `{"name": "foo"}`) prints run help with a non-fatal warning on stderr about the missing `main`. Help still exits 0. *(Spec 5.1, 11.2)*
+- **T-CLI-55b**: `loopx run -h` with `.loopx/` containing a directory script whose `package.json` has a non-string `main` (e.g., `{"main": 42}`) prints run help with a non-fatal warning on stderr about the invalid `main` type. Help still exits 0. *(Spec 5.1, 11.2)*
+- **T-CLI-55c**: `loopx run -h` with `.loopx/` containing a directory script whose `main` points to an unsupported extension (e.g., `{"main": "index.py"}`) prints run help with a non-fatal warning on stderr about the unsupported extension. Help still exits 0. *(Spec 5.1, 11.2)*
+- **T-CLI-55d**: `loopx run -h` with `.loopx/` containing a directory script whose `main` points to a file that does not exist (e.g., `{"main": "missing.ts"}`) prints run help with a non-fatal warning on stderr about the nonexistent file. Help still exits 0. *(Spec 5.1, 11.2)*
 
 #### Bare Invocation & Top-Level Parsing Errors
 
-- **T-CLI-28**: `loopx` with no arguments shows top-level help (equivalent to `loopx -h`). Exits 0. No script discovery is performed. *(Spec 4.1, 4.2)*
+- **T-CLI-28**: `loopx` with no arguments shows top-level help (equivalent to `loopx -h`). Exits 0. Assert that stdout is identical to `loopx -h` output and that no script discovery is performed — when `.loopx/` contains scripts, assert stdout does not contain any script names and stderr does not contain discovery warnings. *(Spec 4.1, 4.2)*
 - **T-CLI-33**: `loopx myscript` is a usage error (unrecognized subcommand, no implicit fallback to `run`). Exit code 1. *(Spec 4.1)*
 - **T-CLI-34**: `loopx --unknown` is a usage error (unrecognized top-level flag). Exit code 1. *(Spec 4.2)*
 - **T-CLI-36**: `loopx -n 5 myscript` is a usage error (top-level `-n` rejected — only `-h` is recognized at top level). Exit code 1. *(Spec 4.2)*
@@ -453,8 +460,17 @@ Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows
 - **T-CLI-12**: `loopx run nonexistent` with `.loopx/` existing but no matching script exits with code 1. *(Spec 4.1)*
 - **T-CLI-13**: `loopx run default` runs a script named `default` as an ordinary script — `default` has no special behavior. Assert via marker file. *(Spec 4.1)*
 - **T-CLI-29**: `loopx run` with no script name is a usage error (exit code 1). This does not inspect `.loopx/` or perform discovery. *(Spec 4.1)*
+- **T-CLI-59**: `loopx run -n 5` (options present but no script name) is a usage error (exit code 1). ADR-0002 explicitly calls out this form as an error — zero positional arguments after options is not valid. *(Spec 4.1)*
+- **T-CLI-60**: `loopx run` with `.loopx/` containing a name collision and an invalid directory script (broken `package.json`) — still exits with code 1 as a usage error (missing script name), AND stderr does not contain any discovery or validation warnings. This proves that the no-script-name error is raised before `.loopx/` is inspected. *(Spec 4.1, 5.1)*
 - **T-CLI-31**: `loopx run version` with `.loopx/version.sh` runs the script named `version`, not the built-in subcommand. Assert via marker file that the script executed and the output is the script's, not the version string. *(Spec 4.1)*
 - **T-CLI-32**: `loopx run run` with `.loopx/run.sh` runs the script named `run`. Assert via marker file. *(Spec 4.1)*
+
+#### Option Order
+
+Within `run`, options and `<script-name>` may appear in any order. The following tests verify normal execution (not just help) with non-standard option placement.
+
+- **T-CLI-57**: `loopx run myscript -n 1` (script name before `-n`) runs the script for exactly 1 iteration. Assert via counter file that the script ran exactly once. This proves that options after the script name are accepted during normal execution, not just under the `-h` short-circuit. *(Spec 4.2)*
+- **T-CLI-58**: `loopx run myscript -e local.env -n 1` (script name before both `-e` and `-n`) runs the script with the env file loaded. Assert via marker file that the env variable from `local.env` is visible to the script. *(Spec 4.2)*
 
 #### CLI `-n` Option
 
@@ -1061,7 +1077,7 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 - **T-INST-27b**: Script-name collision across different path types. `.loopx/foo.sh` exists (file script named `foo`), install a git repo that would clone to `.loopx/foo/` — different destination path, but same derived script name `foo`. → error, existing script untouched, no `.loopx/foo/` directory created. *(Spec 10.3, 5.2)*
 - **T-INST-27c**: Script-name collision across different file extensions. `.loopx/foo.ts` exists (file script named `foo`), install a single-file URL for `foo.sh` → error. Both resolve to script name `foo`. The existing `.loopx/foo.ts` is untouched and no `.loopx/foo.sh` is created. *(Spec 10.3, 5.2)*
 - **T-INST-27d**: Script-name collision when target name already has a pre-existing collision in `.loopx/`. Setup: `.loopx/foo.sh` and `.loopx/foo.ts` both exist (pre-existing name collision on `foo`). Attempt to install a git repo that would clone to `.loopx/foo/`. Assert: exit code 1, error on stderr mentioning name collision, no `.loopx/foo/` directory created, both `.loopx/foo.sh` and `.loopx/foo.ts` untouched. This is distinct from T-INST-27b/27c: those test single-entry collisions where the name is in the scripts map; this tests that install detects the name even when it is already involved in a pre-existing collision (and therefore excluded from the scripts map during discovery). *(Spec 10.3, 5.2)*
-- **T-INST-28**: Installing a script named after a former reserved name (e.g., `output.ts`) succeeds. The script is placed in `.loopx/` and is discoverable. Reserved names no longer exist — all names that pass name restriction rules (section 5.3) are allowed. *(Spec 10.3, 5.3)*
+- **T-INST-28**: Installing a script named after a former reserved name succeeds. Parameterized across all former reserved names and the `run` built-in subcommand name: `output.ts`, `env.ts`, `install.ts`, `version.ts`, and `run.ts`. For each name, serve the file via the local HTTP server, run `loopx install <url>`, and assert: exit code 0, the script is placed in `.loopx/`, and `loopx run -n 1 <name>` executes it successfully (assert via marker file). Reserved names no longer exist — all names that pass name restriction rules (section 5.3) are allowed, and scripts are always invoked via `loopx run <name>` so there is no ambiguity with built-in subcommands. *(Spec 10.3, 5.3)*
 - **T-INST-29**: Installing a script with invalid name (e.g., `-invalid.ts`) → error, nothing saved. *(Spec 10.3)*
 - **T-INST-30**: No automatic `npm install` / `bun install` after clone/extract. Verify `node_modules/` does not appear in installed directory script. *(Spec 10.3)*
 - **T-INST-31**: HTTP 404 during single-file download → error, exit code 1, no partial file left in `.loopx/`. *(Spec 10.3)*
@@ -1402,10 +1418,10 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 3.2 | CLI Delegation | T-DEL-01–11 |
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21 |
-| 4.1 | Running Scripts (run subcommand) | T-CLI-11–13, T-CLI-27–33, T-DISC-22–26 |
-| 4.2 | Options (-n, -e, run -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–56 |
+| 4.1 | Running Scripts (run subcommand) | T-CLI-11–13, T-CLI-27–33, T-CLI-59–60, T-DISC-22–26 |
+| 4.2 | Options (-n, -e, run -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22d, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–63 |
 | 4.3 | Subcommands | T-SUB-01–19, T-SUB-06a–06b, T-SUB-14a–14k, T-DISC-46a–46b |
-| 5.1 | Discovery | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38b, T-DISC-47–50 |
+| 5.1 | Discovery | T-DISC-01–17, T-DISC-11a, T-DISC-14a–14c, T-DISC-16a–16d, T-DISC-33–38b, T-DISC-47–50, T-CLI-55–55d, T-CLI-60 |
 | 5.2 | Name Collision | T-DISC-18–21, T-CLI-22b |
 | 5.3 | Name Restrictions | T-DISC-27–32, T-DISC-30a–30b, T-CLI-44, T-CLI-22d, T-EDGE-05 |
 | 5.4 | Validation Scope | T-DISC-39–46b, T-SUB-06, T-SUB-13, T-SUB-19 |
@@ -1431,6 +1447,6 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08d |
 | 10.2 | Source Type Details | T-INST-09–26b, T-INST-34–39e |
 | 10.3 | Common Install Rules | T-INST-27–27d, T-INST-28–33a, T-INST-31b |
-| 11.1 | Top-Level Help | T-CLI-02–06, T-CLI-07e–07g, T-CLI-07j, T-CLI-28, T-CLI-39 |
-| 11.2 | Run Help | T-CLI-40–55 |
+| 11.1 | Top-Level Help | T-CLI-02–06, T-CLI-07e–07g, T-CLI-07j, T-CLI-28, T-CLI-39, T-CLI-61 |
+| 11.2 | Run Help | T-CLI-40–55d, T-CLI-62 |
 | 12 | Exit Codes | T-EXIT-01–16 |
