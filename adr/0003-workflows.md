@@ -58,7 +58,7 @@ Files without supported extensions (e.g., `.json`, `.schema.json`, `.md`, `.txt`
 
 #### Directory scripts are removed
 
-The "directory script" concept (a directory with `package.json` + `main` field acting as a single script) is removed. All subdirectories of `.loopx/` are now workflows. If a workflow needs dependencies, it may include a `package.json` and `node_modules/` — but the `main` field no longer determines the entry point. The entry point is determined by convention (see section 2).
+The "directory script" concept (a directory with `package.json` + `main` field acting as a single script) is removed. Subdirectories of `.loopx/` are recognized as workflows only if they satisfy the workflow detection rules above — they must contain at least one top-level file with a supported script extension. Subdirectories that do not meet this criterion (e.g., utility directories, shared configuration) are allowed but are not workflows and are ignored by discovery. If a workflow needs dependencies, it may include a `package.json` and `node_modules/` — but the `main` field no longer determines the entry point. The entry point is determined by convention (see section 2).
 
 #### Nested directory scripts within workflows are not supported
 
@@ -198,7 +198,9 @@ Delegation happens **before command parsing**, so it is based on the project roo
 
 #### Workflow-level version declaration (runtime validation)
 
-A workflow's `package.json` may declare a `loopx` version requirement (in `dependencies` or `devDependencies`). This is **not used for delegation** — delegation always happens at project root level. Instead, after delegation and command parsing, the running loopx version is checked against the workflow's declared version range:
+A workflow's `package.json` may declare a `loopx` version requirement (in `dependencies` or `devDependencies`). `optionalDependencies` is intentionally not checked at the workflow level — a version requirement declared there is ignored. Workflow-level version declarations are compatibility assertions, not optional suggestions. (Project-root delegation checks `optionalDependencies` because it follows standard npm dependency semantics for locating a local binary.)
+
+This declaration is **not used for delegation** — delegation always happens at project root level. Instead, after delegation and command parsing, the running loopx version is checked against the workflow's declared version range:
 
 - If the running version satisfies the declared range: execution proceeds normally.
 - If the running version does **not** satisfy the declared range: loopx prints a warning to stderr and continues execution. This is a non-fatal warning, not an error — it alerts the user to a potential incompatibility without blocking work.
@@ -217,6 +219,8 @@ A workflow's `package.json` may be absent, unreadable, or malformed. The followi
 
 In all warning cases, the workflow is still usable — a broken `package.json` degrades version checking but does not block execution.
 
+These `package.json` failure warnings follow the same "first entry only" rule as version mismatch warnings (see "Cross-workflow version checking" below). The version check — and any warnings it produces — runs once on first entry into a workflow during a loop run. Subsequent entries into the same workflow do not re-read `package.json` or repeat warnings.
+
 #### Removed: ancestor-directory traversal
 
 The current behavior of searching from `cwd` upward for `node_modules/.bin/loopx` is removed. Only the project root (cwd) is checked for a local install. This makes the delegation behavior fully deterministic from the invocation directory.
@@ -233,6 +237,8 @@ This means:
 - The starting workflow is checked once before the first iteration.
 - A workflow reached via `goto` is checked on first transition into it.
 - Re-entering a previously visited workflow (e.g., via loop reset or another `goto`) does not produce a second warning.
+
+**`-n 0` behavior:** When `-n 0` is specified, discovery and target resolution still run — the target workflow and script must exist and pass validation (name collisions, name restrictions). However, workflow-level version checking is skipped because no workflow is entered for execution. `-n 0` validates that the target is runnable, but does not perform the runtime version compatibility check.
 
 ### 6. Discovery changes
 
@@ -255,6 +261,12 @@ Discovery scans `.loopx/` for workflow subdirectories, then scans each workflow 
 #### Discovery caching
 
 Discovery metadata is still cached at loop start for the duration of the loop, following the same rules as the current spec (section 5.1).
+
+#### Validation scope
+
+The current spec's global validation model (section 5.4) is preserved. All discovered workflows and their scripts are validated at discovery time. An invalid workflow name, invalid script name, or same-base-name collision in **any** workflow under `.loopx/` is fatal for `loopx run <target>`, regardless of whether the target workflow is the one containing the error. This means `loopx run good` fails if a sibling workflow `broken` contains a name collision or an invalid script name.
+
+For `loopx run -h`, validation remains non-fatal: all issues across all workflows are reported as warnings.
 
 #### Symlink policy
 
@@ -295,13 +307,16 @@ loopx install [options] <source>
 `loopx install <source>` continues to clone/download into `.loopx/`. The key change is that a repository may contain **multiple workflows** (top-level directories with script files), and install handles them as follows:
 
 - **Multi-workflow repo:** The repository root contains one or more top-level directories with script files and **no** script files at the root level. Each valid workflow directory is installed as a separate workflow in `.loopx/`. Non-script files and directories at the repository root (README, LICENSE, CI config, etc.) are ignored — they are not copied into `.loopx/`.
-- **Single-workflow repo:** The repository root itself contains script files (not in subdirectories) and **no** top-level directories that qualify as workflows. The repository is installed as a single workflow named after the repo.
+- **Single-workflow repo:** The repository root itself contains script files (not in subdirectories) and **no** top-level directories that qualify as workflows. The entire repository root is installed as a single workflow named after the repo. Because the repo root is the workflow directory, all files and directories at the root — including non-script files such as `package.json`, configuration, documentation, schemas, and helper directories — are copied into `.loopx/<repo-name>/`.
 - **Mixed-content repo:** If the repository root contains **both** root-level script files and top-level workflow directories, install refuses with an error. The source structure is ambiguous and the author must reorganize it into one of the two supported layouts.
 - **Zero-workflow repo:** If the source contains no installable workflows (no root-level script files and no subdirectories that qualify as workflows), install refuses with an error.
 
 #### Workflow self-containment
 
-Each workflow must be fully self-contained. During installation, only the workflow directory itself is copied — repo-root support files (README, LICENSE, CI config, shared utilities, etc.) are not included. Workflow authors who need shared files must include them within each workflow directory.
+Each workflow must be fully self-contained.
+
+- **Multi-workflow repos:** During installation, only each workflow's own directory is copied. Repo-root support files (README, LICENSE, CI config, shared utilities, etc.) are not included. Workflow authors who need shared files must include them within each workflow directory.
+- **Single-workflow repos:** The repo root is the workflow directory, so all files and directories at the root are part of the workflow and are copied. There is no "repo-root vs. workflow directory" distinction — everything in the repo is part of the workflow.
 
 #### Install-time validation
 
@@ -314,7 +329,7 @@ Installable workflows must satisfy the same discovery and validation rules as ru
 
 #### Install atomicity
 
-Multi-workflow installs are **atomic**: either all valid workflows from the source are installed, or none are. If any workflow fails validation (name restriction violation, script-name collision within a workflow, collision with an existing workflow, destination-path collision), the entire install fails, no workflows are written to `.loopx/`, and an error is displayed listing all failures. Directories with no script files are silently skipped (they are not workflows) and do not cause a failure.
+Multi-workflow installs are **atomic**: either all valid workflows from the source are installed, or none are. If any workflow fails validation (name restriction violation, script-name collision within a workflow, collision with an existing entry at `.loopx/<workflow-name>`), the entire install fails, no workflows are written to `.loopx/`, and an error is displayed listing all failures. Directories with no script files are silently skipped (they are not workflows) and do not cause a failure.
 
 #### Selective workflow installation
 
@@ -329,18 +344,25 @@ When `-w` is used, only the selected workflow is validated. Invalid sibling work
 
 `-w` is not valid for single-workflow repos. If the source is a single-workflow repo (root-level scripts, no workflow directories), using `-w` is an error regardless of the name provided.
 
+#### Source detection
+
+Existing source detection rules (SPEC section 10.1) remain unchanged for `org/repo` shorthand, known git hosts, `.git` URLs, and tarball URLs. The only removal is the single-file URL fallback: any source that would previously have been classified as a single-file URL (rule 5 in section 10.1 — "any other URL") is now rejected with an error. The remaining classification rules, their ordering, and their edge cases are preserved as-is.
+
 #### Single-file URL
 
 Single-file URL install is removed. Scripts must be part of a workflow. To install a single script, it should be in a repository as a workflow directory.
 
 #### Collision handling on install
 
-Two kinds of collisions are checked:
+A workflow install targets `.loopx/<workflow-name>/`. In the workflow model, workflow name and destination path are directly coupled — a workflow named `ralph` always installs to `.loopx/ralph/`. The old spec's separate "script-name collision" and "destination-path collision" checks (section 10.3) collapse into a single path-based check.
 
-- **Destination-path collision:** If any filesystem entry (file or directory) already exists at the target path in `.loopx/` (e.g., `.loopx/ralph/` already exists), installation is refused with an error. This is consistent with the current spec's destination-path collision rules (section 10.3).
-- **Workflow-name collision:** If the derived workflow name would collide with any existing discovered workflow in `.loopx/`, installation is refused with an error — even if the destination filesystem paths differ.
+Collision is determined by whether any filesystem entry (file, directory, or symlink) already exists at `.loopx/<workflow-name>`:
 
-**`-y` and collision overrides:** `-y` overrides collisions **only when the existing entry at the destination path is a discovered workflow**. In that case, `-y` removes the existing workflow and installs the replacement. If the destination path conflicts with a non-workflow entry (e.g., a utility directory with no script files, a stray file), the install is refused with an error even with `-y`. This prevents `-y` from accidentally deleting non-workflow data.
+- **Path does not exist:** The workflow is installed. No collision checks are needed.
+- **Path exists and is a discovered workflow:** The install is refused with an error. With `-y`, the existing workflow is removed and the replacement is installed.
+- **Path exists but is not a discovered workflow** (e.g., a utility directory with no script files, a stray file, a legacy flat file or directory from the pre-workflow layout): The install is refused with an error, even with `-y`. This prevents `-y` from accidentally deleting non-workflow data.
+
+`-y` replaces only discovered workflows. It does not replace legacy flat files, non-workflow directories, or other arbitrary filesystem entries at the target path.
 
 #### Version checking on install
 
@@ -443,7 +465,8 @@ When this ADR is accepted, the following SPEC sections require updates:
 - **8.3 (Injection)** — Add `LOOPX_WORKFLOW` environment variable.
 - **9.1 / 9.2 (Programmatic API)** — Rename `scriptName` to `target`. Update examples to use `workflow:script` syntax.
 - **9.5 (Types)** — Update `run()` and `runPromise()` signatures.
-- **10 (`loopx install`)** — Rewrite for workflow-based installation. Multi-workflow repos, `--workflow` flag, version mismatch handling, single-file removal.
+- **10.1 (Source Detection)** — Remove rule 5 (single-file URL fallback). Existing rules 1–4 (`org/repo`, known git hosts, `.git` URLs, tarball URLs) are preserved unchanged.
+- **10 (`loopx install`)** — Rewrite for workflow-based installation. Multi-workflow repos, single-workflow repos, `--workflow` flag, version mismatch handling, single-file removal, simplified collision model.
 - **11 (Help)** — Update `loopx run -h` to list workflows and their scripts.
 - **12 (Exit Codes)** — Update examples for new syntax.
 - **13 (Summary of Reserved and Special Values)** — Add `index` as the default entry point convention. Add `:` as a reserved delimiter.
@@ -492,6 +515,7 @@ When this ADR is accepted, the following SPEC sections require updates:
 - Verify install refuses a workflow containing scripts with invalid names.
 - Verify install allows a workflow with no `index` script.
 - Verify repo-root support files (README, LICENSE, etc.) are not copied during multi-workflow install.
+- Verify single-workflow repo install copies all root-level files (including non-script files like `package.json`, config, docs) into `.loopx/<repo-name>/`.
 - Verify `LOOPX_WORKFLOW` is set correctly in the script's environment.
 - Verify scripts run with their workflow directory as `cwd`.
 - Verify `loopx run -h` lists discovered workflows and their scripts.
@@ -519,6 +543,10 @@ When this ADR is accepted, the following SPEC sections require updates:
 - Verify workflow-local `node_modules/loopx` takes precedence over CLI-provided helpers for `import "loopx"`.
 - Verify `loopx install` with no source is a usage error (exit code 1).
 - Verify `loopx install -h` shows install help and exits 0 (no source required).
+- Verify `loopx run -n 0 ralph` performs discovery and target validation but does not print workflow version warnings.
+- Verify `loopx run ralph` fails if a sibling workflow has an invalid script name (global validation).
+- Verify `loopx run ralph` fails if a sibling workflow has a same-base-name collision (global validation).
+- Verify `loopx install -y` does not replace a non-workflow entry (legacy flat file or non-workflow directory) at the destination path.
 - Verify `loopx install -w a -w b <source>` (duplicate `-w`) is a usage error.
 - Verify `loopx install --unknown <source>` (unrecognized flag) is a usage error.
 - Verify `loopx install -h --unknown` (unrecognized flag with `-h`) shows help (no error).
