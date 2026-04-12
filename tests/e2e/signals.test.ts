@@ -215,12 +215,12 @@ describe("SPEC: Signal Handling", () => {
     project = await createTempProject();
     const markerPath = join(project.dir, "pid-marker.txt");
 
-    // signalTrapExit: traps SIGTERM, sleeps 1s (under the 5s grace period), then exits 0
+    // signalTrapExit: traps SIGTERM, sleeps 2s (under the 5s grace period), then exits 0
     await createScript(
       project,
       "sig-trap-exit",
       ".sh",
-      signalTrapExit(markerPath, 1),
+      signalTrapExit(markerPath, 2),
     );
 
     const { result, sendSignal, waitForStderr } = runCLIWithSignal(

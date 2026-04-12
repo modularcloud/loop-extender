@@ -88,24 +88,9 @@ describe("SPEC: classifySource — Known Git Hosts (bitbucket.org)", () => {
   });
 });
 
-describe("SPEC: classifySource — SSH Git URLs", () => {
-  it("git@github.com:org/repo.git → git", () => {
-    const result = classifySource("git@github.com:org/repo.git");
-    expect(result.type).toBe("git");
-    expect(result.url).toBe("git@github.com:org/repo.git");
-  });
-
-  it("git@gitlab.com:org/repo.git → git", () => {
-    const result = classifySource("git@gitlab.com:org/repo.git");
-    expect(result.type).toBe("git");
-  });
-
-  it("git@github.com:org/repo (no .git suffix) → git", () => {
-    const result = classifySource("git@github.com:org/repo");
-    expect(result.type).toBe("git");
-    expect(result.url).toBe("git@github.com:org/repo");
-  });
-});
+// SSH/SCP URL tests intentionally omitted per SP-32 (pending spec decision).
+// See TEST-SPEC.md section 9: "No tests are added for this behavior until
+// the spec ambiguity is resolved."
 
 describe("SPEC: classifySource — Generic .git URLs", () => {
   it("https://example.com/some/path/repo.git → git", () => {

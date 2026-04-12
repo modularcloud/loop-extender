@@ -345,3 +345,20 @@ describe("SPEC: parseEnvFile — No Trailing Newline", () => {
     expect(withNewline.vars).toEqual(withoutNewline.vars);
   });
 });
+
+describe("SPEC: parseEnvFile — Very Long Values", () => {
+  it("value of ~1 MB is parsed without truncation", () => {
+    const longValue = "x".repeat(1_000_000);
+    const { vars, warnings } = parseEnvFile(`LONG=${longValue}\n`);
+    expect(vars.LONG).toBe(longValue);
+    expect(vars.LONG).toHaveLength(1_000_000);
+    expect(warnings).toHaveLength(0);
+  });
+
+  it("very long quoted value is parsed without truncation", () => {
+    const longValue = "y".repeat(500_000);
+    const { vars, warnings } = parseEnvFile(`QUOTED="${longValue}"\n`);
+    expect(vars.QUOTED).toBe(longValue);
+    expect(warnings).toHaveLength(0);
+  });
+});

@@ -343,8 +343,6 @@ console.log(JSON.stringify(outputs));
       project = await createTempProject();
       await createBashScript(project, "myscript", `printf '{"goto":""}'`);
 
-      // Use the run() generator API: iterate with for-await, expect an error
-      // on the second iteration when the empty goto is processed.
       const driverCode = `
 import { run } from "loopx";
 let iterationCount = 0;
@@ -362,9 +360,8 @@ console.log(JSON.stringify({ threw, iterationCount, message: errorMessage }));
 `;
       const result = await runAPIDriver("node", driverCode, { cwd: project.dir });
       const parsed = JSON.parse(result.stdout);
-      // Empty string goto IS a string, so parser preserves it (unlike null/true/42)
-      // The generator should throw on the second iteration because "" is not a valid script name
       expect(parsed.threw).toBe(true);
+      expect(parsed.iterationCount).toBe(1);
       expect(parsed.message).toMatch(/goto/i);
     });
 

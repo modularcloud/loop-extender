@@ -364,7 +364,7 @@ describe("SPEC: CLI Basics (T-CLI-01 through T-CLI-100)", () => {
         });
 
         expect(result.exitCode).toBe(0);
-        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr).toMatch(/startswithdash|invalid|name|restrict/i);
         expect(result.stdout).toMatch(/-startswithdash/);
       });
 
@@ -405,7 +405,7 @@ describe("SPEC: CLI Basics (T-CLI-01 through T-CLI-100)", () => {
 
         expect(result.exitCode).toBe(0);
         expect(result.stdout).not.toContain("badpkg");
-        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr).toMatch(/badpkg|invalid|json|package/i);
       });
 
       it("T-CLI-47: `loopx run -h` with main escaping directory warns on stderr", async () => {
@@ -429,7 +429,7 @@ describe("SPEC: CLI Basics (T-CLI-01 through T-CLI-100)", () => {
         });
 
         expect(result.exitCode).toBe(0);
-        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr).toMatch(/escape|traversal|path|boundary|outside/i);
       });
 
       it("T-CLI-55: `loopx run -h` with unreadable package.json warns (conditional)", async () => {
@@ -452,7 +452,7 @@ describe("SPEC: CLI Basics (T-CLI-01 through T-CLI-100)", () => {
         });
 
         expect(result.exitCode).toBe(0);
-        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr).toMatch(/unreadable|permission|read|access|EACCES/i);
 
         // Restore permissions for cleanup
         await chmod(join(scriptDir, "package.json"), 0o644);
@@ -474,7 +474,7 @@ describe("SPEC: CLI Basics (T-CLI-01 through T-CLI-100)", () => {
         });
 
         expect(result.exitCode).toBe(0);
-        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr).toMatch(/nomain|main|missing/i);
       });
 
       it("T-CLI-55b: `loopx run -h` with non-string `main` warns", async () => {
@@ -493,7 +493,7 @@ describe("SPEC: CLI Basics (T-CLI-01 through T-CLI-100)", () => {
         });
 
         expect(result.exitCode).toBe(0);
-        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr).toMatch(/badmain|main|string|type/i);
       });
 
       it("T-CLI-55c: `loopx run -h` with unsupported extension in `main` warns", async () => {
@@ -513,7 +513,7 @@ describe("SPEC: CLI Basics (T-CLI-01 through T-CLI-100)", () => {
         });
 
         expect(result.exitCode).toBe(0);
-        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr).toMatch(/badext|extension|unsupported|\.py/i);
       });
 
       it("T-CLI-55d: `loopx run -h` with nonexistent `main` file warns", async () => {
@@ -532,7 +532,7 @@ describe("SPEC: CLI Basics (T-CLI-01 through T-CLI-100)", () => {
         });
 
         expect(result.exitCode).toBe(0);
-        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr).toMatch(/missing|not found|exist|nonexistent/i);
       });
 
       it("T-CLI-62: `loopx run myscript --help` shows run help, exits 0", async () => {
