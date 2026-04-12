@@ -19,7 +19,7 @@ The core idea:
 5. If neither `goto` nor `stop`, the loop resets to the starting script
 
 Install: `npm install -g loop-extender`
-Run: `loopx` (runs `.loopx/default`), `loopx myscript`, or `loopx -n 10 myscript` (max 10 iterations)
+Run: `loopx run myscript` or `loopx run -n 10 myscript` (max 10 iterations)
 
 ## Your job
 
@@ -104,7 +104,7 @@ loopx env set API_KEY "sk-..."
 loopx env set MODEL "claude-sonnet-4-20250514"
 
 # Use a local .env file (overrides globals on conflict)
-loopx -e .env.local myscript
+loopx run -e .env.local myscript
 
 # List / remove
 loopx env list
@@ -157,7 +157,7 @@ else
 fi
 ```
 
-Run: `loopx run-agent`
+Run: `loopx run run-agent`
 
 ### Pattern 2: Multi-agent review pipeline
 
@@ -201,7 +201,7 @@ printf "Apply this feedback to SPEC.md:\n%s\n\nRead SPEC.md, make the changes, a
 $LOOPX_BIN output --result "Applied feedback. Looping for another round."
 ```
 
-Run: `loopx get-feedback`
+Run: `loopx run get-feedback`
 
 ### Pattern 3: Simple infinite agent loop
 
@@ -209,11 +209,11 @@ The simplest case — just loop an agent command. No structured output needed (r
 
 ```bash
 #!/bin/bash
-# .loopx/default.sh
+# .loopx/agent.sh
 cat PROMPT.md | claude --dangerously-skip-permissions -p
 ```
 
-Run: `loopx` or `loopx -n 20` to cap at 20 iterations.
+Run: `loopx run agent` or `loopx run -n 20 agent` to cap at 20 iterations.
 
 ### Pattern 4: Conditional branching
 
@@ -257,7 +257,7 @@ output({ result: summary, goto: "analyze" });
 - **Iteration counting**: `-n` counts every script execution, including `goto` hops. A chain of A -> B -> C is 3 iterations.
 - **stdin piping**: `result` is only piped to the next script when `goto` is present. When the loop resets (no `goto`), the starting script gets empty stdin.
 - **`stop` beats `goto`**: if both are present, the loop halts.
-- **Script names**: cannot be `output`, `env`, `install`, or `version` (reserved), and cannot start with `-`.
+- **Script names**: cannot start with `-`. Any other valid name is allowed — there are no reserved names since scripts are always invoked via `loopx run <name>`.
 - **Self-goto is valid**: a script can `goto` itself.
 - **Exit codes**: a non-zero exit code from a script causes loopx to exit with that code.
 - **No config files**: loopx has no YAML/JSON config. The scripts themselves are the configuration.
