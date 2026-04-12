@@ -36,7 +36,9 @@ A **workflow** is a subdirectory of `.loopx/` that contains one or more script f
     check-ready.sh
   my-pipeline/
     index.ts              ← default entry point
-    helpers.ts            ← non-entry script
+    setup.ts              ← another script (targeted as my-pipeline:setup)
+    lib/
+      helpers.ts          ← not discovered (subdirectory)
     package.json          ← optional (for dependencies, version pinning)
 ```
 
@@ -55,6 +57,10 @@ Script names (the base name of a file without its extension) follow the same nam
 #### Non-script files
 
 Files without supported extensions (e.g., `.json`, `.schema.json`, `.md`, `.txt`) inside a workflow directory are allowed and ignored by discovery. This supports patterns like schema files, documentation, or configuration that live alongside scripts.
+
+#### All top-level files with supported extensions are scripts
+
+Every file directly inside a workflow directory that has a supported script extension (`.sh`, `.js`, `.jsx`, `.ts`, `.tsx`) is a discovered script — there is no opt-out or exclusion mechanism. This means reusable helper modules, configuration files, or shared utilities that happen to use a supported extension must be placed in subdirectories (e.g., `lib/`, `helpers/`, `config/`). Subdirectories within a workflow are not scanned during script discovery (see "Nested directory scripts within workflows are not supported" below), so files in subdirectories are invisible to loopx and available for internal use by the workflow's scripts.
 
 #### Directory scripts are removed
 
@@ -114,7 +120,7 @@ The following target strings are invalid in all contexts — CLI invocation (`lo
 - **Empty string** (`""`): error.
 - **Bare colon** (`":"`): error.
 - **Leading colon** (e.g., `":script"`): error.
-- **Trailing colon** (e.g., `"workflow:"`): error. To target the default entry point of a workflow, omit the colon (`"workflow"`) or use `"workflow:index"`.
+- **Trailing colon** (e.g., `"workflow:"`): error. In CLI invocation and the programmatic API, target the default entry point by omitting the colon (`"workflow"`) or using `"workflow:index"`. In `goto`, a bare name is a script in the current workflow (see section 4), so targeting another workflow's default entry point from `goto` requires the qualified form `"workflow:index"`.
 - **Multiple colons** (e.g., `"a:b:c"`): error. The colon delimiter may appear at most once.
 - **Name restriction violations**: The workflow portion and the script portion (if present) must each match `[a-zA-Z0-9_][a-zA-Z0-9_-]*`. A target where either portion violates this pattern is an error.
 
@@ -200,6 +206,8 @@ Delegation happens **before command parsing**, so it is based on the project roo
 
 A workflow's `package.json` may declare a `loopx` version requirement (in `dependencies` or `devDependencies`). `optionalDependencies` is intentionally not checked at the workflow level — a version requirement declared there is ignored. Workflow-level version declarations are compatibility assertions, not optional suggestions. (Project-root delegation checks `optionalDependencies` because it follows standard npm dependency semantics for locating a local binary.)
 
+If `loopx` is declared in **both** `dependencies` and `devDependencies` within the same `package.json`, the `dependencies` range takes precedence for version checking. The `devDependencies` range is ignored. This applies at both the workflow level (runtime validation) and the project root level (delegation).
+
 This declaration is **not used for delegation** — delegation always happens at project root level. Instead, after delegation and command parsing, the running loopx version is checked against the workflow's declared version range:
 
 - If the running version satisfies the declared range: execution proceeds normally.
@@ -247,7 +255,7 @@ Discovery scans `.loopx/` for workflow subdirectories, then scans each workflow 
 #### Workflow discovery
 
 - Scan `.loopx/` for top-level subdirectories.
-- A subdirectory is a workflow if it contains at least one file with a supported extension.
+- A subdirectory is a workflow if it contains at least one **top-level** file (directly inside the subdirectory, not in nested subdirectories) with a supported extension.
 - Subdirectories with no script files are ignored (no warning).
 - Workflow names are validated against the name restriction rules.
 
@@ -275,7 +283,7 @@ Symlinks within `.loopx/` are followed during discovery, consistent with the cur
 ### 7. Help changes
 
 - **`loopx -h`:** Top-level help. Lists subcommands and general syntax. No discovery.
-- **`loopx run -h`:** Discovers workflows and lists them with their scripts. Non-fatal validation warnings are shown (name collisions, name restriction violations, etc.). If a workflow has an `index` script, it is indicated as the default entry point. If flat files with supported script extensions are found directly in `.loopx/` root (legacy layout), a migration warning is emitted advising the user to move them into workflow directories.
+- **`loopx run -h`:** Discovers workflows and lists them with their scripts. Non-fatal validation warnings are shown (name collisions, name restriction violations, etc.). If a workflow has an `index` script, it is indicated as the default entry point. If flat files with supported script extensions are found directly in `.loopx/` root (legacy flat-script layout), or if subdirectories resembling legacy directory scripts are detected (e.g., containing a `package.json` with a `main` field but no top-level script files), a migration warning is emitted advising the user to restructure them as workflows.
 - **`loopx run ralph -h`:** Equivalent to `loopx run -h` (the `-h` short-circuit still applies — the workflow argument is ignored). This is consistent with the existing `loopx run <script> -h` behavior.
 
 ### 8. Install changes
@@ -408,6 +416,14 @@ No warning is emitted for this scenario in v1. The workflow's `package.json` ver
 - Scripts within a workflow run with the **workflow directory** as their working directory (e.g., `.loopx/ralph/`). This is analogous to the current directory script behavior and ensures relative imports and `node_modules/` resolve naturally.
 - `LOOPX_PROJECT_ROOT` continues to point to the directory where `loopx` was invoked.
 
+#### Programmatic `RunOptions.cwd` behavior change
+
+The current SPEC (section 9.5) defines `RunOptions.cwd` as the working directory for both script resolution (`.loopx/` discovery) **and** script execution. Under the workflow model, script execution cwd is always the workflow directory (e.g., `.loopx/ralph/`), regardless of `RunOptions.cwd`.
+
+`RunOptions.cwd` now means **project root**: the directory from which `.loopx/` is resolved and from which `LOOPX_PROJECT_ROOT` is derived. It no longer controls the child process working directory. Scripts always execute with their workflow directory as cwd.
+
+This is a behavioral change to the programmatic API. Code that passes `cwd` to `run()` or `runPromise()` expecting it to set the script's working directory must be updated — relative path resolution within the script will be relative to the workflow directory, and `LOOPX_PROJECT_ROOT` (sourced from `RunOptions.cwd` or `process.cwd()`) should be used for project-root-relative paths.
+
 #### Environment
 
 A new environment variable is injected:
@@ -438,6 +454,7 @@ The `output()` JS/TS function requires no changes — the `goto` field is alread
 - **Breaking change: single-file URL install removed.** `loopx install <single-file-url>` is no longer supported.
 - **Breaking change: version delegation simplified.** Projects relying on ancestor-directory traversal for version delegation must ensure the `loopx` dependency is in the project root `package.json` (the directory containing `.loopx/`).
 - **Breaking change: working directory.** Current flat file scripts run with the project root (where `loopx` was invoked) as their working directory. Under the workflow model, all scripts run with their workflow directory as cwd. Scripts that rely on project-root-relative paths must be updated to use `LOOPX_PROJECT_ROOT` instead.
+- **Breaking change: `RunOptions.cwd` semantics.** `RunOptions.cwd` no longer controls the script's execution working directory. It now specifies the project root (where `.loopx/` is resolved and where `LOOPX_PROJECT_ROOT` is derived from). Scripts always execute with their workflow directory as cwd regardless of `RunOptions.cwd`.
 - Cross-workflow `goto` enables multi-workflow compositions where a loop can span several related workflows while always returning to its starting point.
 - The workflow model naturally maps to repositories, making sharing and installation of workflow bundles straightforward.
 - Version expectations can be declared per-workflow, providing compatibility signaling without runtime complexity.
@@ -455,7 +472,7 @@ When this ADR is accepted, the following SPEC sections require updates:
 - **4.2 (Options)** — Add `install`-scoped options (`-w`, `-y`, `-h`). Define parsing rules: duplicate flags, unknown flags, and `-h` short-circuit for `install`, parallel to existing `run` option parsing.
 - **4.3 (Subcommands / `loopx install`)** — Add `--workflow` / `-w` flag. Document multi-workflow repo handling. Remove single-file URL install. Add `-y` flag for version mismatch and workflow collision override. Add install grammar `loopx install [options] <source>`.
 - **5.1 (Discovery)** — Rewrite for two-level discovery: workflow discovery in `.loopx/`, then script discovery within each workflow. Carry forward symlink policy: symlinks are followed during discovery, names derived from the symlink's own name.
-- **5.2 (Name Collision)** — Update to describe collisions within a workflow (same base name, different extensions) and workflow-level name collisions in `.loopx/`.
+- **5.2 (Name Collision)** — Update to describe same-base-name script collisions within a workflow (e.g., `check.sh` and `check.ts` in the same workflow directory). Workflow names themselves cannot collide on a normal filesystem (directory names are unique), so workflow-level collision rules are not needed.
 - **5.3 (Name Restrictions)** — Apply to both workflow names and script names. Explicitly note `:` exclusion.
 - **5.4 (Validation Scope)** — Update command table for new syntax.
 - **6.1 (Working Directory)** — All scripts run with their workflow directory as cwd. Remove file-script vs directory-script distinction.
@@ -464,7 +481,7 @@ When this ADR is accepted, the following SPEC sections require updates:
 - **7.2 (Error Handling)** — Add error cases for missing workflow, missing script within workflow, invalid goto target (bad workflow or bad script).
 - **8.3 (Injection)** — Add `LOOPX_WORKFLOW` environment variable.
 - **9.1 / 9.2 (Programmatic API)** — Rename `scriptName` to `target`. Update examples to use `workflow:script` syntax.
-- **9.5 (Types)** — Update `run()` and `runPromise()` signatures.
+- **9.5 (Types)** — Update `run()` and `runPromise()` signatures. Update `RunOptions.cwd` documentation: `cwd` now specifies the project root for `.loopx/` resolution and `LOOPX_PROJECT_ROOT`, not the script execution working directory.
 - **10.1 (Source Detection)** — Remove rule 5 (single-file URL fallback). Existing rules 1–4 (`org/repo`, known git hosts, `.git` URLs, tarball URLs) are preserved unchanged.
 - **10 (`loopx install`)** — Rewrite for workflow-based installation. Multi-workflow repos, single-workflow repos, `--workflow` flag, version mismatch handling, single-file removal, simplified collision model.
 - **11 (Help)** — Update `loopx run -h` to list workflows and their scripts.
@@ -550,3 +567,9 @@ When this ADR is accepted, the following SPEC sections require updates:
 - Verify `loopx install -w a -w b <source>` (duplicate `-w`) is a usage error.
 - Verify `loopx install --unknown <source>` (unrecognized flag) is a usage error.
 - Verify `loopx install -h --unknown` (unrecognized flag with `-h`) shows help (no error).
+- Verify all top-level files with supported extensions in a workflow are discovered as scripts (no exclusion mechanism).
+- Verify files with supported extensions in subdirectories within a workflow (e.g., `lib/helpers.ts`) are not discovered as scripts.
+- Verify programmatic `RunOptions.cwd` controls `.loopx/` resolution (project root) but does not affect script execution working directory.
+- Verify scripts execute with their workflow directory as cwd even when `RunOptions.cwd` is set to a different path.
+- Verify that when `loopx` is declared in both `dependencies` and `devDependencies` of a workflow `package.json`, the `dependencies` range is used for version checking.
+- Verify `loopx run -h` emits a migration warning when legacy directory-script layouts (subdirectories with `package.json` + `main` but no top-level script files) are detected in `.loopx/`.
