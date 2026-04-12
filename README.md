@@ -4,10 +4,6 @@
 
 loopx is a CLI tool that automates repeated execution ("loops") of scripts, primarily designed to wrap agent CLIs. It provides a scriptable loop engine with structured output, control flow between scripts, environment variable management, and a script installation mechanism.
 
-## Status
-
-**Production ready.** All 1068 tests pass with zero type errors. The implementation is fully conformant with [SPEC.md](./SPEC.md), including [ADR-0002](./adr/0002-run-subcommand.md) (`run` subcommand).
-
 ## Quick Start
 
 ```bash
