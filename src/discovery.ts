@@ -153,7 +153,7 @@ function validateDirScript(
     };
   }
 
-  // In discovery mode: no-pkg and no-main are silent skips
+  // In discovery mode: no-pkg is a silent skip; other codes produce warnings
   const warningMap: Record<string, string | null> = {
     "no-pkg": null,
     "unreadable": `Warning: ${dirName}/package.json is unreadable or has permission issues, skipping`,
