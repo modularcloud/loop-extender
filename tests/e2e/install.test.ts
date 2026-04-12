@@ -1912,7 +1912,7 @@ printf '{"result":"global-ok"}'
 
         // 4. Run loopx from the global prefix
         const binPath = join(globalPrefix, "bin", "loopx");
-        const result = execSync(`"${binPath}" run -n 1`, {
+        const result = execSync(`"${binPath}" run -n 1 default`, {
           cwd: fixtureDir,
           stdio: "pipe",
           env: {
@@ -1989,7 +1989,7 @@ printf '{"result":"bun-global-done"}'
           const loopxPkg = JSON.parse(readFileSync(join(loopxPkgDir, "package.json"), "utf-8"));
           const pkgName = loopxPkg.name as string;
           const binJsPath = join(globalPrefix, "lib", "node_modules", pkgName, "bin.js");
-          execSync(`bun "${binJsPath}" run -n 1`, {
+          execSync(`bun "${binJsPath}" run -n 1 default`, {
             cwd: fixtureDir,
             stdio: "pipe",
             env: {

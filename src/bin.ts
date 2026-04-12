@@ -21,7 +21,6 @@ import { getLoopxBin, ensureLoopxPackageJson } from "./bin-path.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// Read version from dist/package.json
 function getVersion(): string {
   try {
     const pkg = JSON.parse(
@@ -33,129 +32,49 @@ function getVersion(): string {
   }
 }
 
-// --- Argument Parsing ---
-interface ParsedArgs {
-  help: boolean;
-  maxIterations?: number;
-  envFile?: string;
-  subcommand?: string;
-  subcommandArgs: string[];
-  scriptName?: string;
-}
-
-function parseArgs(argv: string[]): ParsedArgs {
-  const result: ParsedArgs = {
-    help: false,
-    subcommandArgs: [],
-  };
-
-  // Help flag takes precedence over everything
-  if (argv.includes("-h") || argv.includes("--help")) {
-    result.help = true;
-    return result;
-  }
-
-  let i = 0;
-  let sawN = false;
-  let sawE = false;
-
-  while (i < argv.length) {
-    const arg = argv[i];
-
-    if (arg === "-n") {
-      if (sawN) {
-        process.stderr.write("Error: duplicate -n flag\n");
-        process.exit(1);
-      }
-      sawN = true;
-      i++;
-      if (i >= argv.length) {
-        process.stderr.write("Error: -n requires a value\n");
-        process.exit(1);
-      }
-      const val = argv[i];
-      const num = Number(val);
-      if (!Number.isInteger(num) || num < 0 || val.trim() === "") {
-        process.stderr.write(
-          `Error: -n must be a non-negative integer, got '${val}'\n`
-        );
-        process.exit(1);
-      }
-      result.maxIterations = num;
-    } else if (arg === "-e") {
-      if (sawE) {
-        process.stderr.write("Error: duplicate -e flag\n");
-        process.exit(1);
-      }
-      sawE = true;
-      i++;
-      if (i >= argv.length) {
-        process.stderr.write("Error: -e requires a value\n");
-        process.exit(1);
-      }
-      result.envFile = argv[i];
-    } else if (arg === "--") {
-      // End-of-flags marker: remaining arguments are positional
-      i++;
-      if (i < argv.length) {
-        if (result.scriptName) {
-          process.stderr.write(`Error: unexpected argument '${argv[i]}'\n`);
-          process.exit(1);
-        }
-        result.scriptName = argv[i];
-        i++;
-      }
-      // Reject any extra positional arguments after --
-      if (i < argv.length) {
-        process.stderr.write(`Error: unexpected argument '${argv[i]}'\n`);
-        process.exit(1);
-      }
-      break;
-    } else if (!arg.startsWith("-")) {
-      // Positional argument
-      if (result.scriptName) {
-        process.stderr.write(`Error: unexpected argument '${arg}'\n`);
-        process.exit(1);
-      }
-      // Only recognize subcommands when no flags (-n, -e) precede them
-      if (
-        !sawN &&
-        !sawE &&
-        ["version", "output", "env", "install"].includes(arg)
-      ) {
-        result.subcommand = arg;
-        result.subcommandArgs = argv.slice(i + 1);
-        return result;
-      }
-      result.scriptName = arg;
-    } else {
-      process.stderr.write(`Error: unknown flag '${arg}'\n`);
-      process.exit(1);
+// --- CLI Delegation ---
+function findLocalBin(startDir: string): string | null {
+  let dir = startDir;
+  while (true) {
+    const candidate = join(dir, "node_modules", ".bin", "loopx");
+    if (existsSync(candidate)) {
+      return candidate;
     }
-    i++;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
   }
-
-  return result;
+  return null;
 }
 
-// --- Help ---
-function printHelp(loopxDir: string): void {
-  console.log(`Usage: loopx [options] [script-name]
+// --- Top-level Help (no discovery) ---
+function printTopLevelHelp(): void {
+  console.log(`Usage: loopx <command> [options]
+
+Commands:
+  run <script-name>   Run a script in a loop
+  version             Print the loopx version
+  output              Emit structured output (for bash scripts)
+  env                 Manage global environment variables
+  install <source>    Install a script into .loopx/
+
+Options:
+  -h, --help          Print this help message
+
+Run 'loopx run -h' to see run options and available scripts.`);
+}
+
+// --- Run Help (with discovery) ---
+function printRunHelp(loopxDir: string): void {
+  console.log(`Usage: loopx run [options] <script-name>
 
 Options:
   -n <count>    Maximum number of loop iterations
   -e <path>     Path to a local env file
-  -h, --help    Print this help message
-
-Subcommands:
-  version       Print the loopx version
-  output        Emit structured output (for bash scripts)
-  env           Manage global environment variables
-  install       Install a script into .loopx/`);
+  -h, --help    Print this help message`);
 
   const discovery = discoverScripts(loopxDir, "help");
 
-  // Print warnings
   for (const w of discovery.warnings) {
     process.stderr.write(w + "\n");
   }
@@ -242,19 +161,90 @@ function handleEnvSubcommand(subArgs: string[]): void {
   }
 }
 
-// --- CLI Delegation ---
-function findLocalBin(startDir: string): string | null {
-  let dir = startDir;
-  while (true) {
-    const candidate = join(dir, "node_modules", ".bin", "loopx");
-    if (existsSync(candidate)) {
-      return candidate;
-    }
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
+// --- Run Subcommand Parsing ---
+interface RunArgs {
+  help: boolean;
+  maxIterations?: number;
+  envFile?: string;
+  scriptName?: string;
+}
+
+function parseRunArgs(argv: string[]): RunArgs {
+  // Check for -h/--help anywhere first (full short-circuit)
+  if (argv.includes("-h") || argv.includes("--help")) {
+    return { help: true };
   }
-  return null;
+
+  const result: RunArgs = { help: false };
+  let i = 0;
+  let sawN = false;
+  let sawE = false;
+
+  while (i < argv.length) {
+    const arg = argv[i];
+
+    if (arg === "-n") {
+      if (sawN) {
+        process.stderr.write("Error: duplicate -n flag\n");
+        process.exit(1);
+      }
+      sawN = true;
+      i++;
+      if (i >= argv.length) {
+        process.stderr.write("Error: -n requires a value\n");
+        process.exit(1);
+      }
+      const val = argv[i];
+      const num = Number(val);
+      if (!Number.isInteger(num) || num < 0 || val.trim() === "") {
+        process.stderr.write(
+          `Error: -n must be a non-negative integer, got '${val}'\n`
+        );
+        process.exit(1);
+      }
+      result.maxIterations = num;
+    } else if (arg === "-e") {
+      if (sawE) {
+        process.stderr.write("Error: duplicate -e flag\n");
+        process.exit(1);
+      }
+      sawE = true;
+      i++;
+      if (i >= argv.length) {
+        process.stderr.write("Error: -e requires a value\n");
+        process.exit(1);
+      }
+      result.envFile = argv[i];
+    } else if (arg === "--") {
+      i++;
+      if (i < argv.length) {
+        if (result.scriptName) {
+          process.stderr.write(`Error: unexpected argument '${argv[i]}'\n`);
+          process.exit(1);
+        }
+        result.scriptName = argv[i];
+        i++;
+      }
+      if (i < argv.length) {
+        process.stderr.write(`Error: unexpected argument '${argv[i]}'\n`);
+        process.exit(1);
+      }
+      break;
+    } else if (arg.startsWith("-")) {
+      process.stderr.write(`Error: unknown flag '${arg}'\n`);
+      process.exit(1);
+    } else {
+      // Positional argument (script name)
+      if (result.scriptName) {
+        process.stderr.write(`Error: unexpected argument '${arg}'\n`);
+        process.exit(1);
+      }
+      result.scriptName = arg;
+    }
+    i++;
+  }
+
+  return result;
 }
 
 async function main(): Promise<void> {
@@ -263,7 +253,6 @@ async function main(): Promise<void> {
     const cwd = process.cwd();
     const localBin = findLocalBin(cwd);
     if (localBin) {
-      // Per Spec 3.2: LOOPX_BIN is set to the resolved realpath of the local binary
       const localBinRealpath = realpathSync(localBin);
       const result = spawnSync(localBin, process.argv.slice(2), {
         cwd,
@@ -287,51 +276,87 @@ async function main(): Promise<void> {
     }
   }
 
-  const args = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
   const cwd = process.cwd();
   const loopxDir = join(cwd, ".loopx");
   const loopxBin = getLoopxBin();
 
-  // Help
-  if (args.help) {
-    printHelp(loopxDir);
+  // No arguments → top-level help
+  if (argv.length === 0) {
+    printTopLevelHelp();
     process.exit(0);
   }
 
-  // Subcommands (no .loopx/ validation needed)
-  if (args.subcommand === "version") {
+  const firstArg = argv[0];
+
+  // Top-level -h/--help takes precedence over everything
+  if (firstArg === "-h" || firstArg === "--help") {
+    printTopLevelHelp();
+    process.exit(0);
+  }
+
+  // Dispatch subcommands
+  const SUBCOMMANDS = ["run", "version", "output", "env", "install"];
+
+  if (!SUBCOMMANDS.includes(firstArg)) {
+    process.stderr.write(
+      `Error: unknown command '${firstArg}'. Run 'loopx -h' for usage.\n`
+    );
+    process.exit(1);
+  }
+
+  if (firstArg === "version") {
     console.log(getVersion());
     process.exit(0);
   }
 
-  if (args.subcommand === "output") {
-    handleOutputSubcommand(args.subcommandArgs);
+  if (firstArg === "output") {
+    handleOutputSubcommand(argv.slice(1));
     process.exit(0);
   }
 
-  if (args.subcommand === "env") {
-    handleEnvSubcommand(args.subcommandArgs);
+  if (firstArg === "env") {
+    handleEnvSubcommand(argv.slice(1));
     process.exit(0);
   }
 
-  if (args.subcommand === "install") {
-    if (args.subcommandArgs.length < 1) {
-      process.stderr.write("Error: loopx install requires a <source> argument\n");
+  if (firstArg === "install") {
+    const installArgs = argv.slice(1);
+    if (installArgs.length < 1) {
+      process.stderr.write(
+        "Error: loopx install requires a <source> argument\n"
+      );
       process.exit(1);
     }
-    await installCommand(args.subcommandArgs[0], cwd);
+    await installCommand(installArgs[0], cwd);
     process.exit(0);
+  }
+
+  // --- run subcommand ---
+  const runArgv = argv.slice(1);
+  const runArgs = parseRunArgs(runArgv);
+
+  // Run help
+  if (runArgs.help) {
+    printRunHelp(loopxDir);
+    process.exit(0);
+  }
+
+  // Script name is required
+  if (!runArgs.scriptName) {
+    process.stderr.write(
+      "Error: loopx run requires a <script-name>. Run 'loopx run -h' for usage.\n"
+    );
+    process.exit(1);
   }
 
   // Run mode: requires .loopx/
   const discovery = discoverScripts(loopxDir, "run");
 
-  // Print warnings to stderr
   for (const w of discovery.warnings) {
     process.stderr.write(w + "\n");
   }
 
-  // Check for fatal errors
   if (discovery.errors.length > 0) {
     for (const err of discovery.errors) {
       process.stderr.write(`Error: ${err}\n`);
@@ -358,9 +383,9 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  if (args.envFile) {
+  if (runArgs.envFile) {
     try {
-      const envFilePath = resolve(cwd, args.envFile);
+      const envFilePath = resolve(cwd, runArgs.envFile);
       const localResult = loadLocalEnv(envFilePath);
       localEnv = localResult.vars;
       for (const w of localResult.warnings) {
@@ -376,25 +401,19 @@ async function main(): Promise<void> {
 
   const mergedEnv = mergeEnv(globalEnv, localEnv, loopxBin, cwd);
 
-  // Determine starting target
-  const scriptName = args.scriptName || "default";
+  // Resolve starting target
+  const scriptName = runArgs.scriptName;
   const startingTarget = discovery.scripts.get(scriptName);
 
   if (!startingTarget) {
-    if (!args.scriptName) {
-      process.stderr.write(
-        "Error: No default script found. Create .loopx/default.ts or specify a script name.\n"
-      );
-    } else {
-      process.stderr.write(
-        `Error: Script '${scriptName}' not found in .loopx/\n`
-      );
-    }
+    process.stderr.write(
+      `Error: Script '${scriptName}' not found in .loopx/\n`
+    );
     process.exit(1);
   }
 
   // -n 0: validate then exit
-  if (args.maxIterations === 0) {
+  if (runArgs.maxIterations === 0) {
     process.exit(0);
   }
 
@@ -418,7 +437,7 @@ async function main(): Promise<void> {
   // Run the loop
   try {
     const loop = runLoop(startingTarget, discovery.scripts, {
-      maxIterations: args.maxIterations,
+      maxIterations: runArgs.maxIterations,
       env: mergedEnv,
       projectRoot: cwd,
       loopxBin,

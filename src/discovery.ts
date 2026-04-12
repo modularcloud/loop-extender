@@ -3,7 +3,6 @@ import { join, extname, basename } from "node:path";
 import { validateDirScriptCore } from "./validate-dir-script.js";
 
 export const SUPPORTED_EXTENSIONS = new Set([".sh", ".js", ".jsx", ".ts", ".tsx"]);
-export const RESERVED_NAMES = new Set(["output", "env", "install", "version"]);
 export const NAME_PATTERN = /^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/;
 
 export interface ScriptEntry {
@@ -37,7 +36,11 @@ export function discoverScripts(
     if (code === "ENOENT") {
       if (mode === "run") {
         errors.push(
-          "No .loopx/ directory found. Create .loopx/default.ts or specify a script name."
+          "No .loopx/ directory found. Create a .loopx/ directory with scripts."
+        );
+      } else {
+        warnings.push(
+          "Warning: .loopx/ directory not found"
         );
       }
     } else {
@@ -101,21 +104,6 @@ export function discoverScripts(
     }
   }
 
-  // Check reserved names (iterate unique names, not all candidates)
-  for (const [name] of nameGroups) {
-    if (RESERVED_NAMES.has(name)) {
-      if (mode === "run") {
-        errors.push(
-          `Script name '${name}' is reserved (used by loopx subcommand)`
-        );
-      } else {
-        warnings.push(
-          `Warning: script '${name}' uses a reserved name`
-        );
-      }
-    }
-  }
-
   // Check name restrictions (iterate unique names, not all candidates)
   for (const [name] of nameGroups) {
     if (!NAME_PATTERN.test(name)) {
@@ -171,7 +159,7 @@ function validateDirScript(
     "unreadable": `Warning: ${dirName}/package.json is unreadable or has permission issues, skipping`,
     "invalid-json": `Warning: ${dirName}/package.json contains invalid JSON, skipping`,
     "invalid-object": `Warning: ${dirName}/package.json is not a valid object, skipping`,
-    "no-main": null,
+    "no-main": `Warning: ${dirName}/package.json has no main field, skipping`,
     "bad-main-type": `Warning: ${dirName}/package.json main field is not a string, skipping`,
     "bad-ext": `Warning: ${dirName}/package.json main has unsupported extension '${result.detail}', skipping`,
     "escapes": `Warning: ${dirName}/package.json main escapes directory boundary, skipping`,

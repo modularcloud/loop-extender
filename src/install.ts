@@ -14,7 +14,6 @@ import { classifySource } from "./parsers/classify-source.js";
 import {
   discoverScripts,
   SUPPORTED_EXTENSIONS,
-  RESERVED_NAMES,
   NAME_PATTERN,
 } from "./discovery.js";
 import { validateDirScriptCore } from "./validate-dir-script.js";
@@ -93,9 +92,6 @@ function deriveRepoName(url: string, source: string): string {
 }
 
 function validateName(name: string): string | null {
-  if (RESERVED_NAMES.has(name)) {
-    return `Script name '${name}' is reserved`;
-  }
   if (!NAME_PATTERN.test(name)) {
     return `Script name '${name}' is invalid: must match [a-zA-Z0-9_][a-zA-Z0-9_-]*`;
   }

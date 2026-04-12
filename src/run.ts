@@ -13,7 +13,7 @@ import { getLoopxBin, ensureLoopxPackageJson } from "./bin-path.js";
  * Returns a custom AsyncGenerator that supports cancellation via .return().
  */
 export function run(
-  scriptName?: string,
+  scriptName: string,
   options?: RunOptions
 ): AsyncGenerator<Output> {
   // Snapshot all options at call time (before any async work)
@@ -146,16 +146,21 @@ async function* runInternal(
 
   ensureLoopxPackageJson(loopxDir);
 
+  // Validate scriptName
+  if (
+    scriptName === undefined ||
+    scriptName === null ||
+    typeof scriptName !== "string"
+  ) {
+    throw new Error(
+      "scriptName is required and must be a string"
+    );
+  }
+
   // Resolve starting target
-  const name = scriptName || "default";
-  const startingTarget = discovery.scripts.get(name);
+  const startingTarget = discovery.scripts.get(scriptName);
   if (!startingTarget) {
-    if (!scriptName) {
-      throw new Error(
-        "No default script found. Create .loopx/default.ts or specify a script name."
-      );
-    }
-    throw new Error(`Script '${name}' not found in .loopx/`);
+    throw new Error(`Script '${scriptName}' not found in .loopx/`);
   }
 
   // maxIterations: 0 validates then exits (mirrors CLI -n 0)
@@ -178,7 +183,7 @@ async function* runInternal(
  * When a signal is provided, the promise rejects on abort.
  */
 export async function runPromise(
-  scriptName?: string,
+  scriptName: string,
   options?: RunOptions
 ): Promise<Output[]> {
   const signal = options?.signal;
