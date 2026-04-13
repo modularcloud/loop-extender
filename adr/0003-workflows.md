@@ -202,6 +202,18 @@ The **project root** is defined as the current working directory where `loopx` i
 
 Delegation happens **before command parsing**, so it is based on the project root only — not on the target workflow. Because the project root is cwd (not "the directory containing `.loopx/`"), delegation works for all commands, including those that do not require `.loopx/` to exist (e.g., `loopx version`, `loopx install`, `loopx env`).
 
+#### Project-root `package.json` failure modes
+
+The delegation check in step 1 above depends on reading the project-root `package.json`. The following rules define behavior when that file is problematic:
+
+- **No `package.json` at project root:** No delegation. The global install runs. No warning.
+- **Unreadable `package.json`** (e.g., permission denied): A warning is printed to stderr. Delegation is skipped and the global install runs.
+- **Invalid JSON:** A warning is printed to stderr. Delegation is skipped and the global install runs.
+- **Valid JSON, `loopx` declared in `dependencies`/`devDependencies`/`optionalDependencies`, but `node_modules/.bin/loopx` does not exist:** A warning is printed to stderr (the dependency is declared but the binary is missing — likely `npm install` has not been run). Delegation is skipped and the global install runs.
+- **Valid JSON, `loopx` not declared in any dependency field, but `node_modules/.bin/loopx` exists:** No delegation. The dependency declaration is required for delegation — an undeclared binary is not used. No warning.
+
+In all cases, a problematic project-root `package.json` degrades delegation but does not prevent loopx from running. The global install is always the fallback.
+
 #### Workflow-level version declaration (runtime validation)
 
 A workflow's `package.json` may declare a `loopx` version requirement (in `dependencies` or `devDependencies`). `optionalDependencies` is intentionally not checked at the workflow level — a version requirement declared there is ignored. Workflow-level version declarations are compatibility assertions, not optional suggestions. (Project-root delegation checks `optionalDependencies` because it follows standard npm dependency semantics for locating a local binary.)
@@ -350,11 +362,19 @@ loopx install --workflow <name> <source>
 
 When `-w` is used, only the selected workflow is validated. Invalid sibling workflows in the source do not block installation of the selected workflow.
 
-`-w` is not valid for single-workflow repos. If the source is a single-workflow repo (root-level scripts, no workflow directories), using `-w` is an error regardless of the name provided.
+`-w` is only valid for multi-workflow sources. If the source is a single-workflow repo (root-level scripts, no workflow directories) or a mixed-content repo (both root-level scripts and workflow directories), using `-w` is an error regardless of the name provided.
 
 #### Source detection
 
 Existing source detection rules (SPEC section 10.1) remain unchanged for `org/repo` shorthand, known git hosts, `.git` URLs, and tarball URLs. The only removal is the single-file URL fallback: any source that would previously have been classified as a single-file URL (rule 5 in section 10.1 — "any other URL") is now rejected with an error. The remaining classification rules, their ordering, and their edge cases are preserved as-is.
+
+#### Tarball source normalization
+
+The current SPEC (section 10.2) defines wrapper-directory stripping for tarballs: if extraction yields a single top-level directory, that directory's contents become the package root; if extraction yields multiple top-level entries, the extracted contents are used directly. This behavior is preserved.
+
+After extraction and wrapper-directory stripping (if applicable), the result is the **source root**. The source root is then classified as multi-workflow, single-workflow, mixed-content, or zero-workflow using the same rules described in "Installing workflows from a repository" above — the classification logic is source-type-agnostic.
+
+For single-workflow tarball sources, the workflow name is the **archive-name**: the URL's last path segment with archive extensions (`.tar.gz`, `.tgz`) removed and query strings and fragments stripped, consistent with the current SPEC §10.2 naming derivation. For multi-workflow tarball sources, workflow names are derived from the subdirectory names within the source root, same as for git sources.
 
 #### Single-file URL
 
@@ -367,10 +387,12 @@ A workflow install targets `.loopx/<workflow-name>/`. In the workflow model, wor
 Collision is determined by whether any filesystem entry (file, directory, or symlink) already exists at `.loopx/<workflow-name>`:
 
 - **Path does not exist:** The workflow is installed. No collision checks are needed.
-- **Path exists and is a discovered workflow:** The install is refused with an error. With `-y`, the existing workflow is removed and the replacement is installed.
-- **Path exists but is not a discovered workflow** (e.g., a utility directory with no script files, a stray file, a legacy flat file or directory from the pre-workflow layout): The install is refused with an error, even with `-y`. This prevents `-y` from accidentally deleting non-workflow data.
+- **Path exists and is a workflow by structure:** The install is refused with an error. With `-y`, the existing entry is removed and the replacement is installed. The check is **local**: `.loopx/<workflow-name>` is a workflow if it is a directory containing at least one top-level file with a supported script extension. This does not require a full discovery/validation pass over all of `.loopx/` — only the target path is inspected. Invalid sibling workflows, name collisions in other workflows, or other issues elsewhere under `.loopx/` do not affect whether `-y` can replace the target.
+- **Path exists but is not a workflow by structure** (e.g., a directory with no script files, or a non-directory filesystem entry): The install is refused with an error, even with `-y`. This prevents `-y` from accidentally deleting non-workflow data.
 
-`-y` replaces only discovered workflows. It does not replace legacy flat files, non-workflow directories, or other arbitrary filesystem entries at the target path.
+`-y` replaces only entries that are workflows by structure at the target path. It does not replace non-workflow directories or other arbitrary filesystem entries.
+
+**Legacy flat files and collision:** Legacy flat files (e.g., `.loopx/foo.sh`) occupy a different filesystem path than the workflow directory `.loopx/foo/`. Because collision is purely path-based, installing a workflow `foo` does not collide with a legacy flat file `.loopx/foo.sh` — the two coexist. Legacy flat files are not discovered at runtime under the workflow model (section 6) and are surfaced only by the migration warning in `loopx run -h` (section 7).
 
 #### Version checking on install
 
@@ -452,7 +474,7 @@ The `output()` JS/TS function requires no changes — the `goto` field is alread
 - **Breaking change: invocation syntax.** `loopx run myscript` now means "run the `index` script in the `myscript` workflow," not "run the flat script named `myscript`."
 - **Breaking change: programmatic API.** The `scriptName` parameter is renamed to `target` and uses `workflow:script` syntax.
 - **Breaking change: single-file URL install removed.** `loopx install <single-file-url>` is no longer supported.
-- **Breaking change: version delegation simplified.** Projects relying on ancestor-directory traversal for version delegation must ensure the `loopx` dependency is in the project root `package.json` (the directory containing `.loopx/`).
+- **Breaking change: version delegation simplified.** Projects relying on ancestor-directory traversal for version delegation must ensure the `loopx` dependency is in the project root `package.json` (cwd where `loopx` is invoked).
 - **Breaking change: working directory.** Current flat file scripts run with the project root (where `loopx` was invoked) as their working directory. Under the workflow model, all scripts run with their workflow directory as cwd. Scripts that rely on project-root-relative paths must be updated to use `LOOPX_PROJECT_ROOT` instead.
 - **Breaking change: `RunOptions.cwd` semantics.** `RunOptions.cwd` no longer controls the script's execution working directory. It now specifies the project root (where `.loopx/` is resolved and where `LOOPX_PROJECT_ROOT` is derived from). Scripts always execute with their workflow directory as cwd regardless of `RunOptions.cwd`.
 - Cross-workflow `goto` enables multi-workflow compositions where a loop can span several related workflows while always returning to its starting point.
@@ -483,6 +505,7 @@ When this ADR is accepted, the following SPEC sections require updates:
 - **9.1 / 9.2 (Programmatic API)** — Rename `scriptName` to `target`. Update examples to use `workflow:script` syntax.
 - **9.5 (Types)** — Update `run()` and `runPromise()` signatures. Update `RunOptions.cwd` documentation: `cwd` now specifies the project root for `.loopx/` resolution and `LOOPX_PROJECT_ROOT`, not the script execution working directory.
 - **10.1 (Source Detection)** — Remove rule 5 (single-file URL fallback). Existing rules 1–4 (`org/repo`, known git hosts, `.git` URLs, tarball URLs) are preserved unchanged.
+- **10.2 (Source Type Details)** — Remove single-file URL details. Update git URL handling to reflect workflow classification instead of directory-script validation. Update tarball handling: preserve wrapper-directory stripping, define source root, apply workflow classification to normalized source root. Update naming derivation for both single-workflow and multi-workflow sources.
 - **10 (`loopx install`)** — Rewrite for workflow-based installation. Multi-workflow repos, single-workflow repos, `--workflow` flag, version mismatch handling, single-file removal, simplified collision model.
 - **11 (Help)** — Update `loopx run -h` to list workflows and their scripts.
 - **12 (Exit Codes)** — Update examples for new syntax.
@@ -563,7 +586,10 @@ When this ADR is accepted, the following SPEC sections require updates:
 - Verify `loopx run -n 0 ralph` performs discovery and target validation but does not print workflow version warnings.
 - Verify `loopx run ralph` fails if a sibling workflow has an invalid script name (global validation).
 - Verify `loopx run ralph` fails if a sibling workflow has a same-base-name collision (global validation).
-- Verify `loopx install -y` does not replace a non-workflow entry (legacy flat file or non-workflow directory) at the destination path.
+- Verify `loopx install -y` does not replace a non-workflow entry (e.g., a directory with no script files, a stray non-directory file) at the destination path.
+- Verify installing workflow `foo` succeeds when legacy flat file `.loopx/foo.sh` exists (different filesystem path, no collision).
+- Verify `-y` replaceability is determined by a local structural check of `.loopx/<workflow-name>` only — a broken sibling workflow does not prevent `-y` from replacing an unrelated target.
+- Verify `loopx install -w <name> <source>` errors on a mixed-content repo source.
 - Verify `loopx install -w a -w b <source>` (duplicate `-w`) is a usage error.
 - Verify `loopx install --unknown <source>` (unrecognized flag) is a usage error.
 - Verify `loopx install -h --unknown` (unrecognized flag with `-h`) shows help (no error).
@@ -571,5 +597,12 @@ When this ADR is accepted, the following SPEC sections require updates:
 - Verify files with supported extensions in subdirectories within a workflow (e.g., `lib/helpers.ts`) are not discovered as scripts.
 - Verify programmatic `RunOptions.cwd` controls `.loopx/` resolution (project root) but does not affect script execution working directory.
 - Verify scripts execute with their workflow directory as cwd even when `RunOptions.cwd` is set to a different path.
+- Verify tarball install strips a single top-level wrapper directory before classifying the source as multi-/single-workflow.
+- Verify tarball install with multiple top-level entries (no wrapper directory) classifies correctly without stripping.
+- Verify single-workflow tarball derives the workflow name from the archive-name (URL last path segment minus extensions).
+- Verify delegation skips with a warning when the project-root `package.json` is unreadable.
+- Verify delegation skips with a warning when the project-root `package.json` contains invalid JSON.
+- Verify delegation skips with a warning when the project-root `package.json` declares `loopx` but `node_modules/.bin/loopx` does not exist.
+- Verify delegation does not occur when `node_modules/.bin/loopx` exists but the project-root `package.json` does not declare `loopx` as a dependency.
 - Verify that when `loopx` is declared in both `dependencies` and `devDependencies` of a workflow `package.json`, the `dependencies` range is used for version checking.
 - Verify `loopx run -h` emits a migration warning when legacy directory-script layouts (subdirectories with `package.json` + `main` but no top-level script files) are detected in `.loopx/`.
