@@ -150,6 +150,7 @@ interface Output {
 - **Empty stdout** (0 bytes) is treated as `{ result: "" }`. This is the default case for scripts that produce no output, and causes the loop to reset (no `goto`, no `stop`).
 - Extra JSON fields beyond `result`, `goto`, and `stop` are silently ignored.
 - If `result` is present but not a string, it is coerced via `String(value)`. This includes `null`: `{"result": null}` produces result `"null"`.
+- A string `goto` value is either a bare script name (targeting a script within the current workflow) or a qualified `workflow:script` name (targeting a specific workflow and script). See section 2.2 for full goto semantics.
 - If `goto` is present but not a string, it is treated as absent. Target validation (section 4.1) applies only after a `goto` value has been parsed as a string.
 - `stop` must be exactly `true` (boolean). Any other value (including truthy strings like `"true"`, numbers, etc.) is treated as absent. This prevents surprises like `{"stop": "false"}` halting the loop.
 
@@ -448,7 +449,7 @@ Single-file URL install is not supported. Creates the `.loopx/` directory if it 
 
 ### 5.1 Discovery
 
-Workflows and scripts are discovered by scanning the `.loopx/` directory in the current working directory. The `.loopx/` directory is only searched in the current working directory — ancestor directories are not searched.
+Workflows and scripts are discovered by scanning the `.loopx/` directory in the project root (section 3.2). The `.loopx/` directory is only searched in the project root — ancestor directories are not searched.
 
 #### Workflow discovery
 
@@ -458,6 +459,8 @@ Files placed directly inside `.loopx/` are never discovered, even if they have s
 - A subdirectory is a workflow if it contains at least one **top-level** file (directly inside the subdirectory, not in nested subdirectories) with a supported extension.
 - Subdirectories with no script files are ignored (no warning).
 - Workflow names are validated against the name restriction rules (section 5.3).
+
+Legacy layouts are not recognized: loose script files placed directly in `.loopx/` are ignored (only subdirectories are candidates), and the former "directory script" model (`package.json` + `main` field as entry point) no longer applies — a subdirectory must satisfy the workflow detection rules (section 2.1) to be discovered.
 
 #### Script discovery within workflows
 
@@ -521,7 +524,7 @@ Not all commands require `.loopx/` to exist or be valid:
 
 All scripts run with the **workflow directory** as their working directory (e.g., `.loopx/ralph/`). This ensures relative imports and `node_modules/` resolve naturally.
 
-loopx injects `LOOPX_PROJECT_ROOT` into every script's environment, set to the absolute path of the directory where `loopx` was invoked. This is essential for scripts that need to reference project files outside their workflow directory.
+loopx injects `LOOPX_PROJECT_ROOT` into every script's environment, set to the absolute path of the project root (see section 3.2; for the programmatic API, this is `RunOptions.cwd` if provided — see section 9.5). This is essential for scripts that need to reference project files outside their workflow directory.
 
 ### 6.2 Bash Scripts
 
@@ -684,7 +687,7 @@ loopx injects the following variables into every script execution:
 | Variable | Value |
 |----------|-------|
 | `LOOPX_BIN` | Resolved realpath of the effective loopx binary (post-delegation) |
-| `LOOPX_PROJECT_ROOT` | Absolute path to the directory where `loopx` was invoked |
+| `LOOPX_PROJECT_ROOT` | Absolute path to the project root (section 3.2) |
 | `LOOPX_WORKFLOW` | The name of the workflow containing the currently executing script |
 
 **Note:** For Node.js/tsx, module resolution for `import from "loopx"` is handled via `--import` and a custom resolve hook (see section 3.3), not via `NODE_PATH`. For Bun, `NODE_PATH` is set internally but is not considered a user-facing injected variable.
@@ -969,7 +972,9 @@ Install help does not require a source argument, does not make network requests,
 | 1 | Error: script exited non-zero, validation failure, invalid `goto` target, missing workflow, missing script, missing `.loopx/` directory, install failure, or usage error. |
 | 128+N | Interrupted by signal N (e.g., 130 for SIGINT). |
 
-Usage errors (exit code 1) include: `loopx run` with no target, `loopx run ralph bar` (extra positional), `loopx foo` (unrecognized subcommand), `loopx ralph` (unrecognized subcommand — no implicit fallback to `run`), `loopx --unknown` (unrecognized top-level flag), `loopx -n 5 ralph` (top-level `-n`), `loopx -e .env ralph` (top-level `-e`), `loopx run --unknown ralph` (unrecognized run flag), `loopx run -n 5 -n 10 ralph` (duplicate run flag), `loopx install` with no source, `loopx install -w a -w b <source>` (duplicate install flag), `loopx install --unknown <source>` (unrecognized install flag), `loopx run ":script"` (leading colon), `loopx run "workflow:"` (trailing colon), `loopx run "a:b:c"` (multiple colons), and `loopx run ""` (empty target).
+Usage errors (exit code 1) include: `loopx run` with no target, `loopx run ralph bar` (extra positional), `loopx foo` (unrecognized subcommand), `loopx ralph` (unrecognized subcommand — no implicit fallback to `run`), `loopx --unknown` (unrecognized top-level flag), `loopx -n 5 ralph` (top-level `-n`), `loopx -e .env ralph` (top-level `-e`), `loopx run --unknown ralph` (unrecognized run flag), `loopx run -n 5 -n 10 ralph` (duplicate run flag), `loopx install` with no source, `loopx install -w a -w b <source>` (duplicate install flag), and `loopx install --unknown <source>` (unrecognized install flag).
+
+Invalid target strings (e.g., `loopx run ":script"`, `loopx run "workflow:"`, `loopx run "a:b:c"`, `loopx run ""`) are also exit code 1 but are not usage errors — they are rejected after discovery, at the same point as a missing workflow or missing script (section 4.1).
 
 Note: A non-zero exit code from any script causes loopx to exit with code 1. Scripts that need error resilience should handle errors internally and exit 0.
 
@@ -980,7 +985,7 @@ Note: A non-zero exit code from any script causes loopx to exit with code 1. Scr
 | Name | Context | Purpose |
 |------|---------|---------|
 | `LOOPX_BIN` | Env variable | Resolved realpath of the effective loopx binary (post-delegation) |
-| `LOOPX_PROJECT_ROOT` | Env variable | Absolute path to the directory where loopx was invoked |
+| `LOOPX_PROJECT_ROOT` | Env variable | Absolute path to the project root (section 3.2) |
 | `LOOPX_WORKFLOW` | Env variable | The name of the workflow containing the currently executing script |
 | `LOOPX_DELEGATED` | Env variable | Set to `1` during delegation to prevent recursion |
 | `index` | Convention | Default entry point script name within a workflow |
