@@ -12,16 +12,14 @@ fi
 
 FEEDBACK=$(cat "$FEEDBACK_FILE")
 
-ADR_0003=$(cat "$ROOT/adr/0003-workflows.md")
-SPEC=$(cat "$ROOT/SPEC.md")
+PROMPT="ADR-0003 has been accepted and SPEC.md has already been updated to incorporate its changes (per the ADR process in ADR-0001). I am now updating TEST-SPEC.md to cover the new and changed spec behavior introduced by ADR-0003. I received the following feedback on the current state of TEST-SPEC.md. Apply this feedback by updating TEST-SPEC.md only — do not modify SPEC.md or ADR-0003, they are read-only references in this cycle. ADR-0003 and the updated SPEC.md are the authoritative sources for what TEST-SPEC.md should cover. If there is any ambiguity about my intentions, ask me clarifying questions. Think critically about this feedback and push back if warranted. After you finish, commit and push.
 
-PROMPT="ADR-0003 has been accepted and I am now updating SPEC.md to incorporate its changes (per the ADR process in ADR-0001). I received the following feedback on the current state of SPEC.md. Apply this feedback by updating SPEC.md only. ADR-0003 is the authoritative reference for what should change — do not modify it. If there is any ambiguity about my intentions, ask me clarifying questions. Think critically about this feedback and push back if warranted. After you finish, commit and push.
+Reference files (read these yourself — do not modify):
+- adr/0003-workflows.md
+- SPEC.md
 
-adr/0003-workflows.md (accepted — read-only reference):
-$ADR_0003
-
-Current SPEC.md:
-$SPEC
+Target file (apply feedback here):
+- TEST-SPEC.md
 
 Feedback:
 $FEEDBACK"
