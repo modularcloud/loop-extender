@@ -460,7 +460,7 @@ Files placed directly inside `.loopx/` are never discovered, even if they have s
 - Subdirectories with no script files are ignored (no warning).
 - Workflow names are validated against the name restriction rules (section 5.3).
 
-Legacy layouts are not recognized: loose script files placed directly in `.loopx/` are ignored (only subdirectories are candidates), and the former "directory script" model (`package.json` + `main` field as entry point) no longer applies — a subdirectory must satisfy the workflow detection rules (section 2.1) to be discovered.
+Legacy layouts are not recognized: loose script files placed directly in `.loopx/` are ignored (only subdirectories are candidates), and the former "directory script" model (`package.json` + `main` field as entry point) no longer applies — a subdirectory must satisfy the workflow detection rules (section 2.1) to be discovered. loopx does not provide migration warnings or automatic migration for these legacy layouts; they are simply not discovered.
 
 #### Script discovery within workflows
 
@@ -560,6 +560,8 @@ output({ result: "hello", goto: "next-step" });
 - Properties whose value is `undefined` are treated as absent (they are omitted during JSON serialization). For example, `output({ result: "done", goto: undefined })` is equivalent to `output({ result: "done" })`.
 - If called with a non-object value (e.g., a plain string, number, or boolean), the value is serialized as `{ result: String(value) }`. Arrays are **not** treated as non-object values (since `typeof [] === 'object'`); an array must contain at least one known field with a defined value, just like any other object — so `output([1,2,3])` throws an error (no known fields).
 - If called with `null` or `undefined`, an error is thrown.
+
+`output()` does not validate `goto` target syntax or existence; it only serializes the value. Target validation occurs during loop execution (section 7.1).
 
 ### 6.5 `input()` Function (JS/TS)
 
@@ -896,7 +898,7 @@ There is no `.loopx/package.json` manifest. Version authority lives in two place
 
 Multi-workflow installs are **preflight-atomic**: no workflows are written until all selected workflows pass preflight and staging completes. Once commit begins, a rare failure may leave a partial install; loopx reports which workflows were and were not committed.
 
-**Preflight phase:** All preflight checks — name restriction violations, script-name collisions within a workflow, collisions with existing entries at `.loopx/<workflow-name>`, and version mismatches (workflow declares a `loopx` range not satisfied by the running version) — are evaluated for every workflow before any are written. If any workflow fails any preflight check, the entire install fails, no workflows are written to `.loopx/`, and a single aggregated error is displayed listing all failures across all workflows. When `-y` is present, replaceable workflow-path collisions and version mismatches are recorded during preflight but are not treated as failures; all other validation failures (invalid names, same-base-name collisions, zero-workflow sources, non-workflow destination paths) remain fatal regardless of `-y`. Directories with no script files are silently skipped (they are not workflows) and do not cause a failure.
+**Preflight phase:** All preflight checks — name restriction violations, script-name collisions within a workflow, collisions with existing entries at `.loopx/<workflow-name>`, and version mismatches (workflow declares a `loopx` range not satisfied by the running version) — are evaluated for every selected workflow (that is, every workflow that would be installed) before any are written. If any workflow fails any preflight check, the entire install fails, no workflows are written to `.loopx/`, and a single aggregated error is displayed listing all failures across all workflows. When `-y` is present, replaceable workflow-path collisions and version mismatches are recorded during preflight but are not treated as failures; all other validation failures (invalid names, same-base-name collisions, zero-workflow sources, non-workflow destination paths) remain fatal regardless of `-y`. Directories with no script files are silently skipped (they are not workflows) and do not cause a failure.
 
 **Write phase (stage-then-commit):** After preflight passes, writes use a stage-then-commit strategy to preserve atomicity:
 
