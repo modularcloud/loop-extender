@@ -1,6 +1,6 @@
 # ADR-0003: Workflow-Based Script Organization
 
-**Status:** Accepted
+**Status:** Spec Updated
 
 ---
 
