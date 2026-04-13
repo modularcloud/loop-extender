@@ -124,6 +124,8 @@ The following target strings are invalid in all contexts — CLI invocation (`lo
 - **Multiple colons** (e.g., `"a:b:c"`): error. The colon delimiter may appear at most once.
 - **Name restriction violations**: The workflow portion and the script portion (if present) must each match `[a-zA-Z0-9_][a-zA-Z0-9_-]*`. A target where either portion violates this pattern is an error.
 
+Existing structured-output parsing semantics are unchanged: if `goto` is present but not a string, it is treated as absent. Target validation in this ADR applies only after a `goto` value has been parsed as a string.
+
 For CLI invocation and the programmatic API, invalid targets are rejected at the same point as a missing workflow (after discovery, or lazily on first iteration for the API). For `goto` values, invalid targets produce an error at transition time (exit code 1).
 
 ### 4. Goto semantics
@@ -268,6 +270,8 @@ This means:
 Discovery scans `.loopx/` for workflow subdirectories, then scans each workflow for script files.
 
 #### Workflow discovery
+
+Files placed directly inside `.loopx/` are never discovered, even if they have supported script extensions; only subdirectories are candidates for workflow discovery.
 
 - Scan `.loopx/` for top-level subdirectories.
 - A subdirectory is a workflow if it contains at least one **top-level** file (directly inside the subdirectory, not in nested subdirectories) with a supported extension.
@@ -476,7 +480,7 @@ $LOOPX_BIN output --goto "check-ready"              # intra-workflow
 $LOOPX_BIN output --goto "review-adr:request-feedback"  # cross-workflow
 ```
 
-The `output()` JS/TS function requires no changes — the `goto` field is already a plain string.
+`loopx output --goto` only serializes the value into the structured output JSON; it does not validate the target format. Target validation occurs at loop execution time when the `goto` value is resolved. This keeps the CLI helper aligned with the JS/TS `output()` function, which also performs no validation — the `goto` field is already a plain string.
 
 ## Consequences
 
@@ -521,9 +525,9 @@ When this ADR is accepted, the following SPEC sections require updates:
 - **10.1 (Source Detection)** — Remove rule 5 (single-file URL fallback). Existing rules 1–4 (`org/repo`, known git hosts, `.git` URLs, tarball URLs) are preserved unchanged.
 - **10.2 (Source Type Details)** — Remove single-file URL details. Update git URL handling to reflect workflow classification instead of directory-script validation. Update tarball handling: preserve wrapper-directory stripping, define source root, apply workflow classification to normalized source root. Update naming derivation for both single-workflow and multi-workflow sources.
 - **10 (`loopx install`)** — Rewrite for workflow-based installation. Multi-workflow repos, single-workflow repos, `--workflow` flag, version mismatch handling, single-file removal, simplified collision model.
-- **11 (Help)** — Update `loopx run -h` to list workflows and their scripts.
+- **11 (Help)** — Update `loopx run -h` to list workflows and their scripts. Add install help (`loopx install -h`) as a third help form alongside top-level help and run help.
 - **12 (Exit Codes)** — Update examples for new syntax.
-- **13 (Summary of Reserved and Special Values)** — Add `index` as the default entry point convention. Add `:` as a reserved delimiter.
+- **13 (Summary of Reserved and Special Values)** — Add `index` as the default entry point convention. Add `:` as a reserved delimiter. Add `LOOPX_WORKFLOW` environment variable.
 
 ## Test Recommendations
 
