@@ -12,7 +12,16 @@ fi
 
 FEEDBACK=$(cat "$FEEDBACK_FILE")
 
-PROMPT="I received the following feedback about ADR-0003 (workflow-based script organization) and its relationship to SPEC.md as defined by the the process laid out in ADR-0001. Incorporate this feedback to improve ADR-0003. If there is any ambiguity about my intentions, ask me clarifying questions. Think critically about this feedback and push back if warranted. Do not update any file other than ADR-0003 and do not mark it as accepted. After you finish, commit and push.
+ADR_0003=$(cat "$ROOT/adr/0003-workflows.md")
+SPEC=$(cat "$ROOT/SPEC.md")
+
+PROMPT="ADR-0003 has been accepted and I am now updating SPEC.md to incorporate its changes (per the ADR process in ADR-0001). I received the following feedback on the current state of SPEC.md. Apply this feedback by updating SPEC.md only. ADR-0003 is the authoritative reference for what should change — do not modify it. If there is any ambiguity about my intentions, ask me clarifying questions. Think critically about this feedback and push back if warranted. After you finish, commit and push.
+
+adr/0003-workflows.md (accepted — read-only reference):
+$ADR_0003
+
+Current SPEC.md:
+$SPEC
 
 Feedback:
 $FEEDBACK"

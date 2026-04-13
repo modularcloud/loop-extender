@@ -30,15 +30,12 @@ fi
 
 # Build the prompt and save to file (too long for a single Telegram message)
 cat <<PROMPT > "$PROMPT_FILE"
-Review ADR 0001, ADR 0003, and SPEC.md holistically and let me know if I can mark ADR 0003 as accepted or if I need to improve it further. Ask me clarifying questions if you have any doubts about my intentions for ADR 0003.
+ADR 0003 has been accepted. The next step in the process is to update SPEC.md to incorporate the changes described in ADR 0003. Review the current SPEC.md against ADR 0003 and let me know if the SPEC updates look correct and complete, or if anything else in the SPEC needs to be changed.
 
-adr/0001-adr-process.md:
-$(cat "$ADR_0001")
-
-adr/0003-workflows.md:
+adr/0003-workflows.md (accepted — do not modify):
 $(cat "$ADR_0003")
 
-SPEC.md:
+SPEC.md (target of updates):
 $(cat "$SPEC")
 PROMPT
 
