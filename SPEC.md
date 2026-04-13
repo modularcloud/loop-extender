@@ -369,11 +369,11 @@ Within `run`, options and the target may appear in any order.
 | `-y` | Override version mismatch and workflow collision checks (see sections 10.5 and 10.6). |
 | `-h`, `--help` | Print install help and exit. |
 
-**Duplicate flags:** Repeating `-w` or `-y` is a usage error (exit code 1) — unless `-h` is present.
+**Duplicate flags:** Repeating `-w` or `-y` is a usage error (exit code 1) — unless `-h` / `--help` is present.
 
-**Unrecognized flags:** Unrecognized flags (e.g., `loopx install --unknown <source>`) are usage errors (exit code 1) — unless `-h` is present.
+**Unrecognized flags:** Unrecognized flags (e.g., `loopx install --unknown <source>`) are usage errors (exit code 1) — unless `-h` / `--help` is present.
 
-**`install -h` short-circuit:** When `-h` is present, loopx shows install help, exits 0, and ignores all other install-level arguments unconditionally. Source is not required, flags are not validated, and no network requests are made.
+**`install -h` / `--help` short-circuit:** When `-h` / `--help` is present, loopx shows install help, exits 0, and ignores all other install-level arguments unconditionally. Source is not required, flags are not validated, and no network requests are made.
 
 ### 4.3 Subcommands
 
@@ -512,7 +512,7 @@ Not all commands require `.loopx/` to exist or be valid:
 | `loopx version` | No | No |
 | `loopx env *` | No | No |
 | `loopx output` | No | No |
-| `loopx install <source>` | No (creates if needed) | Source workflows and target-path collisions (section 10) |
+| `loopx install [options] <source>` | No (creates if needed) | Source workflows, target-path collisions, version mismatches, and install-time validation (section 10) |
 | `loopx run -h` | No | Non-fatal (warnings shown for all discovered workflows) |
 | `loopx run <target>` | Yes | Yes — collisions (5.2), name-restriction violations (5.3), and missing target are fatal across all discovered workflows |
 
@@ -622,6 +622,7 @@ The first script invocation in a loop receives **no input**. Stdin is empty.
 ### 7.2 Error Handling
 
 - **Non-zero exit code from a script:** The loop **stops immediately**. loopx exits with code 1. The script's stderr has already been passed through to the terminal. Any stdout produced by the script before it failed is not parsed as structured output.
+- **Missing workflow / missing script / missing default entry point:** If the starting target resolves to a workflow that does not exist, a script that does not exist in that workflow, or a bare workflow invocation where `index` is missing, loopx exits with code 1 and prints an error to stderr. These checks occur during target resolution (step 3 in section 7.1) before any iterations run.
 - **Invalid `goto` target:** If `goto` contains an invalid target string (section 4.1), references a workflow that does not exist in the cached discovery results, or references a script that does not exist within the target workflow, loopx prints an error message to stderr and exits with code 1.
 - **Missing `.loopx/` directory:** When executing via `loopx run <target>`, if `.loopx/` does not exist, loopx exits with an error instructing the user to create it.
 
