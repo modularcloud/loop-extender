@@ -950,6 +950,7 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 - **T-ENV-21**: `LOOPX_PROJECT_ROOT` always set, overrides user-supplied value. *(Spec 8.3)*
 - **T-ENV-21a**: `LOOPX_PROJECT_ROOT` overrides inherited system environment. *(Spec 8.3)*
 - **T-ENV-21b**: `LOOPX_WORKFLOW` always set, overrides user-supplied value. Script writes `$LOOPX_WORKFLOW` to a marker file. Set `LOOPX_WORKFLOW=fake` in global env. Assert marker contains the real workflow name. *(Spec 8.3)*
+- **T-ENV-21c**: `LOOPX_WORKFLOW` overrides local env file (`-e`) value. Create a local env file containing `LOOPX_WORKFLOW=fake`. Run with `-e <envfile>`. Script writes `$LOOPX_WORKFLOW` to a marker file. Assert marker contains the real workflow name, not `"fake"`. This explicitly tests the highest-precedence layer (loopx-injected) against the second-highest layer (local `-e`). *(Spec 8.3)*
 - **T-ENV-22**: System env has `SYS_VAR=sys`, global env has `SYS_VAR=global`. Script sees `global`. *(Spec 8.3)*
 - **T-ENV-23**: System env has `SYS_VAR=sys`, no loopx override. Script sees `sys`. *(Spec 8.3)*
 - **T-ENV-24**: Full precedence chain. Assert local wins over global over system. *(Spec 8.3)*
@@ -1221,6 +1222,7 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 
 - **T-INST-53**: Git repo with no root-level script files but two subdirectories `ralph/` and `other/` each containing an `index.sh` → multi-workflow source. Both installed as `.loopx/ralph/` and `.loopx/other/`. *(Spec 10.3)*
 - **T-INST-54**: Multi-workflow repo: repo-root support files (README, LICENSE, etc.) are NOT copied into `.loopx/`. Only workflow directories are installed. *(Spec 10.3)*
+- **T-INST-54a**: Multi-workflow install preserves workflow-internal non-script files and subdirectories. Source repo contains `ralph/index.ts`, `ralph/package.json`, `ralph/lib/helpers.ts`, and `ralph/README.md` (plus `other/index.sh` to force multi-workflow classification). After install, assert `.loopx/ralph/package.json`, `.loopx/ralph/lib/helpers.ts`, and `.loopx/ralph/README.md` are all present. This verifies that the entire workflow directory — not just discovered script files — is copied. *(Spec 10.3)*
 - **T-INST-55**: Multi-workflow repo: subdirectories with no script files are silently skipped. They don't cause failure. *(Spec 10.3)*
 - **T-INST-55a**: Non-recursive workflow detection during install classification. Multi-workflow source contains a candidate directory `tools/` with only nested supported-extension files (e.g., `tools/lib/helper.ts`) and no top-level script files (no `tools/*.sh|js|jsx|ts|tsx`). That directory is skipped as a non-workflow — only top-level files count for workflow detection. Other valid workflow directories in the source are installed normally. *(Spec 10.3, 2.1)*
 
@@ -1250,6 +1252,7 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 - **T-INST-65**: Path does not exist → workflow installed without collision check. *(Spec 10.5)*
 - **T-INST-66**: Path exists and is a workflow by structure → install refused with error. *(Spec 10.5)*
 - **T-INST-67**: Path exists and is a workflow by structure, with `-y` → existing workflow replaced. *(Spec 10.5)*
+- **T-INST-67a**: Path exists and is a workflow by structure but would fail runtime validation, with `-y` → existing workflow replaced. Set up `.loopx/foo/` containing a script with an invalid name (`-bad.sh`) and a same-base-name collision (`check.sh` + `check.ts`). `loopx install -y <source>` where the source contains a valid workflow named `foo`. Assert the existing invalid workflow is replaced successfully. The collision structural check requires only that the destination path is a directory with at least one top-level file with a supported script extension — it does not perform full runtime validation. *(Spec 10.5)*
 - **T-INST-68**: Path exists but is NOT a workflow by structure (e.g., directory with no script files, or a non-directory entry) → install refused with error, even with `-y`. *(Spec 10.5)*
 - **T-INST-69**: `-y` must not replace non-workflow entries. A plain file at `.loopx/<name>` is refused even with `-y`. *(Spec 10.5)*
 - **T-INST-70**: Symlinked workflow: structural check follows the symlink. When `-y` removes a symlinked workflow, it removes the symlink itself, not the target directory. *(Spec 10.5)*
@@ -1612,7 +1615,7 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 7.3 | Signal Handling | T-SIG-01–08 |
 | 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-05a–05e, T-ENV-25–25c, T-CLI-22c, F-ENV-01–05, T-API-08k–08m |
 | 8.2 | Local Env Override | T-ENV-16–19, T-ENV-17a, T-ENV-25a |
-| 8.3 | Env Injection Precedence | T-ENV-20–24, T-ENV-20a, T-ENV-21a, T-ENV-21b, T-ENV-24a, T-ENV-24b, T-EXEC-04–04b, T-DISC-39a |
+| 8.3 | Env Injection Precedence | T-ENV-20–24, T-ENV-20a, T-ENV-21a, T-ENV-21b, T-ENV-21c, T-ENV-24a, T-ENV-24b, T-EXEC-04–04b, T-DISC-39a |
 | 9.1 | run() | T-API-01–09c, T-API-08a–08e, T-API-08g–08m, T-API-10–10c, T-API-20h–20i, T-API-20j–20k, T-API-30–37, T-API-35a–35c, T-TYPE-04, T-TYPE-06–07 |
 | 9.2 | runPromise() | T-API-08f, T-API-11–14g, T-API-14a–14a3, T-API-25–25b, T-API-38–48, T-TYPE-05–07 |
 | 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20k, T-API-21c–21d |
@@ -1620,9 +1623,9 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 9.5 | Types / RunOptions | T-API-07–08, T-API-07a, T-API-08b–08m, T-API-10–10c, T-API-14f–14g, T-API-20d–20e, T-API-21–21b, T-API-22–25b, T-API-23a, T-API-24a–24b, T-TYPE-01–07 |
 | 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08f |
 | 10.2 | Source Type Details | T-INST-81–89, T-INST-85a, T-INST-86a |
-| 10.3 | Workflow Classification | T-INST-50–56, T-INST-52a, T-INST-55a, T-INST-56a, T-INST-80g |
+| 10.3 | Workflow Classification | T-INST-50–56, T-INST-52a, T-INST-54a, T-INST-55a, T-INST-56a, T-INST-80g |
 | 10.4 | Install-time Validation | T-INST-52a, T-INST-61–64, T-INST-80h–80i |
-| 10.5 | Collision Handling | T-INST-65–71, T-INST-70a, T-INST-97 |
+| 10.5 | Collision Handling | T-INST-65–71, T-INST-67a, T-INST-70a, T-INST-97 |
 | 10.6 | Version Checking on Install | T-INST-72–76, T-INST-97b, T-VER-12–13, T-VER-15, T-VER-17, T-VER-22, T-INST-80d–80f |
 | 10.7 | Install Atomicity | T-INST-77–80i |
 | 10.8 | Selective Workflow Installation | T-INST-57–60, T-INST-57a, T-INST-59a |
@@ -1631,4 +1634,4 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 11.2 | Run Help | T-CLI-40–43a, T-CLI-62, T-CLI-67–78, T-CLI-84, T-CLI-92–95, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-104a–104b, T-CLI-120, T-DISC-15b, T-DISC-38, T-VER-19 |
 | 11.3 | Install Help | T-INST-41–42, T-INST-41a, T-INST-42a–42c, T-INST-49a–49d |
 | 12 | Exit Codes | T-EXIT-01–17 |
-| 13 | Summary of Special Values | *(Summary-only section — LOOPX_BIN: T-MOD-19–21, T-ENV-20, T-ENV-20a, T-DEL-05; LOOPX_PROJECT_ROOT: T-EXEC-03, T-ENV-21, T-ENV-21a; LOOPX_WORKFLOW: T-EXEC-04–04b, T-ENV-21b; LOOPX_DELEGATED: T-DEL-04, T-DEL-07, T-DEL-09, T-ENV-24a)* |
+| 13 | Summary of Special Values | *(Summary-only section — LOOPX_BIN: T-MOD-19–21, T-ENV-20, T-ENV-20a, T-DEL-05; LOOPX_PROJECT_ROOT: T-EXEC-03, T-ENV-21, T-ENV-21a; LOOPX_WORKFLOW: T-EXEC-04–04b, T-ENV-21b, T-ENV-21c; LOOPX_DELEGATED: T-DEL-04, T-DEL-07, T-DEL-09, T-ENV-24a)* |
