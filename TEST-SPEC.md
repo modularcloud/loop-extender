@@ -432,17 +432,18 @@ Each test is identified by a unique ID (`T-<SECTION>-<NUMBER>`), references a SP
 - **T-CLI-42**: `loopx run -h` without `.loopx/` directory still prints run help with a warning that the directory was not found. The discovered-workflows section is omitted. Exits 0. *(Spec 11.2)*
 - **T-CLI-43**: `loopx run -h` with `.loopx/` containing name collisions (e.g., `check.sh` and `check.ts` in the same workflow) prints run help with warnings on stderr about the conflicting entries. Exits 0. *(Spec 5.2, 11.2)*
 - **T-CLI-43a**: `loopx run -h` with `.loopx/` containing an `index` name collision (`index.sh` and `index.ts` in the same workflow) prints run help with warnings on stderr about the conflicting `index` entries. Exits 0. This is the `index`-specific variant of T-CLI-43 — a bad implementation could special-case `index` and bypass collision warnings for the default entry point. *(Spec 2.1, 5.2, 11.2)*
-- **T-CLI-44**: `loopx run -h` with `.loopx/` containing a script with an invalid name (e.g., `-startswithdash.sh`) prints run help with a non-fatal warning on stderr about the invalid name. Assert that the warning text contains the offending script name (e.g., `-startswithdash`). Help still exits 0. *(Spec 5.3, 11.2)*
+- **T-CLI-44**: `loopx run -h` with `.loopx/` containing a script with an invalid name (e.g., `-startswithdash.sh`) prints run help with a non-fatal warning on stderr about the invalid name. Assert: (a) stderr contains a warning mentioning the offending script name (e.g., `-startswithdash`), and (b) stdout (the help output) lists the offending script name within the context of its parent workflow's script listing — per Spec 5.3, "the invalid entry is listed with a warning." Help still exits 0. *(Spec 5.3, 11.2)*
 - **T-CLI-101**: `loopx run -h` with `.loopx/` containing a workflow that has an `index` script indicates the default entry point in the output. Assert that the help text marks `index` as the default entry point for that workflow. *(Spec 11.2)*
 - **T-CLI-101a**: `loopx run -h` with `.loopx/` containing a workflow that has **no** `index` script (e.g., `.loopx/tools/` with only `check.sh` and `deploy.sh`). Assert: (a) the workflow is still listed in the discovered-workflows output, and (b) no script is marked as the default entry point for that workflow. This is the converse of T-CLI-101 and pins down the ADR-0003 behavior that workflows without `index` are discoverable and listed in help but have no default entry point indication. *(Spec 11.2)*
 - **T-CLI-102**: `loopx run -h` with `.loopx/` containing a workflow with invalid script names shows non-fatal warnings. The workflow is still listed. Exits 0. *(Spec 5.3, 11.2)*
 - **T-CLI-104**: `loopx run -h` with `.loopx/` containing non-workflow files directly in `.loopx/` root (e.g., `.loopx/loose-script.sh`) — the files are neither listed nor warned about. Only workflow subdirectories appear. *(Spec 5.1, 11.2)*
 - **T-CLI-104a**: `loopx run -h` with `.loopx/` containing an empty subdirectory (`.loopx/empty/`) alongside a valid workflow (`.loopx/ralph/index.sh`). The empty directory is not a workflow (no top-level script files) and is neither listed in the workflow discovery output nor warned about on stderr. Only `ralph` appears. *(Spec 5.1, 11.2)*
 - **T-CLI-104b**: `loopx run -h` with `.loopx/` containing a subdirectory with only non-script files (`.loopx/meta/` containing `config.json` and `notes.md`) alongside a valid workflow (`.loopx/ralph/index.sh`). The `meta` directory is not a workflow (no supported-extension files) and is neither listed in the workflow discovery output nor warned about on stderr. Only `ralph` appears. *(Spec 5.1, 11.2)*
+- **T-CLI-104c**: `loopx run -h` with `.loopx/mypipeline/` containing `package.json` and a nested `src/run.js`, but no top-level file with a supported script extension. `mypipeline` is not a workflow — directory scripts are removed (ADR-0003); only top-level script files count for workflow detection. Assert `mypipeline` is neither listed in the discovered-workflows output nor warned about on stderr. *(Spec 5.1, 11.2)*
 - **T-CLI-105**: `loopx run ralph -h` is equivalent to `loopx run -h` — the `-h` short-circuit applies, and the workflow argument is ignored. Assert identical stdout/stderr to `loopx run -h`. *(Spec 4.2, 11.2)*
 - **T-CLI-106**: `loopx run ralph:index -h` is equivalent to `loopx run -h` — the target argument including script is ignored. *(Spec 4.2, 11.2)*
 - **T-CLI-62**: `loopx run myscript --help` shows run help and exits 0. Same behavior as `loopx run myscript -h` — verifies that the `--help` long form triggers the run-help short-circuit identically to `-h` when appearing after a target name. *(Spec 4.2, 11.2)*
-- **T-CLI-120**: `loopx run -h` with `.loopx/` containing a workflow with an invalid name (e.g., `.loopx/-bad-workflow/index.sh`) prints run help with a non-fatal warning on stderr about the invalid workflow name. Assert that the warning text contains the offending workflow name (e.g., `-bad-workflow`). Help still exits 0. *(Spec 5.3, 11.2)*
+- **T-CLI-120**: `loopx run -h` with `.loopx/` containing a workflow with an invalid name (e.g., `.loopx/-bad-workflow/index.sh`) prints run help with a non-fatal warning on stderr about the invalid workflow name. Assert: (a) stderr contains a warning mentioning the offending workflow name (e.g., `-bad-workflow`), and (b) stdout (the help output) lists the offending workflow name in the discovered-workflows section — per Spec 5.3, "the invalid entry is listed with a warning." Help still exits 0. *(Spec 5.3, 11.2)*
 
 #### Run Help Short-Circuit
 
@@ -520,8 +521,9 @@ Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows
 - **T-CLI-114**: `loopx run ":script"` (leading colon) → error, exit code 1. *(Spec 4.1)*
 - **T-CLI-115**: `loopx run "workflow:"` (trailing colon) → error, exit code 1. *(Spec 4.1)*
 - **T-CLI-116**: `loopx run "a:b:c"` (multiple colons) → error, exit code 1. *(Spec 4.1)*
-- **T-CLI-117**: `loopx run "-bad:index"` (workflow name violates name restrictions) → error, exit code 1. *(Spec 4.1)*
-- **T-CLI-118**: `loopx run "ralph:-bad"` (script name violates name restrictions) → error, exit code 1. *(Spec 4.1)*
+- **T-CLI-117**: `loopx run "bad.name:index"` (workflow name violates name restrictions) → error, exit code 1. *(Spec 4.1)*
+- **T-CLI-118**: `loopx run "ralph:bad.name"` (script name violates name restrictions) → error, exit code 1. *(Spec 4.1)*
+- **T-CLI-118a**: `loopx run "bad.name"` (bare target where the workflow name violates name restrictions) → error, exit code 1. This is the bare-name counterpart to T-CLI-117 (qualified target with invalid workflow name) — ADR-0003 made bare names central to the invocation model, so bare invalid-workflow rejection must be tested independently of the qualified form. *(Spec 4.1)*
 - **T-CLI-114a**: Invalid target format is rejected after discovery and global validation, not as an early usage error. Create `.loopx/broken/check.sh` and `.loopx/broken/check.ts` (name collision) alongside `.loopx/valid/index.sh`. Run `loopx run ":script"` (an invalid target string). Assert exit code 1 AND that stderr mentions the name collision in `broken` — proving discovery and global validation ran before the invalid target was rejected. Per Spec 4.1, invalid targets are rejected "at the same point as a missing workflow (after discovery)." *(Spec 4.1, 5.4)*
 
 #### Option Order
@@ -1063,6 +1065,7 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 - **T-API-34**: `run("a:b:c")` (multiple colons). On first `next()`, throws. *(Spec 9.1, 4.1)*
 - **T-API-35a**: `run("-bad:index")` (workflow name violates name restrictions). On first `next()`, throws. *(Spec 9.1, 4.1)*
 - **T-API-35b**: `run("ralph:-bad")` (script name violates name restrictions). On first `next()`, throws. *(Spec 9.1, 4.1)*
+- **T-API-35d**: `run("bad.name")` (bare target where the workflow name violates name restrictions). On first `next()`, throws. This is the bare-name counterpart to T-API-35a (qualified target with invalid workflow name). *(Spec 9.1, 4.1)*
 - **T-API-35c**: Invalid target format is rejected after discovery and global validation in the programmatic API, mirroring CLI T-CLI-114a. Create `.loopx/broken/check.sh` and `.loopx/broken/check.ts` (name collision) alongside `.loopx/valid/index.sh`. Call `run(":script")` — generator is returned (lazy). On first `next()`, the generator throws. Assert that the error mentions the name collision in `broken` — proving discovery and global validation ran before the invalid target format was rejected. *(Spec 9.1, 4.1, 5.4)*
 
 #### `run()` Target Semantics
@@ -1108,6 +1111,7 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 - **T-API-42**: `runPromise("workflow:")` rejects (trailing colon). *(Spec 9.2, 4.1)*
 - **T-API-43**: `runPromise("-bad:index")` rejects (workflow name violates name restrictions). *(Spec 9.2, 4.1)*
 - **T-API-44**: `runPromise("ralph:-bad")` rejects (script name violates name restrictions). *(Spec 9.2, 4.1)*
+- **T-API-44a**: `runPromise("bad.name")` rejects (bare target where the workflow name violates name restrictions). This is the bare-name counterpart to T-API-43 (qualified target with invalid workflow name). *(Spec 9.2, 4.1)*
 - **T-API-45**: `runPromise("ralph")` where workflow `ralph` exists but has no `index` script → rejects (missing default entry point). *(Spec 9.2, 4.1)*
 - **T-API-46**: `runPromise("ralph:missing")` where workflow `ralph` exists but script `missing` does not → rejects. *(Spec 9.2, 4.1)*
 
@@ -1285,6 +1289,7 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 - **T-INST-80g**: `-y` does not override a zero-workflow source. `loopx install -y <source>` where the source contains no root-level script files and no subdirectories that qualify as workflows → error, exit code 1, regardless of `-y`. *(Spec 10.3, 10.7)*
 - **T-INST-80h**: `-y` does not override invalid workflow or script names. `loopx install -y <source>` where the source contains a workflow with an invalid script name (e.g., `-bad.sh`) → error, exit code 1, regardless of `-y`. *(Spec 10.4, 10.7)*
 - **T-INST-80i**: `-y` does not override same-base-name collisions within a workflow. `loopx install -y <source>` where the source contains a workflow with `check.sh` and `check.ts` (same base name, different extensions) → error, exit code 1, regardless of `-y`. *(Spec 10.4, 10.7)*
+- **T-INST-80j**: `-y` does not override an invalid workflow name. `loopx install -y <source>` where the derived workflow name violates `[a-zA-Z0-9_][a-zA-Z0-9_-]*` (e.g., source directory named `bad.name`) → error, exit code 1, regardless of `-y`. *(Spec 10.4, 10.7)*
 
 #### Tarball Install
 
@@ -1602,10 +1607,10 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 3.2 | Local Version Pinning & Delegation | T-DEL-01–21, T-VER-01–23, T-VER-07a–07c, T-VER-19a–19c, T-CLI-119, T-CLI-119c, T-API-08b, T-API-08g |
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21 |
-| 4.1 | Running Scripts (run subcommand, target validation) | T-CLI-11–13, T-CLI-27–33, T-CLI-59–60, T-CLI-64–66, T-CLI-78a–78b, T-CLI-80–81, T-CLI-85, T-CLI-96, T-CLI-107–118, T-CLI-114a, T-CLI-119a–119b, T-DISC-33–37, T-API-08c–08d, T-API-14f–14g, T-API-20j–20k, T-API-35a–35c, T-API-40–48, T-LOOP-31a, T-LOOP-38–42 |
+| 4.1 | Running Scripts (run subcommand, target validation) | T-CLI-11–13, T-CLI-27–33, T-CLI-59–60, T-CLI-64–66, T-CLI-78a–78b, T-CLI-80–81, T-CLI-85, T-CLI-96, T-CLI-107–118, T-CLI-114a, T-CLI-118a, T-CLI-119a–119b, T-DISC-33–37, T-API-08c–08d, T-API-14f–14g, T-API-20j–20k, T-API-35a–35d, T-API-40–48, T-API-44a, T-LOOP-31a, T-LOOP-38–42 |
 | 4.2 | Options (-n, -e, run -h, install -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22e, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–100, T-CLI-78a–78b, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-119–119c, T-ENV-25b–25c, T-INST-40–49, T-INST-40a–40c, T-INST-49a–49d, T-INST-41a, T-INST-42a–42c, T-INST-43a–43b, T-INST-57a, T-INST-59a, T-API-08e–08m |
 | 4.3 | Subcommands | T-SUB-01–19, T-SUB-02a–02d, T-SUB-06a–06b, T-SUB-14a–14k, T-CLI-66, T-CLI-80–81 |
-| 5.1 | Discovery | T-DISC-01–16, T-DISC-10a–10b, T-DISC-38–42b, T-DISC-39a, T-DISC-48, T-CLI-42–43, T-CLI-104–104b |
+| 5.1 | Discovery | T-DISC-01–16, T-DISC-10a–10b, T-DISC-38–42b, T-DISC-39a, T-DISC-48, T-CLI-42–43, T-CLI-104–104c |
 | 5.2 | Name Collision | T-DISC-21–24, T-DISC-21a, T-CLI-22b, T-CLI-43, T-CLI-43a, T-API-08h |
 | 5.3 | Name Restrictions | T-DISC-15a–15b, T-DISC-25–32, T-DISC-47a, T-DISC-47b, T-CLI-44, T-CLI-22d–22e, T-CLI-102, T-CLI-120, T-LOOP-40–42, T-EDGE-05, T-API-08i–08j |
 | 5.4 | Validation Scope | T-DISC-43–47, T-DISC-47a, T-DISC-47b, T-SUB-06, T-SUB-13, T-SUB-19, T-CLI-28, T-CLI-114a, T-API-35c |
@@ -1622,22 +1627,22 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-05a–05e, T-ENV-25–25c, T-CLI-22c, F-ENV-01–05, T-API-08k–08m |
 | 8.2 | Local Env Override | T-ENV-16–19, T-ENV-17a, T-ENV-25a |
 | 8.3 | Env Injection Precedence | T-ENV-20–24, T-ENV-20a, T-ENV-21a, T-ENV-21b, T-ENV-21c, T-ENV-24a, T-ENV-24b, T-EXEC-04–04b, T-DISC-39a |
-| 9.1 | run() | T-API-01–09c, T-API-08a–08e, T-API-08g–08m, T-API-10–10c, T-API-20h–20i, T-API-20j–20k, T-API-30–37, T-API-35a–35c, T-TYPE-04, T-TYPE-06–07 |
-| 9.2 | runPromise() | T-API-08f, T-API-11–14g, T-API-14a–14a3, T-API-25–25b, T-API-38–48, T-TYPE-05–07 |
+| 9.1 | run() | T-API-01–09c, T-API-08a–08e, T-API-08g–08m, T-API-10–10c, T-API-20h–20i, T-API-20j–20k, T-API-30–37, T-API-35a–35d, T-TYPE-04, T-TYPE-06–07 |
+| 9.2 | runPromise() | T-API-08f, T-API-11–14g, T-API-14a–14a3, T-API-25–25b, T-API-38–48, T-API-44a, T-TYPE-05–07 |
 | 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20k, T-API-21c–21d |
 | 9.4 | output() and input() (script-side) | *(Same as 6.4/6.5)* |
 | 9.5 | Types / RunOptions | T-API-07–08, T-API-07a, T-API-08b–08m, T-API-10–10c, T-API-14f–14g, T-API-20d–20e, T-API-21–21b, T-API-22–25b, T-API-23a, T-API-24a–24b, T-TYPE-01–07 |
 | 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08f |
 | 10.2 | Source Type Details | T-INST-81–89, T-INST-85a, T-INST-86a |
 | 10.3 | Workflow Classification | T-INST-50–56, T-INST-52a, T-INST-54a, T-INST-55a, T-INST-56a, T-INST-80g |
-| 10.4 | Install-time Validation | T-INST-52a, T-INST-61–64, T-INST-64a, T-INST-80h–80i |
+| 10.4 | Install-time Validation | T-INST-52a, T-INST-61–64, T-INST-64a, T-INST-80h–80j |
 | 10.5 | Collision Handling | T-INST-65–71, T-INST-67a, T-INST-70a, T-INST-97 |
 | 10.6 | Version Checking on Install | T-INST-72–76, T-INST-97b, T-VER-12–13, T-VER-15, T-VER-17, T-VER-22, T-INST-80d–80f |
-| 10.7 | Install Atomicity | T-INST-77–80i |
+| 10.7 | Install Atomicity | T-INST-77–80j |
 | 10.8 | Selective Workflow Installation | T-INST-57–60, T-INST-57a, T-INST-59a |
 | 10.9 | Common Rules | T-INST-90–96, T-INST-97a |
 | 11.1 | Top-Level Help | T-CLI-02–06, T-CLI-07e–07g, T-CLI-07j, T-CLI-28, T-CLI-39, T-CLI-61, T-CLI-65, T-CLI-90–91 |
-| 11.2 | Run Help | T-CLI-40–43a, T-CLI-62, T-CLI-67–78, T-CLI-84, T-CLI-92–95, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-104a–104b, T-CLI-120, T-DISC-15b, T-DISC-38, T-VER-19, T-VER-19a–19c |
+| 11.2 | Run Help | T-CLI-40–43a, T-CLI-62, T-CLI-67–78, T-CLI-84, T-CLI-92–95, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-104a–104c, T-CLI-120, T-DISC-15b, T-DISC-38, T-VER-19, T-VER-19a–19c |
 | 11.3 | Install Help | T-INST-41–42, T-INST-41a, T-INST-42a–42c, T-INST-49a–49d |
 | 12 | Exit Codes | T-EXIT-01–17 |
 | 13 | Summary of Special Values | *(Summary-only section — LOOPX_BIN: T-MOD-19–21, T-ENV-20, T-ENV-20a, T-DEL-05; LOOPX_PROJECT_ROOT: T-EXEC-03, T-ENV-21, T-ENV-21a; LOOPX_WORKFLOW: T-EXEC-04–04b, T-ENV-21b, T-ENV-21c; LOOPX_DELEGATED: T-DEL-04, T-DEL-07, T-DEL-09, T-ENV-24a)* |
