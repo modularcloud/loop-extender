@@ -434,6 +434,7 @@ Each test is identified by a unique ID (`T-<SECTION>-<NUMBER>`), references a SP
 - **T-CLI-43a**: `loopx run -h` with `.loopx/` containing an `index` name collision (`index.sh` and `index.ts` in the same workflow) prints run help with warnings on stderr about the conflicting `index` entries. Exits 0. This is the `index`-specific variant of T-CLI-43 — a bad implementation could special-case `index` and bypass collision warnings for the default entry point. *(Spec 2.1, 5.2, 11.2)*
 - **T-CLI-44**: `loopx run -h` with `.loopx/` containing a script with an invalid name (e.g., `-startswithdash.sh`) prints run help with a non-fatal warning on stderr about the invalid name. Assert that the warning text contains the offending script name (e.g., `-startswithdash`). Help still exits 0. *(Spec 5.3, 11.2)*
 - **T-CLI-101**: `loopx run -h` with `.loopx/` containing a workflow that has an `index` script indicates the default entry point in the output. Assert that the help text marks `index` as the default entry point for that workflow. *(Spec 11.2)*
+- **T-CLI-101a**: `loopx run -h` with `.loopx/` containing a workflow that has **no** `index` script (e.g., `.loopx/tools/` with only `check.sh` and `deploy.sh`). Assert: (a) the workflow is still listed in the discovered-workflows output, and (b) no script is marked as the default entry point for that workflow. This is the converse of T-CLI-101 and pins down the ADR-0003 behavior that workflows without `index` are discoverable and listed in help but have no default entry point indication. *(Spec 11.2)*
 - **T-CLI-102**: `loopx run -h` with `.loopx/` containing a workflow with invalid script names shows non-fatal warnings. The workflow is still listed. Exits 0. *(Spec 5.3, 11.2)*
 - **T-CLI-104**: `loopx run -h` with `.loopx/` containing non-workflow files directly in `.loopx/` root (e.g., `.loopx/loose-script.sh`) — the files are neither listed nor warned about. Only workflow subdirectories appear. *(Spec 5.1, 11.2)*
 - **T-CLI-104a**: `loopx run -h` with `.loopx/` containing an empty subdirectory (`.loopx/empty/`) alongside a valid workflow (`.loopx/ralph/index.sh`). The empty directory is not a workflow (no top-level script files) and is neither listed in the workflow discovery output nor warned about on stderr. Only `ralph` appears. *(Spec 5.1, 11.2)*
@@ -1039,6 +1040,12 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 - **T-API-08e**: `run("ralph", { maxIterations: 0, envFile: "missing.env" })` → generator throws on first `next()`. Env file validation fires even with `maxIterations: 0`, mirroring CLI `-n 0` behavior (T-CLI-22a). *(Spec 9.1, 9.5, 4.2)*
 - **T-API-08f**: `runPromise("ralph", { maxIterations: 0, envFile: "missing.env" })` → rejects. Env file validation fires even with `maxIterations: 0`, mirroring CLI `-n 0` behavior. *(Spec 9.2, 9.5, 4.2)*
 - **T-API-08g**: `run("ralph", { maxIterations: 0 })` skips the entire version-check path, including `package.json` reading. Set up `.loopx/ralph/package.json` with an invalid semver range for `loopx` (e.g., `"loopx": "not-a-range"` in `dependencies`). Assert: generator completes with no yields, and no `package.json` or version-related warnings on stderr. This extends T-API-08b (which tests unsatisfied range via `runPromise`) to prove the entire runtime version-check path is skipped under `maxIterations: 0` — not just the range comparison. *(Spec 9.1, 9.5, 3.2)*
+- **T-API-08h**: `run("ralph", { maxIterations: 0 })` with `.loopx/` containing a sibling workflow with a same-base-name collision (e.g., `.loopx/broken/check.sh` and `.loopx/broken/check.ts`) → generator throws on first `next()`. Global discovery validation catches the collision before the zero-iteration short-circuit, mirroring CLI `-n 0` behavior (T-CLI-22b). *(Spec 9.1, 9.5, 5.2)*
+- **T-API-08i**: `run("ralph", { maxIterations: 0 })` with `.loopx/` containing a sibling workflow with an invalid script name (e.g., `.loopx/broken/-bad.sh`) → generator throws on first `next()`. Global discovery validation catches the invalid name before the zero-iteration short-circuit, mirroring CLI `-n 0` behavior (T-CLI-22d). *(Spec 9.1, 9.5, 5.3)*
+- **T-API-08j**: `run("ralph", { maxIterations: 0 })` with `.loopx/` containing a sibling workflow with an invalid workflow name (e.g., `.loopx/-bad-workflow/index.sh`) → generator throws on first `next()`. Global discovery validation catches the invalid workflow name before the zero-iteration short-circuit, mirroring CLI `-n 0` behavior (T-CLI-22e). *(Spec 9.1, 9.5, 5.3)*
+- **T-API-08k**: `run("ralph", { maxIterations: 0, envFile: "malformed.env" })` where `malformed.env` exists and is readable but contains an invalid line (e.g., `1BAD=val`) → generator completes with no yields, stderr contains a parser warning for the invalid key. Env files are parsed under `maxIterations: 0`, not just existence-checked, mirroring CLI `-n 0` behavior (T-CLI-22c). *(Spec 9.1, 9.5, 8.1)*
+- **T-API-08l**: `run("ralph", { maxIterations: 0 })` with an unreadable global env file → generator throws on first `next()`. Global env loading and validation fires before the zero-iteration short-circuit, mirroring CLI `-n 0` behavior (T-ENV-25b). **Conditional on `process.getuid() !== 0`.** *(Spec 9.1, 9.5, 8.1)*
+- **T-API-08m**: `run("ralph", { maxIterations: 0 })` with a malformed-but-readable global env file (e.g., containing `1BAD=val`) → generator completes with no yields, stderr contains a parser warning for the invalid key. Global env files are parsed under `maxIterations: 0` in the programmatic API, mirroring CLI `-n 0` behavior (T-ENV-25c). *(Spec 9.1, 9.5, 8.1)*
 
 #### `run()` with Invalid `target`
 
@@ -1220,7 +1227,7 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 #### Workflow Classification — Zero-Workflow Source
 
 - **T-INST-56**: Git repo with no root-level script files and no subdirectories that qualify as workflows → error. *(Spec 10.3)*
-- **T-INST-56a**: A source repo structured as a legacy directory script — root `package.json` with `main` pointing to a nested file (e.g., `{ "main": "src/run.js" }`), with the script file only in a subdirectory (`src/`) and no top-level files with supported script extensions — is classified as zero-workflow and rejected with an error. Assert exit code 1 and that the error indicates no installable workflows were found. This proves the install mechanism does not fall back to legacy directory-script install behavior — the `main` field is not used for workflow classification. *(Spec 10.3)*
+- **T-INST-56a**: A source repo structured as a legacy directory script — root `package.json` with `main` pointing to a deeply nested file (e.g., `{ "main": "src/app/run.js" }`), with the script file only inside a nested subdirectory (`src/app/`) and no top-level files with supported script extensions. The top-level `src/` directory contains no top-level script files (`src/*.{sh,js,jsx,ts,tsx}`) so it does not qualify as a workflow — the source is classified as zero-workflow and rejected with an error. Assert exit code 1 and that the error indicates no installable workflows were found. This proves the install mechanism does not fall back to legacy directory-script install behavior — the `main` field is not used for workflow classification. *(Spec 10.3)*
 
 #### Selective Workflow Installation
 
@@ -1587,11 +1594,11 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21 |
 | 4.1 | Running Scripts (run subcommand, target validation) | T-CLI-11–13, T-CLI-27–33, T-CLI-59–60, T-CLI-64–66, T-CLI-78a–78b, T-CLI-80–81, T-CLI-85, T-CLI-96, T-CLI-107–118, T-CLI-114a, T-CLI-119a–119b, T-DISC-33–37, T-API-08c–08d, T-API-14f–14g, T-API-20j–20k, T-API-35a–35c, T-API-40–48, T-LOOP-31a, T-LOOP-38–42 |
-| 4.2 | Options (-n, -e, run -h, install -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22e, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–100, T-CLI-78a–78b, T-CLI-101–102, T-CLI-104–106, T-CLI-119–119c, T-ENV-25b–25c, T-INST-40–49, T-INST-40a–40c, T-INST-49a–49d, T-INST-41a, T-INST-42a–42c, T-INST-43a–43b, T-INST-57a, T-INST-59a, T-API-08e–08g |
+| 4.2 | Options (-n, -e, run -h, install -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22e, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–100, T-CLI-78a–78b, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-119–119c, T-ENV-25b–25c, T-INST-40–49, T-INST-40a–40c, T-INST-49a–49d, T-INST-41a, T-INST-42a–42c, T-INST-43a–43b, T-INST-57a, T-INST-59a, T-API-08e–08m |
 | 4.3 | Subcommands | T-SUB-01–19, T-SUB-02a–02d, T-SUB-06a–06b, T-SUB-14a–14k, T-CLI-66, T-CLI-80–81 |
 | 5.1 | Discovery | T-DISC-01–16, T-DISC-10a–10b, T-DISC-38–42a, T-DISC-39a, T-DISC-48, T-CLI-42–43, T-CLI-104–104b |
-| 5.2 | Name Collision | T-DISC-21–24, T-DISC-21a, T-CLI-22b, T-CLI-43, T-CLI-43a |
-| 5.3 | Name Restrictions | T-DISC-15a–15b, T-DISC-25–32, T-DISC-47a, T-DISC-47b, T-CLI-44, T-CLI-22d–22e, T-CLI-102, T-CLI-120, T-LOOP-40–42, T-EDGE-05 |
+| 5.2 | Name Collision | T-DISC-21–24, T-DISC-21a, T-CLI-22b, T-CLI-43, T-CLI-43a, T-API-08h |
+| 5.3 | Name Restrictions | T-DISC-15a–15b, T-DISC-25–32, T-DISC-47a, T-DISC-47b, T-CLI-44, T-CLI-22d–22e, T-CLI-102, T-CLI-120, T-LOOP-40–42, T-EDGE-05, T-API-08i–08j |
 | 5.4 | Validation Scope | T-DISC-43–47, T-DISC-47a, T-DISC-47b, T-SUB-06, T-SUB-13, T-SUB-19, T-CLI-28, T-CLI-114a, T-API-35c |
 | 6.1 | Working Directory | T-EXEC-01–03, T-EXEC-16, T-EXEC-16b, T-API-07a |
 | 6.2 | Bash Scripts | T-EXEC-05–07 |
@@ -1603,14 +1610,14 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 7.1 | Basic Loop | T-LOOP-01–10, T-LOOP-25, T-CLI-119a–119b |
 | 7.2 | Error Handling | T-LOOP-18–24, T-LOOP-18a, T-LOOP-19a, T-LOOP-34–42, T-DISC-42a |
 | 7.3 | Signal Handling | T-SIG-01–08 |
-| 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-05a–05e, T-ENV-25–25c, T-CLI-22c, F-ENV-01–05 |
+| 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-05a–05e, T-ENV-25–25c, T-CLI-22c, F-ENV-01–05, T-API-08k–08m |
 | 8.2 | Local Env Override | T-ENV-16–19, T-ENV-17a, T-ENV-25a |
 | 8.3 | Env Injection Precedence | T-ENV-20–24, T-ENV-20a, T-ENV-21a, T-ENV-21b, T-ENV-24a, T-ENV-24b, T-EXEC-04–04b, T-DISC-39a |
-| 9.1 | run() | T-API-01–09c, T-API-08a–08e, T-API-08g, T-API-10–10c, T-API-20h–20i, T-API-20j–20k, T-API-30–37, T-API-35a–35c, T-TYPE-04, T-TYPE-06–07 |
+| 9.1 | run() | T-API-01–09c, T-API-08a–08e, T-API-08g–08m, T-API-10–10c, T-API-20h–20i, T-API-20j–20k, T-API-30–37, T-API-35a–35c, T-TYPE-04, T-TYPE-06–07 |
 | 9.2 | runPromise() | T-API-08f, T-API-11–14g, T-API-14a–14a3, T-API-25–25b, T-API-38–48, T-TYPE-05–07 |
 | 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20k, T-API-21c–21d |
 | 9.4 | output() and input() (script-side) | *(Same as 6.4/6.5)* |
-| 9.5 | Types / RunOptions | T-API-07–08, T-API-07a, T-API-08b–08g, T-API-10–10c, T-API-14f–14g, T-API-20d–20e, T-API-21–21b, T-API-22–25b, T-API-23a, T-API-24a–24b, T-TYPE-01–07 |
+| 9.5 | Types / RunOptions | T-API-07–08, T-API-07a, T-API-08b–08m, T-API-10–10c, T-API-14f–14g, T-API-20d–20e, T-API-21–21b, T-API-22–25b, T-API-23a, T-API-24a–24b, T-TYPE-01–07 |
 | 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08f |
 | 10.2 | Source Type Details | T-INST-81–89, T-INST-85a, T-INST-86a |
 | 10.3 | Workflow Classification | T-INST-50–56, T-INST-52a, T-INST-55a, T-INST-56a, T-INST-80g |
@@ -1621,7 +1628,7 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 10.8 | Selective Workflow Installation | T-INST-57–60, T-INST-57a, T-INST-59a |
 | 10.9 | Common Rules | T-INST-90–96, T-INST-97a |
 | 11.1 | Top-Level Help | T-CLI-02–06, T-CLI-07e–07g, T-CLI-07j, T-CLI-28, T-CLI-39, T-CLI-61, T-CLI-65, T-CLI-90–91 |
-| 11.2 | Run Help | T-CLI-40–43a, T-CLI-62, T-CLI-67–78, T-CLI-84, T-CLI-92–95, T-CLI-101–102, T-CLI-104–106, T-CLI-104a–104b, T-CLI-120, T-DISC-15b, T-DISC-38, T-VER-19 |
+| 11.2 | Run Help | T-CLI-40–43a, T-CLI-62, T-CLI-67–78, T-CLI-84, T-CLI-92–95, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-104a–104b, T-CLI-120, T-DISC-15b, T-DISC-38, T-VER-19 |
 | 11.3 | Install Help | T-INST-41–42, T-INST-41a, T-INST-42a–42c, T-INST-49a–49d |
 | 12 | Exit Codes | T-EXIT-01–17 |
 | 13 | Summary of Special Values | *(Summary-only section — LOOPX_BIN: T-MOD-19–21, T-ENV-20, T-ENV-20a, T-DEL-05; LOOPX_PROJECT_ROOT: T-EXEC-03, T-ENV-21, T-ENV-21a; LOOPX_WORKFLOW: T-EXEC-04–04b, T-ENV-21b; LOOPX_DELEGATED: T-DEL-04, T-DEL-07, T-DEL-09, T-ENV-24a)* |
