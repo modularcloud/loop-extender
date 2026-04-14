@@ -27,7 +27,7 @@
 
 ### 1.3 Coverage Scope
 
-This suite is the **implementation-driving** test suite — it defines the behavior that must pass before a feature is considered complete. All SPEC.md requirements are covered by automated tests in this suite, including:
+This suite is the **implementation-driving** test suite — it defines the behavior that must pass before a feature is considered complete. It targets complete coverage of all SPEC.md requirements, including:
 
 - **Spec 3.1 (Global Install):** Covered by T-INST-GLOBAL-01, which exercises the full `npm pack` → install into isolated global prefix → run against fixture project workflow. This runs in CI on every build.
 
@@ -719,6 +719,7 @@ Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows
 - **T-DISC-41**: During a loop (`-n 3`), create a new workflow in `.loopx/` between iteration 1 and 2 (using a script that creates a directory with a script file). Then have iteration 2 `goto` a script in the new workflow → error (not in cached discovery). *(Spec 5.1)*
 - **T-DISC-42**: During a loop, modify the content of an already-discovered script between iterations. Assert the new content takes effect on the next iteration (since the file is re-read from disk). *(Spec 5.1)*
 - **T-DISC-42a**: During a multi-iteration loop, an already-discovered script is removed (deleted from disk) between iterations. On the next iteration that would execute this script, loopx fails at spawn time. Assert loopx exits with code 1. *(Spec 5.1, 7.2)*
+- **T-DISC-42b**: During a multi-iteration loop, an already-discovered script is renamed between iterations (rename variant of T-DISC-42a). Create a workflow with `index.sh` (emits goto to `check`) and `check.sh`. After the first iteration discovers and caches `check.sh`, rename it to `check-new.sh` before the next iteration. The cached path for `check` still points to the original `check.sh`, which no longer exists. Assert loopx fails at spawn time with exit code 1. This covers the "removed or renamed" language in Spec 5.1. *(Spec 5.1, 7.2)*
 
 #### Validation Scope
 
@@ -1246,6 +1247,7 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 - **T-INST-62**: Workflow with same-base-name collision (e.g., `check.sh` and `check.ts`) → install fails. *(Spec 10.4)*
 - **T-INST-63**: Derived workflow name must match name restriction rules. Invalid name → install fails. *(Spec 10.4)*
 - **T-INST-64**: Missing `index` script is allowed at install time. A workflow without `index` can be installed. *(Spec 10.4)*
+- **T-INST-64a**: Install-time validation is non-recursive within a workflow. Single-workflow source has a top-level `index.ts` plus a nested `lib/` subdirectory containing `-bad.ts` (invalid script name) and both `check.sh` and `check.ts` (same-base-name collision). Install succeeds because nested files within a workflow are not discovered or validated as scripts — only top-level files are checked. Assert exit code 0 and that `.loopx/<repo-name>/lib/-bad.ts`, `.loopx/<repo-name>/lib/check.sh`, and `.loopx/<repo-name>/lib/check.ts` are all present in the installed workflow (copied as workflow content, not rejected as invalid scripts). *(Spec 10.4, 2.1)*
 
 #### Collision Handling
 
@@ -1378,6 +1380,7 @@ The "global" binary is the primary build. The "local" binary is a separate build
 - **T-DEL-18**: Project-root `package.json` declares `loopx` in `devDependencies` (not `dependencies` or `optionalDependencies`) and `node_modules/.bin/loopx` exists → delegation occurs. `devDependencies` is checked at the project root level for locating a local binary. *(Spec 3.2)*
 - **T-DEL-19**: Delegation is presence-based, not range-based. Project-root `package.json` declares `loopx` in `dependencies` with a semver range NOT satisfied by the local binary's actual version (e.g., `"loopx": "^99.0.0"`), and `node_modules/.bin/loopx` exists → delegation still occurs. The global binary delegates based on declaration presence and binary existence, without comparing the declared range against the local binary's version. Verify by having the local binary write a marker file. *(Spec 3.2)*
 - **T-DEL-20**: Workflow-local `package.json` and `node_modules/.bin/loopx` do not trigger delegation. Create a project root with no `package.json`. Create `.loopx/ralph/package.json` declaring `loopx` in `dependencies` and place a marker-writing binary at `.loopx/ralph/node_modules/.bin/loopx`. Create `.loopx/ralph/index.sh`. Run `loopx run -n 1 ralph`. Assert: (a) the global binary runs (marker file is NOT created), and (b) execution succeeds normally. Delegation is based on the project-root `package.json` only — workflow-level version declarations are not used for delegation. *(Spec 3.2)*
+- **T-DEL-21**: Delegation applies to non-version, non-run commands. Set up a project root with `package.json` declaring `loopx` in `dependencies` and a corresponding marker-writing `node_modules/.bin/loopx`. Run `loopx install -h` via the global binary. Assert the local binary handles the command (marker file created). This pins down that the simplified delegation model (cwd-only, command-agnostic, before command parsing) applies to commands beyond `version` and `run` — including commands that do not require `.loopx/`. *(Spec 3.2)*
 
 ### 4.13 Workflow-Level Version Checking
 
@@ -1405,6 +1408,9 @@ The "global" binary is the primary build. The "local" binary is a separate build
 - **T-VER-17**: Install-time: workflow source has a valid `package.json` with no `loopx` declared in any dependency field → no version check is performed, install succeeds without version-related errors or warnings. *(Spec 3.2, 10.6)*
 - **T-VER-18**: Unentered sibling workflows are not version-checked. Create `.loopx/good/index.sh` (the starting workflow, no `package.json`) and `.loopx/sibling/index.sh` with a `package.json` declaring a loopx range NOT satisfied by the running version. Run `loopx run -n 1 good` (the starting workflow completes without ever entering `sibling`). Assert: (a) exit code 0, and (b) no version mismatch warning on stderr for `sibling`. Version checks are entry-scoped — only workflows actually entered during the loop have their `package.json` checked. *(Spec 3.2)*
 - **T-VER-19**: `loopx run -h` does not perform workflow version or `package.json` checks. Create `.loopx/ralph/index.sh` with a `package.json` declaring a loopx range NOT satisfied by the running version. Run `loopx run -h`. Assert: (a) help output is displayed, (b) exit code 0, and (c) stderr contains no version mismatch warnings. Version checking is entry-scoped — `run -h` performs discovery and validation (names, collisions) but does not enter any workflow, so version checks do not run. *(Spec 3.2, 11.2)*
+- **T-VER-19a**: `loopx run -h` does not read workflow `package.json` — unreadable file variant. Create `.loopx/ralph/index.sh` with a `package.json` set to mode 000 (unreadable). Run `loopx run -h`. Assert: (a) help output is displayed, (b) exit code 0, and (c) stderr contains no `package.json`-related read warnings. An implementation that wrongly reads workflow `package.json` during help would emit a read-failure warning; this test catches that. **Conditional on `process.getuid() !== 0`.** *(Spec 3.2, 11.2)*
+- **T-VER-19b**: `loopx run -h` does not read workflow `package.json` — invalid JSON variant. Create `.loopx/ralph/index.sh` with a `package.json` containing `{{{INVALID`. Run `loopx run -h`. Assert: (a) help output is displayed, (b) exit code 0, and (c) stderr contains no JSON parse warnings. An implementation that wrongly reads workflow `package.json` during help would emit a parse-failure warning. *(Spec 3.2, 11.2)*
+- **T-VER-19c**: `loopx run -h` does not read workflow `package.json` — invalid semver variant. Create `.loopx/ralph/index.sh` with a `package.json` containing `{ "dependencies": { "loopx": "not-a-range!!!" } }`. Run `loopx run -h`. Assert: (a) help output is displayed, (b) exit code 0, and (c) stderr contains no semver/version warnings. An implementation that wrongly reads workflow `package.json` during help would emit an invalid-semver warning. *(Spec 3.2, 11.2)*
 - **T-VER-20**: Workflow `package.json` is not re-read after first entry (mutation test). Create `.loopx/ralph/index.sh` with a `package.json` declaring a loopx range SATISFIED by the running version. Set up a multi-iteration loop where the script mutates its own `package.json` to an UNSATISFIED range after the first iteration (e.g., rewrites the loopx version field to `">=999.0.0"`), then re-enters the workflow (via loop reset). Assert: no version mismatch warning appears on any iteration, proving the file was not re-read after first entry. This goes beyond T-VER-03 (which proves the warning is not repeated) by proving the file itself is not re-checked — if the implementation re-read `package.json` on re-entry, the mutated range would trigger a new warning. *(Spec 3.2)*
 - **T-VER-21**: Workflow with no `package.json` runs with no version-check warning. Create `.loopx/ralph/index.sh` with no `package.json` in the workflow directory. Run `loopx run -n 1 ralph`. Assert: (a) exit code 0, (b) stderr contains no version-related warnings or `package.json`-related warnings. This locks down the "normal case" from Spec 3.2: absent `package.json` means no version check is performed and no warnings are emitted. An implementation that wrongly warns on missing `package.json` would fail this test. *(Spec 3.2)*
 - **T-VER-22**: Workflow with no `package.json` installs with no version-related warning. Set up a single-workflow install source with no `package.json`. Run `loopx install <source>`. Assert: (a) exit code 0, (b) stderr contains no version-related warnings or `package.json`-related warnings, (c) the workflow is installed in `.loopx/`. This is the install-time counterpart to T-VER-21. *(Spec 3.2, 10.6)*
@@ -1593,13 +1599,13 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 2.2 | Loop (state machine, goto) | T-LOOP-01–05, T-LOOP-15a, T-LOOP-16–19, T-LOOP-19a–19b, T-LOOP-30–43, T-LOOP-31a, T-EXEC-16b |
 | 2.3 | Structured Output | T-PARSE-01–29, T-PARSE-12a, T-PARSE-20a, F-PARSE-01–05 |
 | 3.1 | Global Install | T-INST-GLOBAL-01, T-INST-GLOBAL-01a |
-| 3.2 | Local Version Pinning & Delegation | T-DEL-01–20, T-VER-01–23, T-VER-07a–07c, T-CLI-119, T-CLI-119c, T-API-08b, T-API-08g |
+| 3.2 | Local Version Pinning & Delegation | T-DEL-01–21, T-VER-01–23, T-VER-07a–07c, T-VER-19a–19c, T-CLI-119, T-CLI-119c, T-API-08b, T-API-08g |
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21 |
 | 4.1 | Running Scripts (run subcommand, target validation) | T-CLI-11–13, T-CLI-27–33, T-CLI-59–60, T-CLI-64–66, T-CLI-78a–78b, T-CLI-80–81, T-CLI-85, T-CLI-96, T-CLI-107–118, T-CLI-114a, T-CLI-119a–119b, T-DISC-33–37, T-API-08c–08d, T-API-14f–14g, T-API-20j–20k, T-API-35a–35c, T-API-40–48, T-LOOP-31a, T-LOOP-38–42 |
 | 4.2 | Options (-n, -e, run -h, install -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22e, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–100, T-CLI-78a–78b, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-119–119c, T-ENV-25b–25c, T-INST-40–49, T-INST-40a–40c, T-INST-49a–49d, T-INST-41a, T-INST-42a–42c, T-INST-43a–43b, T-INST-57a, T-INST-59a, T-API-08e–08m |
 | 4.3 | Subcommands | T-SUB-01–19, T-SUB-02a–02d, T-SUB-06a–06b, T-SUB-14a–14k, T-CLI-66, T-CLI-80–81 |
-| 5.1 | Discovery | T-DISC-01–16, T-DISC-10a–10b, T-DISC-38–42a, T-DISC-39a, T-DISC-48, T-CLI-42–43, T-CLI-104–104b |
+| 5.1 | Discovery | T-DISC-01–16, T-DISC-10a–10b, T-DISC-38–42b, T-DISC-39a, T-DISC-48, T-CLI-42–43, T-CLI-104–104b |
 | 5.2 | Name Collision | T-DISC-21–24, T-DISC-21a, T-CLI-22b, T-CLI-43, T-CLI-43a, T-API-08h |
 | 5.3 | Name Restrictions | T-DISC-15a–15b, T-DISC-25–32, T-DISC-47a, T-DISC-47b, T-CLI-44, T-CLI-22d–22e, T-CLI-102, T-CLI-120, T-LOOP-40–42, T-EDGE-05, T-API-08i–08j |
 | 5.4 | Validation Scope | T-DISC-43–47, T-DISC-47a, T-DISC-47b, T-SUB-06, T-SUB-13, T-SUB-19, T-CLI-28, T-CLI-114a, T-API-35c |
@@ -1611,7 +1617,7 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 6.6 | Input Piping | T-LOOP-11–15, T-LOOP-15a |
 | 6.7 | Initial Input | T-LOOP-14 |
 | 7.1 | Basic Loop | T-LOOP-01–10, T-LOOP-25, T-CLI-119a–119b |
-| 7.2 | Error Handling | T-LOOP-18–24, T-LOOP-18a, T-LOOP-19a, T-LOOP-34–42, T-DISC-42a |
+| 7.2 | Error Handling | T-LOOP-18–24, T-LOOP-18a, T-LOOP-19a, T-LOOP-34–42, T-DISC-42a–42b |
 | 7.3 | Signal Handling | T-SIG-01–08 |
 | 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-05a–05e, T-ENV-25–25c, T-CLI-22c, F-ENV-01–05, T-API-08k–08m |
 | 8.2 | Local Env Override | T-ENV-16–19, T-ENV-17a, T-ENV-25a |
@@ -1624,14 +1630,14 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08f |
 | 10.2 | Source Type Details | T-INST-81–89, T-INST-85a, T-INST-86a |
 | 10.3 | Workflow Classification | T-INST-50–56, T-INST-52a, T-INST-54a, T-INST-55a, T-INST-56a, T-INST-80g |
-| 10.4 | Install-time Validation | T-INST-52a, T-INST-61–64, T-INST-80h–80i |
+| 10.4 | Install-time Validation | T-INST-52a, T-INST-61–64, T-INST-64a, T-INST-80h–80i |
 | 10.5 | Collision Handling | T-INST-65–71, T-INST-67a, T-INST-70a, T-INST-97 |
 | 10.6 | Version Checking on Install | T-INST-72–76, T-INST-97b, T-VER-12–13, T-VER-15, T-VER-17, T-VER-22, T-INST-80d–80f |
 | 10.7 | Install Atomicity | T-INST-77–80i |
 | 10.8 | Selective Workflow Installation | T-INST-57–60, T-INST-57a, T-INST-59a |
 | 10.9 | Common Rules | T-INST-90–96, T-INST-97a |
 | 11.1 | Top-Level Help | T-CLI-02–06, T-CLI-07e–07g, T-CLI-07j, T-CLI-28, T-CLI-39, T-CLI-61, T-CLI-65, T-CLI-90–91 |
-| 11.2 | Run Help | T-CLI-40–43a, T-CLI-62, T-CLI-67–78, T-CLI-84, T-CLI-92–95, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-104a–104b, T-CLI-120, T-DISC-15b, T-DISC-38, T-VER-19 |
+| 11.2 | Run Help | T-CLI-40–43a, T-CLI-62, T-CLI-67–78, T-CLI-84, T-CLI-92–95, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-104a–104b, T-CLI-120, T-DISC-15b, T-DISC-38, T-VER-19, T-VER-19a–19c |
 | 11.3 | Install Help | T-INST-41–42, T-INST-41a, T-INST-42a–42c, T-INST-49a–49d |
 | 12 | Exit Codes | T-EXIT-01–17 |
 | 13 | Summary of Special Values | *(Summary-only section — LOOPX_BIN: T-MOD-19–21, T-ENV-20, T-ENV-20a, T-DEL-05; LOOPX_PROJECT_ROOT: T-EXEC-03, T-ENV-21, T-ENV-21a; LOOPX_WORKFLOW: T-EXEC-04–04b, T-ENV-21b, T-ENV-21c; LOOPX_DELEGATED: T-DEL-04, T-DEL-07, T-DEL-09, T-ENV-24a)* |
