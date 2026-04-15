@@ -584,6 +584,7 @@ Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows
 - **T-CLI-22b**: `loopx run -n 0 ralph` with `.loopx/` containing a name collision in a workflow → exits with code 1 (validation occurs before `-n 0` short-circuit). *(Spec 4.2, 5.2, 7.1)*
 - **T-CLI-22d**: `loopx run -n 0 ralph` with `.loopx/` containing an invalid script name (e.g., `-bad.sh` in any workflow) → exits with code 1. *(Spec 4.2, 5.3, 7.1)*
 - **T-CLI-22e**: `loopx run -n 0 ralph` with `.loopx/` containing a sibling with an invalid workflow name (e.g., `.loopx/-bad-workflow/index.sh`) → exits with code 1 (global validation catches the invalid workflow name before the `-n 0` short-circuit). This is the `-n 0` counterpart to T-DISC-47b (invalid workflow name in sibling, normal run mode). *(Spec 4.2, 5.3, 7.1)*
+- **T-CLI-22f**: `loopx run -n 0 -e unreadable.env ralph` where `unreadable.env` exists but is unreadable (e.g., mode 000) → exits with code 1. Env file readability validation fires before the `-n 0` short-circuit. This completes the local `-e` file failure coverage under `-n 0`: T-CLI-22a covers missing, T-CLI-22c covers malformed, and this test covers unreadable. **Conditional on `process.getuid() !== 0`.** *(Spec 4.2, 7.1, 8.2)*
 
 #### CLI Stdout Silence
 
@@ -1080,6 +1081,9 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 - **T-API-08m**: `run("ralph", { maxIterations: 0 })` with a malformed-but-readable global env file (e.g., containing `1BAD=val`) → generator completes with no yields, stderr contains a parser warning for the invalid key. Global env files are parsed under `maxIterations: 0` in the programmatic API, mirroring CLI `-n 0` behavior (T-ENV-25c). *(Spec 9.1, 9.5, 8.1)*
 - **T-API-08n**: `runPromise("a:b:c", { maxIterations: 0 })` → rejects. Malformed target strings (multiple colons) are validated before the `maxIterations: 0` short-circuit, mirroring CLI `-n 0` behavior (T-CLI-119d). This extends the `maxIterations: 0` validation coverage (T-API-08a/08c/08d test missing workflow/index/script) to cover target-syntax validation. *(Spec 9.2, 9.5, 4.1)*
 - **T-API-08o**: `run("ralph", { maxIterations: 0 })` with `.loopx/ralph/package.json` unreadable (e.g., mode 000) → generator completes with no yields and no `package.json` warning on stderr. This extends T-API-08b (unsatisfied range via `runPromise`) and T-API-08g (invalid semver via `run()`) to the unreadable-file failure path — completing coverage of all three distinct `package.json` failure branches in SPEC 3.2 under `maxIterations: 0`. Mirrors CLI behavior (T-CLI-119e). **Conditional on `process.getuid() !== 0`.** *(Spec 9.1, 9.5, 3.2)*
+- **T-API-08p**: `run("ralph", { maxIterations: 0, envFile: "unreadable.env" })` where `unreadable.env` exists but is unreadable (e.g., mode 000) → generator throws on first `next()`. Env file readability validation fires even with `maxIterations: 0`, mirroring CLI `-n 0` behavior (T-CLI-22f). This completes the local `envFile` failure coverage under `maxIterations: 0`: T-API-08e covers missing, T-API-08k covers malformed, and this test covers unreadable. **Conditional on `process.getuid() !== 0`.** *(Spec 9.1, 9.5, 4.2, 8.2)*
+- **T-API-08p2**: `runPromise("ralph", { maxIterations: 0, envFile: "unreadable.env" })` where `unreadable.env` exists but is unreadable (e.g., mode 000) → rejects. This is the `runPromise` twin of T-API-08p, providing generator/promise symmetry for the unreadable local env file case under `maxIterations: 0`. **Conditional on `process.getuid() !== 0`.** *(Spec 9.2, 9.5, 4.2, 8.2)*
+- **T-API-08q**: `run("ralph", { maxIterations: 0 })` with `.loopx/ralph/package.json` containing invalid JSON (e.g., `{broken`) → generator completes with no yields and no `package.json` warning on stderr. This extends the `maxIterations: 0` version-check skip coverage to the invalid-JSON `package.json` failure branch, mirroring CLI `-n 0` behavior (T-CLI-119c). Together with T-API-08b (unsatisfied range), T-API-08g (invalid semver), and T-API-08o (unreadable), this completes coverage of all four distinct workflow `package.json` failure modes under `maxIterations: 0`. *(Spec 9.1, 9.5, 3.2)*
 
 #### `run()` with Invalid `target`
 
@@ -1276,6 +1280,7 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 - **T-INST-55a**: Non-recursive workflow detection during install classification. Multi-workflow source contains a candidate directory `tools/` with only nested supported-extension files (e.g., `tools/lib/helper.ts`) and no top-level script files (no `tools/*.sh|js|jsx|ts|tsx`). That directory is skipped as a non-workflow — only top-level files count for workflow detection. Other valid workflow directories in the source are installed normally. *(Spec 10.3, 2.1)*
 - **T-INST-55c**: Multi-workflow source where `ralph/` contains only `index.mjs` (unsupported extension) alongside valid workflow `other/` (containing `index.sh`). `ralph/` is skipped as a non-workflow — `.mjs` is not a supported script extension, so the directory has no top-level script files. Assert: (a) only `.loopx/other/` is installed, (b) `.loopx/ralph/` does not exist, and (c) no warning or error about `ralph/`. This is the install-time counterpart to T-DISC-06/07, which cover `.mjs`/`.cjs` being unrecognized at runtime discovery. *(Spec 10.3, 2.1)*
 - **T-INST-55b**: Multi-workflow source with an invalid-named non-workflow subdirectory. Source repo contains `ralph/index.sh`, `other/index.sh`, and `-bad-dir/README.md` (no script files — not a workflow). Install succeeds, installing only `ralph` and `other`. The `-bad-dir` directory is silently skipped with no error or warning about its invalid name. This locks down the rule that name validation applies only to discovered workflows — directories that don't qualify as workflows are never validated, even if their names would fail the naming restriction pattern. *(Spec 10.3)*
+- **T-INST-55d**: Root-level unsupported script-like files (`.mjs`/`.cjs`) do not force single-workflow classification. Source root contains `index.mjs` (or `config.cjs`) plus `ralph/index.sh` and `other/index.sh`. Because `.mjs` and `.cjs` are not supported script extensions (Spec 2.1), the root has no files with supported extensions and the source is classified as multi-workflow — both `ralph` and `other` are installed. Assert: `.loopx/ralph/` and `.loopx/other/` exist. This pins down the boundary between T-INST-50a (supported root-level files force single-workflow) and T-INST-56c/55c (unsupported extensions are ignored) for the case where valid workflow subdirectories coexist with unsupported root files. *(Spec 10.3, 2.1)*
 
 #### Workflow Classification — Zero-Workflow Source
 
@@ -1667,15 +1672,15 @@ Maps each SPEC.md section to the test IDs that verify it.
 | Spec Section | Description | Test IDs |
 |-------------|-------------|----------|
 | 1 | Overview (ESM-only) | T-MOD-22 |
-| 2.1 | Workflow and Script | T-DISC-01–20c, T-DISC-14a, T-DISC-21a, T-DISC-15a–15b, T-DISC-25–38, T-DISC-26a–26b, T-EXEC-15–16a, T-MOD-03a, T-INST-50a, T-INST-53a–53b, T-INST-55c, T-INST-56c–56d, T-INST-62a, T-API-36a, T-API-47a |
+| 2.1 | Workflow and Script | T-DISC-01–20c, T-DISC-14a, T-DISC-21a, T-DISC-15a–15b, T-DISC-25–38, T-DISC-26a–26b, T-EXEC-15–16a, T-MOD-03a, T-INST-50a, T-INST-53a–53b, T-INST-55c–55d, T-INST-56c–56d, T-INST-62a, T-API-36a, T-API-47a |
 | 2.2 | Loop (state machine, goto) | T-LOOP-01–05, T-LOOP-15a, T-LOOP-16–19, T-LOOP-19a–19b, T-LOOP-30–43, T-LOOP-31a, T-EXEC-16b, T-MOD-21a, T-CLI-111a, T-API-35e, T-API-48a |
 | 2.3 | Structured Output | T-PARSE-01–29, T-PARSE-12a, T-PARSE-20a, F-PARSE-01–05 |
 | 3.1 | Global Install | T-INST-GLOBAL-01, T-INST-GLOBAL-01a |
-| 3.2 | Local Version Pinning & Delegation | T-DEL-01–21, T-VER-01–23, T-VER-04a, T-VER-07a–07d, T-VER-10a, T-VER-12a, T-VER-19a–19c, T-CLI-119, T-CLI-119c, T-CLI-119e–119f, T-API-08b, T-API-08g, T-API-08o |
+| 3.2 | Local Version Pinning & Delegation | T-DEL-01–21, T-VER-01–23, T-VER-04a, T-VER-07a–07d, T-VER-10a, T-VER-12a, T-VER-19a–19c, T-CLI-119, T-CLI-119c, T-CLI-119e–119f, T-API-08b, T-API-08g, T-API-08o, T-API-08q |
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21, T-MOD-21a |
 | 4.1 | Running Scripts (run subcommand, target validation) | T-CLI-11–13, T-CLI-27–33, T-CLI-59–60, T-CLI-64–66, T-CLI-78a–78b, T-CLI-80–81, T-CLI-85, T-CLI-96, T-CLI-107–118, T-CLI-111a, T-CLI-114a, T-CLI-118a, T-CLI-119a–119b, T-CLI-119d, T-DISC-33–37, T-API-08c–08d, T-API-08n, T-API-14f–14g, T-API-20j–20k, T-API-35a–35e, T-API-36a, T-API-40–48, T-API-47a, T-API-48a, T-API-44a, T-LOOP-31a, T-LOOP-38–42 |
-| 4.2 | Options (-n, -e, run -h, install -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22e, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–100, T-CLI-78a–78b, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-119–119f, T-ENV-25b–25c, T-INST-40–49, T-INST-40a–40c, T-INST-49a–49e, T-INST-41a, T-INST-42a–42f, T-INST-43a–43b, T-INST-57a, T-INST-59a, T-API-08e–08o |
+| 4.2 | Options (-n, -e, run -h, install -h, top-level -h) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22f, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–100, T-CLI-78a–78b, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-119–119f, T-ENV-25b–25c, T-INST-40–49, T-INST-40a–40c, T-INST-49a–49e, T-INST-41a, T-INST-42a–42f, T-INST-43a–43b, T-INST-57a, T-INST-59a, T-API-08e–08q |
 | 4.3 | Subcommands | T-SUB-01–19, T-SUB-02a–02h, T-SUB-06a–06b, T-SUB-14a–14k, T-CLI-66, T-CLI-80–81, T-MOD-21a |
 | 5.1 | Discovery | T-DISC-01–16, T-DISC-10a–10g, T-DISC-14a, T-DISC-38–42c, T-DISC-39a, T-DISC-40a–40b, T-DISC-48, T-CLI-42–43, T-CLI-104–104e |
 | 5.2 | Name Collision | T-DISC-21–24, T-DISC-21a, T-CLI-22b, T-CLI-43, T-CLI-43a, T-API-08h |
@@ -1692,16 +1697,16 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 7.2 | Error Handling | T-LOOP-18–24, T-LOOP-18a, T-LOOP-19a, T-LOOP-34–42, T-DISC-42a–42b |
 | 7.3 | Signal Handling | T-SIG-01–08 |
 | 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-05a–05e, T-ENV-25–25c, T-CLI-22c, F-ENV-01–05, T-API-08k–08m |
-| 8.2 | Local Env Override | T-ENV-16–19, T-ENV-17a, T-ENV-25a |
+| 8.2 | Local Env Override | T-ENV-16–19, T-ENV-17a, T-ENV-25a, T-CLI-22f, T-API-08p, T-API-08p2 |
 | 8.3 | Env Injection Precedence | T-ENV-20–24, T-ENV-20a, T-ENV-21a, T-ENV-21b, T-ENV-21c, T-ENV-24a, T-ENV-24b, T-EXEC-03a, T-EXEC-04–04b, T-DISC-39a |
-| 9.1 | run() | T-API-01–09c, T-API-08a–08e, T-API-08g–08m, T-API-08o, T-API-10–10c, T-API-20h–20i, T-API-20j–20k, T-API-30–37, T-API-35a–35e, T-API-36a, T-PARSE-20a, T-TYPE-04, T-TYPE-06–07 |
-| 9.2 | runPromise() | T-API-08f, T-API-08n, T-API-11–14g, T-API-14a–14a3, T-API-25–25b, T-API-38–48, T-API-47a–47b, T-API-48a, T-API-44a, T-PARSE-20a, T-TYPE-05–07 |
+| 9.1 | run() | T-API-01–09c, T-API-08a–08e, T-API-08g–08m, T-API-08o–08q, T-API-10–10c, T-API-20h–20i, T-API-20j–20k, T-API-30–37, T-API-35a–35e, T-API-36a, T-PARSE-20a, T-TYPE-04, T-TYPE-06–07 |
+| 9.2 | runPromise() | T-API-08f, T-API-08n, T-API-08p2, T-API-11–14g, T-API-14a–14a3, T-API-25–25b, T-API-38–48, T-API-47a–47b, T-API-48a, T-API-44a, T-PARSE-20a, T-TYPE-05–07 |
 | 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20k, T-API-21c–21d |
 | 9.4 | output() and input() (script-side) | *(Same as 6.4/6.5)* |
-| 9.5 | Types / RunOptions | T-API-07–08, T-API-07a, T-API-08b–08o, T-API-10–10c, T-API-14f–14g, T-API-20d–20e, T-API-21–21b, T-API-22–25b, T-API-23a, T-API-24a–24b, T-API-47b, T-TYPE-01–07 |
+| 9.5 | Types / RunOptions | T-API-07–08, T-API-07a, T-API-08b–08q, T-API-10–10c, T-API-14f–14g, T-API-20d–20e, T-API-21–21b, T-API-22–25b, T-API-23a, T-API-24a–24b, T-API-47b, T-TYPE-01–07 |
 | 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08f, T-INST-41 |
 | 10.2 | Source Type Details | T-INST-56b, T-INST-81–89, T-INST-85a–85b, T-INST-86a |
-| 10.3 | Workflow Classification | T-INST-50–56, T-INST-50a, T-INST-52a, T-INST-53a–53b, T-INST-54a–54c, T-INST-55a–55c, T-INST-56a–56d, T-INST-64, T-INST-64b, T-INST-80g, T-INST-85b |
+| 10.3 | Workflow Classification | T-INST-50–56, T-INST-50a, T-INST-52a, T-INST-53a–53b, T-INST-54a–54c, T-INST-55a–55d, T-INST-56a–56d, T-INST-64, T-INST-64b, T-INST-80g, T-INST-85b |
 | 10.4 | Install-time Validation | T-INST-52a, T-INST-61–64, T-INST-62a, T-INST-63a–63c, T-INST-64a–64c, T-INST-80h–80j, T-INST-60a, T-INST-60e |
 | 10.5 | Collision Handling | T-INST-65–71, T-INST-67a, T-INST-70a, T-INST-71a, T-INST-97, T-INST-60c |
 | 10.6 | Version Checking on Install | T-INST-72–76, T-INST-97b, T-VER-12–13, T-VER-12a, T-VER-15, T-VER-17, T-VER-22, T-INST-80d–80f, T-INST-54b, T-INST-60b, T-INST-60f |
