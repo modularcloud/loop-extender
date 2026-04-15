@@ -697,6 +697,8 @@ Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows
 
 - **T-DISC-25**: Workflow name restrictions follow `[a-zA-Z0-9_][a-zA-Z0-9_-]*`. `.loopx/my-workflow/index.sh` → valid. *(Spec 5.3)*
 - **T-DISC-26**: `.loopx/_underscore/index.sh` → valid workflow name. *(Spec 5.3)*
+- **T-DISC-26a**: `.loopx/1flow/index.sh` → valid workflow name (digit first). `loopx run -n 1 1flow` succeeds and runs the script. Assert via marker file. This mirrors T-DISC-30a (digit-start script name) but covers the workflow-name validation path — an implementation could wrongly require workflows to start with a letter or underscore. *(Spec 5.3)*
+- **T-DISC-26b**: `.loopx/42/index.sh` → valid workflow name (all digits). `loopx run -n 1 42` succeeds and runs the script. Assert via marker file. This mirrors T-DISC-30b (all-digit script name) but covers the workflow-name validation path. *(Spec 5.3)*
 - **T-DISC-27**: `.loopx/-startswithdash/index.sh` → invalid workflow name, error. *(Spec 5.3)*
 - **T-DISC-28**: `.loopx/has space/index.sh` → invalid workflow name (space not allowed). *(Spec 5.3)*
 - **T-DISC-29**: `.loopx/has.dot/index.sh` → invalid workflow name (dot not allowed). *(Spec 5.3)*
@@ -822,7 +824,7 @@ All fixture scripts live inside a workflow (e.g., `.loopx/test/index.sh`). The `
 - **T-PARSE-22**: `{"stop": 1}`. Assert yielded Output is exactly `{}`. *(Spec 2.3)*
 - **T-PARSE-23**: `{"stop": false}`. Assert yielded Output is exactly `{}`. *(Spec 2.3)*
 - **T-PARSE-24**: `{"stop": "false"}`. Assert yielded Output is exactly `{}`. *(Spec 2.3)*
-- **T-PARSE-20a**: `{"goto":""}` (empty string goto). An empty string IS a string, so parser preserves it. Assert the generator throws an error on the first iteration (because `""` is not a valid target). *(Spec 2.3, 4.1)*
+- **T-PARSE-20a**: `{"goto":""}` (empty string goto). An empty string IS a string, so parser preserves it. Observe via `run("test")`: the first yielded Output has `goto: ""` (parsing preserves the string value without validating it). The generator throws an error when advancing past that iteration — target validation rejects `""` at transition time, not at parse time. This matches the T-MOD-13h model: parsing preserves, `run()` yields, transition validates. For direct rejection semantics, also verify `runPromise("test")` rejects with the same invalid-target error (the first iteration's output contains `goto: ""`, but the transition failure surfaces as a promise rejection). *(Spec 2.3, 4.1, 9.1, 9.2)*
 
 #### Mixed Valid/Invalid Fields
 
@@ -1268,7 +1270,8 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 - **T-INST-62**: Workflow with same-base-name collision (e.g., `check.sh` and `check.ts`) → install fails. *(Spec 10.4)*
 - **T-INST-62a**: Workflow source with both `index.sh` and `index.ts` → install fails. This is the `index`-specific variant of T-INST-62 — a buggy installer could special-case `index` and still pass the generic same-base-name collision test (T-INST-62). *(Spec 10.4, 2.1)*
 - **T-INST-63**: Derived workflow name must match name restriction rules. Invalid name → install fails. *(Spec 10.4)*
-- **T-INST-64**: Missing `index` script is allowed at install time. A workflow without `index` can be installed. *(Spec 10.4)*
+- **T-INST-63a**: Digit-start workflow name is valid at install time. Single-workflow source whose derived name starts with a digit (e.g., repo named `3checks` containing `check.sh`). `loopx install <source>` succeeds and installs to `.loopx/3checks/`. This covers the install-time workflow-name validation path separately from runtime discovery (T-DISC-26a/26b), since install has its own name-validation code path. *(Spec 10.4, 5.3)*
+- **T-INST-64**: Missing `index` script is allowed at install time for single-workflow sources. A single-workflow source whose root contains `check.sh` but no `index.*` file. `loopx install <source>` succeeds. Assert the installed workflow is present under `.loopx/<repo-name>/` and contains `check.sh`. This explicitly covers the single-workflow classification path introduced by ADR-0003 — root-level script files make the source single-workflow, and missing `index` is still allowed. A bug could exist where a multi-workflow subdirectory can omit `index` but a single-workflow source incorrectly requires it. *(Spec 10.4, 10.3)*
 - **T-INST-64a**: Install-time validation is non-recursive within a workflow. Single-workflow source has a top-level `index.ts` plus a nested `lib/` subdirectory containing `-bad.ts` (invalid script name) and both `check.sh` and `check.ts` (same-base-name collision). Install succeeds because nested files within a workflow are not discovered or validated as scripts — only top-level files are checked. Assert exit code 0 and that `.loopx/<repo-name>/lib/-bad.ts`, `.loopx/<repo-name>/lib/check.sh`, and `.loopx/<repo-name>/lib/check.ts` are all present in the installed workflow (copied as workflow content, not rejected as invalid scripts). *(Spec 10.4, 2.1)*
 
 #### Collision Handling
@@ -1621,7 +1624,7 @@ Maps each SPEC.md section to the test IDs that verify it.
 | Spec Section | Description | Test IDs |
 |-------------|-------------|----------|
 | 1 | Overview (ESM-only) | T-MOD-22 |
-| 2.1 | Workflow and Script | T-DISC-01–20c, T-DISC-14a, T-DISC-21a, T-DISC-15a–15b, T-DISC-25–38, T-EXEC-15–16a, T-MOD-03a, T-INST-62a |
+| 2.1 | Workflow and Script | T-DISC-01–20c, T-DISC-14a, T-DISC-21a, T-DISC-15a–15b, T-DISC-25–38, T-DISC-26a–26b, T-EXEC-15–16a, T-MOD-03a, T-INST-62a |
 | 2.2 | Loop (state machine, goto) | T-LOOP-01–05, T-LOOP-15a, T-LOOP-16–19, T-LOOP-19a–19b, T-LOOP-30–43, T-LOOP-31a, T-EXEC-16b, T-MOD-21a |
 | 2.3 | Structured Output | T-PARSE-01–29, T-PARSE-12a, T-PARSE-20a, F-PARSE-01–05 |
 | 3.1 | Global Install | T-INST-GLOBAL-01, T-INST-GLOBAL-01a |
@@ -1633,7 +1636,7 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 4.3 | Subcommands | T-SUB-01–19, T-SUB-02a–02d, T-SUB-06a–06b, T-SUB-14a–14k, T-CLI-66, T-CLI-80–81, T-MOD-21a |
 | 5.1 | Discovery | T-DISC-01–16, T-DISC-10a–10e, T-DISC-14a, T-DISC-38–42c, T-DISC-39a, T-DISC-48, T-CLI-42–43, T-CLI-104–104d |
 | 5.2 | Name Collision | T-DISC-21–24, T-DISC-21a, T-CLI-22b, T-CLI-43, T-CLI-43a, T-API-08h |
-| 5.3 | Name Restrictions | T-DISC-15a–15b, T-DISC-25–32, T-DISC-47a, T-DISC-47b, T-CLI-44, T-CLI-22d–22e, T-CLI-102, T-CLI-120, T-LOOP-40–42, T-EDGE-05, T-API-08i–08j, T-INST-60d |
+| 5.3 | Name Restrictions | T-DISC-15a–15b, T-DISC-25–32, T-DISC-26a–26b, T-DISC-47a, T-DISC-47b, T-CLI-44, T-CLI-22d–22e, T-CLI-102, T-CLI-120, T-LOOP-40–42, T-EDGE-05, T-API-08i–08j, T-INST-60d, T-INST-63a |
 | 5.4 | Validation Scope | T-DISC-43–47, T-DISC-47a, T-DISC-47b, T-SUB-06, T-SUB-13, T-SUB-19, T-CLI-28, T-CLI-114a, T-API-35c |
 | 6.1 | Working Directory | T-EXEC-01–03, T-EXEC-16, T-EXEC-16b, T-API-07a |
 | 6.2 | Bash Scripts | T-EXEC-05–07 |
@@ -1648,15 +1651,15 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-05a–05e, T-ENV-25–25c, T-CLI-22c, F-ENV-01–05, T-API-08k–08m |
 | 8.2 | Local Env Override | T-ENV-16–19, T-ENV-17a, T-ENV-25a |
 | 8.3 | Env Injection Precedence | T-ENV-20–24, T-ENV-20a, T-ENV-21a, T-ENV-21b, T-ENV-21c, T-ENV-24a, T-ENV-24b, T-EXEC-04–04b, T-DISC-39a |
-| 9.1 | run() | T-API-01–09c, T-API-08a–08e, T-API-08g–08m, T-API-10–10c, T-API-20h–20i, T-API-20j–20k, T-API-30–37, T-API-35a–35d, T-TYPE-04, T-TYPE-06–07 |
-| 9.2 | runPromise() | T-API-08f, T-API-11–14g, T-API-14a–14a3, T-API-25–25b, T-API-38–48, T-API-44a, T-TYPE-05–07 |
+| 9.1 | run() | T-API-01–09c, T-API-08a–08e, T-API-08g–08m, T-API-10–10c, T-API-20h–20i, T-API-20j–20k, T-API-30–37, T-API-35a–35d, T-PARSE-20a, T-TYPE-04, T-TYPE-06–07 |
+| 9.2 | runPromise() | T-API-08f, T-API-11–14g, T-API-14a–14a3, T-API-25–25b, T-API-38–48, T-API-44a, T-PARSE-20a, T-TYPE-05–07 |
 | 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20k, T-API-21c–21d |
 | 9.4 | output() and input() (script-side) | *(Same as 6.4/6.5)* |
 | 9.5 | Types / RunOptions | T-API-07–08, T-API-07a, T-API-08b–08m, T-API-10–10c, T-API-14f–14g, T-API-20d–20e, T-API-21–21b, T-API-22–25b, T-API-23a, T-API-24a–24b, T-TYPE-01–07 |
 | 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08f |
 | 10.2 | Source Type Details | T-INST-81–89, T-INST-85a–85b, T-INST-86a |
-| 10.3 | Workflow Classification | T-INST-50–56, T-INST-52a, T-INST-54a, T-INST-55a–55b, T-INST-56a, T-INST-80g, T-INST-85b |
-| 10.4 | Install-time Validation | T-INST-52a, T-INST-61–64, T-INST-62a, T-INST-64a, T-INST-80h–80j, T-INST-60a, T-INST-60e |
+| 10.3 | Workflow Classification | T-INST-50–56, T-INST-52a, T-INST-54a, T-INST-55a–55b, T-INST-56a, T-INST-64, T-INST-80g, T-INST-85b |
+| 10.4 | Install-time Validation | T-INST-52a, T-INST-61–64, T-INST-62a, T-INST-63a, T-INST-64a, T-INST-80h–80j, T-INST-60a, T-INST-60e |
 | 10.5 | Collision Handling | T-INST-65–71, T-INST-67a, T-INST-70a, T-INST-97, T-INST-60c |
 | 10.6 | Version Checking on Install | T-INST-72–76, T-INST-97b, T-VER-12–13, T-VER-15, T-VER-17, T-VER-22, T-INST-80d–80f, T-INST-60b |
 | 10.7 | Install Atomicity | T-INST-77–80j |
