@@ -1028,6 +1028,7 @@ All env file parsing tests below use `writeEnvFileRaw` to write exact file conte
 
 - **T-MOD-04**: `output({ result: "hello" })`. Observe via `runPromise("ralph", { maxIterations: 1 })`: yielded Output has `result: "hello"`. *(Spec 6.4)*
 - **T-MOD-05**: `output({ result: "x", goto: "check" })`. Observe via `run("ralph")`: yielded Output has both fields, and loopx transitions. *(Spec 6.4)*
+- **T-MOD-05a**: TS/JS script `alpha:index` calls `output({ goto: "beta:index" })`; `beta:index` writes a marker file and then calls `output({ stop: true })`. Assert `beta:index` executed (marker file exists). This is a positive end-to-end test for a JS/TS `output()` cross-workflow goto: T-MOD-05 covers intra-workflow goto and T-LOOP-05 covers cross-workflow goto generally, but no existing test exercises a JS/TS `output()` emitting a qualified `workflow:script` target that the loop follows. *(Spec 6.4, 2.2)*
 - **T-MOD-06**: `output({ stop: true })`. Loop completes after one iteration. *(Spec 6.4)*
 - **T-MOD-07**: `output({})` (no known fields). Script crashes with non-zero exit code. *(Spec 6.4)*
 - **T-MOD-08**: `output(null)`. Script crashes. *(Spec 6.4)*
@@ -1329,6 +1330,7 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 
 - **T-INST-57**: `loopx install -w ralph <multi-workflow-source>` installs only `ralph`. Assert `.loopx/ralph/` exists but `.loopx/other/` does not. *(Spec 10.8)*
 - **T-INST-57a**: `loopx install --workflow ralph <multi-workflow-source>` is equivalent to `loopx install -w ralph <source>`. Assert `.loopx/ralph/` exists but `.loopx/other/` does not. This tests the long-form `--workflow` flag. *(Spec 4.2, 10.8)*
+- **T-INST-57b**: `loopx install -w ralph <multi-workflow-source>` where the source root also contains `README.md`, `package.json`, `docs/`, `shared/`, and a sibling workflow `other/` (with `index.sh`) → only `.loopx/ralph/` is created. Assert: no source-root support files or directories (`README.md`, `package.json`, `docs/`, `shared/`) are copied into `.loopx/`, and `.loopx/other/` does not exist. This is the `-w` counterpart to T-INST-54 / T-INST-54c, which prove self-containment for full multi-workflow installs — the same rule must hold on the selective `-w` code path. *(Spec 10.3, 10.8)*
 - **T-INST-58**: `loopx install -w nonexistent <multi-workflow-source>` → error (workflow not in source). *(Spec 10.8)*
 - **T-INST-59**: `loopx install -w ralph <single-workflow-source>` → error (`-w` is invalid for single-workflow sources). The source must have root-level script files (e.g., `index.ts`) **and** subdirectories containing supported-extension files (e.g., `lib/helpers.ts`, `src/utils.js`), so the test genuinely proves that root-level scripts force single-workflow classification even in the presence of subdirectories with script-extension files. Using `-w` is an error regardless of the name provided. *(Spec 10.3, 10.8)*
 - **T-INST-59a**: `loopx install --workflow ralph <single-workflow-source>` → error. Long-form `--workflow` parity with T-INST-59: `--workflow` is invalid for single-workflow sources, same as `-w`. *(Spec 10.8, 4.2)*
@@ -1361,6 +1363,7 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 - **T-INST-64b**: Missing `index` script is allowed at install time for multi-workflow sources. Multi-workflow source with `tools/check.sh` (no `tools/index.*`) and `other/index.sh` (to force multi-workflow classification). `loopx install <source>` succeeds. Assert both `.loopx/tools/` and `.loopx/other/` are installed, and `.loopx/tools/` contains `check.sh`. This complements the single-workflow path (T-INST-64) — a bug could allow missing index in single-workflow sources but incorrectly require it in multi-workflow subdirectories. *(Spec 10.4, 10.3)*
 - **T-INST-64c**: Missing `index` script is allowed at install time for multi-workflow sources with `-w` scoping. Same source as T-INST-64b. `loopx install -w tools <source>` succeeds. Assert `.loopx/tools/` is installed and contains `check.sh`, and `.loopx/other/` does not exist. This covers the selective-install path for a workflow without an index script. *(Spec 10.4, 10.8)*
 - **T-INST-64a**: Install-time validation is non-recursive within a workflow. Single-workflow source has a top-level `index.ts` plus a nested `lib/` subdirectory containing `-bad.ts` (invalid script name) and both `check.sh` and `check.ts` (same-base-name collision). Install succeeds because nested files within a workflow are not discovered or validated as scripts — only top-level files are checked. Assert exit code 0 and that `.loopx/<repo-name>/lib/-bad.ts`, `.loopx/<repo-name>/lib/check.sh`, and `.loopx/<repo-name>/lib/check.ts` are all present in the installed workflow (copied as workflow content, not rejected as invalid scripts). *(Spec 10.4, 2.1)*
+- **T-INST-52b**: Multi-workflow source with `ralph/index.sh`, `ralph/eslint.config.js`, and `other/index.sh` → install fails because every top-level file with a supported extension inside a workflow directory is a discovered script, and `eslint.config` violates the script name restriction `[a-zA-Z0-9_][a-zA-Z0-9_-]*` (the dot is not allowed). Assert exit code 1 and that the error references the invalid script name. This is the install-time mirror of T-DISC-15a / T-DISC-15b, which test the same "no opt-out" rule at runtime discovery — a buggy installer could special-case config/helper-style files during workflow-directory scanning and still pass the current suite. *(Spec 2.1, 5.3, 10.4)*
 
 #### Collision Handling
 
@@ -1735,8 +1738,8 @@ Maps each SPEC.md section to the test IDs that verify it.
 | Spec Section | Description | Test IDs |
 |-------------|-------------|----------|
 | 1 | Overview (ESM-only) | T-MOD-22 |
-| 2.1 | Workflow and Script | T-DISC-01–20c, T-DISC-14a, T-DISC-21a, T-DISC-15a–15b, T-DISC-25–38, T-DISC-26a–26b, T-EXEC-15–16a, T-MOD-03a, T-INST-50a–50b, T-INST-53a–53c, T-INST-55c–55d, T-INST-56c–56d, T-INST-62a, T-API-36a, T-API-47a |
-| 2.2 | Loop (state machine, goto) | T-LOOP-01–05, T-LOOP-15a, T-LOOP-16–19, T-LOOP-19a–19b, T-LOOP-30–43, T-LOOP-30a, T-LOOP-31a–31b, T-EXEC-16b, T-MOD-21a, T-CLI-111a, T-API-35e, T-API-48a |
+| 2.1 | Workflow and Script | T-DISC-01–20c, T-DISC-14a, T-DISC-21a, T-DISC-15a–15b, T-DISC-25–38, T-DISC-26a–26b, T-EXEC-15–16a, T-MOD-03a, T-INST-50a–50b, T-INST-52b, T-INST-53a–53c, T-INST-55c–55d, T-INST-56c–56d, T-INST-62a, T-API-36a, T-API-47a |
+| 2.2 | Loop (state machine, goto) | T-LOOP-01–05, T-LOOP-15a, T-LOOP-16–19, T-LOOP-19a–19b, T-LOOP-30–43, T-LOOP-30a, T-LOOP-31a–31b, T-EXEC-16b, T-MOD-05a, T-MOD-21a, T-CLI-111a, T-API-35e, T-API-48a |
 | 2.3 | Structured Output | T-PARSE-01–29, T-PARSE-12a, T-PARSE-20a, F-PARSE-01–05 |
 | 3.1 | Global Install | T-INST-GLOBAL-01, T-INST-GLOBAL-01a |
 | 3.2 | Local Version Pinning & Delegation | T-DEL-01–26, T-VER-01–25, T-VER-04a, T-VER-07a–07f, T-VER-10a, T-VER-12a, T-VER-18a, T-VER-19a–19c, T-VER-24a, T-VER-25a, T-CLI-119, T-CLI-119c, T-CLI-119e–119f, T-API-08b, T-API-08g, T-API-08o, T-API-08q |
@@ -1747,12 +1750,12 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 4.3 | Subcommands | T-SUB-01–19, T-SUB-02a–02h, T-SUB-06a–06b, T-SUB-14a–14k, T-CLI-66, T-CLI-80–81, T-MOD-21a |
 | 5.1 | Discovery | T-DISC-01–16, T-DISC-10a–10g, T-DISC-14a, T-DISC-38–42c, T-DISC-39a, T-DISC-40a–40g, T-DISC-48, T-DISC-48a, T-CLI-42–43, T-CLI-104–104e, T-CLI-121–122 |
 | 5.2 | Name Collision | T-DISC-21–24, T-DISC-21a, T-DISC-40e, T-CLI-22b, T-CLI-43, T-CLI-43a, T-API-08h |
-| 5.3 | Name Restrictions | T-DISC-15a–15b, T-DISC-25–32, T-DISC-26a–26b, T-DISC-40c–40d, T-DISC-40f–40g, T-DISC-47a, T-DISC-47b, T-CLI-44, T-CLI-22d–22e, T-CLI-102, T-CLI-120, T-LOOP-40–42, T-EDGE-05, T-API-08i–08j, T-INST-60d, T-INST-60m, T-INST-63a–63c |
+| 5.3 | Name Restrictions | T-DISC-15a–15b, T-DISC-25–32, T-DISC-26a–26b, T-DISC-40c–40d, T-DISC-40f–40g, T-DISC-47a, T-DISC-47b, T-CLI-44, T-CLI-22d–22e, T-CLI-102, T-CLI-120, T-LOOP-40–42, T-EDGE-05, T-API-08i–08j, T-INST-52b, T-INST-60d, T-INST-60m, T-INST-63a–63c |
 | 5.4 | Validation Scope | T-DISC-43–47, T-DISC-47a, T-DISC-47b, T-SUB-02h, T-SUB-06, T-SUB-13, T-SUB-19, T-CLI-28, T-CLI-114a, T-API-35c, T-API-44b |
 | 6.1 | Working Directory | T-EXEC-01–03, T-EXEC-03a, T-EXEC-16, T-EXEC-16b, T-API-07a, T-API-47b |
 | 6.2 | Bash Scripts | T-EXEC-05–07 |
 | 6.3 | JS/TS Scripts | T-EXEC-08–14 |
-| 6.4 | output() Function | T-MOD-04–14a, T-MOD-13a–13m |
+| 6.4 | output() Function | T-MOD-04–14a, T-MOD-05a, T-MOD-13a–13m |
 | 6.5 | input() Function | T-MOD-15–18 |
 | 6.6 | Input Piping | T-LOOP-11–15, T-LOOP-15a |
 | 6.7 | Initial Input | T-LOOP-14 |
@@ -1769,12 +1772,12 @@ Maps each SPEC.md section to the test IDs that verify it.
 | 9.5 | Types / RunOptions | T-API-07–08, T-API-07a, T-API-08b–08r, T-API-10–10c, T-API-14f–14h, T-API-20d–20e, T-API-21–21b, T-API-22–25b, T-API-23a, T-API-24a–24b, T-API-47b, T-DISC-48a, T-TYPE-01–07 |
 | 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08f, T-INST-41 |
 | 10.2 | Source Type Details | T-INST-56b, T-INST-81–89, T-INST-85a–85b, T-INST-86a |
-| 10.3 | Workflow Classification | T-INST-50–56, T-INST-50a–50b, T-INST-52a, T-INST-53a–53c, T-INST-54a–54c, T-INST-55a–55d, T-INST-56a–56d, T-INST-64, T-INST-64b, T-INST-80g, T-INST-85b |
-| 10.4 | Install-time Validation | T-INST-52a, T-INST-61–64, T-INST-62a, T-INST-63a–63c, T-INST-64a–64c, T-INST-80h–80j, T-INST-60a, T-INST-60e, T-INST-60g, T-INST-60h, T-INST-60n |
+| 10.3 | Workflow Classification | T-INST-50–56, T-INST-50a–50b, T-INST-52a, T-INST-53a–53c, T-INST-54a–54c, T-INST-55a–55d, T-INST-56a–56d, T-INST-57b, T-INST-64, T-INST-64b, T-INST-80g, T-INST-85b |
+| 10.4 | Install-time Validation | T-INST-52a–52b, T-INST-61–64, T-INST-62a, T-INST-63a–63c, T-INST-64a–64c, T-INST-80h–80j, T-INST-60a, T-INST-60e, T-INST-60g, T-INST-60h, T-INST-60n |
 | 10.5 | Collision Handling | T-INST-65–71, T-INST-67a, T-INST-70a–70c, T-INST-71a, T-INST-97, T-INST-60c, T-INST-60k, T-INST-60l |
 | 10.6 | Version Checking on Install | T-INST-72–76, T-INST-97b, T-VER-12–13, T-VER-12a, T-VER-15, T-VER-17, T-VER-22, T-INST-80d–80f, T-INST-54b, T-INST-60b, T-INST-60f, T-INST-60i, T-INST-60j, T-DEL-25 |
 | 10.7 | Install Atomicity | T-INST-77–80j |
-| 10.8 | Selective Workflow Installation | T-INST-57–60, T-INST-57a, T-INST-59a, T-INST-60a–60n, T-INST-64c |
+| 10.8 | Selective Workflow Installation | T-INST-57–60, T-INST-57a–57b, T-INST-59a, T-INST-60a–60n, T-INST-64c |
 | 10.9 | Common Rules | T-INST-90–96, T-INST-97a |
 | 11.1 | Top-Level Help | T-CLI-02–06, T-CLI-07e–07g, T-CLI-07j, T-CLI-28, T-CLI-39, T-CLI-61, T-CLI-65, T-CLI-90–91 |
 | 11.2 | Run Help | T-CLI-40–43a, T-CLI-40a, T-CLI-62, T-CLI-67–78, T-CLI-84, T-CLI-92–95, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-104a–104e, T-CLI-120–122, T-DISC-10d–10g, T-DISC-15b, T-DISC-38, T-DISC-40b–40e, T-DISC-40g, T-VER-19, T-VER-19a–19c |
