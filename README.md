@@ -9,9 +9,9 @@ loopx is a CLI tool that automates repeated execution ("loops") of scripts, prim
 ```bash
 npm install -g loop-extender
 
-# Create a script
-mkdir -p .loopx
-echo 'import { output } from "loopx"; output({ result: "hello", stop: true });' > .loopx/hello.ts
+# Create a workflow
+mkdir -p .loopx/hello
+echo 'import { output } from "loopx"; output({ result: "hello", stop: true });' > .loopx/hello/index.ts
 
 # Run it
 loopx run hello
@@ -19,14 +19,15 @@ loopx run hello
 
 ## Features
 
-- **Loop engine** with goto-based control flow between scripts
+- **Workflow model** — scripts are organized into workflow directories under `.loopx/`, with `index` as the default entry point
+- **Loop engine** with goto-based control flow, including cross-workflow transitions (`workflow:script`)
 - **Structured output** parsing (JSON with `result`, `goto`, `stop` fields)
-- **Script types**: Bash (`.sh`), JavaScript (`.js`/`.jsx`), TypeScript (`.ts`/`.tsx`), directory scripts with `package.json`
+- **Script types**: Bash (`.sh`), JavaScript (`.js`/`.jsx`), TypeScript (`.ts`/`.tsx`)
 - **Environment management** via `loopx env set/remove/list` and `-e` local overrides
-- **Script installation** from GitHub repos, git URLs, tarballs, and single-file URLs
-- **Programmatic API** with `run()` (async generator) and `runPromise()`
+- **Workflow installation** from GitHub repos, git URLs, and tarballs — single- and multi-workflow sources
+- **Programmatic API** with `run()` (async generator) and `runPromise()` using `workflow:script` targets
 - **Signal handling** with proper process group forwarding and grace periods
-- **CLI delegation** for local version pinning via `node_modules/.bin/loopx`
+- **CLI delegation** for local version pinning via project-root `node_modules/.bin/loopx`
 
 ## Running Tests
 
