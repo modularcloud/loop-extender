@@ -3,7 +3,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   createTempProject,
-  createScript,
+  createWorkflowScript,
   type TempProject,
 } from "../helpers/fixtures.js";
 import { runCLIWithSignal } from "../helpers/cli.js";
@@ -121,9 +121,10 @@ describe("SPEC: Signal Handling", () => {
     const markerPath = join(project.dir, "pid-marker.txt");
 
     // Create a script that writes its PID, signals "ready", then sleeps
-    await createScript(
+    await createWorkflowScript(
       project,
       "sig-sleep",
+      "index",
       ".sh",
       signalReadyThenSleep(markerPath),
     );
@@ -150,9 +151,10 @@ describe("SPEC: Signal Handling", () => {
     project = await createTempProject();
     const markerPath = join(project.dir, "pid-marker.txt");
 
-    await createScript(
+    await createWorkflowScript(
       project,
       "sig-sleep",
+      "index",
       ".sh",
       signalReadyThenSleep(markerPath),
     );
@@ -178,9 +180,10 @@ describe("SPEC: Signal Handling", () => {
     project = await createTempProject();
     const markerPath = join(project.dir, "pid-marker.txt");
 
-    await createScript(
+    await createWorkflowScript(
       project,
       "sig-sleep",
+      "index",
       ".sh",
       signalReadyThenSleep(markerPath),
     );
@@ -216,9 +219,10 @@ describe("SPEC: Signal Handling", () => {
     const markerPath = join(project.dir, "pid-marker.txt");
 
     // signalTrapExit: traps SIGTERM, sleeps 2s (under the 5s grace period), then exits 0
-    await createScript(
+    await createWorkflowScript(
       project,
       "sig-trap-exit",
+      "index",
       ".sh",
       signalTrapExit(markerPath, 2),
     );
@@ -248,9 +252,10 @@ describe("SPEC: Signal Handling", () => {
       const markerPath = join(project.dir, "pid-marker.txt");
 
       // signalTrapIgnore: traps SIGTERM with no-op, sleeps indefinitely
-      await createScript(
+      await createWorkflowScript(
         project,
         "sig-trap-ignore",
+        "index",
         ".sh",
         signalTrapIgnore(markerPath),
       );
@@ -290,9 +295,10 @@ describe("SPEC: Signal Handling", () => {
 
     // spawnGrandchild: spawns a background `sleep 3600`, writes both PIDs
     // (parent on line 1, grandchild on line 2), signals "ready", then waits
-    await createScript(
+    await createWorkflowScript(
       project,
       "sig-grandchild",
+      "index",
       ".sh",
       spawnGrandchild(markerPath),
     );
@@ -348,7 +354,7 @@ printf '%s' "$COUNT" > "${iterMarker}"
 sleep 0.1
 printf '{"result":"%s"}' "$COUNT"
 `;
-      await createScript(project, "iter-counter", ".sh", scriptContent);
+      await createWorkflowScript(project, "iter-counter", "index", ".sh", scriptContent);
 
       const { result, sendSignal } = runCLIWithSignal(
         ["run", "-n", "20", "iter-counter"],
@@ -386,9 +392,10 @@ printf '{"result":"%s"}' "$COUNT"
     const markerPath = join(project.dir, "pid-marker.txt");
     const reportPath = join(project.dir, "signal-report.txt");
 
-    await createScript(
+    await createWorkflowScript(
       project,
       "sig-report",
+      "index",
       ".sh",
       signalTrapReport(markerPath, reportPath),
     );
@@ -414,9 +421,10 @@ printf '{"result":"%s"}' "$COUNT"
     const markerPath = join(project.dir, "pid-marker.txt");
     const reportPath = join(project.dir, "signal-report.txt");
 
-    await createScript(
+    await createWorkflowScript(
       project,
       "sig-report",
+      "index",
       ".sh",
       signalTrapReport(markerPath, reportPath),
     );

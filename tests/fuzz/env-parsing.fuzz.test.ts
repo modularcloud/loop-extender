@@ -5,7 +5,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { parseEnvFile } from "loopx/internal";
 import {
   createTempProject,
-  createBashScript,
+  createBashWorkflowScript,
   runCLI,
   writeEnvFileRaw,
 } from "../helpers/index.js";
@@ -137,9 +137,10 @@ async function runE2EEnvTest(
 
     // Create a script that writes the env var to a marker file
     const markerPath = join(project.dir, "marker.txt");
-    await createBashScript(
+    await createBashWorkflowScript(
       project,
       "check-env",
+      "index",
       writeEnvToFile(varName, markerPath),
     );
 
@@ -259,7 +260,7 @@ describe("FUZZ: Env File Parsing", () => {
             await writeEnvFileRaw(envPath, content);
 
             // Create a trivial script that exits successfully
-            await createBashScript(project, "noop", "exit 0");
+            await createBashWorkflowScript(project, "noop", "index", "exit 0");
 
             const result = await runCLI(
               ["-n", "1", "-e", envPath, "noop"],
@@ -669,9 +670,10 @@ describe("FUZZ: Env File Parsing", () => {
             await writeEnvFileRaw(envPath, content);
 
             const markerPath = join(project.dir, "marker.txt");
-            await createBashScript(
+            await createBashWorkflowScript(
               project,
               "check-env",
+              "index",
               writeEnvToFile(uniqueVar, markerPath),
             );
 

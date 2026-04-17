@@ -57,17 +57,23 @@ export function loadLocalEnv(path: string): {
 
 export function mergeEnv(
   globalEnv: Record<string, string>,
-  localEnv: Record<string, string>,
-  loopxBin: string,
-  projectRoot: string
+  localEnv: Record<string, string>
 ): Record<string, string> {
-  const { LOOPX_DELEGATED: _, ...inheritedEnv } = process.env as Record<string, string>;
+  // Per SPEC §8.3 precedence (highest wins):
+  //   loopx-injected (LOOPX_BIN / LOOPX_PROJECT_ROOT / LOOPX_WORKFLOW)
+  //   > local env file (-e)
+  //   > global loopx env
+  //   > inherited system environment
+  //
+  // The loopx-injected variables are layered on top of this merged base in
+  // execution.ts, since they depend on per-script context (workflow name).
+  // LOOPX_DELEGATED is *not* scrubbed — if it was inherited from a parent
+  // loopx invocation, it passes through unchanged (SPEC §4.7 / TEST-SPEC
+  // T-ENV-24a).
   return {
-    ...inheritedEnv,
+    ...(process.env as Record<string, string>),
     ...globalEnv,
     ...localEnv,
-    LOOPX_BIN: loopxBin,
-    LOOPX_PROJECT_ROOT: projectRoot,
   };
 }
 

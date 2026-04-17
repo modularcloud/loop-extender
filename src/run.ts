@@ -1,41 +1,56 @@
 import { join, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Output, RunOptions } from "./types.js";
 import { discoverScripts } from "./discovery.js";
-import { runLoop } from "./loop.js";
+import { runLoop, type LoopStartingTarget } from "./loop.js";
 import { loadGlobalEnv, loadLocalEnv, mergeEnv } from "./env.js";
+import { parseTarget } from "./target-validation.js";
 import { makeAbortError } from "./abort.js";
 import { getLoopxBin, ensureLoopxPackageJson } from "./bin-path.js";
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function getRunningVersion(): string {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(resolve(__dirname, "package.json"), "utf-8")
+    );
+    return pkg.version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
 /**
- * Run a loopx script and yield Output for each iteration.
+ * Run a loopx target and yield Output for each iteration.
  *
- * Options are snapshotted at call time (Spec 9.1).
- * Returns a custom AsyncGenerator that supports cancellation via .return().
+ * Per SPEC §9.1/9.5:
+ *   - RunOptions.cwd is snapshotted at call time; it specifies the project
+ *     root (for `.loopx/` resolution and LOOPX_PROJECT_ROOT), NOT the script
+ *     execution cwd. Scripts always execute with their workflow directory
+ *     as cwd (§6.1).
+ *   - target is a required string of shape `workflow[:script]`.
+ *   - Errors are surfaced lazily on first iteration.
  */
 export function run(
-  scriptName: string,
+  target: string,
   options?: RunOptions
 ): AsyncGenerator<Output> {
-  // Snapshot all options at call time (before any async work)
   const cwd = options?.cwd ?? process.cwd();
   const maxIterations = options?.maxIterations;
   const envFile = options?.envFile;
   const externalSignal = options?.signal;
   const loopxBin = getLoopxBin();
 
-  // Internal abort controller for generator.return() cancellation
   const internalAc = new AbortController();
-
-  // Combine external signal with internal
-  let effectiveSignal: AbortSignal;
-  if (externalSignal) {
-    effectiveSignal = AbortSignal.any([externalSignal, internalAc.signal]);
-  } else {
-    effectiveSignal = internalAc.signal;
-  }
+  const effectiveSignal: AbortSignal = externalSignal
+    ? AbortSignal.any([externalSignal, internalAc.signal])
+    : internalAc.signal;
 
   const gen = runInternal(
-    scriptName,
+    target,
     cwd,
     maxIterations,
     envFile,
@@ -43,7 +58,6 @@ export function run(
     loopxBin
   );
 
-  // Wrap generator to intercept .return() for cancellation
   let returnCalled = false;
 
   const wrapper: AsyncGenerator<Output> = {
@@ -51,7 +65,6 @@ export function run(
       try {
         return await gen.next();
       } catch (err) {
-        // If return() was called, swallow the abort error
         if (returnCalled) {
           return { done: true, value: undefined } as IteratorResult<Output>;
         }
@@ -85,14 +98,13 @@ export function run(
 }
 
 async function* runInternal(
-  scriptName: string | undefined,
+  target: string | undefined,
   cwd: string,
   maxIterations: number | undefined,
   envFile: string | undefined,
   signal: AbortSignal,
   loopxBin: string
 ): AsyncGenerator<Output> {
-  // Validate maxIterations
   if (maxIterations !== undefined) {
     if (
       typeof maxIterations !== "number" ||
@@ -106,33 +118,29 @@ async function* runInternal(
     }
   }
 
-  // Check abort signal
   if (signal.aborted) {
     throw makeAbortError(signal);
   }
 
   const loopxDir = join(cwd, ".loopx");
 
-  // Discover scripts
+  // Discovery (global validation per SPEC §5.4)
   const discovery = discoverScripts(loopxDir, "run");
   if (discovery.errors.length > 0) {
     throw new Error(discovery.errors.join("; "));
   }
-
   for (const w of discovery.warnings) {
     process.stderr.write(w + "\n");
   }
 
-  // Load env
-  let globalEnv: Record<string, string> = {};
-  let localEnv: Record<string, string> = {};
-
+  // Load env (SPEC §8)
   const globalResult = loadGlobalEnv();
-  globalEnv = globalResult.vars;
+  const globalEnv = globalResult.vars;
   for (const w of globalResult.warnings) {
     process.stderr.write(`Warning: ${w}\n`);
   }
 
+  let localEnv: Record<string, string> = {};
   if (envFile) {
     const envFilePath = resolve(cwd, envFile);
     const localResult = loadLocalEnv(envFilePath);
@@ -142,48 +150,74 @@ async function* runInternal(
     }
   }
 
-  const mergedEnv = mergeEnv(globalEnv, localEnv, loopxBin, cwd);
+  const mergedEnv = mergeEnv(globalEnv, localEnv);
 
   ensureLoopxPackageJson(loopxDir);
 
-  // Validate scriptName
   if (
-    scriptName === undefined ||
-    scriptName === null ||
-    typeof scriptName !== "string"
+    target === undefined ||
+    target === null ||
+    typeof target !== "string"
   ) {
+    throw new Error("target is required and must be a string");
+  }
+
+  // Parse the target
+  const parsed = parseTarget(target);
+  if (!parsed.ok) {
+    throw new Error(parsed.error);
+  }
+
+  const workflow = discovery.workflows.get(parsed.workflow);
+  if (!workflow) {
     throw new Error(
-      "scriptName is required and must be a string"
+      `Workflow '${parsed.workflow}' not found in .loopx/`
     );
   }
 
-  // Resolve starting target
-  const startingTarget = discovery.scripts.get(scriptName);
-  if (!startingTarget) {
-    throw new Error(`Script '${scriptName}' not found in .loopx/`);
+  let scriptName: string;
+  if (parsed.script === null) {
+    if (!workflow.hasIndex || !workflow.scripts.get("index")) {
+      throw new Error(
+        `Workflow '${parsed.workflow}' has no default entry point ('index' script)`
+      );
+    }
+    scriptName = "index";
+  } else {
+    scriptName = parsed.script;
   }
 
-  // maxIterations: 0 validates then exits (mirrors CLI -n 0)
+  const scriptFile = workflow.scripts.get(scriptName);
+  if (!scriptFile) {
+    throw new Error(
+      `Script '${scriptName}' not found in workflow '${parsed.workflow}'`
+    );
+  }
+
+  // -n 0 / maxIterations: 0 — validates but does not enter the loop
+  // (workflow-level version checking is skipped per SPEC §3.2).
   if (maxIterations === 0) {
     return;
   }
 
-  // Run the loop
-  yield* runLoop(startingTarget, discovery.scripts, {
+  const starting: LoopStartingTarget = { workflow, script: scriptFile };
+
+  yield* runLoop(starting, discovery.workflows, {
     maxIterations,
     env: mergedEnv,
     projectRoot: cwd,
     loopxBin,
+    runningVersion: getRunningVersion(),
     signal,
   });
 }
 
 /**
- * Run a loopx script and collect all outputs.
+ * Run a loopx target and collect all outputs (SPEC §9.2).
  * When a signal is provided, the promise rejects on abort.
  */
 export async function runPromise(
-  scriptName: string,
+  target: string,
   options?: RunOptions
 ): Promise<Output[]> {
   const signal = options?.signal;
@@ -191,13 +225,10 @@ export async function runPromise(
     throw makeAbortError(signal);
   }
 
-  const gen = run(scriptName, options);
+  const gen = run(target, options);
   const outputs: Output[] = [];
 
   if (signal) {
-    // Create a persistent abort promise that rejects when the signal aborts.
-    // Once rejected, it stays rejected, causing Promise.race to immediately
-    // reject on the next gen.next() call - even for very fast scripts.
     const abortPromise = new Promise<IteratorResult<Output>>((_, reject) => {
       if (signal.aborted) {
         reject(makeAbortError(signal));
@@ -209,7 +240,7 @@ export async function runPromise(
         { once: true }
       );
     });
-    abortPromise.catch(() => {}); // prevent unhandled rejection warning
+    abortPromise.catch(() => {});
 
     try {
       while (true) {

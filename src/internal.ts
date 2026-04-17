@@ -3,3 +3,8 @@ export { parseEnvFile } from "./parsers/parse-env.js";
 export type { ParseEnvResult } from "./parsers/parse-env.js";
 export { classifySource } from "./parsers/classify-source.js";
 export type { ClassifyResult } from "./parsers/classify-source.js";
+export { parseTarget, parseGoto } from "./target-validation.js";
+export type { TargetParse, GotoParse } from "./target-validation.js";
+export { isValidRange, satisfies, parseVersion } from "./semver.js";
+export { checkWorkflowVersion } from "./version-check.js";
+export type { VersionCheckResult } from "./version-check.js";

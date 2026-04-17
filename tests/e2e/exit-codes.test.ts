@@ -2,8 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { join } from "node:path";
 import {
   createTempProject,
-  createScript,
-  createBashScript,
+  createWorkflowScript,
   type TempProject,
 } from "../helpers/fixtures.js";
 import { runCLI, runCLIWithSignal } from "../helpers/cli.js";
@@ -42,7 +41,7 @@ describe("SPEC: Exit Codes", () => {
     forEachRuntime((runtime) => {
       it("T-EXIT-01: script outputs stop -> exit 0", async () => {
         project = await createTempProject();
-        await createScript(project, "stopper", ".sh", emitStop());
+        await createWorkflowScript(project, "stopper", "index", ".sh", emitStop());
 
         const result = await runCLI(["run", "stopper"], {
           cwd: project.dir,
@@ -55,7 +54,7 @@ describe("SPEC: Exit Codes", () => {
       it("T-EXIT-02: -n limit reached -> exit 0", async () => {
         project = await createTempProject();
         const counterFile = join(project.dir, "counter.txt");
-        await createScript(project, "counting", ".sh", counter(counterFile));
+        await createWorkflowScript(project, "counting", "index", ".sh", counter(counterFile));
 
         const result = await runCLI(["run", "-n", "3", "counting"], {
           cwd: project.dir,
@@ -67,7 +66,7 @@ describe("SPEC: Exit Codes", () => {
 
       it("T-EXIT-03: -n 0 -> exit 0", async () => {
         project = await createTempProject();
-        await createScript(project, "myscript", ".sh", emitResult("x"));
+        await createWorkflowScript(project, "myscript", "index", ".sh", emitResult("x"));
 
         const result = await runCLI(["run", "-n", "0", "myscript"], {
           cwd: project.dir,
@@ -99,7 +98,7 @@ describe("SPEC: Exit Codes", () => {
     forEachRuntime((runtime) => {
       it("T-EXIT-05: script exits non-zero -> exit 1", async () => {
         project = await createTempProject();
-        await createScript(project, "fail", ".sh", exitCode(42));
+        await createWorkflowScript(project, "fail", "index", ".sh", exitCode(42));
 
         const result = await runCLI(["run", "-n", "1", "fail"], {
           cwd: project.dir,
@@ -112,8 +111,9 @@ describe("SPEC: Exit Codes", () => {
       it("T-EXIT-06: validation failure (name collision) -> exit 1", async () => {
         project = await createTempProject();
         // Create two scripts with the same base name but different extensions
-        await createScript(project, "example", ".sh", emitResult("from-sh"));
-        await createScript(project, "example", ".ts", emitResult("from-ts"));
+        // within the same workflow (workflow-level same-base-name collision)
+        await createWorkflowScript(project, "example", "index", ".sh", emitResult("from-sh"));
+        await createWorkflowScript(project, "example", "index", ".ts", emitResult("from-ts"));
 
         const result = await runCLI(["run", "example"], {
           cwd: project.dir,
@@ -127,7 +127,7 @@ describe("SPEC: Exit Codes", () => {
       it("T-EXIT-07: invalid goto target -> exit 1", async () => {
         project = await createTempProject();
         // Script emits a goto to a target that does not exist
-        await createScript(project, "bad-goto", ".sh", emitGoto("nonexistent"));
+        await createWorkflowScript(project, "bad-goto", "index", ".sh", emitGoto("nonexistent"));
 
         const result = await runCLI(["run", "-n", "2", "bad-goto"], {
           cwd: project.dir,
@@ -164,7 +164,7 @@ describe("SPEC: Exit Codes", () => {
 
       it("T-EXIT-10: invalid -n -> exit 1", async () => {
         project = await createTempProject();
-        await createScript(project, "myscript", ".sh", emitResult("x"));
+        await createWorkflowScript(project, "myscript", "index", ".sh", emitResult("x"));
 
         const result = await runCLI(["run", "-n", "abc", "myscript"], {
           cwd: project.dir,
@@ -176,7 +176,7 @@ describe("SPEC: Exit Codes", () => {
 
       it("T-EXIT-11: missing -e file -> exit 1", async () => {
         project = await createTempProject();
-        await createScript(project, "myscript", ".sh", emitResult("x"));
+        await createWorkflowScript(project, "myscript", "index", ".sh", emitResult("x"));
 
         const result = await runCLI(
           ["run", "-e", "nonexistent.env", "myscript"],
@@ -237,9 +237,10 @@ describe("SPEC: Exit Codes", () => {
 
         // Use signalReadyThenSleep fixture: writes PID to marker, "ready" to
         // stderr, then sleeps indefinitely until signalled.
-        await createScript(
+        await createWorkflowScript(
           project,
           "sleeper",
+          "index",
           ".sh",
           signalReadyThenSleep(markerPath),
         );
@@ -264,9 +265,10 @@ describe("SPEC: Exit Codes", () => {
         project = await createTempProject();
         const markerPath = join(project.dir, "signal-pid.txt");
 
-        await createScript(
+        await createWorkflowScript(
           project,
           "sleeper",
+          "index",
           ".sh",
           signalReadyThenSleep(markerPath),
         );

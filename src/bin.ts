@@ -1,12 +1,18 @@
 #!/usr/bin/env node
 
-import { readFileSync, realpathSync, existsSync } from "node:fs";
+import {
+  readFileSync,
+  realpathSync,
+  existsSync,
+  accessSync,
+  constants as fsConstants,
+} from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { constants } from "node:os";
 import { discoverScripts } from "./discovery.js";
-import { runLoop } from "./loop.js";
+import { runLoop, type LoopStartingTarget } from "./loop.js";
 import {
   loadGlobalEnv,
   loadLocalEnv,
@@ -16,57 +22,142 @@ import {
   envList,
 } from "./env.js";
 import { installCommand } from "./install.js";
+import { parseTarget } from "./target-validation.js";
 import { getLoopxBin, ensureLoopxPackageJson } from "./bin-path.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 function getVersion(): string {
-  try {
-    const pkg = JSON.parse(
-      readFileSync(resolve(__dirname, "package.json"), "utf-8")
-    );
-    return pkg.version;
-  } catch {
-    return "0.0.0";
+  // Prefer the package.json adjacent to the entry script as seen by Node via
+  // `process.argv[1]`. This preserves any symlink-style install layouts (e.g.
+  // `node_modules/loopx/bin.js` that is itself a symlink): under delegation
+  // the delegated-to binary's directory holds the real package.json with its
+  // own version, which is what workflow-level version checks must compare
+  // against (SPEC §3.2 "LOOPX_BIN contains the resolved realpath of the
+  // effective binary" + ADR-0003 §5 runtime validation semantics).
+  const candidates: string[] = [];
+  if (process.argv[1]) {
+    candidates.push(resolve(dirname(process.argv[1]), "package.json"));
   }
-}
-
-// --- CLI Delegation ---
-function findLocalBin(startDir: string): string | null {
-  let dir = startDir;
-  while (true) {
-    const candidate = join(dir, "node_modules", ".bin", "loopx");
-    if (existsSync(candidate)) {
-      return candidate;
+  candidates.push(resolve(__dirname, "package.json"));
+  for (const candidate of candidates) {
+    try {
+      const pkg = JSON.parse(readFileSync(candidate, "utf-8"));
+      if (typeof pkg.version === "string") return pkg.version;
+    } catch {
+      // try next
     }
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
   }
-  return null;
+  return "0.0.0";
 }
 
-// --- Top-level Help (no discovery) ---
+// --- CLI Delegation (SPEC §3.2 post-ADR-0003) ---
+//
+// Project-root-only delegation: check cwd's package.json for a declared
+// `loopx` dependency, then check node_modules/.bin/loopx. No ancestor
+// traversal.
+
+interface DelegationResult {
+  shouldDelegate: boolean;
+  binPath: string | null;
+  warnings: string[];
+}
+
+function checkDelegation(cwd: string): DelegationResult {
+  const warnings: string[] = [];
+  const pkgPath = join(cwd, "package.json");
+  const localBin = join(cwd, "node_modules", ".bin", "loopx");
+
+  if (!existsSync(pkgPath)) {
+    return { shouldDelegate: false, binPath: null, warnings };
+  }
+
+  try {
+    accessSync(pkgPath, fsConstants.R_OK);
+  } catch {
+    warnings.push(
+      `Warning: project-root package.json is unreadable; skipping delegation`
+    );
+    return { shouldDelegate: false, binPath: null, warnings };
+  }
+
+  let pkgContent: string;
+  try {
+    pkgContent = readFileSync(pkgPath, "utf-8");
+  } catch {
+    warnings.push(
+      `Warning: project-root package.json is unreadable; skipping delegation`
+    );
+    return { shouldDelegate: false, binPath: null, warnings };
+  }
+
+  let pkg: unknown;
+  try {
+    pkg = JSON.parse(pkgContent);
+  } catch {
+    warnings.push(
+      `Warning: project-root package.json contains invalid JSON; skipping delegation`
+    );
+    return { shouldDelegate: false, binPath: null, warnings };
+  }
+
+  if (typeof pkg !== "object" || pkg === null || Array.isArray(pkg)) {
+    warnings.push(
+      `Warning: project-root package.json is not a valid object; skipping delegation`
+    );
+    return { shouldDelegate: false, binPath: null, warnings };
+  }
+
+  const obj = pkg as Record<string, unknown>;
+  const isDeclared =
+    hasLoopxDep(obj.dependencies) ||
+    hasLoopxDep(obj.devDependencies) ||
+    hasLoopxDep(obj.optionalDependencies);
+
+  if (!isDeclared) {
+    // Not declared — no delegation even if node_modules/.bin/loopx exists.
+    return { shouldDelegate: false, binPath: null, warnings };
+  }
+
+  if (!existsSync(localBin)) {
+    warnings.push(
+      `Warning: project-root package.json declares loopx as a dependency but node_modules/.bin/loopx does not exist; skipping delegation (run 'npm install' to restore)`
+    );
+    return { shouldDelegate: false, binPath: null, warnings };
+  }
+
+  return { shouldDelegate: true, binPath: localBin, warnings };
+}
+
+function hasLoopxDep(deps: unknown): boolean {
+  if (typeof deps !== "object" || deps === null || Array.isArray(deps)) {
+    return false;
+  }
+  const v = (deps as Record<string, unknown>).loopx;
+  return typeof v === "string";
+}
+
+// --- Top-level Help ---
 function printTopLevelHelp(): void {
   console.log(`Usage: loopx <command> [options]
 
 Commands:
-  run <script-name>   Run a script in a loop
-  version             Print the loopx version
-  output              Emit structured output (for bash scripts)
-  env                 Manage global environment variables
-  install <source>    Install a script into .loopx/
+  run <workflow>[:<script>]   Run a loopx workflow (and optional script)
+  version                     Print the loopx version
+  output                      Emit structured output (for bash scripts)
+  env                         Manage global environment variables
+  install <source>            Install workflows from a git repo or tarball
 
 Options:
   -h, --help          Print this help message
 
-Run 'loopx run -h' to see run options and available scripts.`);
+Run 'loopx run -h' to see run options and available workflows.`);
 }
 
 // --- Run Help (with discovery) ---
 function printRunHelp(loopxDir: string): void {
-  console.log(`Usage: loopx run [options] <script-name>
+  console.log(`Usage: loopx run [options] <workflow>[:<script>]
 
 Options:
   -n <count>    Maximum number of loop iterations
@@ -79,13 +170,48 @@ Options:
     process.stderr.write(w + "\n");
   }
 
-  if (discovery.scripts.size > 0) {
-    console.log("\nAvailable scripts:");
-    for (const [name, entry] of discovery.scripts) {
-      const typeLabel = entry.type === "directory" ? "directory" : entry.ext;
-      console.log(`  ${name} (${typeLabel})`);
+  if (discovery.workflows.size > 0) {
+    console.log("\nAvailable workflows:");
+    const wfNames = Array.from(discovery.workflows.keys()).sort();
+    for (const wfName of wfNames) {
+      const wf = discovery.workflows.get(wfName)!;
+      console.log(`  ${wf.name}`);
+      // List every candidate script (including invalid-named / colliding)
+      // so run-help surfaces validation warnings in a user-visible form.
+      // The `index` script is annotated as the default entry point, so the
+      // annotation appears *after* the script name in the same line.
+      const allNames = Array.from(wf.candidateScripts.keys()).sort();
+      for (const scriptName of allNames) {
+        const files = wf.candidateScripts.get(scriptName)!;
+        const isDefault = scriptName === "index" && wf.hasIndex;
+        const defaultNote = isDefault ? " — default entry point" : "";
+        if (files.length > 1) {
+          const list = files.map((f) => `${f.name}${f.ext}`).join(", ");
+          console.log(
+            `    ${scriptName} (collision: ${list})${defaultNote}`
+          );
+        } else {
+          const script = files[0];
+          console.log(`    ${scriptName} (${script.ext})${defaultNote}`);
+        }
+      }
     }
   }
+}
+
+// --- Install Help ---
+function printInstallHelp(): void {
+  console.log(`Usage: loopx install [options] <source>
+
+Sources:
+  org/repo                    GitHub shorthand (expanded to https://github.com/org/repo.git)
+  https://github.com/...      Git URL
+  https://.../archive.tar.gz  Tarball URL
+
+Options:
+  -w <name>, --workflow <name>   Install only the named workflow (multi-workflow source)
+  -y                             Override version mismatch and workflow collision checks
+  -h, --help                     Print this help message`);
 }
 
 // --- Output Subcommand ---
@@ -161,16 +287,73 @@ function handleEnvSubcommand(subArgs: string[]): void {
   }
 }
 
+// --- Install Subcommand Parsing ---
+interface InstallArgs {
+  help: boolean;
+  selectedWorkflow?: string | null;
+  override: boolean;
+  source?: string;
+}
+
+function parseInstallArgs(argv: string[]): InstallArgs {
+  // Short-circuit: `-h` / `--help` anywhere ignores all validation.
+  if (argv.includes("-h") || argv.includes("--help")) {
+    return { help: true, override: false };
+  }
+
+  const result: InstallArgs = { help: false, override: false };
+  let sawW = false;
+  let sawY = false;
+  let i = 0;
+
+  while (i < argv.length) {
+    const arg = argv[i];
+    if (arg === "-w" || arg === "--workflow") {
+      if (sawW) {
+        process.stderr.write(`Error: duplicate ${arg} flag\n`);
+        process.exit(1);
+      }
+      sawW = true;
+      i++;
+      if (i >= argv.length) {
+        process.stderr.write(`Error: ${arg} requires a value\n`);
+        process.exit(1);
+      }
+      result.selectedWorkflow = argv[i];
+    } else if (arg === "-y") {
+      if (sawY) {
+        process.stderr.write(`Error: duplicate -y flag\n`);
+        process.exit(1);
+      }
+      sawY = true;
+      result.override = true;
+    } else if (arg.startsWith("-")) {
+      process.stderr.write(`Error: unknown install flag '${arg}'\n`);
+      process.exit(1);
+    } else {
+      if (result.source !== undefined) {
+        process.stderr.write(
+          `Error: multiple sources not allowed ('${result.source}' then '${arg}')\n`
+        );
+        process.exit(1);
+      }
+      result.source = arg;
+    }
+    i++;
+  }
+
+  return result;
+}
+
 // --- Run Subcommand Parsing ---
 interface RunArgs {
   help: boolean;
   maxIterations?: number;
   envFile?: string;
-  scriptName?: string;
+  target?: string;
 }
 
 function parseRunArgs(argv: string[]): RunArgs {
-  // Check for -h/--help anywhere first (full short-circuit)
   if (argv.includes("-h") || argv.includes("--help")) {
     return { help: true };
   }
@@ -218,11 +401,11 @@ function parseRunArgs(argv: string[]): RunArgs {
     } else if (arg === "--") {
       i++;
       if (i < argv.length) {
-        if (result.scriptName) {
+        if (result.target) {
           process.stderr.write(`Error: unexpected argument '${argv[i]}'\n`);
           process.exit(1);
         }
-        result.scriptName = argv[i];
+        result.target = argv[i];
         i++;
       }
       if (i < argv.length) {
@@ -234,12 +417,11 @@ function parseRunArgs(argv: string[]): RunArgs {
       process.stderr.write(`Error: unknown flag '${arg}'\n`);
       process.exit(1);
     } else {
-      // Positional argument (script name)
-      if (result.scriptName) {
+      if (result.target) {
         process.stderr.write(`Error: unexpected argument '${arg}'\n`);
         process.exit(1);
       }
-      result.scriptName = arg;
+      result.target = arg;
     }
     i++;
   }
@@ -248,13 +430,17 @@ function parseRunArgs(argv: string[]): RunArgs {
 }
 
 async function main(): Promise<void> {
-  // Delegation: check for local node_modules/.bin/loopx before anything else
+  const cwd = process.cwd();
+
+  // Delegation: project-root only (SPEC §3.2 post-ADR-0003).
   if (process.env.LOOPX_DELEGATED === undefined) {
-    const cwd = process.cwd();
-    const localBin = findLocalBin(cwd);
-    if (localBin) {
-      const localBinRealpath = realpathSync(localBin);
-      const result = spawnSync(localBin, process.argv.slice(2), {
+    const delegation = checkDelegation(cwd);
+    for (const w of delegation.warnings) {
+      process.stderr.write(w + "\n");
+    }
+    if (delegation.shouldDelegate && delegation.binPath) {
+      const localBinRealpath = realpathSync(delegation.binPath);
+      const result = spawnSync(delegation.binPath, process.argv.slice(2), {
         cwd,
         env: {
           ...process.env,
@@ -277,11 +463,9 @@ async function main(): Promise<void> {
   }
 
   const argv = process.argv.slice(2);
-  const cwd = process.cwd();
   const loopxDir = join(cwd, ".loopx");
   const loopxBin = getLoopxBin();
 
-  // No arguments → top-level help
   if (argv.length === 0) {
     printTopLevelHelp();
     process.exit(0);
@@ -289,15 +473,12 @@ async function main(): Promise<void> {
 
   const firstArg = argv[0];
 
-  // Top-level -h/--help takes precedence over everything
   if (firstArg === "-h" || firstArg === "--help") {
     printTopLevelHelp();
     process.exit(0);
   }
 
-  // Dispatch subcommands
   const SUBCOMMANDS = ["run", "version", "output", "env", "install"];
-
   if (!SUBCOMMANDS.includes(firstArg)) {
     process.stderr.write(
       `Error: unknown command '${firstArg}'. Run 'loopx -h' for usage.\n`
@@ -321,14 +502,24 @@ async function main(): Promise<void> {
   }
 
   if (firstArg === "install") {
-    const installArgs = argv.slice(1);
-    if (installArgs.length < 1) {
+    const installArgs = parseInstallArgs(argv.slice(1));
+    if (installArgs.help) {
+      printInstallHelp();
+      process.exit(0);
+    }
+    if (!installArgs.source) {
       process.stderr.write(
-        "Error: loopx install requires a <source> argument\n"
+        "Error: loopx install requires a <source> argument. Run 'loopx install -h' for usage.\n"
       );
       process.exit(1);
     }
-    await installCommand(installArgs[0], cwd);
+    await installCommand({
+      source: installArgs.source,
+      cwd,
+      selectedWorkflow: installArgs.selectedWorkflow ?? null,
+      override: installArgs.override,
+      runningVersion: getVersion(),
+    });
     process.exit(0);
   }
 
@@ -336,27 +527,26 @@ async function main(): Promise<void> {
   const runArgv = argv.slice(1);
   const runArgs = parseRunArgs(runArgv);
 
-  // Run help
   if (runArgs.help) {
     printRunHelp(loopxDir);
     process.exit(0);
   }
 
-  // Script name is required
-  if (!runArgs.scriptName) {
+  // Distinguish "no target provided" (usage error, no discovery) from
+  // "empty target string provided" (invalid target, rejected after discovery
+  // per SPEC §4.1 and §12).
+  if (runArgs.target === undefined) {
     process.stderr.write(
-      "Error: loopx run requires a <script-name>. Run 'loopx run -h' for usage.\n"
+      "Error: loopx run requires a <workflow>[:<script>]. Run 'loopx run -h' for usage.\n"
     );
     process.exit(1);
   }
 
-  // Run mode: requires .loopx/
+  // Discovery (global validation per SPEC §5.4).
   const discovery = discoverScripts(loopxDir, "run");
-
   for (const w of discovery.warnings) {
     process.stderr.write(w + "\n");
   }
-
   if (discovery.errors.length > 0) {
     for (const err of discovery.errors) {
       process.stderr.write(`Error: ${err}\n`);
@@ -366,7 +556,6 @@ async function main(): Promise<void> {
 
   ensureLoopxPackageJson(loopxDir);
 
-  // Load environment
   let globalEnv: Record<string, string> = {};
   let localEnv: Record<string, string> = {};
 
@@ -399,25 +588,50 @@ async function main(): Promise<void> {
     }
   }
 
-  const mergedEnv = mergeEnv(globalEnv, localEnv, loopxBin, cwd);
+  const mergedEnv = mergeEnv(globalEnv, localEnv);
 
-  // Resolve starting target
-  const scriptName = runArgs.scriptName;
-  const startingTarget = discovery.scripts.get(scriptName);
+  // Target resolution
+  const parsed = parseTarget(runArgs.target);
+  if (!parsed.ok) {
+    process.stderr.write(`Error: ${parsed.error}\n`);
+    process.exit(1);
+  }
 
-  if (!startingTarget) {
+  const workflow = discovery.workflows.get(parsed.workflow);
+  if (!workflow) {
     process.stderr.write(
-      `Error: Script '${scriptName}' not found in .loopx/\n`
+      `Error: workflow '${parsed.workflow}' not found in .loopx/\n`
     );
     process.exit(1);
   }
 
-  // -n 0: validate then exit
+  let scriptName: string;
+  if (parsed.script === null) {
+    if (!workflow.hasIndex || !workflow.scripts.has("index")) {
+      process.stderr.write(
+        `Error: workflow '${parsed.workflow}' has no default entry point ('index' script)\n`
+      );
+      process.exit(1);
+    }
+    scriptName = "index";
+  } else {
+    scriptName = parsed.script;
+  }
+
+  const scriptFile = workflow.scripts.get(scriptName);
+  if (!scriptFile) {
+    process.stderr.write(
+      `Error: script '${scriptName}' not found in workflow '${parsed.workflow}'\n`
+    );
+    process.exit(1);
+  }
+
+  // -n 0: validate then exit (SPEC §3.2 — no workflow-level version check).
   if (runArgs.maxIterations === 0) {
     process.exit(0);
   }
 
-  // Set up signal handling with AbortController
+  // Signal handling
   const ac = new AbortController();
   let receivedSignal: NodeJS.Signals | null = null;
 
@@ -434,13 +648,15 @@ async function main(): Promise<void> {
   process.on("SIGINT", signalHandler);
   process.on("SIGTERM", signalHandler);
 
-  // Run the loop
+  const starting: LoopStartingTarget = { workflow, script: scriptFile };
+
   try {
-    const loop = runLoop(startingTarget, discovery.scripts, {
+    const loop = runLoop(starting, discovery.workflows, {
       maxIterations: runArgs.maxIterations,
       env: mergedEnv,
       projectRoot: cwd,
       loopxBin,
+      runningVersion: getVersion(),
       signal: ac.signal,
     });
 

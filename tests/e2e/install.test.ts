@@ -498,8 +498,10 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           ["install", `${httpServer.url}/org/repo/archive/main.tar.gz`],
           { cwd: project.dir, runtime },
         );
+        // Wrapper `archive/` is stripped (SPEC §10.2); name derives from the
+        // URL archive-name = "main" (last path segment minus `.tar.gz`).
         expect(result.exitCode).toBe(0);
-        expect(existsSync(join(project.loopxDir, "archive"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "main"))).toBe(true);
       });
 
       it("T-INST-08c: github URL with trailing slash → git", async () => {
@@ -1643,10 +1645,14 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
 
       it("T-INST-56b: tarball with no installable workflows → error", async () => {
         project = await createTempProject();
+        // Per TEST-SPEC T-INST-56b: script files must be NESTED inside the
+        // candidate subdirectory (not at its top level) so the subdirectory
+        // does not qualify as a workflow. `lib/src/helpers.ts` keeps lib/'s
+        // top level empty of scripts.
         const tarball = await makeTarball(
           {
             "README.md": "readme",
-            "lib/helpers.ts": "export const x = 1;",
+            "lib/src/helpers.ts": "export const x = 1;",
           },
           { wrapperDir: "empty" },
         );

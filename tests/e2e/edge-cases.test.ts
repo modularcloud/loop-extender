@@ -4,8 +4,8 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   createTempProject,
-  createScript,
-  createBashScript,
+  createWorkflowScript,
+  createBashWorkflowScript,
   type TempProject,
 } from "../helpers/fixtures.js";
 import { runCLI } from "../helpers/cli.js";
@@ -51,9 +51,10 @@ describe("SPEC: Edge Cases & Boundary Tests (§7)", () => {
         await writeFile(payloadFile, payloadContent, "utf-8");
 
         // Create a TS script that reads and writes the payload to stdout
-        await createScript(
+        await createWorkflowScript(
           project,
           "bigresult",
+          "index",
           ".ts",
           stdoutWriter(payloadFile),
         );
@@ -93,9 +94,10 @@ console.log(JSON.stringify({ resultLength: outputs[0]?.result?.length }));
         await writeFile(payloadFile, payloadContent, "utf-8");
 
         // Script reads the payload file and writes it to stdout
-        await createScript(
+        await createWorkflowScript(
           project,
           "specialchars",
+          "index",
           ".ts",
           stdoutWriter(payloadFile),
         );
@@ -132,7 +134,7 @@ process.stdout.write('{"resu');
 process.stdout.write('lt":"pa');
 process.stdout.write('rtial"}');
 `;
-        await createScript(project, "partial", ".ts", tsContent);
+        await createWorkflowScript(project, "partial", "index", ".ts", tsContent);
 
         const driverCode = `
 import { runPromise } from "loopx";
@@ -160,9 +162,10 @@ console.log(JSON.stringify({ result: outputs[0]?.result }));
       it("T-EDGE-04: stdout is structured output, stderr contains expected message", async () => {
         project = await createTempProject();
 
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
           "mixed-io",
+          "index",
           `echo "stderr-message-here" >&2
 printf '{"result":"stdout-ok"}'`,
         );
@@ -205,9 +208,10 @@ console.log(JSON.stringify({ result: outputs[0]?.result }));
         const payloadFile = join(project.dir, "unicode-payload.json");
         await writeFile(payloadFile, payloadContent, "utf-8");
 
-        await createScript(
+        await createWorkflowScript(
           project,
           "unicode-result",
+          "index",
           ".ts",
           stdoutWriter(payloadFile),
         );
@@ -231,9 +235,11 @@ console.log(JSON.stringify({ result: outputs[0]?.result }));
         project = await createTempProject();
 
         // Create a script with a unicode name (U+00E9 = precomposed é)
-        await createScript(
+        // in the workflow name — should be rejected at discovery/validation.
+        await createWorkflowScript(
           project,
           "caf\u00e9",
+          "index",
           ".sh",
           `#!/bin/bash\nprintf '{"result":"ok"}'`,
         );
@@ -257,9 +263,10 @@ console.log(JSON.stringify({ result: outputs[0]?.result }));
         writeEnvFileRaw(envPath, `UNICODE_VAR=${unicodeValue}\n`);
 
         // Script writes the env var to a marker file
-        await createScript(
+        await createWorkflowScript(
           project,
           "check-env",
+          "index",
           ".sh",
           writeEnvToFile("UNICODE_VAR", markerPath),
         );
@@ -290,15 +297,21 @@ console.log(JSON.stringify({ result: outputs[0]?.result }));
 
         const letters = "abcdefghijklmnopqrstuvwxyz".split("");
 
+        // Put all 26 scripts into a single "chain" workflow. The first script
+        // is named "index" (the default entry point), and each subsequent
+        // script bears its letter name. Bare goto in the workflow model
+        // targets a script within the same workflow.
         for (let i = 0; i < letters.length; i++) {
           const letter = letters[i];
+          const scriptName = i === 0 ? "index" : letter;
           const isLast = i === letters.length - 1;
 
           if (isLast) {
             // Last script: just count, no goto (end of chain)
-            await createBashScript(
+            await createBashWorkflowScript(
               project,
-              letter,
+              "chain",
+              scriptName,
               `printf '1' >> "${counterFile}"
 printf '%s' "${letter}" >> "${orderFile}"
 printf '{"result":"done"}'`,
@@ -306,9 +319,10 @@ printf '{"result":"done"}'`,
           } else {
             // Each script gotos the next letter
             const nextLetter = letters[i + 1];
-            await createBashScript(
+            await createBashWorkflowScript(
               project,
-              letter,
+              "chain",
+              scriptName,
               `printf '1' >> "${counterFile}"
 printf '%s' "${letter}" >> "${orderFile}"
 printf '{"goto":"${nextLetter}"}'`,
@@ -316,7 +330,7 @@ printf '{"goto":"${nextLetter}"}'`,
           }
         }
 
-        const result = await runCLI(["run", "-n", "26", "a"], {
+        const result = await runCLI(["run", "-n", "26", "chain"], {
           cwd: project.dir,
           runtime,
           timeout: 60_000,
@@ -348,9 +362,10 @@ printf '{"goto":"${nextLetter}"}'`,
 
         // Bash script that tries to read stdin on first iteration
         // Since stdin is closed/empty, `read` should return immediately with EOF
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
           "stdin-reader",
+          "index",
           `INPUT=$(cat)
 printf '{"result":"read-done"}'`,
         );
@@ -389,7 +404,7 @@ else
   printf '{"result":"iter-%s"}' "$COUNT"
 fi
 `;
-        await createScript(project, "stop-later", ".sh", scriptBody);
+        await createWorkflowScript(project, "stop-later", "index", ".sh", scriptBody);
 
         const result = await runCLI(["run", "-n", "999999", "stop-later"], {
           cwd: project.dir,
@@ -456,9 +471,10 @@ fi
 
         // Script that reads the env var and writes it to a marker file
         const markerPath = join(project.dir, "env-marker.txt");
-        await createScript(
+        await createWorkflowScript(
           project,
           "check-env-edge",
+          "index",
           ".sh",
           writeEnvToFile("MY_EDGE_KEY", markerPath),
         );
@@ -493,9 +509,10 @@ fi
         // Script that checks whether a specific env var is set
         // If the empty env file caused an error or loaded garbage, this would fail
         const markerPath = join(project.dir, "empty-env-marker.txt");
-        await createScript(
+        await createWorkflowScript(
           project,
           "check-no-env",
+          "index",
           ".sh",
           writeEnvToFile("NONEXISTENT_VAR", markerPath),
         );

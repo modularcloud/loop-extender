@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { parseOutput } from "loopx/internal";
 import {
   createTempProject,
-  createScript,
+  createWorkflowScript,
   runAPIDriver,
 } from "../helpers/index.js";
 import { stdoutWriter } from "../helpers/fixture-scripts.js";
@@ -153,9 +153,10 @@ async function runE2EParseTest(
     await writeFile(payloadPath, Buffer.from(payload, "utf-8"));
 
     // Create the stdoutWriter script
-    await createScript(
+    await createWorkflowScript(
       project,
       "writer",
+      "index",
       ".ts",
       stdoutWriter(payloadPath),
     );

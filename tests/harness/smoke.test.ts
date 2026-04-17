@@ -8,9 +8,9 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import {
   createTempProject,
-  createScript,
-  createDirScript,
-  createBashScript,
+  createWorkflowScript,
+  createWorkflowPackageJson,
+  createBashWorkflowScript,
   type TempProject,
 } from "../helpers/fixtures.js";
 import { createEnvFile } from "../helpers/env.js";
@@ -43,39 +43,58 @@ describe("HARNESS: Phase 0 — Test Infrastructure Validation", () => {
     expect(existsSync(dir)).toBe(false);
   });
 
-  // H-02: Script fixture creation
-  it("H-02: createScript writes file to .loopx/ with correct content and permissions", async () => {
+  // H-02: Workflow script fixture creation
+  it("H-02: createWorkflowScript writes file to .loopx/<workflow>/ with correct content", async () => {
     project = await createTempProject();
     const content = '#!/bin/bash\necho "hello"\n';
-    const filePath = await createScript(project, "myscript", ".sh", content);
+    const filePath = await createWorkflowScript(
+      project,
+      "myscript",
+      "index",
+      ".sh",
+      content,
+    );
 
     expect(existsSync(filePath)).toBe(true);
     expect(readFileSync(filePath, "utf-8")).toBe(content);
-    expect(filePath).toBe(join(project.loopxDir, "myscript.sh"));
+    expect(filePath).toBe(join(project.loopxDir, "myscript", "index.sh"));
   });
 
-  // H-03: Directory script fixture creation
-  it("H-03: createDirScript creates expected structure with package.json", async () => {
+  // H-03: Workflow package.json fixture creation
+  it("H-03: createWorkflowPackageJson + createWorkflowScript build expected workflow structure", async () => {
     project = await createTempProject();
-    const dirPath = await createDirScript(project, "mypipe", "index.ts", {
-      "index.ts": 'console.log("hello");\n',
-    });
+    const workflowDir = join(project.loopxDir, "mypipe");
+    await createWorkflowPackageJson(project, "mypipe", { type: "module" });
+    await createWorkflowScript(
+      project,
+      "mypipe",
+      "index",
+      ".ts",
+      'console.log("hello");\n',
+    );
 
-    expect(existsSync(dirPath)).toBe(true);
-    expect(existsSync(join(dirPath, "package.json"))).toBe(true);
-    expect(existsSync(join(dirPath, "index.ts"))).toBe(true);
+    expect(existsSync(workflowDir)).toBe(true);
+    expect(existsSync(join(workflowDir, "package.json"))).toBe(true);
+    expect(existsSync(join(workflowDir, "index.ts"))).toBe(true);
 
-    const pkg = JSON.parse(readFileSync(join(dirPath, "package.json"), "utf-8"));
-    expect(pkg.main).toBe("index.ts");
+    const pkg = JSON.parse(
+      readFileSync(join(workflowDir, "package.json"), "utf-8"),
+    );
+    expect(pkg.type).toBe("module");
 
-    const indexContent = readFileSync(join(dirPath, "index.ts"), "utf-8");
+    const indexContent = readFileSync(join(workflowDir, "index.ts"), "utf-8");
     expect(indexContent).toBe('console.log("hello");\n');
   });
 
-  // H-04: Bash script is executable
+  // H-04: Bash workflow script is executable
   it("H-04: created .sh has execute permission bit", async () => {
     project = await createTempProject();
-    const filePath = await createBashScript(project, "test-exec", 'echo "hi"');
+    const filePath = await createBashWorkflowScript(
+      project,
+      "test-exec",
+      "index",
+      'echo "hi"',
+    );
 
     const stats = statSync(filePath);
     // Check that the file has execute permission (owner execute bit)

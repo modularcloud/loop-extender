@@ -4,14 +4,14 @@ import { classifySource } from "loopx/internal";
 /**
  * TEST-SPEC §6.3 — Unit tests for classifySource internal seam.
  *
- * classifySource(source: string) => { type: "git" | "tarball" | "single-file", url: string }
+ * classifySource(source: string) => { type: "git" | "tarball", url: string }
  *
- * Source detection rules (Spec 10.1), applied in order:
+ * Source detection rules (Spec 10.1, post-ADR-0003), applied in order:
  * 1. org/repo shorthand → https://github.com/org/repo.git (git)
  * 2. Known git hosts (github.com, gitlab.com, bitbucket.org) with /<owner>/<repo>[.git][/] → git
  * 3. URL ending in .git → git
  * 4. URL pathname ending in .tar.gz or .tgz → tarball
- * 5. Any other URL → single-file
+ * 5. Any other URL → throws (single-file URL install removed)
  */
 
 describe("SPEC: classifySource — org/repo Shorthand", () => {
@@ -89,8 +89,6 @@ describe("SPEC: classifySource — Known Git Hosts (bitbucket.org)", () => {
 });
 
 // SSH/SCP URL tests intentionally omitted per SP-32 (pending spec decision).
-// See TEST-SPEC.md section 9: "No tests are added for this behavior until
-// the spec ambiguity is resolved."
 
 describe("SPEC: classifySource — Generic .git URLs", () => {
   it("https://example.com/some/path/repo.git → git", () => {
@@ -139,43 +137,39 @@ describe("SPEC: classifySource — Tarball URLs", () => {
   });
 });
 
-describe("SPEC: classifySource — Single-File URLs", () => {
-  it("https://example.com/script.ts → single-file", () => {
-    const result = classifySource("https://example.com/script.ts");
-    expect(result.type).toBe("single-file");
-    expect(result.url).toBe("https://example.com/script.ts");
+describe("SPEC: classifySource — Single-File URLs Throw (ADR-0003)", () => {
+  it("https://example.com/script.ts → throws", () => {
+    expect(() => classifySource("https://example.com/script.ts")).toThrow();
   });
 
-  it("https://example.com/script.sh → single-file", () => {
-    const result = classifySource("https://example.com/script.sh");
-    expect(result.type).toBe("single-file");
+  it("https://example.com/script.sh → throws", () => {
+    expect(() => classifySource("https://example.com/script.sh")).toThrow();
   });
 
-  it("https://example.com/script.js → single-file", () => {
-    const result = classifySource("https://example.com/script.js");
-    expect(result.type).toBe("single-file");
+  it("https://example.com/script.js → throws", () => {
+    expect(() => classifySource("https://example.com/script.js")).toThrow();
   });
 
-  it("https://example.com/path/to/script.tsx → single-file", () => {
-    const result = classifySource("https://example.com/path/to/script.tsx");
-    expect(result.type).toBe("single-file");
+  it("https://example.com/path/to/script.tsx → throws", () => {
+    expect(() =>
+      classifySource("https://example.com/path/to/script.tsx")
+    ).toThrow();
   });
 
-  it("https://example.com/script.jsx → single-file", () => {
-    const result = classifySource("https://example.com/script.jsx");
-    expect(result.type).toBe("single-file");
+  it("https://example.com/script.jsx → throws", () => {
+    expect(() => classifySource("https://example.com/script.jsx")).toThrow();
   });
 
-  it("any other URL falls through to single-file", () => {
-    const result = classifySource("https://example.com/something");
-    expect(result.type).toBe("single-file");
+  it("any other URL → throws", () => {
+    expect(() => classifySource("https://example.com/something")).toThrow();
   });
 });
 
 describe("SPEC: classifySource — URLs With Ports, Auth, Extra Path Segments", () => {
-  it("URL with port → type detected correctly", () => {
-    const result = classifySource("https://example.com:8443/script.ts");
-    expect(result.type).toBe("single-file");
+  it("URL with port + single-file-shaped pathname → throws", () => {
+    expect(() =>
+      classifySource("https://example.com:8443/script.ts")
+    ).toThrow();
   });
 
   it("URL with port and tarball → tarball", () => {
@@ -183,11 +177,10 @@ describe("SPEC: classifySource — URLs With Ports, Auth, Extra Path Segments", 
     expect(result.type).toBe("tarball");
   });
 
-  it("URL with auth info → type detected correctly", () => {
-    const result = classifySource(
-      "https://user:pass@example.com/script.ts"
-    );
-    expect(result.type).toBe("single-file");
+  it("URL with auth info + single-file-shaped pathname → throws", () => {
+    expect(() =>
+      classifySource("https://user:pass@example.com/script.ts")
+    ).toThrow();
   });
 
   it("URL with auth and .git suffix → git", () => {
@@ -197,21 +190,19 @@ describe("SPEC: classifySource — URLs With Ports, Auth, Extra Path Segments", 
     expect(result.type).toBe("git");
   });
 
-  it("known git host with extra path segments → not matched as git shorthand, falls through", () => {
+  it("known git host with extra path segments → throws (not single-file)", () => {
     // Per spec 10.1 rule 2: known git hosts only match /<owner>/<repo>[.git][/]
-    // Extra segments like /tree/main are not matched as git
-    const result = classifySource(
-      "https://github.com/org/repo/tree/main/script.ts"
-    );
-    // This is not /<owner>/<repo> pattern, so it falls through to single-file
-    expect(result.type).toBe("single-file");
+    // Extra segments like /tree/main do not match git shorthand;
+    // post-ADR-0003, they also don't match tarball, so they throw.
+    expect(() =>
+      classifySource("https://github.com/org/repo/tree/main/script.ts")
+    ).toThrow();
   });
 
-  it("known git host with raw file URL → single-file (not git)", () => {
-    const result = classifySource(
-      "https://github.com/org/repo/raw/main/script.ts"
-    );
-    expect(result.type).toBe("single-file");
+  it("known git host with raw file URL → throws", () => {
+    expect(() =>
+      classifySource("https://github.com/org/repo/raw/main/script.ts")
+    ).toThrow();
   });
 
   it("known git host with tarball download URL → tarball (not git)", () => {
@@ -223,11 +214,10 @@ describe("SPEC: classifySource — URLs With Ports, Auth, Extra Path Segments", 
 });
 
 describe("SPEC: classifySource — URLs With Query Strings", () => {
-  it("single-file URL with query → type detected, query not part of filename", () => {
-    const result = classifySource(
-      "https://example.com/script.ts?v=2&auth=token"
-    );
-    expect(result.type).toBe("single-file");
+  it("non-tarball URL with query → throws", () => {
+    expect(() =>
+      classifySource("https://example.com/script.ts?v=2&auth=token")
+    ).toThrow();
   });
 
   it("tarball URL with query → detected as tarball based on pathname", () => {
@@ -244,21 +234,18 @@ describe("SPEC: classifySource — URLs With Query Strings", () => {
     expect(result.type).toBe("git");
   });
 
-  it("URL where query string contains .tar.gz → not tarball (pathname checked, not full URL)", () => {
-    // The pathname is /download, not ending in .tar.gz
-    const result = classifySource(
-      "https://example.com/download?file=archive.tar.gz"
-    );
-    expect(result.type).toBe("single-file");
+  it("URL where query string contains .tar.gz but pathname does not → throws", () => {
+    expect(() =>
+      classifySource("https://example.com/download?file=archive.tar.gz")
+    ).toThrow();
   });
 });
 
 describe("SPEC: classifySource — Edge Cases", () => {
-  it("trailing slash on single-file URL", () => {
-    const result = classifySource("https://example.com/script.ts/");
-    // Trailing slash means the last path segment is empty; this is an unusual case.
-    // The URL should still be classified (likely as single-file since it doesn't match git/tarball patterns)
-    expect(result.type).toBe("single-file");
+  it("trailing slash on non-tarball/git URL → throws", () => {
+    expect(() =>
+      classifySource("https://example.com/script.ts/")
+    ).toThrow();
   });
 
   it("double extension: .tar.gz is tarball, not .gz single-file", () => {
@@ -266,19 +253,16 @@ describe("SPEC: classifySource — Edge Cases", () => {
     expect(result.type).toBe("tarball");
   });
 
-  it("URL ending in .gz (not .tar.gz) → single-file", () => {
-    const result = classifySource("https://example.com/file.gz");
-    expect(result.type).toBe("single-file");
+  it("URL ending in .gz (not .tar.gz) → throws", () => {
+    expect(() => classifySource("https://example.com/file.gz")).toThrow();
   });
 
-  it("URL ending in .tar (not .tar.gz or .tgz) → single-file", () => {
-    const result = classifySource("https://example.com/file.tar");
-    expect(result.type).toBe("single-file");
+  it("URL ending in .tar (not .tar.gz or .tgz) → throws", () => {
+    expect(() => classifySource("https://example.com/file.tar")).toThrow();
   });
 
-  it("http:// (not https) URL → still classified correctly", () => {
-    const result = classifySource("http://example.com/script.ts");
-    expect(result.type).toBe("single-file");
+  it("http:// (not https) URL pointing to script → throws", () => {
+    expect(() => classifySource("http://example.com/script.ts")).toThrow();
   });
 
   it("http:// tarball URL → tarball", () => {

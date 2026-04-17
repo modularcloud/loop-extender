@@ -2,74 +2,532 @@ import {
   existsSync,
   mkdirSync,
   writeFileSync,
-  readFileSync,
   rmSync,
   readdirSync,
   statSync,
   renameSync,
+  lstatSync,
+  unlinkSync,
+  readFileSync,
+  chmodSync,
+  symlinkSync,
+  readlinkSync,
+  copyFileSync,
 } from "node:fs";
 import { join, basename, extname } from "node:path";
 import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { classifySource } from "./parsers/classify-source.js";
 import {
-  discoverScripts,
   SUPPORTED_EXTENSIONS,
   NAME_PATTERN,
+  isWorkflowByStructure,
 } from "./discovery.js";
-import { validateDirScriptCore } from "./validate-dir-script.js";
+import { checkWorkflowVersion } from "./version-check.js";
 
-export async function installCommand(
-  source: string,
-  cwd: string
-): Promise<void> {
-  // Check for org/repo.git rejection
-  if (
-    !source.includes("://") &&
-    !source.startsWith("git@") &&
-    source.split("/").length === 2
-  ) {
-    const parts = source.split("/");
-    if (parts[1].endsWith(".git")) {
-      process.stderr.write(
-        `Error: org/repo.git shorthand is not supported. Use the full URL: https://github.com/${parts[0]}/${parts[1]}\n`
-      );
-      process.exit(1);
-    }
+export interface InstallOptions {
+  source: string;
+  cwd: string;
+  selectedWorkflow?: string | null; // -w <name>
+  override: boolean; // -y
+  runningVersion: string;
+}
+
+interface WorkflowCandidate {
+  name: string; // derived workflow name
+  sourceDir: string; // path on disk (in the download/extraction dir)
+}
+
+interface ClassifiedSource {
+  kind: "single-workflow" | "multi-workflow" | "zero-workflow";
+  sourceRoot: string;
+  candidates: WorkflowCandidate[];
+  /** Only populated for single-workflow; for multi-workflow, candidates carry names. */
+}
+
+interface PreflightFailure {
+  workflow: string;
+  message: string;
+}
+
+// Fault-injection seam (TEST-SPEC §1.4). Only honored when NODE_ENV=test.
+function getInstallFault(): { kind: "commit-fail-after"; n: number } | null {
+  if (process.env.NODE_ENV !== "test") return null;
+  const raw = process.env.LOOPX_TEST_INSTALL_FAULT;
+  if (!raw) return null;
+  const match = /^commit-fail-after:(\d+)$/.exec(raw);
+  if (match) {
+    return { kind: "commit-fail-after", n: Number(match[1]) };
+  }
+  return null;
+}
+
+export async function installCommand(opts: InstallOptions): Promise<void> {
+  const {
+    source,
+    cwd,
+    selectedWorkflow,
+    override,
+    runningVersion,
+  } = opts;
+
+  let classifyResult;
+  try {
+    classifyResult = classifySource(source);
+  } catch (err) {
+    process.stderr.write(
+      `Error: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+    process.exit(1);
   }
 
-  const { type, url } = classifySource(source);
   const loopxDir = join(cwd, ".loopx");
   mkdirSync(loopxDir, { recursive: true });
 
-  switch (type) {
-    case "single-file":
-      await installSingleFile(url, loopxDir);
-      break;
-    case "git":
-      await installGit(url, source, loopxDir);
-      break;
-    case "tarball":
-      await installTarball(url, loopxDir);
-      break;
-  }
-}
-
-function deriveFilenameFromUrl(rawUrl: string): string {
+  // Download source into a tmp dir outside of .loopx/ so we never pollute
+  // the project while preflight runs.
+  const downloadDir = mkTempDir("loopx-install-src-");
+  let sourceRoot: string;
   try {
-    const parsed = new URL(rawUrl);
-    return basename(parsed.pathname);
-  } catch {
-    return basename(rawUrl);
+    if (classifyResult.type === "git") {
+      sourceRoot = await downloadGit(classifyResult.url, source, downloadDir);
+    } else {
+      sourceRoot = await downloadTarball(classifyResult.url, downloadDir);
+    }
+  } catch (err) {
+    rmSync(downloadDir, { recursive: true, force: true });
+    process.stderr.write(
+      `Error: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+    process.exit(1);
+  }
+
+  let classified: ClassifiedSource;
+  try {
+    classified = classifyWorkflows(sourceRoot, classifyResult, source);
+  } catch (err) {
+    rmSync(downloadDir, { recursive: true, force: true });
+    process.stderr.write(
+      `Error: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+    process.exit(1);
+  }
+
+  if (classified.kind === "zero-workflow") {
+    rmSync(downloadDir, { recursive: true, force: true });
+    process.stderr.write(
+      `Error: no installable workflows found in source '${source}'. Sources must contain at least one workflow (a subdirectory with one or more script files at the top level, or script files at the source root).\n`
+    );
+    process.exit(1);
+  }
+
+  // -w handling
+  let selected: WorkflowCandidate[];
+  if (selectedWorkflow) {
+    if (classified.kind !== "multi-workflow") {
+      rmSync(downloadDir, { recursive: true, force: true });
+      process.stderr.write(
+        `Error: -w / --workflow can only be used with multi-workflow sources. Source '${source}' is a single-workflow source.\n`
+      );
+      process.exit(1);
+    }
+    const match = classified.candidates.find(
+      (c) => c.name === selectedWorkflow
+    );
+    if (!match) {
+      rmSync(downloadDir, { recursive: true, force: true });
+      process.stderr.write(
+        `Error: workflow '${selectedWorkflow}' not found in source '${source}'.\n`
+      );
+      process.exit(1);
+    }
+    selected = [match];
+  } else {
+    selected = classified.candidates;
+  }
+
+  // Preflight
+  const failures: PreflightFailure[] = [];
+  const pkgWarnings: string[] = []; // non-blocking package.json warnings
+  const replacements = new Set<string>(); // workflow names to replace at commit time
+
+  for (const wf of selected) {
+    // Validate workflow name
+    if (!NAME_PATTERN.test(wf.name)) {
+      failures.push({
+        workflow: wf.name,
+        message: `Workflow name '${wf.name}' is invalid: must match [a-zA-Z0-9_][a-zA-Z0-9_-]*`,
+      });
+      continue;
+    }
+
+    // Validate scripts within the workflow (names + base-name collisions)
+    let scriptEntries: string[];
+    try {
+      scriptEntries = readdirSync(wf.sourceDir);
+    } catch (err) {
+      failures.push({
+        workflow: wf.name,
+        message: `Cannot read workflow source: ${(err as Error).message}`,
+      });
+      continue;
+    }
+
+    const scriptBasenames = new Map<string, string[]>();
+    let invalidScriptNames: string[] = [];
+    for (const entry of scriptEntries) {
+      const full = join(wf.sourceDir, entry);
+      let s;
+      try {
+        s = statSync(full);
+      } catch {
+        continue;
+      }
+      if (!s.isFile()) continue;
+      const ext = extname(entry);
+      if (!SUPPORTED_EXTENSIONS.has(ext)) continue;
+      const scriptName = basename(entry, ext);
+      if (!NAME_PATTERN.test(scriptName)) {
+        invalidScriptNames.push(scriptName);
+      }
+      const arr = scriptBasenames.get(scriptName);
+      if (arr) {
+        arr.push(entry);
+      } else {
+        scriptBasenames.set(scriptName, [entry]);
+      }
+    }
+
+    if (invalidScriptNames.length > 0) {
+      failures.push({
+        workflow: wf.name,
+        message: `Workflow '${wf.name}' contains scripts with invalid names: ${invalidScriptNames.join(", ")}`,
+      });
+      // fall through so other failures can also be reported
+    }
+
+    let hasCollision = false;
+    for (const [name, files] of scriptBasenames) {
+      if (files.length > 1) {
+        failures.push({
+          workflow: wf.name,
+          message: `Workflow '${wf.name}' has base-name collision: '${name}' has multiple files: ${files.join(", ")}`,
+        });
+        hasCollision = true;
+      }
+    }
+
+    if (hasCollision) continue;
+
+    // Destination-path collision (SPEC §10.5)
+    const destPath = join(loopxDir, wf.name);
+    if (existsSync(destPath) || isLinkSync(destPath)) {
+      const isWorkflow = isWorkflowByStructure(destPath);
+      if (!isWorkflow) {
+        // Not a workflow-by-structure: refuse even with -y
+        failures.push({
+          workflow: wf.name,
+          message: `Destination '${destPath}' exists and is not a workflow by structure; refusing to replace (use a different name or remove it manually).`,
+        });
+        continue;
+      }
+      if (!override) {
+        failures.push({
+          workflow: wf.name,
+          message: `Workflow '${wf.name}' already exists at '${destPath}' (use -y to replace)`,
+        });
+        continue;
+      }
+      replacements.add(wf.name);
+    }
+
+    // Version check (SPEC §10.6, workflow-level only)
+    const versionResult = checkWorkflowVersion(wf.sourceDir, runningVersion);
+    switch (versionResult.kind) {
+      case "unreadable":
+        pkgWarnings.push(
+          `Warning: workflow '${wf.name}' package.json is unreadable (permission denied); skipping check`
+        );
+        break;
+      case "invalid-json":
+        pkgWarnings.push(
+          `Warning: workflow '${wf.name}' package.json contains invalid JSON; skipping check`
+        );
+        break;
+      case "invalid-semver":
+        pkgWarnings.push(
+          `Warning: workflow '${wf.name}' has an invalid semver specifier for loopx in package.json; skipping check`
+        );
+        break;
+      case "mismatched":
+        if (!override) {
+          failures.push({
+            workflow: wf.name,
+            message: `Workflow '${wf.name}' requires loopx version ${versionResult.range} but running version ${versionResult.running} does not satisfy that range (use -y to override)`,
+          });
+        }
+        break;
+      case "no-package-json":
+      case "no-loopx-declared":
+      case "satisfied":
+        // No action
+        break;
+    }
+  }
+
+  // Emit package.json warnings regardless of outcome
+  for (const w of pkgWarnings) {
+    process.stderr.write(w + "\n");
+  }
+
+  if (failures.length > 0) {
+    rmSync(downloadDir, { recursive: true, force: true });
+    process.stderr.write("Error: install preflight failed:\n");
+    for (const f of failures) {
+      process.stderr.write(`  [${f.workflow}] ${f.message}\n`);
+    }
+    process.exit(1);
+  }
+
+  // Stage phase
+  const stageDir = mkTempDir("loopx-install-stage-", loopxDir);
+  try {
+    for (const wf of selected) {
+      const stagedPath = join(stageDir, wf.name);
+      try {
+        copyWorkflow(wf.sourceDir, stagedPath);
+      } catch (err) {
+        throw new Error(
+          `Failed to stage workflow '${wf.name}': ${(err as Error).message}`
+        );
+      }
+    }
+  } catch (err) {
+    rmSync(stageDir, { recursive: true, force: true });
+    rmSync(downloadDir, { recursive: true, force: true });
+    process.stderr.write(
+      `Error: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+    process.exit(1);
+  }
+
+  // Commit phase
+  const fault = getInstallFault();
+  const committed: string[] = [];
+  const uncommitted: string[] = [];
+  let commitError: Error | null = null;
+
+  for (let i = 0; i < selected.length; i++) {
+    const wf = selected[i];
+
+    if (fault && fault.kind === "commit-fail-after" && i >= fault.n) {
+      uncommitted.push(wf.name);
+      commitError = new Error(
+        `LOOPX_TEST_INSTALL_FAULT: simulated commit failure after workflow #${fault.n}`
+      );
+      continue;
+    }
+
+    const destPath = join(loopxDir, wf.name);
+    const stagedPath = join(stageDir, wf.name);
+
+    try {
+      if (replacements.has(wf.name)) {
+        removeFsEntry(destPath);
+      }
+      renameSync(stagedPath, destPath);
+      committed.push(wf.name);
+    } catch (err) {
+      commitError = err as Error;
+      uncommitted.push(wf.name);
+      for (let j = i + 1; j < selected.length; j++) {
+        uncommitted.push(selected[j].name);
+      }
+      break;
+    }
+  }
+
+  rmSync(stageDir, { recursive: true, force: true });
+  rmSync(downloadDir, { recursive: true, force: true });
+
+  if (commitError) {
+    process.stderr.write(
+      `Error: commit phase failed: ${commitError.message}\n`
+    );
+    if (committed.length > 0) {
+      process.stderr.write(
+        `  Committed workflows: ${committed.join(", ")}\n`
+      );
+    }
+    if (uncommitted.length > 0) {
+      process.stderr.write(
+        `  Not committed: ${uncommitted.join(", ")}\n`
+      );
+    }
+    process.exit(1);
   }
 }
 
-function deriveArchiveNameFromUrl(rawUrl: string): string {
-  const filename = deriveFilenameFromUrl(rawUrl);
-  return filename.replace(/\.(tar\.gz|tgz)$/, "");
+function mkTempDir(prefix: string, parent?: string): string {
+  const base = parent ?? tmpdir();
+  mkdirSync(base, { recursive: true });
+  const name = `${prefix}${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const dir = join(base, name);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+async function downloadGit(
+  url: string,
+  _source: string,
+  downloadDir: string
+): Promise<string> {
+  const repoDir = join(downloadDir, "repo");
+  try {
+    execFileSync("git", ["clone", "--depth", "1", url, repoDir], {
+      stdio: "pipe",
+    });
+  } catch (err) {
+    const stderr = (err as { stderr?: Buffer })?.stderr;
+    const detail = stderr ? stderr.toString().trim() : "";
+    throw new Error(`git clone failed for ${url}${detail ? `\n${detail}` : ""}`);
+  }
+  return repoDir;
+}
+
+async function downloadTarball(
+  url: string,
+  downloadDir: string
+): Promise<string> {
+  const tarPath = join(downloadDir, "archive.tar.gz");
+
+  let data: Buffer;
+  try {
+    if (url.startsWith("file://")) {
+      const filePath = url.replace(/^file:\/\//, "");
+      data = Buffer.from(readFileSync(filePath));
+    } else {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} downloading ${url}`);
+      }
+      data = Buffer.from(await response.arrayBuffer());
+    }
+  } catch (err) {
+    throw new Error(
+      `Failed to download ${url}: ${(err as Error).message}`
+    );
+  }
+
+  writeFileSync(tarPath, data);
+
+  const extractDir = join(downloadDir, "extract");
+  mkdirSync(extractDir, { recursive: true });
+
+  try {
+    execFileSync("tar", ["xzf", tarPath, "-C", extractDir], {
+      stdio: "pipe",
+    });
+  } catch (err) {
+    const stderr = (err as { stderr?: Buffer })?.stderr;
+    const detail = stderr ? stderr.toString().trim() : "";
+    throw new Error(`Failed to extract tarball${detail ? `: ${detail}` : ""}`);
+  }
+
+  // Wrapper-directory stripping (SPEC §10.2)
+  const entries = readdirSync(extractDir);
+  if (entries.length === 0) {
+    throw new Error("tarball is empty");
+  }
+  if (entries.length === 1) {
+    const only = join(extractDir, entries[0]);
+    let s;
+    try {
+      s = statSync(only);
+    } catch {
+      throw new Error(`Cannot stat tarball entry '${entries[0]}'`);
+    }
+    if (s.isDirectory()) {
+      return only;
+    }
+  }
+  return extractDir;
+}
+
+function classifyWorkflows(
+  sourceRoot: string,
+  classifyResult: { type: "git" | "tarball"; url: string },
+  originalSource: string
+): ClassifiedSource {
+  // Is there a top-level script file?
+  let entries: string[];
+  try {
+    entries = readdirSync(sourceRoot);
+  } catch (err) {
+    throw new Error(`Cannot read source root: ${(err as Error).message}`);
+  }
+
+  let rootHasScript = false;
+  for (const entry of entries) {
+    const full = join(sourceRoot, entry);
+    let s;
+    try {
+      s = statSync(full);
+    } catch {
+      continue;
+    }
+    if (s.isFile() && SUPPORTED_EXTENSIONS.has(extname(entry))) {
+      rootHasScript = true;
+      break;
+    }
+  }
+
+  if (rootHasScript) {
+    const name = deriveSingleWorkflowName(classifyResult, originalSource);
+    if (!NAME_PATTERN.test(name)) {
+      throw new Error(
+        `Derived workflow name '${name}' is invalid: must match [a-zA-Z0-9_][a-zA-Z0-9_-]*`
+      );
+    }
+    return {
+      kind: "single-workflow",
+      sourceRoot,
+      candidates: [{ name, sourceDir: sourceRoot }],
+    };
+  }
+
+  // Multi-workflow: each top-level subdir that is a workflow by structure.
+  const candidates: WorkflowCandidate[] = [];
+  for (const entry of entries) {
+    const full = join(sourceRoot, entry);
+    let s;
+    try {
+      s = statSync(full);
+    } catch {
+      continue;
+    }
+    if (!s.isDirectory()) continue;
+    if (!isWorkflowByStructure(full)) continue;
+    candidates.push({ name: entry, sourceDir: full });
+  }
+
+  if (candidates.length === 0) {
+    return { kind: "zero-workflow", sourceRoot, candidates: [] };
+  }
+  return { kind: "multi-workflow", sourceRoot, candidates };
+}
+
+function deriveSingleWorkflowName(
+  classifyResult: { type: "git" | "tarball"; url: string },
+  originalSource: string
+): string {
+  if (classifyResult.type === "git") {
+    return deriveRepoName(classifyResult.url, originalSource);
+  }
+  return deriveArchiveNameFromUrl(classifyResult.url);
 }
 
 function deriveRepoName(url: string, source: string): string {
-  // For SSH URLs: git@host:org/repo.git
   if (source.startsWith("git@")) {
     const match = source.match(/\/([^/]+?)(?:\.git)?$/);
     if (match) return match[1];
@@ -91,283 +549,114 @@ function deriveRepoName(url: string, source: string): string {
   }
 }
 
-function validateName(name: string): string | null {
-  if (!NAME_PATTERN.test(name)) {
-    return `Script name '${name}' is invalid: must match [a-zA-Z0-9_][a-zA-Z0-9_-]*`;
+function deriveArchiveNameFromUrl(rawUrl: string): string {
+  let pathname: string;
+  try {
+    pathname = new URL(rawUrl).pathname;
+  } catch {
+    pathname = rawUrl;
   }
-  return null;
+  const filename = basename(pathname);
+  return filename.replace(/\.(tar\.gz|tgz)$/, "");
 }
 
-function checkCollisions(
-  name: string,
-  destPath: string,
-  loopxDir: string
-): string | null {
-  // Destination path collision
-  if (existsSync(destPath)) {
-    return `Destination already exists: ${basename(destPath)}`;
+function copyWorkflow(src: string, dest: string): void {
+  // Manual recursive copy. Excludes `.git/` — git clones bring a history
+  // directory that is not part of the workflow. An unreadable workflow-root
+  // `package.json` is tolerated by temporarily restoring the owner read bit
+  // for the copy only; any OTHER unreadable file fails the stage (per SPEC
+  // §10.7 "any write fails during staging → install fails, .loopx/ unchanged"
+  // — TEST-SPEC T-INST-79).
+  //
+  // `src` is the workflow root directory itself. We create `dest` then
+  // iterate its children — children are "root-level" entries of the workflow;
+  // grandchildren and deeper are not.
+  const rootStat = lstatSync(src);
+  if (!rootStat.isDirectory()) {
+    // Shouldn't happen for a workflow, but handle defensively.
+    throw new Error(`Workflow source is not a directory: ${src}`);
   }
-
-  // Script name collision (check all candidates, including pre-existing collisions)
-  const discovery = discoverScripts(loopxDir, "help");
-  if (discovery.candidateNames.has(name)) {
-    return `Script name '${name}' already exists in .loopx/`;
+  mkdirSync(dest, { recursive: true, mode: rootStat.mode & 0o777 });
+  for (const entry of readdirSync(src)) {
+    if (entry === ".git") continue;
+    copyEntry(join(src, entry), join(dest, entry), /*isRootLevel*/ true);
   }
-
-  return null;
+  try {
+    chmodSync(dest, rootStat.mode & 0o777);
+  } catch {
+    // best-effort
+  }
 }
 
-function validateInstalledDirScript(dirPath: string, name: string): string | null {
-  const result = validateDirScriptCore(dirPath);
-  if (result.valid) return null;
-
-  const errorMap: Record<string, string> = {
-    "no-pkg": `${name}: package.json not found or unreadable`,
-    "unreadable": `${name}: package.json not found or unreadable`,
-    "invalid-json": `${name}: package.json is invalid JSON`,
-    "invalid-object": `${name}: package.json is not a valid object`,
-    "no-main": `${name}: package.json missing valid 'main' field`,
-    "bad-main-type": `${name}: package.json missing valid 'main' field`,
-    "bad-ext": `${name}: unsupported extension '${result.detail}' for main entry`,
-    "escapes": `${name}: main field escapes directory boundary`,
-    "not-found": `${name}: main entry '${result.detail}' not found`,
-    "not-file": `${name}: main entry '${result.detail}' not found`,
-    "symlink-escape": `${name}: main field resolves outside directory boundary (symlink)`,
-    "resolve-failed": `${name}: main entry cannot be resolved`,
-  };
-
-  return errorMap[result.code] || `${name}: validation failed`;
-}
-
-async function downloadUrl(
-  url: string
-): Promise<{ data: Buffer; ok: boolean; status: number }> {
-  // Handle file:// URLs
-  if (url.startsWith("file://")) {
+function copyEntry(src: string, dest: string, isRootLevel: boolean): void {
+  const srcStat = lstatSync(src);
+  if (srcStat.isSymbolicLink()) {
+    symlinkSync(readlinkSync(src), dest);
+    return;
+  }
+  if (srcStat.isDirectory()) {
+    mkdirSync(dest, { recursive: true, mode: srcStat.mode & 0o777 });
+    for (const entry of readdirSync(src)) {
+      if (entry === ".git") continue;
+      copyEntry(join(src, entry), join(dest, entry), /*isRootLevel*/ false);
+    }
     try {
-      const filePath = url.replace(/^file:\/\//, "");
-      const data = readFileSync(filePath);
-      return { data: Buffer.from(data), ok: true, status: 200 };
+      chmodSync(dest, srcStat.mode & 0o777);
     } catch {
-      return { data: Buffer.alloc(0), ok: false, status: 404 };
+      // best-effort
     }
-  }
-
-  const response = await fetch(url);
-  if (!response.ok) {
-    return {
-      data: Buffer.alloc(0),
-      ok: false,
-      status: response.status,
-    };
-  }
-  const data = Buffer.from(await response.arrayBuffer());
-  return { data, ok: true, status: response.status };
-}
-
-async function installSingleFile(
-  url: string,
-  loopxDir: string
-): Promise<void> {
-  const filename = deriveFilenameFromUrl(url);
-  const ext = extname(filename);
-
-  if (!SUPPORTED_EXTENSIONS.has(ext)) {
-    process.stderr.write(
-      `Error: unsupported file extension '${ext}'\n`
-    );
-    process.exit(1);
-  }
-
-  const name = basename(filename, ext);
-  const nameError = validateName(name);
-  if (nameError) {
-    process.stderr.write(`Error: ${nameError}\n`);
-    process.exit(1);
-  }
-
-  const destPath = join(loopxDir, filename);
-  const collisionError = checkCollisions(name, destPath, loopxDir);
-  if (collisionError) {
-    process.stderr.write(`Error: ${collisionError}\n`);
-    process.exit(1);
-  }
-
-  // Download
-  let result: { data: Buffer; ok: boolean; status: number };
-  try {
-    result = await downloadUrl(url);
-  } catch (err: unknown) {
-    process.stderr.write(
-      `Error: failed to download ${url}: ${err instanceof Error ? err.message : String(err)}\n`
-    );
-    process.exit(1);
     return;
   }
-
-  if (!result.ok) {
-    process.stderr.write(
-      `Error: HTTP ${result.status} downloading ${url}\n`
-    );
-    process.exit(1);
-  }
-
-  try {
-    writeFileSync(destPath, result.data);
-  } catch (err: unknown) {
-    try {
-      rmSync(destPath, { force: true });
-    } catch {}
-    process.stderr.write(
-      `Error: failed to write ${filename}: ${err instanceof Error ? err.message : String(err)}\n`
-    );
-    process.exit(1);
-  }
-}
-
-async function installGit(
-  url: string,
-  source: string,
-  loopxDir: string
-): Promise<void> {
-  const repoName = deriveRepoName(url, source);
-  const nameError = validateName(repoName);
-  if (nameError) {
-    process.stderr.write(`Error: ${nameError}\n`);
-    process.exit(1);
-  }
-
-  const destPath = join(loopxDir, repoName);
-  const collisionError = checkCollisions(repoName, destPath, loopxDir);
-  if (collisionError) {
-    process.stderr.write(`Error: ${collisionError}\n`);
-    process.exit(1);
-  }
-
-  try {
-    execFileSync("git", ["clone", "--depth", "1", url, destPath], {
-      stdio: "pipe",
-    });
-  } catch (err: unknown) {
-    try {
-      rmSync(destPath, { recursive: true, force: true });
-    } catch {}
-    const stderr = (err as { stderr?: Buffer })?.stderr;
-    const detail = stderr ? stderr.toString().trim() : "";
-    process.stderr.write(
-      `Error: git clone failed for ${url}${detail ? `\n${detail}` : ""}\n`
-    );
-    process.exit(1);
-  }
-
-  // Validate directory script
-  const validationError = validateInstalledDirScript(destPath, repoName);
-  if (validationError) {
-    rmSync(destPath, { recursive: true, force: true });
-    process.stderr.write(`Error: ${validationError}\n`);
-    process.exit(1);
-  }
-}
-
-async function installTarball(
-  url: string,
-  loopxDir: string
-): Promise<void> {
-  const archiveName = deriveArchiveNameFromUrl(url);
-  const nameError = validateName(archiveName);
-  if (nameError) {
-    process.stderr.write(`Error: ${nameError}\n`);
-    process.exit(1);
-  }
-
-  const destPath = join(loopxDir, archiveName);
-  const collisionError = checkCollisions(archiveName, destPath, loopxDir);
-  if (collisionError) {
-    process.stderr.write(`Error: ${collisionError}\n`);
-    process.exit(1);
-  }
-
-  // Download tarball
-  let result: { data: Buffer; ok: boolean; status: number };
-  try {
-    result = await downloadUrl(url);
-  } catch (err: unknown) {
-    process.stderr.write(
-      `Error: failed to download ${url}: ${err instanceof Error ? err.message : String(err)}\n`
-    );
-    process.exit(1);
-    return;
-  }
-
-  if (!result.ok) {
-    process.stderr.write(
-      `Error: HTTP ${result.status} downloading ${url}\n`
-    );
-    process.exit(1);
-  }
-
-  // Extract to temp dir
-  const tmpDir = join(loopxDir, `.tmp-${archiveName}-${Date.now()}`);
-  mkdirSync(tmpDir, { recursive: true });
-
-  try {
-    const tarPath = join(tmpDir, "archive.tar.gz");
-    writeFileSync(tarPath, result.data);
-
-    try {
-      execFileSync("tar", ["xzf", tarPath, "-C", tmpDir], {
-        stdio: "pipe",
-      });
-    } catch (err: unknown) {
-      const stderr = (err as { stderr?: Buffer })?.stderr;
-      const detail = stderr ? stderr.toString().trim() : "";
-      throw new Error(
-        `Failed to extract tarball${detail ? `: ${detail}` : ""}`
-      );
-    }
-
-    // Determine top-level entries (excluding the archive file)
-    const entries = readdirSync(tmpDir).filter(
-      (e) => e !== "archive.tar.gz"
-    );
-
-    if (entries.length === 0) {
-      throw new Error("archive is empty");
-    }
-
-    if (
-      entries.length === 1 &&
-      statSync(join(tmpDir, entries[0])).isDirectory()
-    ) {
-      // Single top-level dir: unwrap
-      renameSync(join(tmpDir, entries[0]), destPath);
-    } else {
-      // Multiple entries: move all to dest
-      mkdirSync(destPath, { recursive: true });
-      for (const entry of entries) {
-        renameSync(join(tmpDir, entry), join(destPath, entry));
+  if (srcStat.isFile()) {
+    const origMode = srcStat.mode & 0o777;
+    const isRootPackageJson = isRootLevel && basename(src) === "package.json";
+    let restoredReadability = false;
+    if ((origMode & 0o400) === 0 && isRootPackageJson) {
+      try {
+        chmodSync(src, origMode | 0o600);
+        restoredReadability = true;
+      } catch {
+        // fall through — copyFileSync will surface the EACCES
       }
     }
-  } catch (err: unknown) {
     try {
-      rmSync(destPath, { recursive: true, force: true });
-    } catch {}
-    rmSync(tmpDir, { recursive: true, force: true });
-    process.stderr.write(
-      `Error: failed to extract tarball: ${err instanceof Error ? err.message : String(err)}\n`
-    );
-    process.exit(1);
-  } finally {
+      copyFileSync(src, dest);
+    } finally {
+      if (restoredReadability) {
+        try {
+          chmodSync(src, origMode);
+        } catch {
+          // best-effort restore
+        }
+      }
+    }
     try {
-      rmSync(tmpDir, { recursive: true, force: true });
-    } catch {}
+      chmodSync(dest, origMode);
+    } catch {
+      // best-effort
+    }
+    return;
   }
+}
 
-  // Validate directory script
-  const validationError = validateInstalledDirScript(destPath, archiveName);
-  if (validationError) {
-    rmSync(destPath, { recursive: true, force: true });
-    process.stderr.write(`Error: ${validationError}\n`);
-    process.exit(1);
+function isLinkSync(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
   }
+}
+
+function removeFsEntry(path: string): void {
+  let st;
+  try {
+    st = lstatSync(path);
+  } catch {
+    return;
+  }
+  if (st.isSymbolicLink()) {
+    unlinkSync(path);
+    return;
+  }
+  rmSync(path, { recursive: true, force: true });
 }
