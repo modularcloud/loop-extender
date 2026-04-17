@@ -3,32 +3,48 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   createTempProject,
-  createBashScript,
-  runAPIDriver,
+  createBashWorkflowScript,
   type TempProject,
-} from "../helpers/index.js";
+} from "../helpers/fixtures.js";
+import { runAPIDriver } from "../helpers/api-driver.js";
+import { forEachRuntime } from "../helpers/runtime.js";
 
-/**
- * Helper: run the API driver with a script that calls runPromise and prints
- * the Output array as JSON.
- */
+// ---------------------------------------------------------------------------
+// TEST-SPEC §4.5 — Structured Output Parsing (ADR-0003 workflow model)
+// Spec refs: 2.3
+//
+// All fixture scripts live inside a workflow (e.g. `.loopx/test/index.sh`).
+// `runPromise` / `run` calls target the workflow by name ("test").
+//
+// Parsing correctness is asserted by examining the actual yielded `Output`
+// object via `runPromise()` / `run()` through `runAPIDriver`, not by inferring
+// from loop behavior alone.
+// ---------------------------------------------------------------------------
+
+/** Spawn a driver that calls runPromise on the `test` workflow with maxIterations: 1. */
 async function runParseTest(
+  runtime: "node" | "bun",
   project: TempProject,
-  scriptName: string
-): Promise<{ outputs: unknown[]; exitCode: number; stderr: string }> {
+): Promise<{ outputs: unknown[]; exitCode: number; stderr: string; stdout: string }> {
   const driverCode = `
 import { runPromise } from "loopx";
-const outputs = await runPromise("${scriptName}", { cwd: "${project.dir}", maxIterations: 1 });
+const outputs = await runPromise("test", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
 console.log(JSON.stringify(outputs));
 `;
-  const result = await runAPIDriver("node", driverCode, { cwd: project.dir });
+  const result = await runAPIDriver(runtime, driverCode);
   let outputs: unknown[] = [];
   try {
     outputs = JSON.parse(result.stdout);
   } catch {
-    // If parsing fails, leave outputs empty — the test will fail with a clear message
+    // Parse failure leaves outputs as []; the test will surface the real failure
+    // through the stderr/exitCode assertions.
   }
-  return { outputs, exitCode: result.exitCode, stderr: result.stderr };
+  return {
+    outputs,
+    exitCode: result.exitCode,
+    stderr: result.stderr,
+    stdout: result.stdout,
+  };
 }
 
 describe("SPEC: Structured Output Parsing (T-PARSE-01 through T-PARSE-29)", () => {
@@ -36,501 +52,672 @@ describe("SPEC: Structured Output Parsing (T-PARSE-01 through T-PARSE-29)", () =
 
   afterEach(async () => {
     if (project) {
-      await project.cleanup();
+      await project.cleanup().catch(() => {});
       project = null;
     }
   });
 
-  // ---------------------------------------------------------------------------
-  // Valid Structured Output
-  // ---------------------------------------------------------------------------
+  forEachRuntime((runtime) => {
+    // -------------------------------------------------------------------------
+    // Valid Structured Output
+    // -------------------------------------------------------------------------
+    describe("Valid Structured Output", () => {
+      it('T-PARSE-01: {"result":"hello"} yields Output with result: "hello"', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"result":"hello"}'`,
+        );
 
-  describe("SPEC: Valid Structured Output", () => {
-    it("T-PARSE-01: {\"result\":\"hello\"} yields Output with result: \"hello\"", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '{"result":"hello"}'`);
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      const { outputs } = await runParseTest(project, "myscript");
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output.result).toBe("hello");
+        expect(output).not.toHaveProperty("goto");
+        expect(output).not.toHaveProperty("stop");
+      });
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("hello");
-      expect(output).not.toHaveProperty("goto");
-      expect(output).not.toHaveProperty("stop");
-    });
+      it('T-PARSE-02: {"goto":"next"} transitions to script "next" (same workflow)', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"goto":"next"}'`,
+        );
+        // "next" script exists to prove transition semantics, though with
+        // maxIterations: 1 the transition is not actually performed.
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "next",
+          `printf '{"result":"arrived"}'`,
+        );
 
-    it("T-PARSE-02: {\"goto\":\"next\"} transitions to script \"next\"", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '{"goto":"next"}'`);
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      const { outputs } = await runParseTest(project, "myscript");
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output.goto).toBe("next");
+      });
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.goto).toBe("next");
-    });
+      it('T-PARSE-03: {"stop":true} halts the loop, exit code 0', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"stop":true}'`,
+        );
 
-    it("T-PARSE-03: {\"stop\":true} halts the loop, exit code 0", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '{"stop":true}'`);
-
-      // Use maxIterations > 1 so the loop *could* continue if stop didn't halt it
-      const driverCode = `
+        // maxIterations > 1 proves stop halts control flow, not the iteration cap.
+        const driverCode = `
 import { runPromise } from "loopx";
-const outputs = await runPromise("myscript", { cwd: "${project.dir}", maxIterations: 5 });
+const outputs = await runPromise("test", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5 });
 console.log(JSON.stringify(outputs));
 `;
-      const result = await runAPIDriver("node", driverCode, { cwd: project.dir });
+        const result = await runAPIDriver(runtime, driverCode);
 
-      expect(result.exitCode).toBe(0);
-      const outputs = JSON.parse(result.stdout);
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.stop).toBe(true);
-    });
+        expect(result.exitCode).toBe(0);
+        const outputs = JSON.parse(result.stdout) as unknown[];
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output.stop).toBe(true);
+      });
 
-    it("T-PARSE-04: {\"result\":\"x\",\"goto\":\"next\",\"stop\":true} stop takes priority, exit code 0", async () => {
-      project = await createTempProject();
-      await createBashScript(
-        project,
-        "myscript",
-        `printf '{"result":"x","goto":"next","stop":true}'`
-      );
+      it('T-PARSE-04: {"result":"x","goto":"next","stop":true} → stop priority, 1 iteration', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"result":"x","goto":"next","stop":true}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "next",
+          `printf '{"result":"never"}'`,
+        );
 
-      // Use maxIterations > 1 so the loop *could* follow goto if stop didn't halt it
-      const driverCode = `
+        const driverCode = `
 import { runPromise } from "loopx";
-const outputs = await runPromise("myscript", { cwd: "${project.dir}", maxIterations: 5 });
+const outputs = await runPromise("test", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5 });
 console.log(JSON.stringify(outputs));
 `;
-      const result = await runAPIDriver("node", driverCode, { cwd: project.dir });
+        const result = await runAPIDriver(runtime, driverCode);
 
-      expect(result.exitCode).toBe(0);
-      const outputs = JSON.parse(result.stdout);
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.stop).toBe(true);
-      // result and goto may be present in the Output object, but stop takes
-      // priority for control flow — the loop halts.
+        expect(result.exitCode).toBe(0);
+        const outputs = JSON.parse(result.stdout) as unknown[];
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output.stop).toBe(true);
+      });
+
+      it('T-PARSE-05: {"result":"x","extra":"ignored"} drops unknown fields', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"result":"x","extra":"ignored"}'`,
+        );
+
+        const { outputs, exitCode } = await runParseTest(runtime, project);
+
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output.result).toBe("x");
+        expect(output).not.toHaveProperty("extra");
+        expect(output).not.toHaveProperty("goto");
+        expect(output).not.toHaveProperty("stop");
+      });
     });
 
-    it("T-PARSE-05: {\"result\":\"x\",\"extra\":\"ignored\"} extra field not in Output", async () => {
-      project = await createTempProject();
-      await createBashScript(
-        project,
-        "myscript",
-        `printf '{"result":"x","extra":"ignored"}'`
-      );
+    // -------------------------------------------------------------------------
+    // Fallback to Raw Result
+    // -------------------------------------------------------------------------
+    describe("Fallback to Raw Result", () => {
+      it('T-PARSE-06: {"unknown":"field"} falls back to raw string', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"unknown":"field"}'`,
+        );
 
-      const { outputs } = await runParseTest(project, "myscript");
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("x");
-      expect(output).not.toHaveProperty("extra");
-      expect(output).not.toHaveProperty("goto");
-      expect(output).not.toHaveProperty("stop");
-    });
-  });
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe(
+          '{"unknown":"field"}',
+        );
+      });
 
-  // ---------------------------------------------------------------------------
-  // Fallback to Raw Result
-  // ---------------------------------------------------------------------------
+      it("T-PARSE-07: [1,2,3] (JSON array) falls back to raw result", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '[1,2,3]'`,
+        );
 
-  describe("SPEC: Fallback to Raw Result", () => {
-    it("T-PARSE-06: {\"unknown\":\"field\"} falls back to raw result string", async () => {
-      project = await createTempProject();
-      await createBashScript(
-        project,
-        "myscript",
-        `printf '{"unknown":"field"}'`
-      );
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      const { outputs } = await runParseTest(project, "myscript");
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe("[1,2,3]");
+      });
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe('{"unknown":"field"}');
-    });
+      it('T-PARSE-08: "hello" (JSON string) falls back to raw result including quotes', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '"hello"'`,
+        );
 
-    it("T-PARSE-07: [1,2,3] (JSON array) falls back to raw result", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '[1,2,3]'`);
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      const { outputs } = await runParseTest(project, "myscript");
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe('"hello"');
+      });
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("[1,2,3]");
-    });
+      it("T-PARSE-09: 42 (JSON number) falls back to raw result", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '42'`,
+        );
 
-    it('T-PARSE-08: "hello" (JSON string) falls back to raw result including quotes', async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '"hello"'`);
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      const { outputs } = await runParseTest(project, "myscript");
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe("42");
+      });
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe('"hello"');
-    });
+      it("T-PARSE-10: true (JSON boolean) falls back to raw result", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf 'true'`,
+        );
 
-    it("T-PARSE-09: 42 (JSON number) falls back to raw result", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '42'`);
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      const { outputs } = await runParseTest(project, "myscript");
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe("true");
+      });
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("42");
-    });
+      it("T-PARSE-11: null (JSON null) falls back to raw result", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf 'null'`,
+        );
 
-    it("T-PARSE-10: true (JSON boolean) falls back to raw result", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf 'true'`);
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      const { outputs } = await runParseTest(project, "myscript");
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe("null");
+      });
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("true");
-    });
+      it("T-PARSE-12: non-JSON text falls back to raw result", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf 'not json at all'`,
+        );
 
-    it("T-PARSE-11: null (JSON null) falls back to raw result", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf 'null'`);
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      const { outputs } = await runParseTest(project, "myscript");
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe(
+          "not json at all",
+        );
+      });
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("null");
-    });
+      it("T-PARSE-12a: raw fallback preserves trailing newline", async () => {
+        project = await createTempProject();
+        // Use explicit \n via printf to emit "hello\n" exactly.
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf 'hello\n'`,
+        );
 
-    it("T-PARSE-12: non-JSON text falls back to raw result", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf 'not json at all'`);
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      const { outputs } = await runParseTest(project, "myscript");
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe("hello\n");
+      });
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("not json at all");
-    });
+      it('T-PARSE-13: empty stdout yields result: ""', async () => {
+        project = await createTempProject();
+        // Script exits cleanly with no stdout at all.
+        await createBashWorkflowScript(project, "test", "index", `true`);
 
-    it("T-PARSE-12a: raw fallback preserves trailing newline", async () => {
-      project = await createTempProject();
-      // Use printf with explicit \n to produce "hello\n"
-      await createBashScript(project, "myscript", `printf 'hello\n'`);
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      const { outputs } = await runParseTest(project, "myscript");
-
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("hello\n");
-    });
-
-    it("T-PARSE-13: empty stdout yields result: \"\"", async () => {
-      project = await createTempProject();
-      // Script produces no output at all
-      await createBashScript(project, "myscript", `true`);
-
-      const { outputs } = await runParseTest(project, "myscript");
-
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("");
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // Type Coercion
-  // ---------------------------------------------------------------------------
-
-  describe("SPEC: Type Coercion", () => {
-    it("T-PARSE-14: {\"result\":42} coerces result to string \"42\"", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '{"result":42}'`);
-
-      const { outputs } = await runParseTest(project, "myscript");
-
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("42");
-    });
-
-    it("T-PARSE-15: {\"result\":true} coerces result to string \"true\"", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '{"result":true}'`);
-
-      const { outputs } = await runParseTest(project, "myscript");
-
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("true");
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe("");
+      });
     });
 
-    it("T-PARSE-16: {\"result\":{\"nested\":\"obj\"}} coerces to \"[object Object]\"", async () => {
-      project = await createTempProject();
-      await createBashScript(
-        project,
-        "myscript",
-        `printf '{"result":{"nested":"obj"}}'`
-      );
+    // -------------------------------------------------------------------------
+    // Type Coercion
+    // -------------------------------------------------------------------------
+    describe("Type Coercion", () => {
+      it('T-PARSE-14: {"result":42} coerces to "42"', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"result":42}'`,
+        );
 
-      const { outputs } = await runParseTest(project, "myscript");
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("[object Object]");
-    });
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe("42");
+      });
 
-    it("T-PARSE-17: {\"result\":null} coerces result to string \"null\"", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '{"result":null}'`);
+      it('T-PARSE-15: {"result":true} coerces to "true"', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"result":true}'`,
+        );
 
-      const { outputs } = await runParseTest(project, "myscript");
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("null");
-    });
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe("true");
+      });
 
-    it("T-PARSE-18: {\"goto\":42} invalid goto discarded, Output is {}", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '{"goto":42}'`);
+      it('T-PARSE-16: {"result":{"nested":"obj"}} coerces to "[object Object]"', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"result":{"nested":"obj"}}'`,
+        );
 
-      const { outputs } = await runParseTest(project, "myscript");
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output).not.toHaveProperty("result");
-      expect(output).not.toHaveProperty("goto");
-      expect(output).not.toHaveProperty("stop");
-      expect(Object.keys(output)).toHaveLength(0);
-    });
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe(
+          "[object Object]",
+        );
+      });
 
-    it("T-PARSE-19: {\"goto\":true} invalid goto discarded, Output is {}", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '{"goto":true}'`);
+      it('T-PARSE-17: {"result":null} coerces to "null"', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"result":null}'`,
+        );
 
-      const { outputs } = await runParseTest(project, "myscript");
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output).not.toHaveProperty("result");
-      expect(output).not.toHaveProperty("goto");
-      expect(output).not.toHaveProperty("stop");
-      expect(Object.keys(output)).toHaveLength(0);
-    });
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe("null");
+      });
 
-    it("T-PARSE-20: {\"goto\":null} invalid goto discarded, Output is {}", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '{"goto":null}'`);
+      it('T-PARSE-18: {"goto":42} invalid goto discarded, Output is {}', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"goto":42}'`,
+        );
 
-      const { outputs } = await runParseTest(project, "myscript");
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output).not.toHaveProperty("result");
-      expect(output).not.toHaveProperty("goto");
-      expect(output).not.toHaveProperty("stop");
-      expect(Object.keys(output)).toHaveLength(0);
-    });
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output).not.toHaveProperty("result");
+        expect(output).not.toHaveProperty("goto");
+        expect(output).not.toHaveProperty("stop");
+        expect(Object.keys(output)).toHaveLength(0);
+      });
 
-    it('T-PARSE-20a: {"goto":""} empty string goto preserved, not discarded → error via run() generator', async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '{"goto":""}'`);
+      it('T-PARSE-19: {"goto":true} invalid goto discarded, Output is {}', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"goto":true}'`,
+        );
 
-      const driverCode = `
+        const { outputs, exitCode } = await runParseTest(runtime, project);
+
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output).not.toHaveProperty("result");
+        expect(output).not.toHaveProperty("goto");
+        expect(output).not.toHaveProperty("stop");
+        expect(Object.keys(output)).toHaveLength(0);
+      });
+
+      it('T-PARSE-20: {"goto":null} invalid goto discarded, Output is {}', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"goto":null}'`,
+        );
+
+        const { outputs, exitCode } = await runParseTest(runtime, project);
+
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output).not.toHaveProperty("result");
+        expect(output).not.toHaveProperty("goto");
+        expect(output).not.toHaveProperty("stop");
+        expect(Object.keys(output)).toHaveLength(0);
+      });
+
+      it('T-PARSE-20a: {"goto":""} preserved at parse, rejected at transition', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"goto":""}'`,
+        );
+
+        // Observe via run(): first yield has goto: "", generator throws when
+        // advancing past the first iteration.
+        const runDriver = `
 import { run } from "loopx";
-let iterationCount = 0;
+const gen = run("test", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+const first = await gen.next();
 let threw = false;
-let errorMessage = "";
+let message = "";
 try {
-  for await (const output of run("myscript", { cwd: "${project.dir}", maxIterations: 2 })) {
-    iterationCount++;
-  }
+  await gen.next();
 } catch (e) {
   threw = true;
-  errorMessage = e.message;
+  message = (e && e.message) ? e.message : String(e);
 }
-console.log(JSON.stringify({ threw, iterationCount, message: errorMessage }));
+console.log(JSON.stringify({
+  firstDone: first.done,
+  firstValue: first.value,
+  threw,
+  message,
+}));
 `;
-      const result = await runAPIDriver("node", driverCode, { cwd: project.dir });
-      const parsed = JSON.parse(result.stdout);
-      expect(parsed.threw).toBe(true);
-      expect(parsed.iterationCount).toBe(1);
-      expect(parsed.message).toMatch(/goto/i);
+        const runResult = await runAPIDriver(runtime, runDriver);
+        expect(runResult.exitCode).toBe(0);
+        const runParsed = JSON.parse(runResult.stdout);
+        expect(runParsed.firstDone).toBe(false);
+        expect(runParsed.firstValue).toHaveProperty("goto", "");
+        expect(runParsed.threw).toBe(true);
+        expect(runParsed.message).toMatch(/goto|target/i);
+
+        // runPromise() rejects with the same invalid-target error because the
+        // transition past the first iteration fails.
+        const promiseDriver = `
+import { runPromise } from "loopx";
+let threw = false;
+let message = "";
+try {
+  await runPromise("test", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+} catch (e) {
+  threw = true;
+  message = (e && e.message) ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message }));
+`;
+        const promiseResult = await runAPIDriver(runtime, promiseDriver);
+        expect(promiseResult.exitCode).toBe(0);
+        const promiseParsed = JSON.parse(promiseResult.stdout);
+        expect(promiseParsed.threw).toBe(true);
+        expect(promiseParsed.message).toMatch(/goto|target/i);
+      });
+
+      it('T-PARSE-21: {"stop":"true"} (string) discarded, Output is {}', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"stop":"true"}'`,
+        );
+
+        const { outputs, exitCode } = await runParseTest(runtime, project);
+
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output).not.toHaveProperty("result");
+        expect(output).not.toHaveProperty("goto");
+        expect(output).not.toHaveProperty("stop");
+        expect(Object.keys(output)).toHaveLength(0);
+      });
+
+      it('T-PARSE-22: {"stop":1} (number) discarded, Output is {}', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"stop":1}'`,
+        );
+
+        const { outputs, exitCode } = await runParseTest(runtime, project);
+
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output).not.toHaveProperty("result");
+        expect(output).not.toHaveProperty("goto");
+        expect(output).not.toHaveProperty("stop");
+        expect(Object.keys(output)).toHaveLength(0);
+      });
+
+      it('T-PARSE-23: {"stop":false} not treated as stop, Output is {}', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"stop":false}'`,
+        );
+
+        const { outputs, exitCode } = await runParseTest(runtime, project);
+
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output).not.toHaveProperty("result");
+        expect(output).not.toHaveProperty("goto");
+        expect(output).not.toHaveProperty("stop");
+        expect(Object.keys(output)).toHaveLength(0);
+      });
+
+      it('T-PARSE-24: {"stop":"false"} (string) discarded, Output is {}', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"stop":"false"}'`,
+        );
+
+        const { outputs, exitCode } = await runParseTest(runtime, project);
+
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output).not.toHaveProperty("result");
+        expect(output).not.toHaveProperty("goto");
+        expect(output).not.toHaveProperty("stop");
+        expect(Object.keys(output)).toHaveLength(0);
+      });
     });
 
-    it("T-PARSE-21: {\"stop\":\"true\"} string not boolean, Output is {}", async () => {
-      project = await createTempProject();
-      await createBashScript(
-        project,
-        "myscript",
-        `printf '{"stop":"true"}'`
-      );
+    // -------------------------------------------------------------------------
+    // Mixed Valid / Invalid Fields
+    // -------------------------------------------------------------------------
+    describe("Mixed Valid/Invalid Fields", () => {
+      it('T-PARSE-28: {"result":"x","goto":42} keeps result, drops goto', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"result":"x","goto":42}'`,
+        );
 
-      const { outputs } = await runParseTest(project, "myscript");
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output).not.toHaveProperty("result");
-      expect(output).not.toHaveProperty("goto");
-      expect(output).not.toHaveProperty("stop");
-      expect(Object.keys(output)).toHaveLength(0);
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output.result).toBe("x");
+        expect(output).not.toHaveProperty("goto");
+        expect(output).not.toHaveProperty("stop");
+      });
+
+      it('T-PARSE-29: {"result":"x","stop":"true"} keeps result, drops stop', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"result":"x","stop":"true"}'`,
+        );
+
+        const { outputs, exitCode } = await runParseTest(runtime, project);
+
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output.result).toBe("x");
+        expect(output).not.toHaveProperty("goto");
+        expect(output).not.toHaveProperty("stop");
+      });
     });
 
-    it("T-PARSE-22: {\"stop\":1} number not boolean, Output is {}", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '{"stop":1}'`);
+    // -------------------------------------------------------------------------
+    // Whitespace & Formatting
+    // -------------------------------------------------------------------------
+    describe("Whitespace & Formatting", () => {
+      it("T-PARSE-25: JSON with trailing newline is parsed correctly", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"result":"x"}\n'`,
+        );
 
-      const { outputs } = await runParseTest(project, "myscript");
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output).not.toHaveProperty("result");
-      expect(output).not.toHaveProperty("goto");
-      expect(output).not.toHaveProperty("stop");
-      expect(Object.keys(output)).toHaveLength(0);
-    });
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output.result).toBe("x");
+        expect(output).not.toHaveProperty("goto");
+        expect(output).not.toHaveProperty("stop");
+      });
 
-    it("T-PARSE-23: {\"stop\":false} false not treated as stop, Output is {}", async () => {
-      project = await createTempProject();
-      await createBashScript(project, "myscript", `printf '{"stop":false}'`);
+      it("T-PARSE-26: pretty-printed JSON is parsed correctly", async () => {
+        project = await createTempProject();
+        // Write pretty JSON to a payload file and cat it — avoids shell quoting.
+        const payloadPath = join(project.dir, "pretty.json");
+        const prettyJson = JSON.stringify(
+          { result: "pretty", goto: "next" },
+          null,
+          2,
+        );
+        await writeFile(payloadPath, prettyJson, "utf-8");
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `cat "${payloadPath}"`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "next",
+          `printf '{"result":"arrived"}'`,
+        );
 
-      const { outputs } = await runParseTest(project, "myscript");
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output).not.toHaveProperty("result");
-      expect(output).not.toHaveProperty("goto");
-      expect(output).not.toHaveProperty("stop");
-      expect(Object.keys(output)).toHaveLength(0);
-    });
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output.result).toBe("pretty");
+        expect(output.goto).toBe("next");
+      });
 
-    it("T-PARSE-24: {\"stop\":\"false\"} string not boolean, Output is {}", async () => {
-      project = await createTempProject();
-      await createBashScript(
-        project,
-        "myscript",
-        `printf '{"stop":"false"}'`
-      );
+      it("T-PARSE-27: JSON with leading whitespace is parsed correctly", async () => {
+        project = await createTempProject();
+        const payloadPath = join(project.dir, "leading-ws.json");
+        await writeFile(payloadPath, '  \n  {"result":"ws"}', "utf-8");
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `cat "${payloadPath}"`,
+        );
 
-      const { outputs } = await runParseTest(project, "myscript");
+        const { outputs, exitCode } = await runParseTest(runtime, project);
 
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output).not.toHaveProperty("result");
-      expect(output).not.toHaveProperty("goto");
-      expect(output).not.toHaveProperty("stop");
-      expect(Object.keys(output)).toHaveLength(0);
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // Mixed Valid/Invalid Fields
-  // ---------------------------------------------------------------------------
-
-  describe("SPEC: Mixed Valid/Invalid Fields", () => {
-    it("T-PARSE-28: {\"result\":\"x\",\"goto\":42} valid result preserved, invalid goto discarded", async () => {
-      project = await createTempProject();
-      await createBashScript(
-        project,
-        "myscript",
-        `printf '{"result":"x","goto":42}'`
-      );
-
-      const { outputs } = await runParseTest(project, "myscript");
-
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("x");
-      expect(output).not.toHaveProperty("goto");
-      expect(output).not.toHaveProperty("stop");
-    });
-
-    it("T-PARSE-29: {\"result\":\"x\",\"stop\":\"true\"} valid result preserved, invalid stop discarded", async () => {
-      project = await createTempProject();
-      await createBashScript(
-        project,
-        "myscript",
-        `printf '{"result":"x","stop":"true"}'`
-      );
-
-      const { outputs } = await runParseTest(project, "myscript");
-
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("x");
-      expect(output).not.toHaveProperty("goto");
-      expect(output).not.toHaveProperty("stop");
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // Whitespace & Formatting
-  // ---------------------------------------------------------------------------
-
-  describe("SPEC: Whitespace & Formatting", () => {
-    it("T-PARSE-25: JSON with trailing newline is parsed correctly", async () => {
-      project = await createTempProject();
-      // printf with explicit \n after JSON
-      await createBashScript(
-        project,
-        "myscript",
-        `printf '{"result":"x"}\n'`
-      );
-
-      const { outputs } = await runParseTest(project, "myscript");
-
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("x");
-      expect(output).not.toHaveProperty("goto");
-      expect(output).not.toHaveProperty("stop");
-    });
-
-    it("T-PARSE-26: pretty-printed JSON is parsed correctly", async () => {
-      project = await createTempProject();
-      // Write a payload file with pretty-printed JSON to avoid shell quoting issues
-      const payloadPath = join(project.dir, "pretty.json");
-      const prettyJson = JSON.stringify({ result: "pretty", goto: "next" }, null, 2);
-      await writeFile(payloadPath, prettyJson, "utf-8");
-      await createBashScript(
-        project,
-        "myscript",
-        `cat "${payloadPath}"`
-      );
-
-      const { outputs } = await runParseTest(project, "myscript");
-
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("pretty");
-      expect(output.goto).toBe("next");
-    });
-
-    it("T-PARSE-27: JSON with leading whitespace is parsed correctly", async () => {
-      project = await createTempProject();
-      // Write payload with leading whitespace to a file
-      const payloadPath = join(project.dir, "leading-ws.json");
-      await writeFile(payloadPath, '  \n  {"result":"ws"}', "utf-8");
-      await createBashScript(
-        project,
-        "myscript",
-        `cat "${payloadPath}"`
-      );
-
-      const { outputs } = await runParseTest(project, "myscript");
-
-      expect(outputs).toHaveLength(1);
-      const output = outputs[0] as Record<string, unknown>;
-      expect(output.result).toBe("ws");
-      expect(output).not.toHaveProperty("goto");
-      expect(output).not.toHaveProperty("stop");
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output.result).toBe("ws");
+        expect(output).not.toHaveProperty("goto");
+        expect(output).not.toHaveProperty("stop");
+      });
     });
   });
 });
