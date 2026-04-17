@@ -1,316 +1,303 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   createTempProject,
-  createScript,
-  createBashScript,
+  createWorkflowScript,
+  createBashWorkflowScript,
   type TempProject,
 } from "../helpers/fixtures.js";
 import { runCLI } from "../helpers/cli.js";
 import { runAPIDriver } from "../helpers/api-driver.js";
 import { forEachRuntime } from "../helpers/runtime.js";
 import {
-  emitResult,
-  emitGoto,
-  emitStop,
-  emitResultGoto,
-  counter,
   catStdin,
   exitCode,
   writeStderr,
-  emitRaw,
 } from "../helpers/fixture-scripts.js";
 
 // ---------------------------------------------------------------------------
-// SPEC: §7.1 — Basic Loop State Machine & Control Flow
+// TEST-SPEC §4.6 — Loop State Machine & Control Flow
+// Spec refs: 2.2, 7.1, 7.2, 6.6, 6.7 (workflow model per ADR-0003)
 // ---------------------------------------------------------------------------
 
-describe("SPEC: Loop state machine (§2.2, §7.1, §7.2)", () => {
+describe("SPEC: Loop state machine (ADR-0003 workflow model)", () => {
   let project: TempProject | null = null;
 
   afterEach(async () => {
     if (project) {
-      await project.cleanup();
+      await project.cleanup().catch(() => {});
       project = null;
     }
   });
 
   // =========================================================================
-  // Basic Loop Behavior
+  // Basic Loop Behavior (T-LOOP-01 – T-LOOP-05)
   // =========================================================================
-
   describe("SPEC: Basic Loop Behavior", () => {
     forEachRuntime((runtime) => {
-      // T-LOOP-01: No output → loop resets, runs 3 times with -n 3
-      it("T-LOOP-01: no output → loop resets to starting target, runs 3 times with -n 3", async () => {
+      it("T-LOOP-01: no output → loop resets to starting target, -n 3 yields 3 runs", async () => {
         project = await createTempProject();
         const counterFile = join(project.dir, "counter.txt");
 
-        // Script that increments counter but produces no structured output
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "noop",
-          `printf '1' >> "${counterFile}"`
+          "ralph",
+          "index",
+          `printf '1' >> "${counterFile}"`,
         );
 
-        const result = await runCLI(["run", "-n", "3", "noop"], {
+        const result = await runCLI(["run", "-n", "3", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
-        const count = readFileSync(counterFile, "utf-8");
-        expect(count).toBe("111"); // 3 invocations
+        expect(readFileSync(counterFile, "utf-8")).toBe("111");
       });
 
-      // T-LOOP-02: A→goto:B→B no output→A again. -n 4: A,B,A,B
-      it("T-LOOP-02: A→goto:B→B no output→loop resets to A. -n 4 yields A,B,A,B", async () => {
+      it("T-LOOP-02: ralph:index → goto check → check no output → reset. -n 4 yields index,check,index,check", async () => {
         project = await createTempProject();
         const orderFile = join(project.dir, "order.txt");
 
-        // A: records "A", gotos B
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "A",
-          `printf 'A' >> "${orderFile}"\nprintf '{"goto":"B"}'`
+          "ralph",
+          "index",
+          `printf 'I' >> "${orderFile}"\nprintf '{"goto":"check"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "check",
+          `printf 'C' >> "${orderFile}"`,
         );
 
-        // B: records "B", no output (no goto, no stop)
-        await createBashScript(
-          project,
-          "B",
-          `printf 'B' >> "${orderFile}"`
-        );
-
-        const result = await runCLI(["run", "-n", "4", "A"], {
+        const result = await runCLI(["run", "-n", "4", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
-        const order = readFileSync(orderFile, "utf-8");
-        expect(order).toBe("ABAB");
+        expect(readFileSync(orderFile, "utf-8")).toBe("ICIC");
       });
 
-      // T-LOOP-03: A→B→C→A. -n 4: A,B,C,A
-      it("T-LOOP-03: A→goto:B→B→goto:C→C no goto→reset to A. -n 4 yields A,B,C,A", async () => {
+      it("T-LOOP-03: ralph:index → goto setup → goto check → reset. -n 4 yields index,setup,check,index", async () => {
         project = await createTempProject();
         const orderFile = join(project.dir, "order.txt");
 
-        // A: records "A", gotos B
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "A",
-          `printf 'A' >> "${orderFile}"\nprintf '{"goto":"B"}'`
+          "ralph",
+          "index",
+          `printf 'I' >> "${orderFile}"\nprintf '{"goto":"setup"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "setup",
+          `printf 'S' >> "${orderFile}"\nprintf '{"goto":"check"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "check",
+          `printf 'C' >> "${orderFile}"`,
         );
 
-        // B: records "B", gotos C
-        await createBashScript(
-          project,
-          "B",
-          `printf 'B' >> "${orderFile}"\nprintf '{"goto":"C"}'`
-        );
-
-        // C: records "C", no goto (resets to starting target A)
-        await createBashScript(
-          project,
-          "C",
-          `printf 'C' >> "${orderFile}"`
-        );
-
-        const result = await runCLI(["run", "-n", "4", "A"], {
+        const result = await runCLI(["run", "-n", "4", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
-        const order = readFileSync(orderFile, "utf-8");
-        expect(order).toBe("ABCA");
+        expect(readFileSync(orderFile, "utf-8")).toBe("ISCI");
       });
 
-      // T-LOOP-04: stop:true on first → 1 iteration, exit 0
       it("T-LOOP-04: stop:true on first iteration → 1 iteration, exit 0", async () => {
         project = await createTempProject();
         const counterFile = join(project.dir, "counter.txt");
 
-        // Script emits stop and records execution
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "stopper",
-          `printf '1' >> "${counterFile}"\nprintf '{"stop":true}'`
+          "ralph",
+          "index",
+          `printf '1' >> "${counterFile}"\nprintf '{"stop":true}'`,
         );
 
-        const result = await runCLI(["run", "stopper"], {
+        const result = await runCLI(["run", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
-        const count = readFileSync(counterFile, "utf-8");
-        expect(count).toBe("1"); // exactly 1 iteration
+        expect(readFileSync(counterFile, "utf-8")).toBe("1");
       });
 
-      // T-LOOP-05: Counter-based: runs 3 times, stops on 4th
-      it("T-LOOP-05: script runs 3 times without stop, stops on 4th → exactly 4 iterations", async () => {
+      it("T-LOOP-05: script runs 3 times then emits stop on 4th → exactly 4 iterations", async () => {
         project = await createTempProject();
         const counterFile = join(project.dir, "counter.txt");
 
-        // Script: increments counter, on 4th invocation emits stop
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "conditional-stop",
+          "ralph",
+          "index",
           `printf '1' >> "${counterFile}"
 COUNT=$(wc -c < "${counterFile}" | tr -d ' ')
 if [ "$COUNT" -ge 4 ]; then
   printf '{"stop":true}'
-fi`
+fi`,
         );
 
-        const result = await runCLI(["run", "conditional-stop"], {
+        const result = await runCLI(["run", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
-        const count = readFileSync(counterFile, "utf-8");
-        expect(count).toBe("1111"); // exactly 4 iterations
+        expect(readFileSync(counterFile, "utf-8")).toBe("1111");
       });
     });
   });
 
   // =========================================================================
-  // -n Counting
+  // -n Counting (T-LOOP-06 – T-LOOP-10)
   // =========================================================================
-
-  describe("SPEC: -n counting (§7.1)", () => {
+  describe("SPEC: -n counting", () => {
     forEachRuntime((runtime) => {
-      // T-LOOP-06: -n 1 → exactly 1 iteration
       it("T-LOOP-06: -n 1 → exactly 1 iteration", async () => {
         project = await createTempProject();
         const counterFile = join(project.dir, "counter.txt");
 
-        await createScript(project, "count", ".sh", counter(counterFile));
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '1' >> "${counterFile}"`,
+        );
 
-        const result = await runCLI(["run", "-n", "1", "count"], {
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
-        const count = readFileSync(counterFile, "utf-8");
-        expect(count).toBe("1");
+        expect(readFileSync(counterFile, "utf-8")).toBe("1");
       });
 
-      // T-LOOP-07: -n 3 with no stop → exactly 3
       it("T-LOOP-07: -n 3 with script that never stops → exactly 3 iterations", async () => {
         project = await createTempProject();
         const counterFile = join(project.dir, "counter.txt");
 
-        await createScript(project, "count", ".sh", counter(counterFile));
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '1' >> "${counterFile}"`,
+        );
 
-        const result = await runCLI(["run", "-n", "3", "count"], {
+        const result = await runCLI(["run", "-n", "3", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
-        const count = readFileSync(counterFile, "utf-8");
-        expect(count).toBe("111");
+        expect(readFileSync(counterFile, "utf-8")).toBe("111");
       });
 
-      // T-LOOP-08: -n 3 with A→goto:B→B no goto. A,B,A = 3
-      it("T-LOOP-08: -n 3 with A→goto:B→B no goto → A,B,A = 3 iterations", async () => {
+      it("T-LOOP-08: -n 3 with ralph:index → goto check → check no goto → yields index,check,index", async () => {
         project = await createTempProject();
         const orderFile = join(project.dir, "order.txt");
 
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "A",
-          `printf 'A' >> "${orderFile}"\nprintf '{"goto":"B"}'`
+          "ralph",
+          "index",
+          `printf 'I' >> "${orderFile}"\nprintf '{"goto":"check"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "check",
+          `printf 'C' >> "${orderFile}"`,
         );
 
-        await createBashScript(
-          project,
-          "B",
-          `printf 'B' >> "${orderFile}"`
-        );
-
-        const result = await runCLI(["run", "-n", "3", "A"], {
+        const result = await runCLI(["run", "-n", "3", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
-        const order = readFileSync(orderFile, "utf-8");
-        expect(order).toBe("ABA");
+        expect(readFileSync(orderFile, "utf-8")).toBe("ICI");
       });
 
-      // T-LOOP-09: -n 2 with A→goto:B. A(1),B(2)
-      it("T-LOOP-09: -n 2 with A→goto:B → A(1),B(2), A does not run again", async () => {
+      it("T-LOOP-09: -n 2 with ralph:index → goto check → yields index,check", async () => {
         project = await createTempProject();
         const orderFile = join(project.dir, "order.txt");
 
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "A",
-          `printf 'A' >> "${orderFile}"\nprintf '{"goto":"B"}'`
+          "ralph",
+          "index",
+          `printf 'I' >> "${orderFile}"\nprintf '{"goto":"check"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "check",
+          `printf 'C' >> "${orderFile}"`,
         );
 
-        await createBashScript(
-          project,
-          "B",
-          `printf 'B' >> "${orderFile}"`
-        );
-
-        const result = await runCLI(["run", "-n", "2", "A"], {
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
-        const order = readFileSync(orderFile, "utf-8");
-        expect(order).toBe("AB");
+        expect(readFileSync(orderFile, "utf-8")).toBe("IC");
       });
 
-      // T-LOOP-10: -n 0 → no iterations
       it("T-LOOP-10: -n 0 → no iterations, script never runs", async () => {
         project = await createTempProject();
         const counterFile = join(project.dir, "counter.txt");
 
-        await createScript(project, "count", ".sh", counter(counterFile));
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '1' >> "${counterFile}"`,
+        );
 
-        const result = await runCLI(["run", "-n", "0", "count"], {
+        const result = await runCLI(["run", "-n", "0", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
-        // Counter file should not exist since script never ran
-        expect(() => readFileSync(counterFile, "utf-8")).toThrow();
+        expect(existsSync(counterFile)).toBe(false);
       });
     });
   });
 
   // =========================================================================
-  // Input Piping
+  // Input Piping (T-LOOP-11 – T-LOOP-15a)
   // =========================================================================
-
-  describe("SPEC: Input piping (§6.7, §6.8)", () => {
+  describe("SPEC: Input piping", () => {
     forEachRuntime((runtime) => {
-      // T-LOOP-11: A outputs result+goto:B, B reads stdin → gets payload
-      it("T-LOOP-11: A outputs result+goto:B, B reads stdin and gets the payload", async () => {
+      it("T-LOOP-11: ralph:index emits {result,goto:reader}; ralph:reader reads stdin → gets payload", async () => {
         project = await createTempProject();
 
-        // A: emits result "payload" and goto B
-        await createScript(project, "A", ".sh", emitResultGoto("payload", "B"));
-
-        // B: reads stdin and echoes it as result
-        await createScript(project, "B", ".sh", catStdin());
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"result":"payload","goto":"reader"}'`,
+        );
+        await createWorkflowScript(project, "ralph", "reader", ".sh", catStdin());
 
         const driverCode = `
 import { runPromise } from "loopx";
-const outputs = await runPromise("A", { cwd: "${project.dir}", maxIterations: 2 });
+const outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
 console.log(JSON.stringify(outputs));
 `;
 
@@ -319,24 +306,24 @@ console.log(JSON.stringify(outputs));
         });
 
         const outputs = JSON.parse(result.stdout);
-        // Second output (B's output) should have result equal to "payload"
         expect(outputs).toHaveLength(2);
         expect(outputs[1].result).toBe("payload");
       });
 
-      // T-LOOP-12: A outputs goto:B (no result), B reads stdin → empty
-      it("T-LOOP-12: A outputs goto:B with no result, B reads stdin → empty string", async () => {
+      it("T-LOOP-12: ralph:index emits {goto:reader} (no result); ralph:reader reads stdin → empty", async () => {
         project = await createTempProject();
 
-        // A: emits only goto B (no result)
-        await createScript(project, "A", ".sh", emitGoto("B"));
-
-        // B: reads stdin and echoes it as result
-        await createScript(project, "B", ".sh", catStdin());
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"reader"}'`,
+        );
+        await createWorkflowScript(project, "ralph", "reader", ".sh", catStdin());
 
         const driverCode = `
 import { runPromise } from "loopx";
-const outputs = await runPromise("A", { cwd: "${project.dir}", maxIterations: 2 });
+const outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
 console.log(JSON.stringify(outputs));
 `;
 
@@ -349,18 +336,14 @@ console.log(JSON.stringify(outputs));
         expect(outputs[1].result).toBe("");
       });
 
-      // T-LOOP-13: A outputs result (no goto), loop resets, A reads stdin → empty
-      it("T-LOOP-13: A outputs result with no goto, loop resets, A reads stdin → empty (result not piped on reset)", async () => {
+      it("T-LOOP-13: ralph:index emits {result:payload} (no goto) → loop resets; index reads empty stdin on second iteration", async () => {
         project = await createTempProject();
-
         const counterFile = join(project.dir, "iter-count.txt");
 
-        // A: on first call emits result "payload" (no goto).
-        // On second call reads stdin and echoes it.
-        // Use a counter to differentiate iterations.
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "A",
+          "ralph",
+          "index",
           `printf '1' >> "${counterFile}"
 COUNT=$(wc -c < "${counterFile}" | tr -d ' ')
 if [ "$COUNT" -eq 1 ]; then
@@ -368,12 +351,12 @@ if [ "$COUNT" -eq 1 ]; then
 else
   INPUT=$(cat)
   printf '{"result":"%s"}' "$INPUT"
-fi`
+fi`,
         );
 
         const driverCode = `
 import { runPromise } from "loopx";
-const outputs = await runPromise("A", { cwd: "${project.dir}", maxIterations: 2 });
+const outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
 console.log(JSON.stringify(outputs));
 `;
 
@@ -383,22 +366,18 @@ console.log(JSON.stringify(outputs));
 
         const outputs = JSON.parse(result.stdout);
         expect(outputs).toHaveLength(2);
-        // First iteration produces "payload"
         expect(outputs[0].result).toBe("payload");
-        // Second iteration (reset, no input piped) should get empty stdin
         expect(outputs[1].result).toBe("");
       });
 
-      // T-LOOP-14: First iteration reads stdin → empty
       it("T-LOOP-14: first iteration receives empty stdin", async () => {
         project = await createTempProject();
 
-        // Script reads stdin and echoes it as result
-        await createScript(project, "echo-stdin", ".sh", catStdin());
+        await createWorkflowScript(project, "ralph", "index", ".sh", catStdin());
 
         const driverCode = `
 import { runPromise } from "loopx";
-const outputs = await runPromise("echo-stdin", { cwd: "${project.dir}", maxIterations: 1 });
+const outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
 console.log(JSON.stringify(outputs));
 `;
 
@@ -411,27 +390,26 @@ console.log(JSON.stringify(outputs));
         expect(outputs[0].result).toBe("");
       });
 
-      // T-LOOP-15: A→B→C chain, C gets B's result not A's
-      it("T-LOOP-15: A→B→C chain, C receives B's result not A's", async () => {
+      it("T-LOOP-15: chain ralph:index → ralph:mid → ralph:tail; tail receives mid's result, not index's", async () => {
         project = await createTempProject();
 
-        // A: emits result "from-A" and goto B
-        await createScript(project, "A", ".sh", emitResultGoto("from-A", "B"));
-
-        // B: reads stdin (gets "from-A"), emits result "from-B" and goto C
-        // We want B to emit its own result regardless of input
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "B",
-          `printf '{"result":"from-B","goto":"C"}'`
+          "ralph",
+          "index",
+          `printf '{"result":"from-index","goto":"mid"}'`,
         );
-
-        // C: reads stdin and echoes it as result
-        await createScript(project, "C", ".sh", catStdin());
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "mid",
+          `printf '{"result":"from-mid","goto":"tail"}'`,
+        );
+        await createWorkflowScript(project, "ralph", "tail", ".sh", catStdin());
 
         const driverCode = `
 import { runPromise } from "loopx";
-const outputs = await runPromise("A", { cwd: "${project.dir}", maxIterations: 3 });
+const outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 3 });
 console.log(JSON.stringify(outputs));
 `;
 
@@ -441,82 +419,99 @@ console.log(JSON.stringify(outputs));
 
         const outputs = JSON.parse(result.stdout);
         expect(outputs).toHaveLength(3);
-        // C should receive B's result, not A's
-        expect(outputs[2].result).toBe("from-B");
+        expect(outputs[2].result).toBe("from-mid");
+      });
+
+      it("T-LOOP-15a: cross-workflow stdin piping — ralph:index result crosses workflow boundary to other:reader", async () => {
+        project = await createTempProject();
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"result":"cross-payload","goto":"other:reader"}'`,
+        );
+        await createWorkflowScript(project, "other", "reader", ".sh", catStdin());
+
+        const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+console.log(JSON.stringify(outputs));
+`;
+
+        const result = await runAPIDriver(runtime, driverCode, {
+          cwd: project.dir,
+        });
+
+        const outputs = JSON.parse(result.stdout);
+        expect(outputs).toHaveLength(2);
+        expect(outputs[1].result).toBe("cross-payload");
       });
     });
   });
 
   // =========================================================================
-  // Goto Behavior
+  // Goto Semantics — Intra-Workflow (T-LOOP-16 – T-LOOP-19b)
   // =========================================================================
-
-  describe("SPEC: Goto behavior (§2.2)", () => {
+  describe("SPEC: Goto semantics — intra-workflow", () => {
     forEachRuntime((runtime) => {
-      // T-LOOP-16: Goto is transition not permanent
-      it("T-LOOP-16: goto is a transition, not permanent — A→goto:B→B no goto→A runs again", async () => {
+      it("T-LOOP-16: goto is transition not permanent — ralph:index → check → reset → index runs (not check)", async () => {
         project = await createTempProject();
         const orderFile = join(project.dir, "order.txt");
 
-        // A: records "A", gotos B
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "A",
-          `printf 'A' >> "${orderFile}"\nprintf '{"goto":"B"}'`
+          "ralph",
+          "index",
+          `printf 'I' >> "${orderFile}"\nprintf '{"goto":"check"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "check",
+          `printf 'C' >> "${orderFile}"`,
         );
 
-        // B: records "B", no goto → resets to starting target A
-        await createBashScript(
-          project,
-          "B",
-          `printf 'B' >> "${orderFile}"`
-        );
-
-        const result = await runCLI(["run", "-n", "3", "A"], {
+        const result = await runCLI(["run", "-n", "3", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
-        const order = readFileSync(orderFile, "utf-8");
-        // A(1), B(2), A(3) — not A,B,B
-        expect(order).toBe("ABA");
+        expect(readFileSync(orderFile, "utf-8")).toBe("ICI");
       });
 
-      // T-LOOP-17: Self-goto (A→A)
-      it("T-LOOP-17: self-goto A→goto:A works, A runs twice with -n 2", async () => {
+      it("T-LOOP-17: self-referencing bare goto — ralph:index → goto index → -n 2 runs index twice", async () => {
         project = await createTempProject();
         const counterFile = join(project.dir, "counter.txt");
 
-        // A: records execution, self-goto
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "A",
-          `printf '1' >> "${counterFile}"\nprintf '{"goto":"A"}'`
+          "ralph",
+          "index",
+          `printf '1' >> "${counterFile}"\nprintf '{"goto":"index"}'`,
         );
 
-        const result = await runCLI(["run", "-n", "2", "A"], {
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
-        const count = readFileSync(counterFile, "utf-8");
-        expect(count).toBe("11"); // ran exactly twice
+        expect(readFileSync(counterFile, "utf-8")).toBe("11");
       });
 
-      // T-LOOP-18: Invalid goto target → exit 1
-      it("T-LOOP-18: goto to non-existent target → exit 1, stderr mentions target", async () => {
+      it("T-LOOP-18: goto to script that doesn't exist within the workflow → exit 1", async () => {
         project = await createTempProject();
 
-        // A: gotos a target that doesn't exist
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "A",
-          `printf '{"goto":"nonexistent"}'`
+          "ralph",
+          "index",
+          `printf '{"goto":"nonexistent"}'`,
         );
 
-        const result = await runCLI(["run", "-n", "2", "A"], {
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
           cwd: project.dir,
           runtime,
         });
@@ -525,12 +520,17 @@ console.log(JSON.stringify(outputs));
         expect(result.stderr).toContain("nonexistent");
       });
 
-      // T-LOOP-18a: Empty string goto → exit 1
-      it("T-LOOP-18a: goto to empty string → exit 1, stderr references empty target", async () => {
+      it("T-LOOP-18a: goto empty string → exit 1", async () => {
         project = await createTempProject();
-        await createBashScript(project, "A", `printf '{"goto":""}'`);
 
-        const result = await runCLI(["run", "-n", "2", "A"], {
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":""}'`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
           cwd: project.dir,
           runtime,
         });
@@ -539,48 +539,619 @@ console.log(JSON.stringify(outputs));
         expect(result.stderr.length).toBeGreaterThan(0);
       });
 
-      // T-LOOP-19: Goto to undiscoverable script → exit 1
-      it("T-LOOP-19: goto to undiscoverable script (e.g., .mjs) → exit 1", async () => {
+      it("T-LOOP-19: bare goto to a script that exists only in a sibling workflow → exit 1 (bare resolves in current workflow)", async () => {
         project = await createTempProject();
 
-        // A: gotos "hidden" which is a .mjs file (not discoverable)
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "A",
-          `printf '{"goto":"hidden"}'`
+          "ralph",
+          "index",
+          `printf '{"goto":"check-ready"}'`,
+        );
+        // .loopx/other/check-ready.sh exists in a sibling workflow, but ralph has no check-ready.
+        await createBashWorkflowScript(
+          project,
+          "other",
+          "check-ready",
+          `printf 'should-not-run'`,
         );
 
-        // Create a .mjs file — this extension is not discoverable by loopx
-        await createScript(
-          project,
-          "hidden",
-          ".mjs",
-          'console.log(JSON.stringify({ result: "found" }));\n'
-        );
-
-        const result = await runCLI(["run", "-n", "2", "A"], {
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(1);
+      });
+
+      it("T-LOOP-19a: bare goto matching a workflow name does NOT jump to that workflow's index", async () => {
+        project = await createTempProject();
+        const otherMarker = join(project.dir, "other-index-ran.txt");
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"other"}'`,
+        );
+        // .loopx/other/index.sh exists (a workflow with a default entry point), and ralph has NO other.* script.
+        await createBashWorkflowScript(
+          project,
+          "other",
+          "index",
+          `printf 'other-ran' > "${otherMarker}"`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+        expect(existsSync(otherMarker)).toBe(false);
+      });
+
+      it("T-LOOP-19b: bare goto disambiguation — current-workflow script wins over a same-named workflow", async () => {
+        project = await createTempProject();
+        const ralphApplyMarker = join(project.dir, "ralph-apply.txt");
+        const applyIndexMarker = join(project.dir, "apply-index.txt");
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"apply"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "apply",
+          `printf 'ralph-apply-ran' > "${ralphApplyMarker}"`,
+        );
+        // .loopx/apply/index.sh exists (same-named workflow) — must NOT run.
+        await createBashWorkflowScript(
+          project,
+          "apply",
+          "index",
+          `printf 'apply-index-ran' > "${applyIndexMarker}"`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(ralphApplyMarker)).toBe(true);
+        expect(readFileSync(ralphApplyMarker, "utf-8")).toBe("ralph-apply-ran");
+        expect(existsSync(applyIndexMarker)).toBe(false);
       });
     });
   });
 
   // =========================================================================
-  // Error Handling
+  // Goto Semantics — Cross-Workflow (T-LOOP-30 – T-LOOP-43)
   // =========================================================================
-
-  describe("SPEC: Error handling (§7.2)", () => {
+  describe("SPEC: Goto semantics — cross-workflow", () => {
     forEachRuntime((runtime) => {
-      // T-LOOP-20: Script exit 1 → loop stops, loopx exit 1
+      it("T-LOOP-30: qualified goto ralph:index → other:check runs other's script", async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "other-check.txt");
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"other:check"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "other",
+          "check",
+          `printf 'other-check-ran' > "${marker}"`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(marker)).toBe(true);
+        expect(readFileSync(marker, "utf-8")).toBe("other-check-ran");
+      });
+
+      it("T-LOOP-30a: qualified cross-workflow goto into workflow with no index script (alpha:index → beta:check)", async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "beta-check.txt");
+
+        await createBashWorkflowScript(
+          project,
+          "alpha",
+          "index",
+          `printf '{"goto":"beta:check"}'`,
+        );
+        // .loopx/beta/ has check.sh but no index.*
+        await createBashWorkflowScript(
+          project,
+          "beta",
+          "check",
+          `printf 'beta-check-ran' > "${marker}"`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "alpha"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(marker)).toBe(true);
+        expect(readFileSync(marker, "utf-8")).toBe("beta-check-ran");
+      });
+
+      it("T-LOOP-31: qualified same-workflow goto works — ralph:index → ralph:check is equivalent to bare check", async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "ralph-check.txt");
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"ralph:check"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "check",
+          `printf 'ralph-check-ran' > "${marker}"`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(marker)).toBe(true);
+        expect(readFileSync(marker, "utf-8")).toBe("ralph-check-ran");
+      });
+
+      it("T-LOOP-31a: cross-workflow default-entry targeting — ralph:index → other:index runs other's index", async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "other-index.txt");
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"other:index"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "other",
+          "index",
+          `printf 'other-index-ran' > "${marker}"`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(marker)).toBe(true);
+        expect(readFileSync(marker, "utf-8")).toBe("other-index-ran");
+      });
+
+      it("T-LOOP-31b: qualified same-workflow goto to index — ralph:check → ralph:index runs ralph's index", async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "ralph-index.txt");
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "check",
+          `printf '{"goto":"ralph:index"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'ralph-index-ran' > "${marker}"`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph:check"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(marker)).toBe(true);
+        expect(readFileSync(marker, "utf-8")).toBe("ralph-index-ran");
+      });
+
+      it("T-LOOP-31c: qualified goto other:index where other has no index → exit 1", async () => {
+        project = await createTempProject();
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"other:index"}'`,
+        );
+        // .loopx/other/check.sh exists but no index.*
+        await createBashWorkflowScript(
+          project,
+          "other",
+          "check",
+          `printf 'should-not-run'`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-LOOP-32: bare goto from cross-workflow context resolves in executing workflow — other:step1 → step2 runs other:step2", async () => {
+        project = await createTempProject();
+        const otherStep2Marker = join(project.dir, "other-step2.txt");
+        const ralphStep2Marker = join(project.dir, "ralph-step2.txt");
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"other:step1"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "other",
+          "step1",
+          `printf '{"goto":"step2"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "other",
+          "step2",
+          `printf 'other-step2-ran' > "${otherStep2Marker}"`,
+        );
+        // Decoy: ralph:step2 must NOT execute
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "step2",
+          `printf 'ralph-step2-ran' > "${ralphStep2Marker}"`,
+        );
+
+        const result = await runCLI(["run", "-n", "3", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(otherStep2Marker)).toBe(true);
+        expect(readFileSync(otherStep2Marker, "utf-8")).toBe("other-step2-ran");
+        expect(existsSync(ralphStep2Marker)).toBe(false);
+      });
+
+      it("T-LOOP-32a: bare goto 'index' from cross-workflow context resolves to executing workflow's index", async () => {
+        project = await createTempProject();
+        const betaIndexMarker = join(project.dir, "beta-index.txt");
+        const alphaIndexCounter = join(project.dir, "alpha-index-count.txt");
+
+        await createBashWorkflowScript(
+          project,
+          "alpha",
+          "index",
+          `printf '1' >> "${alphaIndexCounter}"
+COUNT=$(wc -c < "${alphaIndexCounter}" | tr -d ' ')
+if [ "$COUNT" -eq 1 ]; then
+  printf '{"goto":"beta:step"}'
+fi`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "beta",
+          "step",
+          `printf '{"goto":"index"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "beta",
+          "index",
+          `printf 'beta-index-ran' > "${betaIndexMarker}"`,
+        );
+
+        const result = await runCLI(["run", "-n", "3", "alpha"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(betaIndexMarker)).toBe(true);
+        expect(readFileSync(betaIndexMarker, "utf-8")).toBe("beta-index-ran");
+      });
+
+      it("T-LOOP-33: loop reset returns to starting target (ralph:index), not other's default entry", async () => {
+        project = await createTempProject();
+        const orderFile = join(project.dir, "order.txt");
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'R' >> "${orderFile}"
+COUNT=$(wc -c < "${orderFile}" | tr -d ' ')
+if [ "$COUNT" -eq 1 ]; then
+  printf '{"goto":"other:check"}'
+fi`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "other",
+          "check",
+          `printf 'C' >> "${orderFile}"`,
+        );
+        // Decoy: other:index exists but should NEVER run during a reset.
+        await createBashWorkflowScript(
+          project,
+          "other",
+          "index",
+          `printf 'X' >> "${orderFile}"`,
+        );
+
+        const result = await runCLI(["run", "-n", "3", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        // iter 1: ralph:index (R, goto other:check)
+        // iter 2: other:check (C, no goto → reset to ralph:index)
+        // iter 3: ralph:index (R; counter > 1 so no goto)
+        expect(readFileSync(orderFile, "utf-8")).toBe("RCR");
+      });
+
+      it("T-LOOP-34: qualified goto with missing workflow → exit 1", async () => {
+        project = await createTempProject();
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"nonexistent:check"}'`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-LOOP-35: qualified goto with missing script in target workflow → exit 1", async () => {
+        project = await createTempProject();
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"other:nonexistent"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "other",
+          "check",
+          `printf 'should-not-run'`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-LOOP-36: goto ':script' (leading colon) → exit 1", async () => {
+        project = await createTempProject();
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":":check"}'`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-LOOP-37: goto 'a:b:c' (multiple colons) → exit 1", async () => {
+        project = await createTempProject();
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"a:b:c"}'`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-LOOP-38: goto ':' (bare colon) → exit 1", async () => {
+        project = await createTempProject();
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":":"}'`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-LOOP-39: goto 'other:' (trailing colon) → exit 1", async () => {
+        project = await createTempProject();
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"other:"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "other",
+          "index",
+          `printf 'should-not-run'`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-LOOP-40: goto '-bad' (name restriction on bare name) → exit 1", async () => {
+        project = await createTempProject();
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"-bad"}'`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-LOOP-41: goto 'other:-bad' (name restriction on qualified script portion) → exit 1", async () => {
+        project = await createTempProject();
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"other:-bad"}'`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "other",
+          "check",
+          `printf 'should-not-run'`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-LOOP-42: goto '-bad:index' (name restriction on qualified workflow portion) → exit 1", async () => {
+        project = await createTempProject();
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"goto":"-bad:index"}'`,
+        );
+
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-LOOP-43: loop reset goes to explicit script starting target (ralph:check), not ralph:index", async () => {
+        project = await createTempProject();
+        const orderFile = join(project.dir, "order.txt");
+
+        // Starting target: ralph:check (NOT ralph:index)
+        // ralph:check → goto other:step → other:step → no goto → reset to ralph:check
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'I' >> "${orderFile}"`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "check",
+          `printf 'K' >> "${orderFile}"
+COUNT=$(wc -c < "${orderFile}" | tr -d ' ')
+if [ "$COUNT" -eq 1 ]; then
+  printf '{"goto":"other:step"}'
+fi`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "other",
+          "step",
+          `printf 'S' >> "${orderFile}"`,
+        );
+
+        const result = await runCLI(["run", "-n", "3", "ralph:check"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        // iter 1: ralph:check → K, goto other:step
+        // iter 2: other:step → S, no goto → reset to ralph:check
+        // iter 3: ralph:check → K again (no goto this time since counter>1)
+        // "I" must NOT appear (ralph:index should never execute)
+        const order = readFileSync(orderFile, "utf-8");
+        expect(order).toBe("KSK");
+        expect(order).not.toContain("I");
+      });
+    });
+  });
+
+  // =========================================================================
+  // Error Handling (T-LOOP-20 – T-LOOP-24)
+  // =========================================================================
+  describe("SPEC: Error handling", () => {
+    forEachRuntime((runtime) => {
       it("T-LOOP-20: script exits with code 1 → loop stops, loopx exits 1", async () => {
         project = await createTempProject();
 
-        await createScript(project, "fail", ".sh", exitCode(1));
+        await createWorkflowScript(project, "ralph", "index", ".sh", exitCode(1));
 
-        const result = await runCLI(["run", "-n", "5", "fail"], {
+        const result = await runCLI(["run", "-n", "5", "ralph"], {
           cwd: project.dir,
           runtime,
         });
@@ -588,13 +1159,12 @@ console.log(JSON.stringify(outputs));
         expect(result.exitCode).toBe(1);
       });
 
-      // T-LOOP-21: Script exit 2 → same
-      it("T-LOOP-21: script exits with code 2 → loop stops, loopx exits 1", async () => {
+      it("T-LOOP-21: script exits with code 2 → loopx exits 1", async () => {
         project = await createTempProject();
 
-        await createScript(project, "fail2", ".sh", exitCode(2));
+        await createWorkflowScript(project, "ralph", "index", ".sh", exitCode(2));
 
-        const result = await runCLI(["run", "-n", "5", "fail2"], {
+        const result = await runCLI(["run", "-n", "5", "ralph"], {
           cwd: project.dir,
           runtime,
         });
@@ -602,40 +1172,43 @@ console.log(JSON.stringify(outputs));
         expect(result.exitCode).toBe(1);
       });
 
-      // T-LOOP-22: Fails on iteration 3 of 5 → exactly 3 ran
       it("T-LOOP-22: script fails on iteration 3 of -n 5 → exactly 3 iterations ran", async () => {
         project = await createTempProject();
         const counterFile = join(project.dir, "counter.txt");
 
-        // Script runs normally first 2 times, fails on 3rd
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "fail-on-3",
+          "ralph",
+          "index",
           `printf '1' >> "${counterFile}"
 COUNT=$(wc -c < "${counterFile}" | tr -d ' ')
 if [ "$COUNT" -ge 3 ]; then
   exit 1
 fi
-printf '{"result":"ok"}'`
+printf '{"result":"ok"}'`,
         );
 
-        const result = await runCLI(["run", "-n", "5", "fail-on-3"], {
+        const result = await runCLI(["run", "-n", "5", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(1);
-        const count = readFileSync(counterFile, "utf-8");
-        expect(count).toBe("111"); // exactly 3 iterations ran
+        expect(readFileSync(counterFile, "utf-8")).toBe("111");
       });
 
-      // T-LOOP-23: Script stderr visible on CLI stderr
       it("T-LOOP-23: script stderr output is visible on CLI stderr", async () => {
         project = await createTempProject();
 
-        await createScript(project, "stderr-script", ".sh", writeStderr("custom-error-msg"));
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          writeStderr("custom-error-msg"),
+        );
 
-        const result = await runCLI(["run", "-n", "1", "stderr-script"], {
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
           cwd: project.dir,
           runtime,
         });
@@ -643,17 +1216,14 @@ printf '{"result":"ok"}'`
         expect(result.stderr).toContain("custom-error-msg");
       });
 
-      // T-LOOP-24: stdout NOT parsed on failure (generator throws, no yield)
       it("T-LOOP-24: stdout is not parsed on failure — generator throws without yielding Output for failing iteration", async () => {
         project = await createTempProject();
 
-        // Script outputs valid JSON with result AND stop:true, then exits 1
-        // If stdout were parsed on failure, it would yield the result and stop cleanly.
-        // Instead, the generator should throw an error for this iteration.
-        await createBashScript(
+        await createBashWorkflowScript(
           project,
-          "fail-with-output",
-          `printf '{"result":"should-not-appear","stop":true}'\nexit 1`
+          "ralph",
+          "index",
+          `printf '{"result":"should-not-appear","stop":true}'\nexit 1`,
         );
 
         const driverCode = `
@@ -663,7 +1233,7 @@ const outputs = [];
 let threwError = false;
 
 try {
-  for await (const output of run("fail-with-output", { cwd: "${project.dir}" })) {
+  for await (const output of run("ralph", { cwd: ${JSON.stringify(project.dir)} })) {
     outputs.push(output);
   }
 } catch (e) {
@@ -678,11 +1248,8 @@ console.log(JSON.stringify({ outputs, threwError }));
         });
 
         const parsed = JSON.parse(result.stdout);
-        // The generator should throw, not yield an Output for the failing iteration
         expect(parsed.threwError).toBe(true);
-        // No outputs should have been yielded for the failing iteration
         expect(parsed.outputs).toHaveLength(0);
-        // Specifically, "should-not-appear" must not be in any result
         for (const output of parsed.outputs) {
           expect(output.result).not.toBe("should-not-appear");
         }
@@ -691,22 +1258,26 @@ console.log(JSON.stringify({ outputs, threwError }));
   });
 
   // =========================================================================
-  // Final Iteration Output
+  // Final Iteration Output (T-LOOP-25)
   // =========================================================================
-
-  describe("SPEC: Final iteration output (§7.1)", () => {
+  describe("SPEC: Final iteration output", () => {
     forEachRuntime((runtime) => {
-      // T-LOOP-25: -n 2 → both outputs observable via programmatic API
-      it("T-LOOP-25: -n 2 with result-producing script → both outputs observable via API", async () => {
+      it("T-LOOP-25: -n 2 with iter-N result producer — both outputs observable via programmatic API", async () => {
         project = await createTempProject();
         const counterFile = join(project.dir, "counter.txt");
 
-        // Script uses counter to produce unique result per iteration
-        await createScript(project, "numbered", ".sh", counter(counterFile));
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '1' >> "${counterFile}"
+COUNT=$(wc -c < "${counterFile}" | tr -d ' ')
+printf '{"result":"iter-%s"}' "$COUNT"`,
+        );
 
         const driverCode = `
 import { runPromise } from "loopx";
-const outputs = await runPromise("numbered", { cwd: "${project.dir}", maxIterations: 2 });
+const outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
 console.log(JSON.stringify(outputs));
 `;
 
@@ -716,10 +1287,8 @@ console.log(JSON.stringify(outputs));
 
         const outputs = JSON.parse(result.stdout);
         expect(outputs).toHaveLength(2);
-        // First iteration: counter = 1
-        expect(outputs[0].result).toBe("1");
-        // Second iteration: counter = 2
-        expect(outputs[1].result).toBe("2");
+        expect(outputs[0].result).toBe("iter-1");
+        expect(outputs[1].result).toBe("iter-2");
       });
     });
   });
