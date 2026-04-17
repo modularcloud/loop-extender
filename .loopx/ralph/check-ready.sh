@@ -29,5 +29,5 @@ if echo "$VERDICT" | grep -qw "READY"; then
   $LOOPX_BIN output --result "Production ready after iteration ${ITER}." --stop
 else
   echo "=== Not production ready — continuing loop ===" >&2
-  $LOOPX_BIN output --result "continuing" --goto "run-ralph"
+  $LOOPX_BIN output --result "continuing" --goto "index"
 fi
