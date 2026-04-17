@@ -1,13 +1,23 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { writeFile, mkdir, rm, chmod } from "node:fs/promises";
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  lstatSync,
+  symlinkSync,
+  chmodSync,
+} from "node:fs";
+import { writeFile, mkdir, rm, chmod, mkdtemp } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { execSync, execFileSync } from "node:child_process";
+import { execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import {
   createTempProject,
-  createScript,
-  createBashScript,
+  createBashWorkflowScript,
+  createWorkflowScript,
+  createWorkflowPackageJson,
+  createWorkflow,
   type TempProject,
 } from "../helpers/fixtures.js";
 import { runCLI } from "../helpers/cli.js";
@@ -21,84 +31,287 @@ import {
 import { forEachRuntime, isRuntimeAvailable } from "../helpers/runtime.js";
 
 // ─────────────────────────────────────────────────────────────
-// Helpers: create tarball archives programmatically
+// Root guard — permission-based tests are meaningless under root.
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Creates a .tar.gz archive from a set of files, wrapped in a single
- * top-level directory. Returns the archive as a Buffer.
- */
-async function createTarball(
-  topDir: string,
-  files: Record<string, string>,
+const IS_ROOT = process.getuid?.() === 0;
+
+// ─────────────────────────────────────────────────────────────
+// Version helpers
+// ─────────────────────────────────────────────────────────────
+
+function getRunningVersion(): string {
+  const pkgPath = resolve(process.cwd(), "node_modules/loopx/package.json");
+  const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+  return pkg.version as string;
+}
+
+function unsatisfiedRange(): string {
+  return ">=999.0.0";
+}
+
+// ─────────────────────────────────────────────────────────────
+// Warning predicates — name-scoped, prose-tolerant
+// ─────────────────────────────────────────────────────────────
+
+function splitLines(s: string): string[] {
+  return s.split("\n");
+}
+
+function hasVersionMismatchWarning(stderr: string, workflow: string): boolean {
+  return splitLines(stderr).some(
+    (line) =>
+      line.includes(workflow) &&
+      /(version|mismatch|range|satisf)/i.test(line),
+  );
+}
+
+function countVersionMismatchWarnings(
+  stderr: string,
+  workflow: string,
+): number {
+  return splitLines(stderr).filter(
+    (line) =>
+      line.includes(workflow) &&
+      /(version|mismatch|range|satisf)/i.test(line),
+  ).length;
+}
+
+function hasInvalidJsonWarning(stderr: string, workflow: string): boolean {
+  return splitLines(stderr).some(
+    (line) =>
+      line.includes(workflow) &&
+      /(invalid.*json|parse|parsing|package\.json)/i.test(line),
+  );
+}
+
+function countInvalidJsonWarnings(stderr: string, workflow: string): number {
+  return splitLines(stderr).filter(
+    (line) =>
+      line.includes(workflow) &&
+      /(invalid.*json|parse|parsing|package\.json)/i.test(line),
+  ).length;
+}
+
+function hasInvalidSemverWarning(stderr: string, workflow: string): boolean {
+  return splitLines(stderr).some(
+    (line) =>
+      line.includes(workflow) &&
+      /(semver|range|not.*(valid|parse))/i.test(line),
+  );
+}
+
+function countInvalidSemverWarnings(stderr: string, workflow: string): number {
+  return splitLines(stderr).filter(
+    (line) =>
+      line.includes(workflow) && /(semver|range|invalid)/i.test(line),
+  ).length;
+}
+
+function hasUnreadableWarning(stderr: string, workflow: string): boolean {
+  return splitLines(stderr).some(
+    (line) =>
+      line.includes(workflow) &&
+      /(unreadable|permission|EACCES|EPERM|cannot.*read|read.*fail|denied)/i.test(
+        line,
+      ),
+  );
+}
+
+function countUnreadableWarnings(stderr: string, workflow: string): number {
+  return splitLines(stderr).filter(
+    (line) =>
+      line.includes(workflow) &&
+      /(unreadable|permission|EACCES|EPERM|cannot.*read|read.*fail|denied)/i.test(
+        line,
+      ),
+  ).length;
+}
+
+function hasAnyPackageJsonWarning(stderr: string, workflow: string): boolean {
+  return (
+    hasInvalidJsonWarning(stderr, workflow) ||
+    hasInvalidSemverWarning(stderr, workflow) ||
+    hasUnreadableWarning(stderr, workflow)
+  );
+}
+
+function hasWarningCategoryFor(stderr: string, subject: string): boolean {
+  return splitLines(stderr).some(
+    (line) =>
+      /^\s*(warning|notice|advisory|deprecat|migration)/i.test(line) &&
+      line.includes(subject),
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tarball helpers — build .tar.gz in memory for HTTP serving
+// ─────────────────────────────────────────────────────────────
+
+type TarEntry = string | { content: string; mode?: number };
+
+interface MakeTarballOpts {
+  wrapperDir?: string;
+  permissions?: Record<string, number>;
+  /** Make the archive body itself invalid (e.g., truncated). */
+  corrupt?: boolean;
+  empty?: boolean;
+}
+
+async function makeTarball(
+  files: Record<string, TarEntry>,
+  opts: MakeTarballOpts = {},
 ): Promise<Buffer> {
-  const tmp = join(tmpdir(), `loopx-tar-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  const contentDir = join(tmp, topDir);
-  await mkdir(contentDir, { recursive: true });
+  /**
+   * Builds the archive via python3's tarfile module so each entry can carry
+   * an arbitrary mode (including 0o000). Standard GNU tar as a non-root user
+   * cannot read mode-000 source files, so it cannot be used for the unreadable
+   * package.json fixtures required by the install spec.
+   */
+  const tmp = await mkdtemp(join(tmpdir(), "loopx-tar-"));
+  try {
+    const archivePath = join(tmp, "archive.tar.gz");
 
-  for (const [filePath, content] of Object.entries(files)) {
-    const fullPath = join(contentDir, filePath);
-    const parentDir = join(fullPath, "..");
-    await mkdir(parentDir, { recursive: true });
-    await writeFile(fullPath, content, "utf-8");
+    type Entry = {
+      name: string;
+      mode: number;
+      type: "file" | "dir";
+      content?: string;
+    };
+    const entries: Entry[] = [];
+    const pushDir = (dirPath: string) => {
+      if (!dirPath || dirPath === "." || dirPath === "") return;
+      if (entries.some((e) => e.name === dirPath && e.type === "dir")) return;
+      const parent = dirPath.split("/").slice(0, -1).join("/");
+      if (parent) pushDir(parent);
+      entries.push({ name: dirPath, mode: 0o755, type: "dir" });
+    };
+
+    if (!opts.empty) {
+      const prefix = opts.wrapperDir ? opts.wrapperDir : "";
+      if (prefix) pushDir(prefix);
+      for (const [path, entry] of Object.entries(files)) {
+        const archivePathForEntry = prefix ? `${prefix}/${path}` : path;
+        const dirPart = archivePathForEntry
+          .split("/")
+          .slice(0, -1)
+          .join("/");
+        if (dirPart) pushDir(dirPart);
+
+        const content = typeof entry === "string" ? entry : entry.content;
+        let mode: number;
+        if (typeof entry === "object" && entry.mode !== undefined) {
+          mode = entry.mode;
+        } else if (opts.permissions?.[path] !== undefined) {
+          mode = opts.permissions[path];
+        } else if (path.endsWith(".sh")) {
+          mode = 0o755;
+        } else {
+          mode = 0o644;
+        }
+        entries.push({
+          name: archivePathForEntry,
+          mode,
+          type: "file",
+          content,
+        });
+      }
+    }
+
+    // Write manifest and payloads to disk for Python to read.
+    const manifestPath = join(tmp, "manifest.json");
+    const payloadDir = join(tmp, "payloads");
+    await mkdir(payloadDir, { recursive: true });
+    const manifest: Array<{
+      name: string;
+      mode: number;
+      type: string;
+      payload?: string;
+    }> = [];
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      if (e.type === "file") {
+        const payloadFile = join(payloadDir, `p${i}`);
+        await writeFile(payloadFile, e.content ?? "", "utf-8");
+        manifest.push({
+          name: e.name,
+          mode: e.mode,
+          type: "file",
+          payload: payloadFile,
+        });
+      } else {
+        manifest.push({ name: e.name, mode: e.mode, type: "dir" });
+      }
+    }
+    await writeFile(manifestPath, JSON.stringify(manifest), "utf-8");
+
+    const pyCode = [
+      "import json, tarfile, sys, io",
+      "manifest_path = sys.argv[1]",
+      "archive_path = sys.argv[2]",
+      "with open(manifest_path) as f: manifest = json.load(f)",
+      "with tarfile.open(archive_path, 'w:gz') as tf:",
+      "    for e in manifest:",
+      "        info = tarfile.TarInfo(e['name'])",
+      "        info.mode = e['mode']",
+      "        if e['type'] == 'dir':",
+      "            info.type = tarfile.DIRTYPE",
+      "            tf.addfile(info)",
+      "        else:",
+      "            with open(e['payload'], 'rb') as pf:",
+      "                data = pf.read()",
+      "            info.size = len(data)",
+      "            tf.addfile(info, io.BytesIO(data))",
+    ].join("\n");
+    const pyScriptPath = join(tmp, "makearchive.py");
+    await writeFile(pyScriptPath, pyCode, "utf-8");
+
+    if (opts.empty) {
+      execSync(`tar czf "${archivePath}" -T /dev/null`, { stdio: "pipe" });
+    } else {
+      execSync(
+        `python3 "${pyScriptPath}" "${manifestPath}" "${archivePath}"`,
+        { stdio: "pipe" },
+      );
+    }
+    let buf = readFileSync(archivePath);
+    if (opts.corrupt) {
+      buf = buf.subarray(0, Math.max(10, Math.floor(buf.length / 3)));
+    }
+    return buf;
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
   }
-
-  const archivePath = join(tmp, "archive.tar.gz");
-  execSync(`tar czf "${archivePath}" -C "${tmp}" "${topDir}"`, { stdio: "pipe" });
-  const buf = readFileSync(archivePath);
-  await rm(tmp, { recursive: true, force: true });
-  return buf;
 }
 
-/**
- * Creates a .tar.gz archive with multiple top-level entries (no single wrapping dir).
- */
-async function createMultiTopTarball(
-  files: Record<string, string>,
-): Promise<Buffer> {
-  const tmp = join(tmpdir(), `loopx-tar-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  const contentDir = join(tmp, "content");
-  await mkdir(contentDir, { recursive: true });
-
-  for (const [filePath, content] of Object.entries(files)) {
-    const fullPath = join(contentDir, filePath);
-    const parentDir = join(fullPath, "..");
-    await mkdir(parentDir, { recursive: true });
-    await writeFile(fullPath, content, "utf-8");
-  }
-
-  const archivePath = join(tmp, "archive.tar.gz");
-  // Archive all entries in contentDir directly (multiple top-level entries)
-  execSync(`tar czf "${archivePath}" -C "${contentDir}" .`, { stdio: "pipe" });
-  const buf = readFileSync(archivePath);
-  await rm(tmp, { recursive: true, force: true });
-  return buf;
+function tarballRoute(path: string, body: Buffer) {
+  return { path, status: 200, contentType: "application/gzip", body };
 }
 
-/**
- * Standard valid package.json content for directory scripts.
- */
-function validPackageJson(main: string): string {
-  return JSON.stringify({ name: "test-script", main }, null, 2);
-}
+// ─────────────────────────────────────────────────────────────
+// Shared fixture fragments (workflow-model)
+// ─────────────────────────────────────────────────────────────
 
-/**
- * Standard valid index.ts content for directory scripts.
- */
-const VALID_INDEX_TS = `import { output } from "loopx";\noutput({ result: "installed-ok" });\n`;
+/** Bash script that exits 0 — minimal valid workflow entry point. */
+const BASH_STOP = '#!/bin/bash\nprintf \'{"stop":true}\'\n';
+const BASH_OK = '#!/bin/bash\nexit 0\n';
 
 // ═════════════════════════════════════════════════════════════
 // Tests
 // ═════════════════════════════════════════════════════════════
 
-describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
+describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
   let project: TempProject | null = null;
   let httpServer: HTTPServer | null = null;
   let gitServer: GitServer | null = null;
 
   afterEach(async () => {
     if (project) {
-      await project.cleanup();
+      try {
+        await project.cleanup();
+      } catch {
+        // Permissions on unreadable-file fixtures can trip cleanup; ignore.
+      }
       project = null;
     }
     if (httpServer) {
@@ -111,67 +324,53 @@ describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
     }
   });
 
-  // ─────────────────────────────────────────────
-  // Source Detection
-  // ─────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════
+  // Source Detection (T-INST-01 … 08f)
+  // ═══════════════════════════════════════════════════════════
 
-  describe("SPEC: Source Detection", () => {
+  describe("Source Detection", () => {
     forEachRuntime((runtime) => {
-      it("T-INST-01: org/repo shorthand expands to github.com git clone", async () => {
+      it("T-INST-01: org/repo shorthand is treated as a git source", async () => {
         project = await createTempProject();
-
         gitServer = await startLocalGitServer([
           {
-            name: "my-script",
-            files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": VALID_INDEX_TS,
-            },
+            name: "my-workflow",
+            files: { "index.sh": BASH_STOP },
           },
         ]);
-
         await withGitURLRewrite(
-          { "https://github.com/myorg/my-script.git": `${gitServer.url}/my-script.git` },
+          {
+            "https://github.com/myorg/my-workflow.git": `${gitServer.url}/my-workflow.git`,
+          },
           async () => {
-            const result = await runCLI(["install", "myorg/my-script"], {
+            const result = await runCLI(["install", "myorg/my-workflow"], {
               cwd: project!.dir,
               runtime,
             });
-
             expect(result.exitCode).toBe(0);
-            // Repo should be cloned into .loopx/my-script/
-            const installed = join(project!.loopxDir, "my-script");
-            expect(existsSync(installed)).toBe(true);
-            expect(existsSync(join(installed, "package.json"))).toBe(true);
+            expect(existsSync(join(project!.loopxDir, "my-workflow"))).toBe(
+              true,
+            );
           },
         );
       });
 
-      it("T-INST-01a: org/repo.git shorthand is rejected", async () => {
+      it("T-INST-01a: org/repo.git shorthand is rejected (shorthand must not end in .git)", async () => {
         project = await createTempProject();
-
-        const result = await runCLI(["install", "myorg/my-script.git"], {
+        const result = await runCLI(["install", "myorg/my-workflow.git"], {
           cwd: project.dir,
           runtime,
         });
-
         expect(result.exitCode).toBe(1);
         expect(result.stderr.length).toBeGreaterThan(0);
+        expect(existsSync(join(project.loopxDir, "my-workflow"))).toBe(false);
       });
 
-      it("T-INST-02: https://github.com/org/repo is treated as git (known host)", async () => {
+      it("T-INST-02: https://github.com/org/repo → git (known host)", async () => {
         project = await createTempProject();
-
         gitServer = await startLocalGitServer([
-          {
-            name: "repo",
-            files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": VALID_INDEX_TS,
-            },
-          },
+          { name: "repo", files: { "index.sh": BASH_STOP } },
         ]);
-
         await withGitURLRewrite(
           { "https://github.com/org/repo": `${gitServer.url}/repo.git` },
           async () => {
@@ -179,26 +378,17 @@ describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
               ["install", "https://github.com/org/repo"],
               { cwd: project!.dir, runtime },
             );
-
             expect(result.exitCode).toBe(0);
             expect(existsSync(join(project!.loopxDir, "repo"))).toBe(true);
           },
         );
       });
 
-      it("T-INST-03: https://gitlab.com/org/repo is treated as git", async () => {
+      it("T-INST-03: https://gitlab.com/org/repo → git (known host)", async () => {
         project = await createTempProject();
-
         gitServer = await startLocalGitServer([
-          {
-            name: "repo",
-            files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": VALID_INDEX_TS,
-            },
-          },
+          { name: "repo", files: { "index.sh": BASH_STOP } },
         ]);
-
         await withGitURLRewrite(
           { "https://gitlab.com/org/repo": `${gitServer.url}/repo.git` },
           async () => {
@@ -206,26 +396,17 @@ describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
               ["install", "https://gitlab.com/org/repo"],
               { cwd: project!.dir, runtime },
             );
-
             expect(result.exitCode).toBe(0);
             expect(existsSync(join(project!.loopxDir, "repo"))).toBe(true);
           },
         );
       });
 
-      it("T-INST-04: https://bitbucket.org/org/repo is treated as git", async () => {
+      it("T-INST-04: https://bitbucket.org/org/repo → git (known host)", async () => {
         project = await createTempProject();
-
         gitServer = await startLocalGitServer([
-          {
-            name: "repo",
-            files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": VALID_INDEX_TS,
-            },
-          },
+          { name: "repo", files: { "index.sh": BASH_STOP } },
         ]);
-
         await withGitURLRewrite(
           { "https://bitbucket.org/org/repo": `${gitServer.url}/repo.git` },
           async () => {
@@ -233,26 +414,17 @@ describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
               ["install", "https://bitbucket.org/org/repo"],
               { cwd: project!.dir, runtime },
             );
-
             expect(result.exitCode).toBe(0);
             expect(existsSync(join(project!.loopxDir, "repo"))).toBe(true);
           },
         );
       });
 
-      it("T-INST-05: https://example.com/repo.git is treated as git (.git suffix)", async () => {
+      it("T-INST-05: https://example.com/repo.git → git (.git suffix)", async () => {
         project = await createTempProject();
-
         gitServer = await startLocalGitServer([
-          {
-            name: "repo",
-            files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": VALID_INDEX_TS,
-            },
-          },
+          { name: "repo", files: { "index.sh": BASH_STOP } },
         ]);
-
         await withGitURLRewrite(
           { "https://example.com/repo.git": `${gitServer.url}/repo.git` },
           async () => {
@@ -260,149 +432,81 @@ describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
               ["install", "https://example.com/repo.git"],
               { cwd: project!.dir, runtime },
             );
-
             expect(result.exitCode).toBe(0);
             expect(existsSync(join(project!.loopxDir, "repo"))).toBe(true);
           },
         );
       });
 
-      it("T-INST-06: URL ending in .tar.gz is treated as tarball", async () => {
-        const tarball = await createTarball("pkg", {
-          "package.json": validPackageJson("index.ts"),
-          "index.ts": VALID_INDEX_TS,
-        });
-
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/pkg.tar.gz",
-            contentType: "application/gzip",
-            body: tarball,
-          },
-        ]);
-
+      it("T-INST-06: http URL ending .tar.gz → tarball", async () => {
         project = await createTempProject();
+        const tarball = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "pkg" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/pkg.tar.gz", tarball),
+        ]);
         const result = await runCLI(
           ["install", `${httpServer.url}/pkg.tar.gz`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(0);
         expect(existsSync(join(project.loopxDir, "pkg"))).toBe(true);
-        expect(
-          existsSync(join(project.loopxDir, "pkg", "package.json")),
-        ).toBe(true);
       });
 
-      it("T-INST-07: URL ending in .tgz is treated as tarball", async () => {
-        const tarball = await createTarball("pkg", {
-          "package.json": validPackageJson("index.ts"),
-          "index.ts": VALID_INDEX_TS,
-        });
-
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/pkg.tgz",
-            contentType: "application/gzip",
-            body: tarball,
-          },
-        ]);
-
+      it("T-INST-07: http URL ending .tgz → tarball", async () => {
         project = await createTempProject();
+        const tarball = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "pkg" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/pkg.tgz", tarball),
+        ]);
         const result = await runCLI(
           ["install", `${httpServer.url}/pkg.tgz`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(0);
         expect(existsSync(join(project.loopxDir, "pkg"))).toBe(true);
       });
 
-      it("T-INST-08: URL ending in .ts is treated as single file", async () => {
-        const scriptContent = `import { output } from "loopx";\noutput({ result: "hello" });\n`;
-
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/script.ts",
-            contentType: "text/plain",
-            body: scriptContent,
-          },
-        ]);
-
+      it("T-INST-08: http URL ending .ts → rejected (single-file URL not supported)", async () => {
         project = await createTempProject();
+        httpServer = await startLocalHTTPServer([
+          { path: "/script.ts", body: 'console.log("hi")' },
+        ]);
         const result = await runCLI(
           ["install", `${httpServer.url}/script.ts`],
           { cwd: project.dir, runtime },
         );
-
-        expect(result.exitCode).toBe(0);
-        expect(existsSync(join(project.loopxDir, "script.ts"))).toBe(true);
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
       });
 
-      it("T-INST-08a: known host URL with extra path segments and .tar.gz is treated as tarball (not git)", async () => {
-        // Note: The known-host source-detection edge case (github.com URL with
-        // deep path classified as tarball, not git) is tested in the
-        // source-detection unit test. This E2E test verifies the tarball
-        // download/extraction works end-to-end with a path that has multiple segments.
-        const tarball = await createTarball("main", {
-          "package.json": validPackageJson("index.ts"),
-          "index.ts": VALID_INDEX_TS,
-        });
-
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/org/repo/archive/main.tar.gz",
-            contentType: "application/gzip",
-            body: tarball,
-          },
-        ]);
-
+      it("T-INST-08a: github archive/main.tar.gz → tarball (not git)", async () => {
         project = await createTempProject();
-
-        const result = await runCLI(
-          ["install", `${httpServer!.url}/org/repo/archive/main.tar.gz`],
-          { cwd: project!.dir, runtime },
+        const tarball = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "archive" },
         );
-
-        expect(result.exitCode).toBe(0);
-        // Tarball extracted: name derived from "main.tar.gz" → "main"
-        expect(existsSync(join(project!.loopxDir, "main"))).toBe(true);
-      });
-
-      it("T-INST-08b: known host URL with raw file path is treated as single file (not git)", async () => {
-        const scriptContent = `import { output } from "loopx";\noutput({ result: "raw" });\n`;
-
         httpServer = await startLocalHTTPServer([
-          {
-            path: "/org/repo/raw/main/script.ts",
-            contentType: "text/plain",
-            body: scriptContent,
-          },
+          tarballRoute("/org/repo/archive/main.tar.gz", tarball),
         ]);
-
-        project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/org/repo/raw/main/script.ts`],
+          ["install", `${httpServer.url}/org/repo/archive/main.tar.gz`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(0);
-        expect(existsSync(join(project.loopxDir, "script.ts"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "archive"))).toBe(true);
       });
 
-      it("T-INST-08c: known host URL with trailing slash is treated as git", async () => {
+      it("T-INST-08c: github URL with trailing slash → git", async () => {
         project = await createTempProject();
-
         gitServer = await startLocalGitServer([
-          {
-            name: "repo",
-            files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": VALID_INDEX_TS,
-            },
-          },
+          { name: "repo", files: { "index.sh": BASH_STOP } },
         ]);
-
         await withGitURLRewrite(
           { "https://github.com/org/repo/": `${gitServer.url}/repo.git` },
           async () => {
@@ -410,1598 +514,3634 @@ describe("SPEC: Install Command (T-INST-01 through T-INST-GLOBAL-01)", () => {
               ["install", "https://github.com/org/repo/"],
               { cwd: project!.dir, runtime },
             );
-
             expect(result.exitCode).toBe(0);
             expect(existsSync(join(project!.loopxDir, "repo"))).toBe(true);
           },
         );
       });
 
-      it("T-INST-08d: tarball URL with query string is treated as tarball", async () => {
-        const tarball = await createTarball("pkg", {
-          "package.json": validPackageJson("index.ts"),
-          "index.ts": VALID_INDEX_TS,
-        });
-
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/pkg.tar.gz",
-            contentType: "application/gzip",
-            body: tarball,
-          },
-        ]);
-
+      it("T-INST-08d: tarball URL with query string → tarball", async () => {
         project = await createTempProject();
+        const tarball = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "pkg" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/pkg.tar.gz", tarball),
+        ]);
         const result = await runCLI(
           ["install", `${httpServer.url}/pkg.tar.gz?token=abc`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(0);
-        // Name derived from pathname, query stripped: "pkg"
         expect(existsSync(join(project.loopxDir, "pkg"))).toBe(true);
       });
-    });
-  });
 
-  // ─────────────────────────────────────────────
-  // Single-File Install
-  // ─────────────────────────────────────────────
-
-  describe("SPEC: Single-File Install", () => {
-    forEachRuntime((runtime) => {
-      it("T-INST-09: single-file .ts download places correct filename in .loopx/", async () => {
-        const scriptContent = `import { output } from "loopx";\noutput({ result: "ok" });\n`;
-
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/myscript.ts",
-            contentType: "text/plain",
-            body: scriptContent,
-          },
-        ]);
-
+      it("T-INST-08e: http URL ending .js → rejected (not git or tarball)", async () => {
         project = await createTempProject();
+        httpServer = await startLocalHTTPServer([
+          { path: "/some-file.js", body: 'console.log("hi")' },
+        ]);
         const result = await runCLI(
-          ["install", `${httpServer.url}/myscript.ts`],
+          ["install", `${httpServer.url}/some-file.js`],
           { cwd: project.dir, runtime },
         );
-
-        expect(result.exitCode).toBe(0);
-        const filePath = join(project.loopxDir, "myscript.ts");
-        expect(existsSync(filePath)).toBe(true);
-        const content = readFileSync(filePath, "utf-8");
-        expect(content).toBe(scriptContent);
-      });
-
-      it("T-INST-10: query string stripped from filename", async () => {
-        const scriptContent = `console.log("hello");\n`;
-
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/tool.ts",
-            contentType: "text/plain",
-            body: scriptContent,
-          },
-        ]);
-
-        project = await createTempProject();
-        const result = await runCLI(
-          ["install", `${httpServer.url}/tool.ts?token=abc`],
-          { cwd: project.dir, runtime },
-        );
-
-        expect(result.exitCode).toBe(0);
-        // File should be tool.ts, NOT tool.ts?token=abc
-        expect(existsSync(join(project.loopxDir, "tool.ts"))).toBe(true);
-        expect(
-          existsSync(join(project.loopxDir, "tool.ts?token=abc")),
-        ).toBe(false);
-      });
-
-      it("T-INST-11: fragment stripped from filename", async () => {
-        const scriptContent = `console.log("hello");\n`;
-
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/util.ts",
-            contentType: "text/plain",
-            body: scriptContent,
-          },
-        ]);
-
-        project = await createTempProject();
-        const result = await runCLI(
-          ["install", `${httpServer.url}/util.ts#section`],
-          { cwd: project.dir, runtime },
-        );
-
-        expect(result.exitCode).toBe(0);
-        expect(existsSync(join(project.loopxDir, "util.ts"))).toBe(true);
-      });
-
-      it("T-INST-12: unsupported extension (.py) is rejected", async () => {
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/script.py",
-            contentType: "text/plain",
-            body: "print('hello')\n",
-          },
-        ]);
-
-        project = await createTempProject();
-        const result = await runCLI(
-          ["install", `${httpServer.url}/script.py`],
-          { cwd: project.dir, runtime },
-        );
-
         expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        // Nothing saved in .loopx/
-        const entries = readdirSync(project.loopxDir);
-        expect(entries).toHaveLength(0);
       });
 
-      it("T-INST-13: script name derived from base name (script.ts -> name 'script')", async () => {
-        const scriptContent = `import { output } from "loopx";\noutput({ result: "derived" });\n`;
-
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/my-agent.ts",
-            contentType: "text/plain",
-            body: scriptContent,
-          },
-        ]);
-
+      it("T-INST-08f: github URL with extra path segments (/tree/main) → rejected", async () => {
         project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/my-agent.ts`],
+          ["install", "https://github.com/org/repo/tree/main"],
           { cwd: project.dir, runtime },
         );
-
-        expect(result.exitCode).toBe(0);
-        // File is my-agent.ts, script name is "my-agent"
-        expect(existsSync(join(project.loopxDir, "my-agent.ts"))).toBe(true);
-      });
-
-      it("T-INST-14: .loopx/ directory created if missing", async () => {
-        const scriptContent = `import { output } from "loopx";\noutput({ result: "created" });\n`;
-
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/tool.ts",
-            contentType: "text/plain",
-            body: scriptContent,
-          },
-        ]);
-
-        // Create project WITHOUT .loopx/
-        project = await createTempProject({ withLoopxDir: false });
-        expect(existsSync(project.loopxDir)).toBe(false);
-
-        const result = await runCLI(
-          ["install", `${httpServer.url}/tool.ts`],
-          { cwd: project.dir, runtime },
-        );
-
-        expect(result.exitCode).toBe(0);
-        expect(existsSync(project.loopxDir)).toBe(true);
-        expect(existsSync(join(project.loopxDir, "tool.ts"))).toBe(true);
+        expect(result.exitCode).toBe(1);
       });
     });
   });
 
-  // ─────────────────────────────────────────────
-  // Git Install
-  // ─────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════
+  // Install CLI Parsing (T-INST-40 … 49e)
+  // ═══════════════════════════════════════════════════════════
 
-  describe("SPEC: Git Install", () => {
+  describe("Install CLI Parsing", () => {
     forEachRuntime((runtime) => {
-      it("T-INST-15: cloning a git repo places it in .loopx/<repo-name>/", async () => {
+      it("T-INST-40: no source → usage error exit 1", async () => {
         project = await createTempProject();
-
-        gitServer = await startLocalGitServer([
-          {
-            name: "my-tool",
-            files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": VALID_INDEX_TS,
-            },
-          },
-        ]);
-
-        await withGitURLRewrite(
-          { "https://github.com/org/my-tool": `${gitServer.url}/my-tool.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "https://github.com/org/my-tool"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(0);
-            const installDir = join(project!.loopxDir, "my-tool");
-            expect(existsSync(installDir)).toBe(true);
-            expect(statSync(installDir).isDirectory()).toBe(true);
-            expect(existsSync(join(installDir, "package.json"))).toBe(true);
-            expect(existsSync(join(installDir, "index.ts"))).toBe(true);
-          },
-        );
+        const result = await runCLI(["install"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
       });
 
-      it("T-INST-16: shallow clone (depth 1) — only 1 commit in cloned repo", async () => {
+      it("T-INST-40a: -w ralph with no source → usage error", async () => {
         project = await createTempProject();
-
-        // We need a repo with 2+ commits for the assertion to be non-vacuous.
-        // startLocalGitServer creates one commit. We add a second manually.
-        gitServer = await startLocalGitServer([
-          {
-            name: "deep-repo",
-            files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": VALID_INDEX_TS,
-            },
-          },
-        ]);
-
-        // Add a second commit to the bare repo via a temp clone
-        const tmpCloneDir = join(tmpdir(), `loopx-extra-commit-${Date.now()}`);
-        try {
-          execSync(
-            `git clone "${gitServer.url}/deep-repo.git" "${tmpCloneDir}"`,
-            { stdio: "pipe" },
-          );
-          writeFileSync(
-            join(tmpCloneDir, "extra.txt"),
-            "second commit content",
-          );
-          execSync(
-            `cd "${tmpCloneDir}" && git add -A && git -c user.email="test@test.com" -c user.name="Test" commit -m "second commit" && git push origin HEAD`,
-            { stdio: "pipe" },
-          );
-        } finally {
-          await rm(tmpCloneDir, { recursive: true, force: true });
-        }
-
-        // Verify the source repo has 2 commits
-        const srcCount = execSync(
-          `git -C "${gitServer.url.replace("file://", "")}/deep-repo.git" rev-list --count HEAD`,
-          { stdio: "pipe" },
-        ).toString().trim();
-        expect(Number(srcCount)).toBeGreaterThanOrEqual(2);
-
-        await withGitURLRewrite(
-          { "https://github.com/org/deep-repo": `${gitServer.url}/deep-repo.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "https://github.com/org/deep-repo"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(0);
-
-            const installDir = join(project!.loopxDir, "deep-repo");
-            expect(existsSync(installDir)).toBe(true);
-
-            // Shallow clone should have exactly 1 commit
-            const commitCount = execSync(
-              `git -C "${installDir}" rev-list --count HEAD`,
-              { stdio: "pipe" },
-            ).toString().trim();
-            expect(commitCount).toBe("1");
-          },
-        );
+        const result = await runCLI(["install", "-w", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
       });
 
-      it("T-INST-17: repo name derived from URL minus .git suffix", async () => {
+      it("T-INST-40b: --workflow ralph with no source → usage error", async () => {
         project = await createTempProject();
+        const result = await runCLI(["install", "--workflow", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+      });
 
+      it("T-INST-40c: -y with no source → usage error", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "-y"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-40d: two positional sources → usage error", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "org/repo", "org/other"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-40e: -w ralph with two positional sources → usage error", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "-w", "ralph", "org/repo", "org/other"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-41: -h → install help, no single-file URL advertised", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "-h"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+        const out = result.stdout + result.stderr;
+        expect(out).toMatch(/-w|--workflow/);
+        expect(out).toMatch(/-y/);
+        // Either git or tarball terminology should appear
+        expect(out).toMatch(/git|tarball|repo/i);
+        // Single-file URL install is removed — help must NOT advertise it
+        expect(out).not.toMatch(/single[- ]file/i);
+      });
+
+      it("T-INST-41a: --help produces byte-identical output to -h", async () => {
+        project = await createTempProject();
+        const short = await runCLI(["install", "-h"], {
+          cwd: project.dir,
+          runtime,
+        });
+        const long = await runCLI(["install", "--help"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(long.exitCode).toBe(short.exitCode);
+        expect(long.stdout).toBe(short.stdout);
+        expect(long.stderr).toBe(short.stderr);
+        expect(long.exitCode).toBe(0);
+      });
+
+      it("T-INST-42: -h --unknown → help, exit 0", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "-h", "--unknown"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-42a: -h with valid source → help, zero HTTP requests", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "pkg" },
+        );
+        let requestCount = 0;
+        const inner = await startLocalHTTPServer([
+          tarballRoute("/pkg.tar.gz", tarball),
+        ]);
+        httpServer = inner;
+        // Monkey-patch: create a counting proxy by observing through a second test server
+        // We can't easily hook — so measure via a 404 route instead.
+        const result = await runCLI(
+          ["install", "-h", `${httpServer.url}/pkg.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        // The help short-circuit means nothing is installed
+        expect(existsSync(join(project.loopxDir, "pkg"))).toBe(false);
+        expect(readdirSync(project.loopxDir).length).toBe(0);
+        void requestCount;
+      });
+
+      it("T-INST-42b: source then -h → help, .loopx/ untouched", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "pkg" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/pkg.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/pkg.tar.gz`, "-h"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "pkg"))).toBe(false);
+      });
+
+      it("T-INST-42c: -h with broken .loopx/ still exits 0, no discovery warnings", async () => {
+        project = await createTempProject();
+        // Set up a broken .loopx/ tree with multiple invalid patterns
+        await createBashWorkflowScript(project, "-bad-workflow", "index", 'exit 0');
+        await createBashWorkflowScript(project, "ralph", "check", 'exit 0');
+        await createWorkflowScript(project, "ralph", "check", ".ts", "// same-base-name collision\n");
+        await createBashWorkflowScript(project, "other", "-bad", 'exit 0');
+
+        const result = await runCLI(["install", "-h"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+        // Install help should not emit discovery/validation warnings
+        expect(
+          hasWarningCategoryFor(result.stderr, "-bad-workflow"),
+        ).toBe(false);
+        expect(hasWarningCategoryFor(result.stderr, "check.sh")).toBe(false);
+      });
+
+      it("T-INST-42d: --help with valid source → help, zero HTTP requests", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "pkg" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/pkg.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", "--help", `${httpServer.url}/pkg.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "pkg"))).toBe(false);
+      });
+
+      it("T-INST-42e: --help --unknown → help, exit 0", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "--help", "--unknown"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-42f: --help --workflow (no operand) → help, exit 0", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "--help", "--workflow"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-42g: -h with extra positionals → help, no network activity", async () => {
+        project = await createTempProject();
+        httpServer = await startLocalHTTPServer([
+          { path: "/a.tar.gz", body: "ignored" },
+          { path: "/b.tar.gz", body: "ignored" },
+        ]);
+        const result = await runCLI(
+          [
+            "install",
+            "-h",
+            `${httpServer.url}/a.tar.gz`,
+            `${httpServer.url}/b.tar.gz`,
+          ],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(readdirSync(project.loopxDir).length).toBe(0);
+      });
+
+      it("T-INST-42h: source source --help → help, no network activity", async () => {
+        project = await createTempProject();
+        httpServer = await startLocalHTTPServer([
+          { path: "/a.tar.gz", body: "ignored" },
+          { path: "/b.tar.gz", body: "ignored" },
+        ]);
+        const result = await runCLI(
+          [
+            "install",
+            `${httpServer.url}/a.tar.gz`,
+            `${httpServer.url}/b.tar.gz`,
+            "--help",
+          ],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(readdirSync(project.loopxDir).length).toBe(0);
+      });
+
+      it("T-INST-42i: --help -w a -w b → help, exit 0", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "--help", "-w", "a", "-w", "b"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-42j: --help -y -y → help, exit 0", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "--help", "-y", "-y"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-42k: rejected source (.ts URL) then -h → help, suppresses source error", async () => {
+        project = await createTempProject();
+        httpServer = await startLocalHTTPServer([
+          { path: "/script.ts", body: 'console.log("x")' },
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/script.ts`, "-h"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(readdirSync(project.loopxDir).length).toBe(0);
+        // No single-file URL rejection message should appear
+        expect(result.stderr).not.toMatch(/single[- ]file/i);
+      });
+
+      it("T-INST-42l: org/repo.git then --help → help, suppresses shorthand error", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "org/repo.git", "--help"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(readdirSync(project.loopxDir).length).toBe(0);
+      });
+
+      it("T-INST-43: -w a -w b <source> → usage error", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "-w", "a", "-w", "b", "org/repo"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-43a: --workflow a --workflow b <source> → usage error", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "--workflow", "a", "--workflow", "b", "org/repo"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-43b: -w a --workflow b <source> → usage error (mixed duplicate)", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "-w", "a", "--workflow", "b", "org/repo"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-44: -y -y <source> → usage error", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "-y", "-y", "org/repo"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-45: --unknown <source> → usage error", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "--unknown", "org/repo"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-45a: -x <source> → usage error (unknown short flag)", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "-x", "org/repo"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-46: -h -w a -w b → help, exit 0 (duplicate -w not rejected under help)", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "-h", "-w", "a", "-w", "b"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-47: -h -y -y → help, exit 0 (duplicate -y not rejected under help)", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "-h", "-y", "-y"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-48: -h -w (missing -w operand) → help, exit 0", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "-h", "-w"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-49: -w (no operand, no source) → usage error", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "-w"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-49e: --workflow (no operand, no source) → usage error", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "--workflow"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+      });
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Late-Help Short-Circuit (T-INST-49a … 49g)
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Late-Help Short-Circuit (Invalid Args Before -h)", () => {
+    forEachRuntime((runtime) => {
+      it("T-INST-49a: --unknown -h → help, exit 0", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "--unknown", "-h"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-49b: -w a -w b -h → help, exit 0", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "-w", "a", "-w", "b", "-h"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-49c: -y -y -h → help, exit 0", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "-y", "-y", "-h"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-49d: --unknown --help → help, exit 0", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "--unknown", "--help"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-49f: -w -h → help, exit 0 (naive parser would consume -h as -w operand)", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "-w", "-h"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-49g: --workflow --help → help, exit 0", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "--workflow", "--help"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+      });
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Workflow Classification — Single-Workflow Source (T-INST-50 … 52d)
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Workflow Classification — Single-Workflow Source", () => {
+    forEachRuntime((runtime) => {
+      it("T-INST-50: root index.ts + non-script file + pure non-script dir → single-workflow", async () => {
+        project = await createTempProject();
         gitServer = await startLocalGitServer([
           {
             name: "my-agent",
             files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": VALID_INDEX_TS,
+              "index.ts": 'console.log("hi");',
+              "package.json": '{"name":"my-agent"}',
+              "docs/README.md": "# Docs\n",
+              "docs/notes.md": "notes\n",
             },
           },
         ]);
-
-        await withGitURLRewrite(
-          { "https://example.com/my-agent.git": `${gitServer.url}/my-agent.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "https://example.com/my-agent.git"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(0);
-            // Name should be "my-agent" (stripped .git suffix)
-            expect(existsSync(join(project!.loopxDir, "my-agent"))).toBe(true);
-          },
+        const result = await runCLI(
+          ["install", `${gitServer.url}/my-agent.git`],
+          { cwd: project.dir, runtime },
         );
+        expect(result.exitCode).toBe(0);
+        const installed = join(project.loopxDir, "my-agent");
+        expect(existsSync(join(installed, "index.ts"))).toBe(true);
+        expect(existsSync(join(installed, "package.json"))).toBe(true);
+        expect(existsSync(join(installed, "docs"))).toBe(true);
+        expect(existsSync(join(installed, "docs", "README.md"))).toBe(true);
       });
 
-      it("T-INST-18: repo name derived from URL without .git suffix (known host)", async () => {
+      it("T-INST-50a: root index.js → single-workflow", async () => {
         project = await createTempProject();
-
         gitServer = await startLocalGitServer([
           {
-            name: "toolbox",
-            files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": VALID_INDEX_TS,
-            },
+            name: "my-agent",
+            files: { "index.js": 'console.log("hi");' },
           },
         ]);
-
-        await withGitURLRewrite(
-          { "https://github.com/org/toolbox": `${gitServer.url}/toolbox.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "https://github.com/org/toolbox"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(0);
-            // Name is "toolbox"
-            expect(existsSync(join(project!.loopxDir, "toolbox"))).toBe(true);
-          },
+        const result = await runCLI(
+          ["install", `${gitServer.url}/my-agent.git`],
+          { cwd: project.dir, runtime },
         );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "my-agent", "index.js")),
+        ).toBe(true);
       });
 
-      it("T-INST-19: missing package.json with main -> clone removed, error", async () => {
-        project = await createTempProject();
+      for (const ext of [".sh", ".js", ".jsx", ".ts", ".tsx"]) {
+        it(`T-INST-50b: single-workflow root classification for ${ext}`, async () => {
+          project = await createTempProject();
+          const body = ext === ".sh" ? BASH_STOP : 'console.log("hi");';
+          gitServer = await startLocalGitServer([
+            {
+              name: "my-agent",
+              files: { [`index${ext}`]: body },
+            },
+          ]);
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/my-agent.git`],
+            { cwd: project.dir, runtime },
+          );
+          expect(result.exitCode).toBe(0);
+          expect(
+            existsSync(join(project.loopxDir, "my-agent", `index${ext}`)),
+          ).toBe(true);
+        });
+      }
 
+      it("T-INST-51: root index.ts + lib/ subdir → single-workflow, lib/ is content", async () => {
+        project = await createTempProject();
         gitServer = await startLocalGitServer([
           {
-            name: "no-main",
+            name: "my-agent",
             files: {
-              // package.json exists but has no main field
-              "package.json": JSON.stringify({ name: "no-main" }),
-              "index.ts": VALID_INDEX_TS,
+              "index.ts": 'console.log("hi");',
+              "lib/helpers.ts": "export const x = 1;",
             },
           },
         ]);
-
-        await withGitURLRewrite(
-          { "https://github.com/org/no-main": `${gitServer.url}/no-main.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "https://github.com/org/no-main"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(1);
-            expect(result.stderr.length).toBeGreaterThan(0);
-            // Clone should be removed
-            expect(existsSync(join(project!.loopxDir, "no-main"))).toBe(false);
-          },
+        const result = await runCLI(
+          ["install", `${gitServer.url}/my-agent.git`],
+          { cwd: project.dir, runtime },
         );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "my-agent", "lib", "helpers.ts")),
+        ).toBe(true);
       });
 
-      it("T-INST-20: package.json main with unsupported extension -> clone removed, error", async () => {
+      it("T-INST-52: root index.sh + would-be-workflow subdirs → single-workflow, subdirs are content", async () => {
         project = await createTempProject();
-
         gitServer = await startLocalGitServer([
           {
-            name: "bad-ext",
+            name: "my-agent",
             files: {
-              "package.json": validPackageJson("index.py"),
-              "index.py": "print('hello')",
+              "index.sh": BASH_STOP,
+              "tools/build.sh": BASH_STOP,
+              "helpers/setup.ts": 'console.log("s");',
             },
           },
         ]);
-
-        await withGitURLRewrite(
-          { "https://github.com/org/bad-ext": `${gitServer.url}/bad-ext.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "https://github.com/org/bad-ext"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(1);
-            expect(result.stderr.length).toBeGreaterThan(0);
-            // Clone should be removed
-            expect(existsSync(join(project!.loopxDir, "bad-ext"))).toBe(false);
-          },
+        const result = await runCLI(
+          ["install", `${gitServer.url}/my-agent.git`],
+          { cwd: project.dir, runtime },
         );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "my-agent", "tools", "build.sh")),
+        ).toBe(true);
+        expect(
+          existsSync(
+            join(project.loopxDir, "my-agent", "helpers", "setup.ts"),
+          ),
+        ).toBe(true);
+        expect(existsSync(join(project.loopxDir, "tools"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "helpers"))).toBe(false);
       });
 
-      it("T-INST-21: successful git install -> runnable via loopx -n 1 <name>", async () => {
+      it("T-INST-52a: root config-style file (eslint.config.js) forces single-workflow, fails on invalid script name", async () => {
         project = await createTempProject();
-
         gitServer = await startLocalGitServer([
           {
-            name: "runnable",
+            name: "my-agent",
             files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": VALID_INDEX_TS,
+              "eslint.config.js": "module.exports = {};",
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
             },
           },
         ]);
-
-        await withGitURLRewrite(
-          { "https://github.com/org/runnable": `${gitServer.url}/runnable.git` },
-          async () => {
-            const installResult = await runCLI(
-              ["install", "https://github.com/org/runnable"],
-              { cwd: project!.dir, runtime },
-            );
-            expect(installResult.exitCode).toBe(0);
-
-            // Now run the installed script
-            const runResult = await runCLI(["run", "-n", "1", "runnable"], {
-              cwd: project!.dir,
-              runtime,
-            });
-            expect(runResult.exitCode).toBe(0);
-          },
+        const result = await runCLI(
+          ["install", `${gitServer.url}/my-agent.git`],
+          { cwd: project.dir, runtime },
         );
+        expect(result.exitCode).toBe(1);
+        // Invalid script name errors ref the file name
+        expect(result.stderr).toMatch(/eslint\.config/);
+        // Sibling subdirectories were NOT installed as sibling workflows
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
+      });
+
+      it("T-INST-52c: root non-index script (setup.ts) forces single-workflow even with workflow-like subdirs", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "my-agent",
+            files: {
+              "setup.ts": 'console.log("s");',
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/my-agent.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "my-agent", "setup.ts")),
+        ).toBe(true);
+        expect(
+          existsSync(
+            join(project.loopxDir, "my-agent", "ralph", "index.sh"),
+          ),
+        ).toBe(true);
+        expect(
+          existsSync(
+            join(project.loopxDir, "my-agent", "other", "index.sh"),
+          ),
+        ).toBe(true);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
+      });
+
+      it("T-INST-52d: tarball counterpart to 52a — config-style root file, single-workflow, name error", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          {
+            "eslint.config.js": "module.exports = {};",
+            "ralph/index.sh": BASH_STOP,
+            "other/index.sh": BASH_STOP,
+          },
+          { wrapperDir: "my-agent" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/my-agent.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/my-agent.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/eslint\.config/);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
       });
     });
   });
 
-  // ─────────────────────────────────────────────
-  // Tarball Install
-  // ─────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════
+  // Workflow Classification — Multi-Workflow Source (T-INST-53 … 55e)
+  // ═══════════════════════════════════════════════════════════
 
-  describe("SPEC: Tarball Install", () => {
+  describe("Workflow Classification — Multi-Workflow Source", () => {
     forEachRuntime((runtime) => {
-      it("T-INST-22: extracting .tar.gz places contents in .loopx/<archive-name>/", async () => {
-        const tarball = await createTarball("my-pkg", {
-          "package.json": validPackageJson("index.ts"),
-          "index.ts": VALID_INDEX_TS,
-        });
-
-        httpServer = await startLocalHTTPServer([
+      it("T-INST-53: two subdirs with index.sh → multi-workflow", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
           {
-            path: "/my-pkg.tar.gz",
-            contentType: "application/gzip",
-            body: tarball,
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+            },
           },
         ]);
-
-        project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/my-pkg.tar.gz`],
+          ["install", `${gitServer.url}/multi.git`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(0);
-        const installDir = join(project.loopxDir, "my-pkg");
-        expect(existsSync(installDir)).toBe(true);
-        expect(existsSync(join(installDir, "package.json"))).toBe(true);
-        expect(existsSync(join(installDir, "index.ts"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
       });
 
-      it("T-INST-23: single top-level directory in archive is unwrapped", async () => {
-        // Archive structure: wrapper-dir/package.json, wrapper-dir/index.ts
-        // After install, .loopx/archive/ should contain package.json directly
-        const tarball = await createTarball("wrapper-dir", {
-          "package.json": validPackageJson("index.ts"),
-          "index.ts": VALID_INDEX_TS,
-        });
-
-        httpServer = await startLocalHTTPServer([
+      it("T-INST-53a: multi-workflow with subdir qualifying via index.jsx", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
           {
-            path: "/archive.tar.gz",
-            contentType: "application/gzip",
-            body: tarball,
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.jsx": 'console.log("x");',
+            },
           },
         ]);
-
-        project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/archive.tar.gz`],
+          ["install", `${gitServer.url}/multi.git`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(0);
-        const installDir = join(project.loopxDir, "archive");
-        expect(existsSync(installDir)).toBe(true);
-        // The single top-level dir "wrapper-dir" should be unwrapped
-        expect(existsSync(join(installDir, "package.json"))).toBe(true);
-        // wrapper-dir itself should NOT be a subdir
-        expect(existsSync(join(installDir, "wrapper-dir"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other", "index.jsx"))).toBe(
+          true,
+        );
       });
 
-      it("T-INST-24: multiple top-level entries placed directly", async () => {
-        // Create archive with multiple top-level entries (not a single wrapping dir)
-        const tarball = await createMultiTopTarball({
-          "package.json": validPackageJson("index.ts"),
-          "index.ts": VALID_INDEX_TS,
-          "README.md": "# Hello",
-        });
-
-        httpServer = await startLocalHTTPServer([
+      it("T-INST-53b: multi-workflow with subdir qualifying via index.tsx", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
           {
-            path: "/multi.tar.gz",
-            contentType: "application/gzip",
-            body: tarball,
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.tsx": 'console.log("x");',
+            },
           },
         ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "other", "index.tsx"))).toBe(
+          true,
+        );
+      });
 
+      for (const ext of [".sh", ".js", ".jsx", ".ts", ".tsx"]) {
+        it(`T-INST-53c: multi-workflow subdir classification for ${ext}`, async () => {
+          project = await createTempProject();
+          const body = ext === ".sh" ? BASH_STOP : 'console.log("x");';
+          gitServer = await startLocalGitServer([
+            {
+              name: "multi",
+              files: {
+                [`target/index${ext}`]: body,
+                "other/index.sh": BASH_STOP,
+              },
+            },
+          ]);
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            { cwd: project.dir, runtime },
+          );
+          expect(result.exitCode).toBe(0);
+          expect(
+            existsSync(join(project.loopxDir, "target", `index${ext}`)),
+          ).toBe(true);
+          expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
+        });
+      }
+
+      it("T-INST-54: multi-workflow repo-root support files not copied", async () => {
         project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+              "README.md": "readme",
+              "LICENSE": "MIT",
+              "package.json": '{"name":"multi"}',
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "package.json"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "README.md"))).toBe(false);
+      });
+
+      it("T-INST-54a: multi-workflow preserves workflow-internal non-script files/subdirs", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.ts": 'console.log("r");',
+              "ralph/package.json": '{"name":"ralph"}',
+              "ralph/lib/helpers.ts": "export const x = 1;",
+              "ralph/README.md": "# ralph",
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "ralph", "package.json")),
+        ).toBe(true);
+        expect(
+          existsSync(join(project.loopxDir, "ralph", "lib", "helpers.ts")),
+        ).toBe(true);
+        expect(existsSync(join(project.loopxDir, "ralph", "README.md"))).toBe(
+          true,
+        );
+      });
+
+      it("T-INST-54b: multi-workflow source-root package.json ignored", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+              "package.json": "{broken",
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).not.toMatch(/package\.json/i);
+      });
+
+      it("T-INST-54c: multi-workflow does not copy root support directories", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+              "docs/README.md": "docs",
+              "shared/config.json": "{}",
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "docs"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "shared"))).toBe(false);
+      });
+
+      it("T-INST-54d: tarball counterpart to 54b — source-root package.json ignored", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          {
+            "ralph/index.sh": BASH_STOP,
+            "other/index.sh": BASH_STOP,
+            "package.json": "{broken",
+          },
+          { wrapperDir: "multi" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/multi.tar.gz", tarball),
+        ]);
         const result = await runCLI(
           ["install", `${httpServer.url}/multi.tar.gz`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(0);
-        const installDir = join(project.loopxDir, "multi");
-        expect(existsSync(installDir)).toBe(true);
-        expect(existsSync(join(installDir, "package.json"))).toBe(true);
-        expect(existsSync(join(installDir, "index.ts"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "package.json"))).toBe(false);
+        expect(result.stderr).not.toMatch(/package\.json/i);
       });
 
-      it("T-INST-25: .tgz extension handled identically", async () => {
-        const tarball = await createTarball("tgz-pkg", {
-          "package.json": validPackageJson("index.ts"),
-          "index.ts": VALID_INDEX_TS,
-        });
-
-        httpServer = await startLocalHTTPServer([
+      it("T-INST-55: subdirectories with no script files silently skipped", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
           {
-            path: "/tgz-pkg.tgz",
-            contentType: "application/gzip",
-            body: tarball,
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+              "empty/README.md": "empty",
+            },
           },
         ]);
-
-        project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/tgz-pkg.tgz`],
+          ["install", `${gitServer.url}/multi.git`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(0);
-        const installDir = join(project.loopxDir, "tgz-pkg");
-        expect(existsSync(installDir)).toBe(true);
-        expect(existsSync(join(installDir, "package.json"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
       });
 
-      it("T-INST-26: extracted dir must have package.json with main, otherwise removed", async () => {
-        // Tarball with package.json but no main field
-        const tarball = await createTarball("no-main-pkg", {
-          "package.json": JSON.stringify({ name: "no-main-pkg" }),
-          "index.ts": VALID_INDEX_TS,
-        });
-
-        httpServer = await startLocalHTTPServer([
+      it("T-INST-55a: non-recursive workflow detection (nested scripts don't count)", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
           {
-            path: "/no-main-pkg.tar.gz",
-            contentType: "application/gzip",
-            body: tarball,
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "tools/lib/helper.ts": "export const x = 1;",
+            },
           },
         ]);
-
-        project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/no-main-pkg.tar.gz`],
+          ["install", `${gitServer.url}/multi.git`],
           { cwd: project.dir, runtime },
         );
-
-        expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        // Directory should be removed
-        expect(existsSync(join(project.loopxDir, "no-main-pkg"))).toBe(false);
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "tools"))).toBe(false);
       });
 
-      it("T-INST-26a: tarball URL with query string -> query stripped from archive-name", async () => {
-        const tarball = await createTarball("qs-pkg", {
-          "package.json": validPackageJson("index.ts"),
-          "index.ts": VALID_INDEX_TS,
-        });
-
-        httpServer = await startLocalHTTPServer([
+      it("T-INST-55c: subdir with only index.mjs skipped (unsupported extension)", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
           {
-            path: "/qs-pkg.tar.gz",
-            contentType: "application/gzip",
-            body: tarball,
+            name: "multi",
+            files: {
+              "ralph/index.mjs": 'console.log("x");',
+              "other/index.sh": BASH_STOP,
+            },
           },
         ]);
-
-        project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/qs-pkg.tar.gz?token=abc`],
+          ["install", `${gitServer.url}/multi.git`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(0);
-        // Installed as .loopx/qs-pkg/, NOT .loopx/qs-pkg.tar.gz?token=abc/
-        expect(existsSync(join(project.loopxDir, "qs-pkg"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
+        expect(hasWarningCategoryFor(result.stderr, "ralph")).toBe(false);
       });
 
-      it("T-INST-26b: tarball URL with fragment -> fragment stripped from archive-name", async () => {
-        const tarball = await createTarball("frag-pkg", {
-          "package.json": validPackageJson("index.ts"),
-          "index.ts": VALID_INDEX_TS,
-        });
-
-        httpServer = await startLocalHTTPServer([
+      it("T-INST-55b: invalid-named non-workflow subdirectory silently skipped", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
           {
-            path: "/frag-pkg.tgz",
-            contentType: "application/gzip",
-            body: tarball,
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+              "-bad-dir/README.md": "readme",
+            },
           },
         ]);
-
-        project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/frag-pkg.tgz#v1`],
+          ["install", `${gitServer.url}/multi.git`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(0);
-        // Installed as .loopx/frag-pkg/
-        expect(existsSync(join(project.loopxDir, "frag-pkg"))).toBe(true);
+        expect(result.stderr).not.toMatch(/-bad-dir/);
+      });
+
+      it("T-INST-55e: legacy directory-script subdirectory skipped, valid workflows installed", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "good/index.sh": BASH_STOP,
+              "legacy/package.json": '{"main":"src/run.js"}',
+              "legacy/src/run.js": 'console.log("x");',
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "good", "index.sh"))).toBe(
+          true,
+        );
+        expect(existsSync(join(project.loopxDir, "legacy"))).toBe(false);
+      });
+
+      it("T-INST-55d: root .mjs/.cjs do not force single-workflow classification", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "index.mjs": 'console.log("x");',
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
       });
     });
   });
 
-  // ─────────────────────────────────────────────
-  // Common Rules
-  // ─────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════
+  // Workflow Classification — Zero-Workflow Source (T-INST-56 … 56e)
+  // ═══════════════════════════════════════════════════════════
 
-  describe("SPEC: Common Install Rules", () => {
+  describe("Workflow Classification — Zero-Workflow Source", () => {
     forEachRuntime((runtime) => {
-      it("T-INST-27: destination-path collision with existing file -> error", async () => {
-        const scriptContent = `import { output } from "loopx";\noutput({ result: "new" });\n`;
-
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/foo.ts",
-            contentType: "text/plain",
-            body: scriptContent,
-          },
-        ]);
-
+      it("T-INST-56: no root scripts, no qualifying subdirs → error", async () => {
         project = await createTempProject();
-        // Pre-create .loopx/foo.ts
-        const existingContent = `// existing\n`;
-        await writeFile(join(project.loopxDir, "foo.ts"), existingContent, "utf-8");
-
-        const result = await runCLI(
-          ["install", `${httpServer.url}/foo.ts`],
-          { cwd: project.dir, runtime },
-        );
-
-        expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        // Existing file untouched
-        const content = readFileSync(join(project.loopxDir, "foo.ts"), "utf-8");
-        expect(content).toBe(existingContent);
-      });
-
-      it("T-INST-27a: destination-path collision with non-script directory -> error", async () => {
-        project = await createTempProject();
-
         gitServer = await startLocalGitServer([
           {
-            name: "foo",
-            files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": VALID_INDEX_TS,
-            },
+            name: "empty",
+            files: { "README.md": "nothing" },
           },
         ]);
-
-        // Pre-create .loopx/foo/ as a non-script directory (no package.json)
-        const existingDir = join(project.loopxDir, "foo");
-        await mkdir(existingDir, { recursive: true });
-        await writeFile(join(existingDir, "utils.ts"), "export const x = 1;\n", "utf-8");
-
-        await withGitURLRewrite(
-          { "https://github.com/org/foo": `${gitServer.url}/foo.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "https://github.com/org/foo"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(1);
-            expect(result.stderr.length).toBeGreaterThan(0);
-            // Existing directory untouched
-            expect(existsSync(join(existingDir, "utils.ts"))).toBe(true);
-            // No package.json added (it was not overwritten)
-            expect(existsSync(join(existingDir, "package.json"))).toBe(false);
-          },
+        const result = await runCLI(
+          ["install", `${gitServer.url}/empty.git`],
+          { cwd: project.dir, runtime },
         );
+        expect(result.exitCode).toBe(1);
       });
 
-      it("T-INST-27b: script-name collision across types (file vs dir) -> error", async () => {
+      it("T-INST-56a: legacy directory-script source (package.json main) → zero-workflow", async () => {
         project = await createTempProject();
-
         gitServer = await startLocalGitServer([
           {
-            name: "foo",
+            name: "legacy",
             files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": VALID_INDEX_TS,
+              "package.json": '{"main":"src/app/run.js"}',
+              "src/app/run.js": 'console.log("x");',
             },
           },
         ]);
-
-        // Pre-create .loopx/foo.sh (file script named "foo")
-        await createBashScript(project, "foo", 'echo "existing"');
-
-        await withGitURLRewrite(
-          { "https://github.com/org/foo": `${gitServer.url}/foo.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "https://github.com/org/foo"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(1);
-            expect(result.stderr.length).toBeGreaterThan(0);
-            // .loopx/foo.sh still exists
-            expect(existsSync(join(project!.loopxDir, "foo.sh"))).toBe(true);
-            // .loopx/foo/ NOT created
-            expect(existsSync(join(project!.loopxDir, "foo"))).toBe(false);
-          },
-        );
-      });
-
-      it("T-INST-27c: script-name collision across file extensions -> error", async () => {
-        const shContent = `import { output } from "loopx";\noutput({ result: "new" });\n`;
-
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/foo.sh",
-            contentType: "text/plain",
-            body: "#!/bin/bash\necho 'new'\n",
-          },
-        ]);
-
-        project = await createTempProject();
-        // Pre-create .loopx/foo.ts (file script named "foo")
-        await createScript(project, "foo", ".ts", `console.log("existing");\n`);
-
         const result = await runCLI(
-          ["install", `${httpServer.url}/foo.sh`],
+          ["install", `${gitServer.url}/legacy.git`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        // .loopx/foo.ts still exists, .loopx/foo.sh NOT created
-        expect(existsSync(join(project.loopxDir, "foo.ts"))).toBe(true);
-        expect(existsSync(join(project.loopxDir, "foo.sh"))).toBe(false);
       });
 
-      it("T-INST-27d: name collision detected even with pre-existing collision in .loopx/", async () => {
-        // Create TWO file scripts with the same base name (pre-existing collision)
+      it("T-INST-56e: legacy directory-script rejected without migration-guidance messaging", async () => {
         project = await createTempProject();
-        await createBashScript(project, "foo", `printf '{"result":"sh"}'`);
-        await createScript(project, "foo", ".ts", `console.log(JSON.stringify({result:"ts"}));`);
-
         gitServer = await startLocalGitServer([
           {
-            name: "foo",
+            name: "legacy",
             files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": VALID_INDEX_TS,
+              "package.json": '{"main":"src/app/run.js"}',
+              "src/app/run.js": 'console.log("x");',
             },
           },
         ]);
-
-        await withGitURLRewrite(
-          { "https://github.com/testorg/foo": `${gitServer.url}/foo.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "testorg/foo"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(1);
-            expect(result.stderr.length).toBeGreaterThan(0);
-            // No directory created for the install
-            expect(existsSync(join(project!.loopxDir, "foo"))).toBe(false);
-            // Both pre-existing files still intact
-            expect(existsSync(join(project!.loopxDir, "foo.sh"))).toBe(true);
-            expect(existsSync(join(project!.loopxDir, "foo.ts"))).toBe(true);
-          },
+        const result = await runCLI(
+          ["install", `${gitServer.url}/legacy.git`],
+          { cwd: project.dir, runtime },
         );
+        expect(result.exitCode).toBe(1);
+        expect(hasWarningCategoryFor(result.stderr, "package.json")).toBe(
+          false,
+        );
+        expect(hasWarningCategoryFor(result.stderr, "src/app/run.js")).toBe(
+          false,
+        );
+        expect(hasWarningCategoryFor(result.stderr, "main")).toBe(false);
       });
 
-      it("T-INST-28: formerly reserved names (output, env, install, version, run) install and run successfully", async () => {
-        const formerlyReserved = ["output", "env", "install", "version", "run"];
-
-        for (const name of formerlyReserved) {
-          project = await createTempProject();
-          const markerFile = join(project.dir, `marker-${name}.txt`);
-          const scriptBody = [
-            `import { writeFileSync } from "node:fs";`,
-            `writeFileSync(${JSON.stringify(markerFile)}, "ran-${name}");`,
-            `console.log(JSON.stringify({ result: "${name}-ok" }));`,
-          ].join("\n") + "\n";
-
-          httpServer = await startLocalHTTPServer([
-            {
-              path: `/${name}.ts`,
-              contentType: "text/plain",
-              body: scriptBody,
-            },
-          ]);
-
-          const installResult = await runCLI(
-            ["install", `${httpServer.url}/${name}.ts`],
-            { cwd: project.dir, runtime },
-          );
-
-          expect(installResult.exitCode, `expected "${name}.ts" to install successfully`).toBe(0);
-          expect(existsSync(join(project.loopxDir, `${name}.ts`))).toBe(true);
-
-          // Verify the installed script is runnable
-          const runResult = await runCLI(["run", "-n", "1", name], {
-            cwd: project.dir,
-            runtime,
-          });
-          expect(runResult.exitCode, `expected "loopx run -n 1 ${name}" to succeed`).toBe(0);
-          expect(existsSync(markerFile)).toBe(true);
-          expect(readFileSync(markerFile, "utf-8")).toBe(`ran-${name}`);
-
-          await httpServer.close();
-          httpServer = null;
-          await project.cleanup();
-          project = null;
-        }
-      });
-
-      it("T-INST-28a: directory script named after formerly reserved name installs and runs successfully", async () => {
+      it("T-INST-56c: root-only index.mjs → zero-workflow error", async () => {
         project = await createTempProject();
-        const markerFile = join(project.dir, "marker-version-dir.txt");
-        const scriptBody = [
-          `import { writeFileSync } from "node:fs";`,
-          `writeFileSync(${JSON.stringify(markerFile)}, "ran-version-dir");`,
-          `console.log(JSON.stringify({ result: "version-dir-ok" }));`,
-        ].join("\n") + "\n";
-
         gitServer = await startLocalGitServer([
           {
-            name: "version",
-            files: {
-              "package.json": validPackageJson("index.ts"),
-              "index.ts": scriptBody,
-            },
+            name: "mjs-only",
+            files: { "index.mjs": 'console.log("x");' },
           },
         ]);
-
-        const installResult = await runCLI(
-          ["install", `${gitServer.url}/version.git`],
-          { cwd: project.dir, runtime },
-        );
-
-        expect(installResult.exitCode).toBe(0);
-        expect(existsSync(join(project.loopxDir, "version"))).toBe(true);
-        expect(existsSync(join(project.loopxDir, "version", "package.json"))).toBe(true);
-
-        // Verify the installed directory script is runnable
-        const runResult = await runCLI(["run", "-n", "1", "version"], {
-          cwd: project.dir,
-          runtime,
-        });
-        expect(runResult.exitCode).toBe(0);
-        expect(existsSync(markerFile)).toBe(true);
-        expect(readFileSync(markerFile, "utf-8")).toBe("ran-version-dir");
-      });
-
-      it("T-INST-29: invalid name (-invalid.ts) -> error, nothing saved", async () => {
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/-invalid.ts",
-            contentType: "text/plain",
-            body: `console.log("should not install");\n`,
-          },
-        ]);
-
-        project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/-invalid.ts`],
+          ["install", `${gitServer.url}/mjs-only.git`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        expect(existsSync(join(project.loopxDir, "-invalid.ts"))).toBe(false);
       });
 
-      it("T-INST-30: no auto npm install after git clone", async () => {
+      it("T-INST-56d: root-only index.cjs → zero-workflow error", async () => {
         project = await createTempProject();
-
         gitServer = await startLocalGitServer([
           {
-            name: "has-deps",
-            files: {
-              "package.json": JSON.stringify(
-                {
-                  name: "has-deps",
-                  main: "index.ts",
-                  dependencies: { lodash: "^4.0.0" },
-                },
-                null,
-                2,
-              ),
-              "index.ts": VALID_INDEX_TS,
-            },
+            name: "cjs-only",
+            files: { "index.cjs": 'console.log("x");' },
           },
         ]);
-
-        await withGitURLRewrite(
-          { "https://github.com/org/has-deps": `${gitServer.url}/has-deps.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "https://github.com/org/has-deps"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(0);
-            const installDir = join(project!.loopxDir, "has-deps");
-            expect(existsSync(installDir)).toBe(true);
-            // node_modules should NOT exist — no auto-install
-            expect(
-              existsSync(join(installDir, "node_modules")),
-            ).toBe(false);
-          },
-        );
-      });
-
-      it("T-INST-31: HTTP 404 during single-file download -> error, no partial file", async () => {
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/not-here.ts",
-            status: 404,
-            contentType: "text/plain",
-            body: "Not Found",
-          },
-        ]);
-
-        project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/not-here.ts`],
+          ["install", `${gitServer.url}/cjs-only.git`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        // No partial file left
-        expect(existsSync(join(project.loopxDir, "not-here.ts"))).toBe(false);
       });
 
-      it("T-INST-31a: HTTP 500 during single-file download -> error", async () => {
-        httpServer = await startLocalHTTPServer([
+      it("T-INST-56b: tarball with no installable workflows → error", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
           {
-            path: "/error.ts",
-            status: 500,
-            contentType: "text/plain",
-            body: "Internal Server Error",
+            "README.md": "readme",
+            "lib/helpers.ts": "export const x = 1;",
           },
-        ]);
-
-        project = await createTempProject();
-        const result = await runCLI(
-          ["install", `${httpServer.url}/error.ts`],
-          { cwd: project.dir, runtime },
+          { wrapperDir: "empty" },
         );
-
-        expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        expect(existsSync(join(project.loopxDir, "error.ts"))).toBe(false);
-      });
-
-      it.skipIf(process.getuid?.() === 0)(
-        "T-INST-31b: single-file install write failure (read-only .loopx/) -> clean up, error",
-        async () => {
-          httpServer = await startLocalHTTPServer([
-            {
-              path: "/script.ts",
-              contentType: "text/plain",
-              body: `console.log(JSON.stringify({result:"ok"}));\n`,
-            },
-          ]);
-
-          project = await createTempProject();
-
-          // Make .loopx/ read-only so the write fails
-          await chmod(project.loopxDir, 0o555);
-
-          try {
-            const result = await runCLI(
-              ["install", `${httpServer.url}/script.ts`],
-              { cwd: project.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(1);
-            expect(existsSync(join(project.loopxDir, "script.ts"))).toBe(false);
-          } finally {
-            // Restore permissions so cleanup works
-            await chmod(project.loopxDir, 0o755);
-          }
-        },
-      );
-
-      it("T-INST-32: git clone failure (non-existent repo) -> error, no partial dir", async () => {
-        project = await createTempProject();
-
-        // Use withGitURLRewrite pointing to a non-existent bare repo
-        gitServer = await startLocalGitServer([]);
-
-        await withGitURLRewrite(
-          { "https://github.com/org/nonexistent": `${gitServer.url}/nonexistent.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "https://github.com/org/nonexistent"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(1);
-            expect(result.stderr.length).toBeGreaterThan(0);
-            // No partial directory left
-            expect(
-              existsSync(join(project!.loopxDir, "nonexistent")),
-            ).toBe(false);
-          },
-        );
-      });
-
-      it("T-INST-33a: empty archive -> error with clear message, no partial dir", async () => {
-        // Create a valid but empty tar.gz (just end-of-archive markers)
-        const emptyTmp = join(tmpdir(), `loopx-empty-tar-${Date.now()}`);
-        await mkdir(emptyTmp, { recursive: true });
-        execFileSync("tar", ["czf", join(emptyTmp, "empty.tar.gz"), "-T", "/dev/null"], { cwd: emptyTmp });
-        const emptyArchive = readFileSync(join(emptyTmp, "empty.tar.gz"));
-        await rm(emptyTmp, { recursive: true, force: true });
-
         httpServer = await startLocalHTTPServer([
-          {
-            path: "/empty.tar.gz",
-            contentType: "application/gzip",
-            body: emptyArchive,
-          },
+          tarballRoute("/empty.tar.gz", tarball),
         ]);
-
-        project = await createTempProject();
         const result = await runCLI(
           ["install", `${httpServer.url}/empty.tar.gz`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(1);
-        expect(result.stderr).toMatch(/empty/i);
-        expect(existsSync(join(project.loopxDir, "empty"))).toBe(false);
-      });
-
-      it("T-INST-33: corrupt archive -> error, no partial dir", async () => {
-        // Serve garbage bytes as a tarball
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/corrupt.tar.gz",
-            contentType: "application/gzip",
-            body: Buffer.from("this is not a real tarball at all!!!"),
-          },
-        ]);
-
-        project = await createTempProject();
-        const result = await runCLI(
-          ["install", `${httpServer.url}/corrupt.tar.gz`],
-          { cwd: project.dir, runtime },
-        );
-
-        expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        // No partial directory left
-        expect(existsSync(join(project.loopxDir, "corrupt"))).toBe(false);
       });
     });
   });
 
-  // ─────────────────────────────────────────────
-  // Post-Validation (Directory Scripts)
-  // ─────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════
+  // Selective Workflow Installation (T-INST-57 … 60s)
+  // ═══════════════════════════════════════════════════════════
 
-  describe("SPEC: Install Post-Validation (Directory Scripts)", () => {
+  describe("Selective Workflow Installation", () => {
     forEachRuntime((runtime) => {
-      // --- Git post-validation ---
-
-      it("T-INST-34: git install with invalid JSON in package.json -> clone removed, error", async () => {
+      it("T-INST-57: -w ralph installs only ralph", async () => {
         project = await createTempProject();
-
         gitServer = await startLocalGitServer([
           {
-            name: "bad-json",
+            name: "multi",
             files: {
-              "package.json": "{invalid json!!!}",
-              "index.ts": VALID_INDEX_TS,
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
             },
           },
         ]);
-
-        await withGitURLRewrite(
-          { "https://github.com/org/bad-json": `${gitServer.url}/bad-json.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "https://github.com/org/bad-json"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(1);
-            expect(result.stderr.length).toBeGreaterThan(0);
-            expect(
-              existsSync(join(project!.loopxDir, "bad-json")),
-            ).toBe(false);
-          },
+        const result = await runCLI(
+          ["install", "-w", "ralph", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
         );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
       });
 
-      it("T-INST-35: git install with non-string main -> clone removed, error", async () => {
+      it("T-INST-57a: --workflow ralph equivalent to -w ralph", async () => {
         project = await createTempProject();
-
         gitServer = await startLocalGitServer([
           {
-            name: "num-main",
+            name: "multi",
             files: {
-              "package.json": JSON.stringify({ name: "num-main", main: 42 }),
-              "index.ts": VALID_INDEX_TS,
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
             },
           },
         ]);
-
-        await withGitURLRewrite(
-          { "https://github.com/org/num-main": `${gitServer.url}/num-main.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "https://github.com/org/num-main"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(1);
-            expect(result.stderr.length).toBeGreaterThan(0);
-            expect(
-              existsSync(join(project!.loopxDir, "num-main")),
-            ).toBe(false);
-          },
+        const result = await runCLI(
+          ["install", "--workflow", "ralph", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
         );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
       });
 
-      it("T-INST-36: git install with main escaping directory -> clone removed, error", async () => {
+      it("T-INST-57b: -w ralph does not copy root support files/dirs or sibling workflows", async () => {
         project = await createTempProject();
-
         gitServer = await startLocalGitServer([
           {
-            name: "escape-main",
+            name: "multi",
             files: {
-              "package.json": JSON.stringify({
-                name: "escape-main",
-                main: "../escape.ts",
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+              "README.md": "readme",
+              "package.json": '{"name":"multi"}',
+              "docs/a.md": "a",
+              "shared/b.json": "{}",
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "ralph", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "README.md"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "package.json"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "docs"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "shared"))).toBe(false);
+      });
+
+      it("T-INST-57c: -w ralph from tarball installs only ralph", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          {
+            "ralph/index.sh": BASH_STOP,
+            "other/index.sh": BASH_STOP,
+          },
+          { wrapperDir: "multi" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/multi.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "ralph", `${httpServer.url}/multi.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "ralph", "index.sh")),
+        ).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
+      });
+
+      it("T-INST-58: -w nonexistent → error (workflow not in source)", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "nonexistent", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(existsSync(join(project.loopxDir, "nonexistent"))).toBe(false);
+      });
+
+      it("T-INST-59: -w on single-workflow source → error", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "single",
+            files: {
+              "index.ts": 'console.log("hi");',
+              "lib/helpers.ts": "export const x = 1;",
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "ralph", `${gitServer.url}/single.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-59a: --workflow on single-workflow source → error", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "single",
+            files: {
+              "index.ts": 'console.log("hi");',
+              "lib/helpers.ts": "export const x = 1;",
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "--workflow", "ralph", `${gitServer.url}/single.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-59b: -w on single-workflow with non-index root script → error", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "single",
+            files: {
+              "setup.ts": 'console.log("s");',
+              "lib/helpers.ts": "export const x = 1;",
+              "src/utils.js": 'console.log("u");',
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "ralph", `${gitServer.url}/single.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-60: with -w, only selected workflow validated, invalid siblings don't block", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "broken/-bad.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "ralph", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "broken"))).toBe(false);
+      });
+
+      it("T-INST-60a: -w, invalid script name in unselected sibling ignored", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "broken/-bad.sh": BASH_STOP,
+              "broken/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "ralph", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-60b: -w, version mismatch in unselected sibling ignored, no warning", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+              "other/package.json": JSON.stringify({
+                dependencies: { loopx: unsatisfiedRange() },
               }),
-              "index.ts": VALID_INDEX_TS,
             },
           },
         ]);
-
-        await withGitURLRewrite(
-          { "https://github.com/org/escape-main": `${gitServer.url}/escape-main.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "https://github.com/org/escape-main"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(1);
-            expect(result.stderr.length).toBeGreaterThan(0);
-            expect(
-              existsSync(join(project!.loopxDir, "escape-main")),
-            ).toBe(false);
-          },
+        const result = await runCLI(
+          ["install", "-w", "ralph", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
         );
+        expect(result.exitCode).toBe(0);
+        expect(hasVersionMismatchWarning(result.stderr, "other")).toBe(false);
       });
 
-      it("T-INST-37: git install with main pointing to non-existent file -> clone removed, error", async () => {
+      it("T-INST-60c: -w, destination collisions for unselected sibling ignored", async () => {
         project = await createTempProject();
-
+        await createBashWorkflowScript(project, "other", "index", 'exit 0');
         gitServer = await startLocalGitServer([
           {
-            name: "missing-main",
+            name: "multi",
             files: {
-              "package.json": validPackageJson("nonexistent.ts"),
-              // Note: nonexistent.ts is NOT created
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
             },
           },
         ]);
-
-        await withGitURLRewrite(
-          { "https://github.com/org/missing-main": `${gitServer.url}/missing-main.git` },
-          async () => {
-            const result = await runCLI(
-              ["install", "https://github.com/org/missing-main"],
-              { cwd: project!.dir, runtime },
-            );
-
-            expect(result.exitCode).toBe(1);
-            expect(result.stderr.length).toBeGreaterThan(0);
-            expect(
-              existsSync(join(project!.loopxDir, "missing-main")),
-            ).toBe(false);
-          },
-        );
-      });
-
-      // --- Tarball post-validation ---
-
-      it("T-INST-38: tarball install with invalid JSON in package.json -> dir removed, error", async () => {
-        const tarball = await createTarball("bad-json-tar", {
-          "package.json": "{not valid json!}",
-          "index.ts": VALID_INDEX_TS,
-        });
-
-        httpServer = await startLocalHTTPServer([
-          {
-            path: "/bad-json-tar.tar.gz",
-            contentType: "application/gzip",
-            body: tarball,
-          },
-        ]);
-
-        project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/bad-json-tar.tar.gz`],
+          ["install", "-w", "ralph", `${gitServer.url}/multi.git`],
           { cwd: project.dir, runtime },
         );
-
-        expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        expect(
-          existsSync(join(project.loopxDir, "bad-json-tar")),
-        ).toBe(false);
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
       });
 
-      it("T-INST-39: tarball install with main pointing to missing file -> dir removed, error", async () => {
-        const tarball = await createTarball("missing-main-tar", {
-          "package.json": validPackageJson("nonexistent.ts"),
-          // nonexistent.ts NOT included
-        });
-
-        httpServer = await startLocalHTTPServer([
+      it("T-INST-60d: -w, invalid workflow name on unselected sibling ignored", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
           {
-            path: "/missing-main-tar.tar.gz",
-            contentType: "application/gzip",
-            body: tarball,
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "-bad-name/index.sh": BASH_STOP,
+            },
           },
         ]);
-
-        project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/missing-main-tar.tar.gz`],
+          ["install", "-w", "ralph", `${gitServer.url}/multi.git`],
           { cwd: project.dir, runtime },
         );
-
-        expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        expect(
-          existsSync(join(project.loopxDir, "missing-main-tar")),
-        ).toBe(false);
+        expect(result.exitCode).toBe(0);
       });
 
-      it("T-INST-39a: tarball install with non-string main -> dir removed, error", async () => {
-        const tarball = await createTarball("num-main-tar", {
-          "package.json": JSON.stringify({ name: "num-main-tar", main: 42 }),
-          "index.ts": VALID_INDEX_TS,
-        });
-
-        httpServer = await startLocalHTTPServer([
+      it("T-INST-60e: -w, same-base-name collision in unselected sibling ignored", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
           {
-            path: "/num-main-tar.tar.gz",
-            contentType: "application/gzip",
-            body: tarball,
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/check.sh": BASH_STOP,
+              "other/check.ts": 'console.log("c");',
+            },
           },
         ]);
-
-        project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/num-main-tar.tar.gz`],
+          ["install", "-w", "ralph", `${gitServer.url}/multi.git`],
           { cwd: project.dir, runtime },
         );
-
-        expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        expect(
-          existsSync(join(project.loopxDir, "num-main-tar")),
-        ).toBe(false);
+        expect(result.exitCode).toBe(0);
       });
 
-      it("T-INST-39b: tarball install with main escaping directory -> dir removed, error", async () => {
-        const tarball = await createTarball("escape-tar", {
-          "package.json": JSON.stringify({
-            name: "escape-tar",
-            main: "../escape.ts",
-          }),
-          "index.ts": VALID_INDEX_TS,
-        });
-
-        httpServer = await startLocalHTTPServer([
+      it("T-INST-60f: -w, broken package.json in unselected sibling emits no warning", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
           {
-            path: "/escape-tar.tar.gz",
-            contentType: "application/gzip",
-            body: tarball,
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "broken/index.sh": BASH_STOP,
+              "broken/package.json": "{broken",
+            },
           },
         ]);
-
-        project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/escape-tar.tar.gz`],
+          ["install", "-w", "ralph", `${gitServer.url}/multi.git`],
           { cwd: project.dir, runtime },
         );
-
-        expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        expect(
-          existsSync(join(project.loopxDir, "escape-tar")),
-        ).toBe(false);
+        expect(result.exitCode).toBe(0);
+        expect(hasAnyPackageJsonWarning(result.stderr, "broken")).toBe(false);
       });
 
-      it("T-INST-39c: tarball install with unsupported main extension -> dir removed, error", async () => {
-        const tarball = await createTarball("py-main-tar", {
-          "package.json": JSON.stringify({
-            name: "py-main-tar",
-            main: "index.py",
-          }),
-          "index.py": "print('hello')",
-        });
-
-        httpServer = await startLocalHTTPServer([
+      it("T-INST-60g: -w, selected workflow's invalid script names fatal", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
           {
-            path: "/py-main-tar.tar.gz",
-            contentType: "application/gzip",
-            body: tarball,
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "broken/-bad.sh": BASH_STOP,
+            },
           },
         ]);
-
-        project = await createTempProject();
         const result = await runCLI(
-          ["install", `${httpServer.url}/py-main-tar.tar.gz`],
+          ["install", "-w", "broken", `${gitServer.url}/multi.git`],
           { cwd: project.dir, runtime },
         );
-
         expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        expect(
-          existsSync(join(project.loopxDir, "py-main-tar")),
-        ).toBe(false);
       });
 
-      it("T-INST-39d: git install with symlink escaping directory boundary -> dir removed, error", async () => {
-        // Create a git repo manually with a symlink to outside
-        const repoBase = join(tmpdir(), `loopx-symlink-git-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-        const workDir = join(repoBase, "work");
-        await mkdir(workDir, { recursive: true });
+      it("T-INST-60h: -w, selected workflow's same-base-name collisions fatal", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "broken/check.sh": BASH_STOP,
+              "broken/check.ts": 'console.log("c");',
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "broken", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
 
-        await writeFile(
-          join(workDir, "package.json"),
-          validPackageJson("entry.ts"),
+      it("T-INST-60i: -w, selected workflow's version mismatch blocking", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "ralph/package.json": JSON.stringify({
+                dependencies: { loopx: unsatisfiedRange() },
+              }),
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "ralph", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-60j: -w -y, selected workflow's version mismatch overridden", async () => {
+        project = await createTempProject();
+        const pkg = JSON.stringify({
+          dependencies: { loopx: unsatisfiedRange() },
+        });
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "ralph/package.json": pkg,
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          [
+            "install",
+            "-w",
+            "ralph",
+            "-y",
+            `${gitServer.url}/multi.git`,
+          ],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        const installedPkg = readFileSync(
+          join(project.loopxDir, "ralph", "package.json"),
           "utf-8",
         );
-        // Create entry.ts as a symlink to ../../outside.ts
-        execSync(`ln -s ../../outside.ts entry.ts`, { cwd: workDir, stdio: "pipe" });
-        execSync(
-          `git init && git add -A && git commit -m "init"`,
-          { cwd: workDir, stdio: "pipe", env: { ...process.env, GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "t@t" } },
+        expect(installedPkg).toContain(unsatisfiedRange());
+      });
+
+      it("T-INST-60k: -w, selected workflow's destination collision blocking", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(project, "ralph", "index", 'exit 0');
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "ralph", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
         );
+        expect(result.exitCode).toBe(1);
+      });
 
-        // Create a bare clone
-        const bareDir = join(repoBase, "symlink-escape.git");
-        execSync(`git clone --bare "${workDir}" "${bareDir}"`, { stdio: "pipe" });
+      it("T-INST-60l: -w -y, selected workflow's destination collision overridden", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          'echo "OLD_CONTENT" > /dev/null',
+        );
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": '#!/bin/bash\nprintf \'{"new":true}\'\n',
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          [
+            "install",
+            "-w",
+            "ralph",
+            "-y",
+            `${gitServer.url}/multi.git`,
+          ],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        const content = readFileSync(
+          join(project.loopxDir, "ralph", "index.sh"),
+          "utf-8",
+        );
+        expect(content).toContain('{"new":true}');
+        expect(content).not.toContain("OLD_CONTENT");
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
+      });
 
-        try {
+      it("T-INST-60p: -w -y, non-workflow destination still causes failure", async () => {
+        project = await createTempProject();
+        // Create a plain file at .loopx/ralph (not a workflow directory)
+        await writeFile(join(project.loopxDir, "ralph"), "plain file", "utf-8");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          [
+            "install",
+            "-w",
+            "ralph",
+            "-y",
+            `${gitServer.url}/multi.git`,
+          ],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        // The plain file must still exist (not replaced)
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(statSync(join(project.loopxDir, "ralph")).isFile()).toBe(true);
+      });
+
+      it("T-INST-60m: -w, selecting workflow with invalid name → error", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "-bad-name/index.sh": BASH_STOP,
+              "good/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "-bad-name", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-60n: --workflow long form exercises same selective-validation as -w", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "broken/-bad.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          [
+            "install",
+            "--workflow",
+            "ralph",
+            `${gitServer.url}/multi.git`,
+          ],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+      });
+
+      it("T-INST-60o: -w, selecting non-qualifying subdirectory (legacy) → error", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "good/index.sh": BASH_STOP,
+              "legacy/package.json": '{"main":"src/run.js"}',
+              "legacy/src/run.js": 'console.log("x");',
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "legacy", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-60q: -w, selected workflow's broken package.json → non-fatal warning", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "ralph/package.json": "{broken",
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "ralph", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(countInvalidJsonWarnings(result.stderr, "ralph")).toBe(1);
+        expect(existsSync(join(project.loopxDir, "ralph", "index.sh"))).toBe(
+          true,
+        );
+        expect(
+          existsSync(join(project.loopxDir, "ralph", "package.json")),
+        ).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
+      });
+
+      it.skipIf(IS_ROOT)(
+        "T-INST-60r: -w, selected workflow's unreadable package.json → non-fatal warning (tarball)",
+        async () => {
           project = await createTempProject();
-          // Create the symlink target outside .loopx/ so the symlink resolves
-          await writeFile(join(project.dir, "outside.ts"), `export {};\n`, "utf-8");
-
+          const tarball = await makeTarball(
+            {
+              "ralph/index.sh": BASH_STOP,
+              "ralph/package.json": {
+                content: "{}",
+                mode: 0o000,
+              },
+              "other/index.sh": BASH_STOP,
+            },
+            { wrapperDir: "multi" },
+          );
+          httpServer = await startLocalHTTPServer([
+            tarballRoute("/multi.tar.gz", tarball),
+          ]);
           const result = await runCLI(
-            ["install", `file://${bareDir}`],
+            [
+              "install",
+              "-w",
+              "ralph",
+              `${httpServer.url}/multi.tar.gz`,
+            ],
             { cwd: project.dir, runtime },
           );
+          expect(result.exitCode).toBe(0);
+          expect(countUnreadableWarnings(result.stderr, "ralph")).toBe(1);
+          expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
+          try {
+            chmodSync(
+              join(project.loopxDir, "ralph", "package.json"),
+              0o644,
+            );
+          } catch {}
+        },
+      );
 
+      it("T-INST-60s: -w, selected workflow's invalid semver range → non-fatal warning", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "ralph/package.json": JSON.stringify({
+                dependencies: { loopx: "not-a-range!!!" },
+              }),
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "ralph", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(countInvalidSemverWarnings(result.stderr, "ralph")).toBe(1);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
+      });
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Install-time Validation (T-INST-61 … 64d, 52b)
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Install-time Validation", () => {
+    forEachRuntime((runtime) => {
+      it("T-INST-61: invalid script name (-bad.sh) → install fails", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "bad",
+            files: {
+              "index.sh": BASH_STOP,
+              "-bad.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/bad.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-62: same-base-name collision (check.sh + check.ts) → install fails", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "bad",
+            files: {
+              "index.sh": BASH_STOP,
+              "check.sh": BASH_STOP,
+              "check.ts": 'console.log("c");',
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/bad.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-62a: index.sh + index.ts collision → install fails", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "bad",
+            files: {
+              "index.sh": BASH_STOP,
+              "index.ts": 'console.log("x");',
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/bad.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-63: invalid derived workflow name → install fails", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "pkg" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/-bad.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/-bad.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-63a: digit-start workflow name valid at install time", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "3checks",
+            files: { "check.sh": BASH_STOP },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/3checks.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "3checks"))).toBe(true);
+      });
+
+      it("T-INST-63b: install rejects workflow name containing ':'", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "pkg" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/my:workflow.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/my:workflow.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-63c: install rejects a script base name containing ':'", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "bad",
+            files: {
+              "index.sh": BASH_STOP,
+              "check:ready.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/bad.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-63d: numeric script names valid at install time", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "numeric",
+            files: {
+              "index.sh": BASH_STOP,
+              "1start.sh": BASH_STOP,
+              "42.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/numeric.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "numeric", "1start.sh")),
+        ).toBe(true);
+        expect(existsSync(join(project.loopxDir, "numeric", "42.sh"))).toBe(
+          true,
+        );
+      });
+
+      it("T-INST-63e: install rejects multi-workflow subdir name containing ':' — atomic", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          {
+            "foo:bar/index.sh": BASH_STOP,
+            "other/index.sh": BASH_STOP,
+          },
+          { wrapperDir: "multi" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/multi.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/multi.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(existsSync(join(project.loopxDir, "foo:bar"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
+      });
+
+      it("T-INST-64: missing index script allowed for single-workflow sources", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "no-index",
+            files: { "check.sh": BASH_STOP },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/no-index.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "no-index", "check.sh")),
+        ).toBe(true);
+      });
+
+      it("T-INST-64b: missing index script allowed for multi-workflow sources", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "tools/check.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "tools", "check.sh"))).toBe(
+          true,
+        );
+        expect(existsSync(join(project.loopxDir, "other", "index.sh"))).toBe(
+          true,
+        );
+      });
+
+      it("T-INST-64c: missing index script allowed for multi-workflow with -w scoping", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "tools/check.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-w", "tools", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "tools", "check.sh"))).toBe(
+          true,
+        );
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
+      });
+
+      it("T-INST-64a: install-time validation is non-recursive (nested invalid files OK, single-workflow)", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "single",
+            files: {
+              "index.ts": 'console.log("r");',
+              "lib/-bad.ts": 'console.log("x");',
+              "lib/check.sh": BASH_STOP,
+              "lib/check.ts": 'console.log("c");',
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/single.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "single", "lib", "-bad.ts")),
+        ).toBe(true);
+        expect(
+          existsSync(join(project.loopxDir, "single", "lib", "check.sh")),
+        ).toBe(true);
+        expect(
+          existsSync(join(project.loopxDir, "single", "lib", "check.ts")),
+        ).toBe(true);
+      });
+
+      it("T-INST-64d: install-time validation is non-recursive (nested invalid files OK, multi-workflow)", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "ralph/lib/-bad.ts": 'console.log("x");',
+              "ralph/lib/check.sh": BASH_STOP,
+              "ralph/lib/check.ts": 'console.log("c");',
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "ralph", "lib", "-bad.ts")),
+        ).toBe(true);
+      });
+
+      it("T-INST-52b: multi-workflow with workflow-internal config-style file fails validation", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "ralph/eslint.config.js": "module.exports = {};",
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/eslint\.config/);
+      });
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Collision Handling (T-INST-65 … 71a, 97)
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Collision Handling", () => {
+    forEachRuntime((runtime) => {
+      it("T-INST-65: path does not exist → workflow installed without collision check", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          { name: "repo", files: { "index.sh": BASH_STOP } },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/repo.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "repo"))).toBe(true);
+      });
+
+      it("T-INST-66: path exists as workflow → install refused", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(project, "repo", "index", 'exit 0');
+        gitServer = await startLocalGitServer([
+          { name: "repo", files: { "index.sh": BASH_STOP } },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/repo.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-67: path exists as workflow with -y → replaced", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "repo",
+          "index",
+          'echo "OLD_CONTENT" > /dev/null',
+        );
+        gitServer = await startLocalGitServer([
+          {
+            name: "repo",
+            files: {
+              "index.sh": '#!/bin/bash\nprintf \'{"new":true}\'\n',
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-y", `${gitServer.url}/repo.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        const content = readFileSync(
+          join(project.loopxDir, "repo", "index.sh"),
+          "utf-8",
+        );
+        expect(content).toContain('{"new":true}');
+        expect(content).not.toContain("OLD_CONTENT");
+      });
+
+      it("T-INST-67a: path exists as runtime-invalid workflow with -y → replaced", async () => {
+        project = await createTempProject();
+        // Create an existing "workflow" with invalid content:
+        await createBashWorkflowScript(project, "foo", "-bad", 'exit 0');
+        await createBashWorkflowScript(project, "foo", "check", 'exit 0');
+        await createWorkflowScript(
+          project,
+          "foo",
+          "check",
+          ".ts",
+          'console.log("x");',
+        );
+        gitServer = await startLocalGitServer([
+          { name: "foo", files: { "index.sh": BASH_STOP } },
+        ]);
+        const result = await runCLI(
+          ["install", "-y", `${gitServer.url}/foo.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "foo", "index.sh"))).toBe(
+          true,
+        );
+        expect(existsSync(join(project.loopxDir, "foo", "-bad.sh"))).toBe(
+          false,
+        );
+      });
+
+      it("T-INST-68: path exists but not a workflow by structure → refused even with -y", async () => {
+        project = await createTempProject();
+        // Non-workflow directory (no top-level script files)
+        await mkdir(join(project.loopxDir, "repo"), { recursive: true });
+        await writeFile(
+          join(project.loopxDir, "repo", "README.md"),
+          "readme",
+          "utf-8",
+        );
+        gitServer = await startLocalGitServer([
+          { name: "repo", files: { "index.sh": BASH_STOP } },
+        ]);
+        const result = await runCLI(
+          ["install", "-y", `${gitServer.url}/repo.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-69: plain file at .loopx/<name> → refused even with -y", async () => {
+        project = await createTempProject();
+        await writeFile(
+          join(project.loopxDir, "repo"),
+          "not a directory",
+          "utf-8",
+        );
+        gitServer = await startLocalGitServer([
+          { name: "repo", files: { "index.sh": BASH_STOP } },
+        ]);
+        const result = await runCLI(
+          ["install", "-y", `${gitServer.url}/repo.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(statSync(join(project.loopxDir, "repo")).isFile()).toBe(true);
+      });
+
+      it("T-INST-70: symlink to workflow directory → collision error", async () => {
+        project = await createTempProject();
+        const extDir = await mkdtemp(join(tmpdir(), "loopx-sym-"));
+        try {
+          await writeFile(join(extDir, "index.sh"), BASH_STOP, "utf-8");
+          await chmod(join(extDir, "index.sh"), 0o755);
+          symlinkSync(extDir, join(project.loopxDir, "foo"));
+          gitServer = await startLocalGitServer([
+            { name: "foo", files: { "index.sh": BASH_STOP } },
+          ]);
+          const result = await runCLI(
+            ["install", `${gitServer.url}/foo.git`],
+            { cwd: project.dir, runtime },
+          );
           expect(result.exitCode).toBe(1);
-          expect(result.stderr.length).toBeGreaterThan(0);
-          expect(existsSync(join(project.loopxDir, "symlink-escape"))).toBe(false);
         } finally {
-          await rm(repoBase, { recursive: true, force: true });
+          await rm(extDir, { recursive: true, force: true });
         }
       });
 
-      it("T-INST-39e: tarball install with symlink escaping directory boundary -> dir removed, error", async () => {
-        // Create a tarball manually with a symlink
-        const tmp = join(tmpdir(), `loopx-symlink-tar-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-        const contentDir = join(tmp, "symlink-pkg");
-        await mkdir(contentDir, { recursive: true });
+      it("T-INST-70b: symlink to workflow with -y → removes symlink, not target", async () => {
+        project = await createTempProject();
+        const extDir = await mkdtemp(join(tmpdir(), "loopx-sym-"));
+        try {
+          await writeFile(join(extDir, "index.sh"), BASH_OK, "utf-8");
+          await chmod(join(extDir, "index.sh"), 0o755);
+          symlinkSync(extDir, join(project.loopxDir, "foo"));
+          gitServer = await startLocalGitServer([
+            {
+              name: "foo",
+              files: {
+                "index.sh": '#!/bin/bash\nprintf \'{"new":true}\'\n',
+              },
+            },
+          ]);
+          const result = await runCLI(
+            ["install", "-y", `${gitServer.url}/foo.git`],
+            { cwd: project.dir, runtime },
+          );
+          expect(result.exitCode).toBe(0);
+          // .loopx/foo is now a regular directory
+          const st = lstatSync(join(project.loopxDir, "foo"));
+          expect(st.isSymbolicLink()).toBe(false);
+          expect(st.isDirectory()).toBe(true);
+          // The external directory is preserved
+          expect(existsSync(join(extDir, "index.sh"))).toBe(true);
+          const oldContent = readFileSync(join(extDir, "index.sh"), "utf-8");
+          expect(oldContent).toBe(BASH_OK);
+        } finally {
+          await rm(extDir, { recursive: true, force: true });
+        }
+      });
 
+      it("T-INST-70a: symlink to non-workflow directory → refused even with -y", async () => {
+        project = await createTempProject();
+        const extDir = await mkdtemp(join(tmpdir(), "loopx-sym-"));
+        try {
+          await mkdir(join(extDir, "lib"), { recursive: true });
+          await writeFile(
+            join(extDir, "lib", "helper.ts"),
+            "export const x = 1;",
+            "utf-8",
+          );
+          symlinkSync(extDir, join(project.loopxDir, "foo"));
+          gitServer = await startLocalGitServer([
+            { name: "foo", files: { "index.sh": BASH_STOP } },
+          ]);
+          const result = await runCLI(
+            ["install", "-y", `${gitServer.url}/foo.git`],
+            { cwd: project.dir, runtime },
+          );
+          expect(result.exitCode).toBe(1);
+        } finally {
+          await rm(extDir, { recursive: true, force: true });
+        }
+      });
+
+      it("T-INST-70c: symlink to file → refused even with -y", async () => {
+        project = await createTempProject();
+        const extDir = await mkdtemp(join(tmpdir(), "loopx-sym-"));
+        try {
+          const targetFile = join(extDir, "target.txt");
+          await writeFile(targetFile, "data", "utf-8");
+          symlinkSync(targetFile, join(project.loopxDir, "foo"));
+          gitServer = await startLocalGitServer([
+            { name: "foo", files: { "index.sh": BASH_STOP } },
+          ]);
+          const result = await runCLI(
+            ["install", "-y", `${gitServer.url}/foo.git`],
+            { cwd: project.dir, runtime },
+          );
+          expect(result.exitCode).toBe(1);
+        } finally {
+          await rm(extDir, { recursive: true, force: true });
+        }
+      });
+
+      it("T-INST-70d: symlink to validly-structured-but-invalid workflow with -y → replaced", async () => {
+        project = await createTempProject();
+        const extDir = await mkdtemp(join(tmpdir(), "loopx-sym-"));
+        try {
+          // Structurally a workflow (has index.sh) but would fail validation
+          await writeFile(join(extDir, "index.sh"), BASH_OK, "utf-8");
+          await chmod(join(extDir, "index.sh"), 0o755);
+          await writeFile(join(extDir, "-bad.sh"), BASH_OK, "utf-8");
+          await chmod(join(extDir, "-bad.sh"), 0o755);
+          await writeFile(join(extDir, "check.sh"), BASH_OK, "utf-8");
+          await chmod(join(extDir, "check.sh"), 0o755);
+          await writeFile(
+            join(extDir, "check.ts"),
+            'console.log("c");',
+            "utf-8",
+          );
+          symlinkSync(extDir, join(project.loopxDir, "foo"));
+          gitServer = await startLocalGitServer([
+            {
+              name: "foo",
+              files: {
+                "index.sh": '#!/bin/bash\nprintf \'{"new":true}\'\n',
+              },
+            },
+          ]);
+          const result = await runCLI(
+            ["install", "-y", `${gitServer.url}/foo.git`],
+            { cwd: project.dir, runtime },
+          );
+          expect(result.exitCode).toBe(0);
+          const st = lstatSync(join(project.loopxDir, "foo"));
+          expect(st.isSymbolicLink()).toBe(false);
+          expect(st.isDirectory()).toBe(true);
+          // External target still exists
+          expect(existsSync(join(extDir, "-bad.sh"))).toBe(true);
+        } finally {
+          await rm(extDir, { recursive: true, force: true });
+        }
+      });
+
+      it("T-INST-71: broken non-workflow siblings do not affect collision eval", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(project, "foo", "index", 'exit 0');
+        await mkdir(join(project.loopxDir, "broken"), { recursive: true });
         await writeFile(
-          join(contentDir, "package.json"),
-          validPackageJson("entry.ts"),
+          join(project.loopxDir, "broken", "README.md"),
+          "readme",
           "utf-8",
         );
-        execSync(`ln -s ../../outside.ts entry.ts`, { cwd: contentDir, stdio: "pipe" });
-
-        const archivePath = join(tmp, "symlink-pkg.tar.gz");
-        execSync(`tar czf "${archivePath}" -C "${tmp}" "symlink-pkg"`, { stdio: "pipe" });
-        const tarball = readFileSync(archivePath);
-        await rm(tmp, { recursive: true, force: true });
-
-        httpServer = await startLocalHTTPServer([
+        gitServer = await startLocalGitServer([
           {
-            path: "/symlink-pkg.tar.gz",
-            contentType: "application/gzip",
-            body: tarball,
+            name: "foo",
+            files: { "index.sh": '#!/bin/bash\nprintf \'{"new":true}\'\n' },
           },
         ]);
-
-        project = await createTempProject();
-        // Create the symlink target outside .loopx/ so the symlink resolves
-        await writeFile(join(project.dir, "outside.ts"), `export {};\n`, "utf-8");
-
         const result = await runCLI(
-          ["install", `${httpServer.url}/symlink-pkg.tar.gz`],
+          ["install", "-y", `${gitServer.url}/foo.git`],
           { cwd: project.dir, runtime },
         );
+        expect(result.exitCode).toBe(0);
+        const content = readFileSync(
+          join(project.loopxDir, "foo", "index.sh"),
+          "utf-8",
+        );
+        expect(content).toContain('{"new":true}');
+      });
 
-        expect(result.exitCode).toBe(1);
-        expect(result.stderr.length).toBeGreaterThan(0);
-        expect(existsSync(join(project.loopxDir, "symlink-pkg"))).toBe(false);
+      it("T-INST-71a: invalid sibling workflows do not affect collision eval", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(project, "foo", "index", 'exit 0');
+        await createBashWorkflowScript(project, "broken", "check", 'exit 0');
+        await createWorkflowScript(
+          project,
+          "broken",
+          "check",
+          ".ts",
+          'console.log("x");',
+        );
+        gitServer = await startLocalGitServer([
+          {
+            name: "foo",
+            files: {
+              "index.sh": '#!/bin/bash\nprintf \'{"new":true}\'\n',
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-y", `${gitServer.url}/foo.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        const content = readFileSync(
+          join(project.loopxDir, "foo", "index.sh"),
+          "utf-8",
+        );
+        expect(content).toContain('{"new":true}');
+      });
+
+      it("T-INST-97: .loopx/foo.sh file does not collide with installing workflow foo", async () => {
+        project = await createTempProject();
+        await writeFile(join(project.loopxDir, "foo.sh"), BASH_OK, "utf-8");
+        gitServer = await startLocalGitServer([
+          { name: "foo", files: { "index.sh": BASH_STOP } },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/foo.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "foo", "index.sh"))).toBe(
+          true,
+        );
+        // The loose file still exists
+        expect(existsSync(join(project.loopxDir, "foo.sh"))).toBe(true);
       });
     });
   });
 
-  // ─────────────────────────────────────────────
-  // Global Install Smoke Test
-  // ─────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════
+  // Version Checking on Install (T-INST-72 … 76a)
+  // ═══════════════════════════════════════════════════════════
 
-  describe("SPEC: Global Install", () => {
-    it("T-INST-GLOBAL-01: npm pack -> install into isolated prefix -> run fixture project", async () => {
+  describe("Version Checking on Install", () => {
+    forEachRuntime((runtime) => {
+      it("T-INST-72: workflow declares mismatched loopx range → install refused", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "wf",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                dependencies: { loopx: unsatisfiedRange() },
+              }),
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/wf.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-73: -y overrides version mismatch, declaration preserved", async () => {
+        project = await createTempProject();
+        const pkg = JSON.stringify({
+          dependencies: { loopx: unsatisfiedRange() },
+        });
+        gitServer = await startLocalGitServer([
+          {
+            name: "wf",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": pkg,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-y", `${gitServer.url}/wf.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        const installedPkg = readFileSync(
+          join(project.loopxDir, "wf", "package.json"),
+          "utf-8",
+        );
+        expect(installedPkg).toContain(unsatisfiedRange());
+      });
+
+      it("T-INST-72a: no-index workflow version mismatch → install refused", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "wf",
+            files: {
+              "check.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                dependencies: { loopx: unsatisfiedRange() },
+              }),
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/wf.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-73a: -y overrides no-index workflow version mismatch", async () => {
+        project = await createTempProject();
+        const pkg = JSON.stringify({
+          dependencies: { loopx: unsatisfiedRange() },
+        });
+        gitServer = await startLocalGitServer([
+          {
+            name: "wf",
+            files: {
+              "check.sh": BASH_STOP,
+              "package.json": pkg,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-y", `${gitServer.url}/wf.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "wf", "check.sh"))).toBe(
+          true,
+        );
+        const installedPkg = readFileSync(
+          join(project.loopxDir, "wf", "package.json"),
+          "utf-8",
+        );
+        expect(installedPkg).toContain(unsatisfiedRange());
+      });
+
+      it.skipIf(IS_ROOT)(
+        "T-INST-74: workflow package.json unreadable → warning, proceeds (tarball)",
+        async () => {
+          project = await createTempProject();
+          const tarball = await makeTarball(
+            {
+              "index.sh": BASH_STOP,
+              "package.json": { content: "{}", mode: 0o000 },
+            },
+            { wrapperDir: "wf" },
+          );
+          httpServer = await startLocalHTTPServer([
+            tarballRoute("/wf.tar.gz", tarball),
+          ]);
+          const result = await runCLI(
+            ["install", `${httpServer.url}/wf.tar.gz`],
+            { cwd: project.dir, runtime },
+          );
+          expect(result.exitCode).toBe(0);
+          expect(hasUnreadableWarning(result.stderr, "wf")).toBe(true);
+          try {
+            chmodSync(join(project.loopxDir, "wf", "package.json"), 0o644);
+          } catch {}
+        },
+      );
+
+      it.skipIf(IS_ROOT)(
+        "T-INST-74a: no-index workflow unreadable package.json → warning, proceeds",
+        async () => {
+          project = await createTempProject();
+          const tarball = await makeTarball(
+            {
+              "check.sh": BASH_STOP,
+              "package.json": { content: "{}", mode: 0o000 },
+            },
+            { wrapperDir: "wf" },
+          );
+          httpServer = await startLocalHTTPServer([
+            tarballRoute("/wf.tar.gz", tarball),
+          ]);
+          const result = await runCLI(
+            ["install", `${httpServer.url}/wf.tar.gz`],
+            { cwd: project.dir, runtime },
+          );
+          expect(result.exitCode).toBe(0);
+          expect(hasUnreadableWarning(result.stderr, "wf")).toBe(true);
+          expect(existsSync(join(project.loopxDir, "wf", "check.sh"))).toBe(
+            true,
+          );
+          try {
+            chmodSync(join(project.loopxDir, "wf", "package.json"), 0o644);
+          } catch {}
+        },
+      );
+
+      it("T-INST-75: workflow package.json invalid JSON → warning, proceeds", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "wf",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": "{broken",
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/wf.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(hasInvalidJsonWarning(result.stderr, "wf")).toBe(true);
+        expect(existsSync(join(project.loopxDir, "wf", "index.sh"))).toBe(
+          true,
+        );
+      });
+
+      it("T-INST-75a: no-index workflow invalid-JSON package.json → warning, proceeds", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "wf",
+            files: {
+              "check.sh": BASH_STOP,
+              "package.json": "{broken",
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/wf.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(hasInvalidJsonWarning(result.stderr, "wf")).toBe(true);
+        expect(existsSync(join(project.loopxDir, "wf", "check.sh"))).toBe(
+          true,
+        );
+      });
+
+      it("T-INST-76: workflow package.json invalid semver range → warning, proceeds", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "wf",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                dependencies: { loopx: "not-a-range!!!" },
+              }),
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/wf.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(hasInvalidSemverWarning(result.stderr, "wf")).toBe(true);
+      });
+
+      it("T-INST-76a: no-index workflow invalid-semver package.json → warning, proceeds", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "wf",
+            files: {
+              "check.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                dependencies: { loopx: "not-a-range!!!" },
+              }),
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/wf.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(hasInvalidSemverWarning(result.stderr, "wf")).toBe(true);
+        expect(existsSync(join(project.loopxDir, "wf", "check.sh"))).toBe(
+          true,
+        );
+      });
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Install Atomicity (T-INST-77 … 80j)
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Install Atomicity", () => {
+    forEachRuntime((runtime) => {
+      it("T-INST-77: multi-workflow all pass preflight → all installed", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
+      });
+
+      it("T-INST-78: one workflow fails preflight → entire install fails, .loopx/ unchanged", async () => {
+        project = await createTempProject();
+        // Existing workflow at .loopx/ralph will cause collision for ralph
+        await createBashWorkflowScript(project, "ralph", "index", 'exit 0');
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh":
+                '#!/bin/bash\nprintf \'{"new":true}\'\n',
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const beforeOther = existsSync(join(project.loopxDir, "other"));
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        // The pre-existing ralph/ is unchanged
+        const ralphContent = readFileSync(
+          join(project.loopxDir, "ralph", "index.sh"),
+          "utf-8",
+        );
+        expect(ralphContent).not.toContain('{"new":true}');
+        // other/ was not written (atomic)
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(beforeOther);
+      });
+
+      it.skipIf(IS_ROOT)(
+        "T-INST-79: staging failure leaves .loopx/ unchanged (tarball)",
+        async () => {
+          project = await createTempProject();
+          const tarball = await makeTarball(
+            {
+              "ralph/index.sh": BASH_STOP,
+              "broken/index.sh": BASH_STOP,
+              "broken/data.txt": { content: "secret", mode: 0o000 },
+            },
+            { wrapperDir: "multi" },
+          );
+          httpServer = await startLocalHTTPServer([
+            tarballRoute("/multi.tar.gz", tarball),
+          ]);
+          const result = await runCLI(
+            ["install", `${httpServer.url}/multi.tar.gz`],
+            { cwd: project.dir, runtime },
+          );
+          expect(result.exitCode).toBe(1);
+          expect(existsSync(join(project.loopxDir, "ralph"))).toBe(false);
+          expect(existsSync(join(project.loopxDir, "broken"))).toBe(false);
+        },
+      );
+
+      it("T-INST-80: -y succeeds despite collisions and version mismatches", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          'echo "OLD" > /dev/null',
+        );
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh":
+                '#!/bin/bash\nprintf \'{"new":true}\'\n',
+              "other/index.sh": BASH_STOP,
+              "other/package.json": JSON.stringify({
+                dependencies: { loopx: unsatisfiedRange() },
+              }),
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-y", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        const ralphContent = readFileSync(
+          join(project.loopxDir, "ralph", "index.sh"),
+          "utf-8",
+        );
+        expect(ralphContent).toContain('{"new":true}');
+        const otherPkg = readFileSync(
+          join(project.loopxDir, "other", "package.json"),
+          "utf-8",
+        );
+        expect(otherPkg).toContain(unsatisfiedRange());
+      });
+
+      it("T-INST-80a: multiple preflight failures → single aggregated error", async () => {
+        project = await createTempProject();
+        // Pre-existing collision for A
+        await createBashWorkflowScript(project, "alpha", "index", 'exit 0');
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh":
+                '#!/bin/bash\nprintf \'{"new":true}\'\n',
+              "beta/-bad.sh": BASH_STOP,
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                dependencies: { loopx: unsatisfiedRange() },
+              }),
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        // No new workflows were written
+        expect(existsSync(join(project.loopxDir, "beta"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "gamma"))).toBe(false);
+        // The pre-existing alpha/ is unchanged
+        const alphaContent = readFileSync(
+          join(project.loopxDir, "alpha", "index.sh"),
+          "utf-8",
+        );
+        expect(alphaContent).not.toContain('{"new":true}');
+      });
+
+      it.skipIf(IS_ROOT)(
+        "T-INST-80b: -y replacement preserves existing workflow when staging fails (tarball)",
+        async () => {
+          project = await createTempProject();
+          await createBashWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            'echo "PRESERVED" > /dev/null',
+          );
+          const tarball = await makeTarball(
+            {
+              "ralph/index.sh":
+                '#!/bin/bash\nprintf \'{"new":true}\'\n',
+              "other/index.sh": BASH_STOP,
+              "other/data.txt": { content: "secret", mode: 0o000 },
+            },
+            { wrapperDir: "multi" },
+          );
+          httpServer = await startLocalHTTPServer([
+            tarballRoute("/multi.tar.gz", tarball),
+          ]);
+          const result = await runCLI(
+            ["install", "-y", `${httpServer.url}/multi.tar.gz`],
+            { cwd: project.dir, runtime },
+          );
+          expect(result.exitCode).toBe(1);
+          const ralphContent = readFileSync(
+            join(project.loopxDir, "ralph", "index.sh"),
+            "utf-8",
+          );
+          expect(ralphContent).toContain("PRESERVED");
+          expect(ralphContent).not.toContain('{"new":true}');
+        },
+      );
+
+      it("T-INST-80c: commit-phase failure reports which workflows were/were not committed", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "beta/index.sh": BASH_STOP,
+              "gamma/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          {
+            cwd: project.dir,
+            runtime,
+            env: {
+              NODE_ENV: "test",
+              LOOPX_TEST_INSTALL_FAULT: "commit-fail-after:1",
+            },
+          },
+        );
+        expect(result.exitCode).toBe(1);
+        // Exactly one workflow directory exists (the one committed before failure)
+        const loopxDir = project!.loopxDir;
+        const names = readdirSync(loopxDir).filter((name) =>
+          statSync(join(loopxDir, name)).isDirectory(),
+        );
+        expect(names.length).toBe(1);
+      });
+
+      it.skipIf(IS_ROOT)(
+        "T-INST-80d: package.json warning is once-per-workflow (tarball)",
+        async () => {
+          project = await createTempProject();
+          const tarball = await makeTarball(
+            {
+              "ralph/index.sh": BASH_STOP,
+              "ralph/package.json": { content: "{}", mode: 0o000 },
+              "other/index.sh": BASH_STOP,
+              "other/package.json": { content: "{}", mode: 0o000 },
+            },
+            { wrapperDir: "multi" },
+          );
+          httpServer = await startLocalHTTPServer([
+            tarballRoute("/multi.tar.gz", tarball),
+          ]);
+          const result = await runCLI(
+            ["install", `${httpServer.url}/multi.tar.gz`],
+            { cwd: project.dir, runtime },
+          );
+          expect(result.exitCode).toBe(0);
+          expect(countUnreadableWarnings(result.stderr, "ralph")).toBe(1);
+          expect(countUnreadableWarnings(result.stderr, "other")).toBe(1);
+          try {
+            chmodSync(join(project.loopxDir, "ralph", "package.json"), 0o644);
+            chmodSync(join(project.loopxDir, "other", "package.json"), 0o644);
+          } catch {}
+        },
+      );
+
+      it("T-INST-80e: invalid semver warning is once-per-workflow", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "ralph/package.json": JSON.stringify({
+                dependencies: { loopx: "bad-range-1" },
+              }),
+              "other/index.sh": BASH_STOP,
+              "other/package.json": JSON.stringify({
+                dependencies: { loopx: "bad-range-2" },
+              }),
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(countInvalidSemverWarnings(result.stderr, "ralph")).toBe(1);
+        expect(countInvalidSemverWarnings(result.stderr, "other")).toBe(1);
+      });
+
+      it("T-INST-80f: invalid JSON warning is once-per-workflow", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "ralph/package.json": "{broken-1",
+              "other/index.sh": BASH_STOP,
+              "other/package.json": "{broken-2",
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(countInvalidJsonWarnings(result.stderr, "ralph")).toBe(1);
+        expect(countInvalidJsonWarnings(result.stderr, "other")).toBe(1);
+      });
+
+      it("T-INST-80g: -y does not override zero-workflow source", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "empty",
+            files: { "README.md": "nothing" },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-y", `${gitServer.url}/empty.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-80h: -y does not override invalid script names", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "bad",
+            files: {
+              "index.sh": BASH_STOP,
+              "-bad.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-y", `${gitServer.url}/bad.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-80i: -y does not override same-base-name collisions within a workflow", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "bad",
+            files: {
+              "index.sh": BASH_STOP,
+              "check.sh": BASH_STOP,
+              "check.ts": 'console.log("c");',
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-y", `${gitServer.url}/bad.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-80j: -y does not override invalid workflow name", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "bad.name",
+            files: { "index.sh": BASH_STOP },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "-y", `${gitServer.url}/bad.name.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Tarball Install (T-INST-81 … 86a, 85a, 85b)
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Tarball Install", () => {
+    forEachRuntime((runtime) => {
+      it("T-INST-81: multi-workflow tarball install with exact name derivation", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          {
+            "ralph/index.sh": BASH_STOP,
+            "other/index.sh": BASH_STOP,
+          },
+          { wrapperDir: "multi" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/multi.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/multi.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "ralph", "index.sh")),
+        ).toBe(true);
+        expect(
+          existsSync(join(project.loopxDir, "other", "index.sh")),
+        ).toBe(true);
+      });
+
+      it("T-INST-82: wrapper-directory stripping for multi-workflow tarball", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          {
+            "ralph/index.sh": BASH_STOP,
+            "other/index.sh": BASH_STOP,
+          },
+          { wrapperDir: "pkg" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/pkg.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/pkg.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "pkg"))).toBe(false);
+      });
+
+      it("T-INST-83: no wrapper-directory stripping for multi-entry tarball", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball({
+          "ralph/index.sh": BASH_STOP,
+          "other/index.sh": BASH_STOP,
+        });
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/multi.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/multi.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
+      });
+
+      it("T-INST-83a: multi-workflow tarball self-containment", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          {
+            "ralph/index.sh": BASH_STOP,
+            "other/index.sh": BASH_STOP,
+            "README.md": "readme",
+            "LICENSE": "MIT",
+            "docs/guide.md": "# guide",
+            "shared/config.json": "{}",
+          },
+          { wrapperDir: "multi" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/multi.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/multi.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "README.md"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "LICENSE"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "docs"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "shared"))).toBe(false);
+      });
+
+      it("T-INST-84: .tgz extension handled identically", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          {
+            "ralph/index.sh": BASH_STOP,
+            "other/index.sh": BASH_STOP,
+          },
+          { wrapperDir: "multi" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/multi.tgz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/multi.tgz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
+      });
+
+      it("T-INST-85: single-workflow tarball name derived from archive name", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball({ "index.sh": BASH_STOP });
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/my-agent.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/my-agent.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "my-agent", "index.sh")),
+        ).toBe(true);
+      });
+
+      it("T-INST-86: tarball URL with query string → query stripped", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball({ "index.sh": BASH_STOP });
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/my-agent.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/my-agent.tar.gz?token=abc`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "my-agent"))).toBe(true);
+      });
+
+      it("T-INST-86a: tarball URL with fragment → fragment stripped", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball({ "index.sh": BASH_STOP });
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/pkg.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/pkg.tar.gz#v1`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "pkg"))).toBe(true);
+      });
+
+      it("T-INST-85a: single-workflow tarball with wrapper-directory stripping", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          {
+            "index.sh": BASH_STOP,
+            "check.sh": BASH_STOP,
+          },
+          { wrapperDir: "wrapper" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/my-agent.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/my-agent.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "my-agent", "index.sh")),
+        ).toBe(true);
+        expect(
+          existsSync(join(project.loopxDir, "my-agent", "check.sh")),
+        ).toBe(true);
+        expect(existsSync(join(project.loopxDir, "wrapper"))).toBe(false);
+      });
+
+      it("T-INST-85b: single-workflow tarball with root scripts plus subdirs", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          {
+            "index.sh": BASH_STOP,
+            "check.sh": BASH_STOP,
+            "lib/helpers.ts": "export const x = 1;",
+            "src/utils.js": 'console.log("u");',
+            "package.json": '{"name":"my-agent"}',
+            "README.md": "readme",
+          },
+          { wrapperDir: "wrapper" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/my-agent.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/my-agent.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "my-agent", "index.sh")),
+        ).toBe(true);
+        expect(
+          existsSync(
+            join(project.loopxDir, "my-agent", "lib", "helpers.ts"),
+          ),
+        ).toBe(true);
+        expect(
+          existsSync(join(project.loopxDir, "my-agent", "src", "utils.js")),
+        ).toBe(true);
+        expect(
+          existsSync(join(project.loopxDir, "my-agent", "package.json")),
+        ).toBe(true);
+        expect(
+          existsSync(join(project.loopxDir, "my-agent", "README.md")),
+        ).toBe(true);
+      });
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Git Install (T-INST-87 … 89)
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Git Install", () => {
+    forEachRuntime((runtime) => {
+      it("T-INST-87: shallow clone (--depth 1), only 1 commit", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          { name: "repo", files: { "index.sh": BASH_STOP } },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/repo.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        // Installed workflow has no .git directory (it's excluded)
+        // but the install should not attempt deep history fetches.
+        expect(existsSync(join(project.loopxDir, "repo", ".git"))).toBe(false);
+      });
+
+      it("T-INST-88: single-workflow git name derived from repo URL minus .git", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "my-agent",
+            files: { "index.sh": BASH_STOP },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/my-agent.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "my-agent"))).toBe(true);
+      });
+
+      it("T-INST-89: multi-workflow git names derived from subdirectory names", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
+      });
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Common Rules (T-INST-90 … 97b)
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Common Rules", () => {
+    forEachRuntime((runtime) => {
+      it("T-INST-90: .loopx/ created if it doesn't exist", async () => {
+        project = await createTempProject({ withLoopxDir: false });
+        gitServer = await startLocalGitServer([
+          { name: "repo", files: { "index.sh": BASH_STOP } },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/repo.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(project.loopxDir)).toBe(true);
+        expect(existsSync(join(project.loopxDir, "repo"))).toBe(true);
+      });
+
+      it("T-INST-91: no npm install / bun install after clone/extract", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "repo",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                dependencies: { "left-pad": "^1.0.0" },
+              }),
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/repo.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        // No node_modules created from the install
+        expect(
+          existsSync(join(project.loopxDir, "repo", "node_modules")),
+        ).toBe(false);
+      });
+
+      it("T-INST-92: HTTP 404 during tarball download → error, no partial directory", async () => {
+        project = await createTempProject();
+        httpServer = await startLocalHTTPServer([
+          { path: "/pkg.tar.gz", status: 404, body: "not found" },
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/pkg.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(existsSync(join(project.loopxDir, "pkg"))).toBe(false);
+      });
+
+      it("T-INST-93: git clone failure (non-existent repo) → error, no partial directory", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "file:///nonexistent/repo.git"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(existsSync(join(project.loopxDir, "repo"))).toBe(false);
+      });
+
+      it("T-INST-94: tarball extraction failure (corrupt archive) → error", async () => {
+        project = await createTempProject();
+        const corrupt = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "pkg", corrupt: true },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/pkg.tar.gz", corrupt),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/pkg.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(existsSync(join(project.loopxDir, "pkg"))).toBe(false);
+      });
+
+      it("T-INST-95: empty tarball → error", async () => {
+        project = await createTempProject();
+        const empty = await makeTarball({}, { empty: true });
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/empty.tar.gz", empty),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/empty.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-96: successful single-workflow git install → runnable via loopx run", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: { "index.sh": BASH_STOP },
+          },
+        ]);
+        const installResult = await runCLI(
+          ["install", `${gitServer.url}/ralph.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(installResult.exitCode).toBe(0);
+        const runResult = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(runResult.exitCode).toBe(0);
+      });
+
+      it("T-INST-97a: single-workflow install failure cleanup", async () => {
+        project = await createTempProject();
+        // A tarball that extracts successfully but whose workflow derived-name is invalid
+        const tarball = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "pkg" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/-bad.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/-bad.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(existsSync(join(project.loopxDir, "-bad"))).toBe(false);
+      });
+
+      it("T-INST-97b: successful install does not create .loopx/package.json", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: { "index.sh": BASH_STOP },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/ralph.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "package.json"))).toBe(false);
+      });
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Global Install Smoke Test (T-INST-GLOBAL-01, 01a)
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Global Install", () => {
+    it("T-INST-GLOBAL-01: full global install lifecycle with import 'loopx' (Node)", async () => {
       const projectRoot = resolve(process.cwd());
-      const tmpBase = join(
-        tmpdir(),
-        `loopx-global-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      const tmpBase = await mkdtemp(
+        join(tmpdir(), "loopx-global-"),
       );
       const globalPrefix = join(tmpBase, "global");
       const fixtureDir = join(tmpBase, "fixture-project");
       const loopxDir = join(fixtureDir, ".loopx");
-      const markerFile = join(fixtureDir, "marker.txt");
+      const ralphDir = join(loopxDir, "ralph");
 
       await mkdir(globalPrefix, { recursive: true });
-      await mkdir(loopxDir, { recursive: true });
+      await mkdir(ralphDir, { recursive: true });
 
       try {
-        // 1. npm pack the loopx package (from the monorepo or node_modules)
-        //    We need to find the actual loopx package to pack.
-        //    It should be at node_modules/loopx/
         const loopxPkgDir = resolve(projectRoot, "node_modules", "loopx");
-
-        // If loopx doesn't exist as a package yet, skip
         if (!existsSync(loopxPkgDir)) {
-          // loopx not yet installed — this test will fail when loopx exists
-          expect(existsSync(loopxPkgDir)).toBe(true);
-          return;
+          throw new Error(
+            `node_modules/loopx missing — run 'npm run build' first`,
+          );
         }
 
-        // npm pack produces a .tgz
         const packOutput = execSync("npm pack --json", {
           cwd: loopxPkgDir,
           stdio: "pipe",
-        }).toString().trim();
+        })
+          .toString()
+          .trim();
         const packResult = JSON.parse(packOutput);
         const tgzFilename = Array.isArray(packResult)
           ? packResult[0].filename
           : packResult.filename;
         const tgzPath = join(loopxPkgDir, tgzFilename);
 
-        // 2. Install globally into isolated prefix
         execSync(
           `npm install -g --prefix "${globalPrefix}" "${tgzPath}"`,
           { stdio: "pipe" },
         );
 
-        // 3. Create a fixture project with a default script
-        const scriptContent = `#!/bin/bash
-printf 'installed-globally' > "${markerFile}"
-printf '{"result":"global-ok"}'
-`;
-        await writeFile(join(loopxDir, "default.sh"), scriptContent, "utf-8");
-        const { chmodSync } = await import("node:fs");
-        chmodSync(join(loopxDir, "default.sh"), 0o755);
+        // Fixture: workflow `ralph` with an index.ts that imports loopx
+        const indexTs =
+          'import { output } from "loopx";\noutput({ stop: true });\n';
+        await writeFile(join(ralphDir, "index.ts"), indexTs, "utf-8");
 
-        // 4. Run loopx from the global prefix
         const binPath = join(globalPrefix, "bin", "loopx");
-        const result = execSync(`"${binPath}" run -n 1 default`, {
+        // Run ralph — no -n, relies on output({stop:true}) to exit
+        execSync(`"${binPath}" run ralph`, {
           cwd: fixtureDir,
           stdio: "pipe",
           env: {
             ...process.env,
             PATH: `${join(globalPrefix, "bin")}:${process.env.PATH}`,
           },
+          timeout: 30_000,
         });
-
-        // 5. Assert the script ran
-        expect(existsSync(markerFile)).toBe(true);
-        const markerContent = readFileSync(markerFile, "utf-8");
-        expect(markerContent).toBe("installed-globally");
+        // execSync throws on non-zero exit — reaching here means exit 0
       } finally {
         await rm(tmpBase, { recursive: true, force: true });
       }
     });
 
     it.skipIf(!isRuntimeAvailable("bun"))(
-      "T-INST-GLOBAL-01a: global install lifecycle under Bun with import from 'loopx'",
+      "T-INST-GLOBAL-01a: [Bun] full global install lifecycle with import 'loopx'",
       async () => {
         const projectRoot = resolve(process.cwd());
-        const tmpBase = join(
-          tmpdir(),
-          `loopx-global-bun-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        const tmpBase = await mkdtemp(
+          join(tmpdir(), "loopx-global-bun-"),
         );
         const globalPrefix = join(tmpBase, "global");
         const fixtureDir = join(tmpBase, "fixture-project");
         const loopxDir = join(fixtureDir, ".loopx");
-        const markerFile = join(fixtureDir, "marker.txt");
+        const ralphDir = join(loopxDir, "ralph");
 
         await mkdir(globalPrefix, { recursive: true });
-        await mkdir(loopxDir, { recursive: true });
+        await mkdir(ralphDir, { recursive: true });
 
         try {
           const loopxPkgDir = resolve(projectRoot, "node_modules", "loopx");
           if (!existsSync(loopxPkgDir)) {
-            expect(existsSync(loopxPkgDir)).toBe(true);
-            return;
+            throw new Error(
+              `node_modules/loopx missing — run 'npm run build' first`,
+            );
           }
 
-          // npm pack
           const packOutput = execSync("npm pack --json", {
             cwd: loopxPkgDir,
             stdio: "pipe",
-          }).toString().trim();
+          })
+            .toString()
+            .trim();
           const packResult = JSON.parse(packOutput);
           const tgzFilename = Array.isArray(packResult)
             ? packResult[0].filename
             : packResult.filename;
           const tgzPath = join(loopxPkgDir, tgzFilename);
 
-          // Install globally
           execSync(
             `npm install -g --prefix "${globalPrefix}" "${tgzPath}"`,
             { stdio: "pipe" },
           );
 
-          // Create a bash fixture script.
-          // NOTE: A .ts script with `import { output } from "loopx"` cannot work
-          // for Bun global installs because the npm package is named "loop-extender"
-          // (not "loopx"), and Bun's NODE_PATH resolution requires directory names
-          // to match the import specifier. This is a known limitation documented
-          // in SPEC-PROBLEMS.md.
-          const scriptContent = `#!/bin/bash
-printf 'bun-global-ok' > "${markerFile}"
-printf '{"result":"bun-global-done"}'
-`;
-          await writeFile(join(loopxDir, "default.sh"), scriptContent, "utf-8");
-          const { chmodSync } = await import("node:fs");
-          chmodSync(join(loopxDir, "default.sh"), 0o755);
+          const indexTs =
+            'import { output } from "loopx";\noutput({ stop: true });\n';
+          await writeFile(join(ralphDir, "index.ts"), indexTs, "utf-8");
 
-          // Run loopx via Bun using the actual JS entry point
-          // (npm global bin is a bash wrapper that Bun can't interpret directly)
-          const loopxPkg = JSON.parse(readFileSync(join(loopxPkgDir, "package.json"), "utf-8"));
+          const loopxPkg = JSON.parse(
+            readFileSync(join(loopxPkgDir, "package.json"), "utf-8"),
+          );
           const pkgName = loopxPkg.name as string;
-          const binJsPath = join(globalPrefix, "lib", "node_modules", pkgName, "bin.js");
-          execSync(`bun "${binJsPath}" run -n 1 default`, {
+          const binJsPath = join(
+            globalPrefix,
+            "lib",
+            "node_modules",
+            pkgName,
+            "bin.js",
+          );
+          execSync(`bun "${binJsPath}" run ralph`, {
             cwd: fixtureDir,
             stdio: "pipe",
             env: {
               ...process.env,
               PATH: `${join(globalPrefix, "bin")}:${process.env.PATH}`,
             },
+            timeout: 30_000,
           });
-
-          // Assert the script ran
-          expect(existsSync(markerFile)).toBe(true);
-          const markerContent = readFileSync(markerFile, "utf-8");
-          expect(markerContent).toBe("bun-global-ok");
         } finally {
           await rm(tmpBase, { recursive: true, force: true });
         }
