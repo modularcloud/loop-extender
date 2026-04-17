@@ -46,7 +46,15 @@ function getBunClassicJsxConfig(): string {
 }
 
 // Add our node_modules/.bin to PATH so tsx is findable regardless of cwd.
-const LOOPX_BIN_DIR = resolve(__dirname, "..", "node_modules", ".bin");
+// Two layouts must be supported:
+//   - Nested: <pkg>/node_modules/.bin — npm `install -g` produces this,
+//     because the loopx package's runtime deps (tsx + its transitive deps)
+//     are nested under the loopx package root.
+//   - Flat: <pkg>/../node_modules/.bin — the dev-tree layout, where `dist/`
+//     sits next to the repo-root `node_modules/.bin` via `resolve(__dirname, "..")`.
+// Prepend both; missing entries on PATH are harmless.
+const LOOPX_NESTED_BIN_DIR = resolve(__dirname, "node_modules", ".bin");
+const LOOPX_FLAT_BIN_DIR = resolve(__dirname, "..", "node_modules", ".bin");
 // NODE_PATH entries: loopx's own deps + parent dir (for global installs
 // where the parent node_modules/ contains the loopx package itself).
 const LOOPX_NODE_MODULES = resolve(__dirname, "..", "node_modules");
@@ -132,9 +140,19 @@ export function executeScript(
     LOOPX_BIN: loopxBin,
     LOOPX_PROJECT_ROOT: projectRoot,
     LOOPX_WORKFLOW: workflowName,
-    PATH: currentPath.split(":").includes(LOOPX_BIN_DIR)
-      ? currentPath
-      : `${LOOPX_BIN_DIR}:${currentPath}`,
+    PATH: (() => {
+      const pathEntries = currentPath.split(":");
+      const prepend: string[] = [];
+      if (!pathEntries.includes(LOOPX_NESTED_BIN_DIR)) {
+        prepend.push(LOOPX_NESTED_BIN_DIR);
+      }
+      if (!pathEntries.includes(LOOPX_FLAT_BIN_DIR)) {
+        prepend.push(LOOPX_FLAT_BIN_DIR);
+      }
+      return prepend.length === 0
+        ? currentPath
+        : `${prepend.join(":")}:${currentPath}`;
+    })(),
     NODE_PATH: currentNodePath
       ? `${LOOPX_NODE_PATH}:${currentNodePath}`
       : LOOPX_NODE_PATH,

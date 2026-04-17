@@ -1,5 +1,6 @@
 import {
   copyFileSync,
+  readFileSync,
   writeFileSync,
   symlinkSync,
   rmSync,
@@ -13,6 +14,18 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, "..");
 
+// Source the tsx range from the repo-level package.json so the published
+// manifest can't drift from the version actually exercised in tests.
+const rootPkg = JSON.parse(
+  readFileSync(resolve(root, "package.json"), "utf-8")
+);
+const tsxRange = rootPkg.devDependencies?.tsx;
+if (!tsxRange) {
+  throw new Error(
+    "postbuild: could not read tsx version from root package.json devDependencies"
+  );
+}
+
 // Write dist/package.json for the loopx package
 const pkg = {
   name: "loop-extender",
@@ -20,6 +33,13 @@ const pkg = {
   type: "module",
   bin: {
     loopx: "./bin.js",
+  },
+  // SPEC §3.3 / §6.3: Node runs workflow JS/TS scripts via a spawned `tsx`
+  // (src/execution.ts). Must be a runtime dependency so a consumer-side
+  // `npm install -g loop-extender` resolves it — without this, a fresh
+  // global install fails with `spawn tsx ENOENT` on the first JS/TS script.
+  dependencies: {
+    tsx: tsxRange,
   },
   exports: {
     ".": {

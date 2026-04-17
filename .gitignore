@@ -4,3 +4,5 @@ coverage/
 .vitest/
 tmp/
 *.tgz
+.loopx/.iteration.tmp
+.loopx/package.json

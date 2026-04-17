@@ -9,7 +9,7 @@ import {
   chmodSync,
 } from "node:fs";
 import { writeFile, mkdir, rm, chmod, mkdtemp } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname } from "node:path";
 import { execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import {
@@ -4062,20 +4062,51 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           { stdio: "pipe" },
         );
 
+        const loopxPkg = JSON.parse(
+          readFileSync(join(loopxPkgDir, "package.json"), "utf-8"),
+        );
+        const pkgName = loopxPkg.name as string;
+
+        // SPEC §4.10 guard: installed package root must be a real directory,
+        // not a symlink back into the dev tree (`npm install -g .` from a
+        // local same-filesystem path would create such a symlink).
+        const installedPkgRoot = join(
+          globalPrefix,
+          "lib",
+          "node_modules",
+          pkgName,
+        );
+        expect(lstatSync(installedPkgRoot).isSymbolicLink()).toBe(false);
+
         // Fixture: workflow `ralph` with an index.ts that imports loopx
         const indexTs =
           'import { output } from "loopx";\noutput({ stop: true });\n';
         await writeFile(join(ralphDir, "index.ts"), indexTs, "utf-8");
 
         const binPath = join(globalPrefix, "bin", "loopx");
+        // SPEC §4.10: scrubbed spawn env — must not leak dev-tree binaries
+        // (e.g. tsx from ./node_modules/.bin) into the installed loopx, so
+        // the test actually catches missing published dependencies.
+        const scrubbedEnv: Record<string, string> = {
+          HOME: process.env.HOME ?? "",
+          PATH: [
+            join(globalPrefix, "bin"),
+            dirname(process.execPath),
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+          ].join(":"),
+        };
+        if (process.env.TMPDIR) scrubbedEnv.TMPDIR = process.env.TMPDIR;
+        if (process.env.GIT_CONFIG_GLOBAL) {
+          scrubbedEnv.GIT_CONFIG_GLOBAL = process.env.GIT_CONFIG_GLOBAL;
+        }
+
         // Run ralph — no -n, relies on output({stop:true}) to exit
         execSync(`"${binPath}" run ralph`, {
           cwd: fixtureDir,
           stdio: "pipe",
-          env: {
-            ...process.env,
-            PATH: `${join(globalPrefix, "bin")}:${process.env.PATH}`,
-          },
+          env: scrubbedEnv,
           timeout: 30_000,
         });
         // execSync throws on non-zero exit — reaching here means exit 0
@@ -4124,28 +4155,57 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
             { stdio: "pipe" },
           );
 
-          const indexTs =
-            'import { output } from "loopx";\noutput({ stop: true });\n';
-          await writeFile(join(ralphDir, "index.ts"), indexTs, "utf-8");
-
           const loopxPkg = JSON.parse(
             readFileSync(join(loopxPkgDir, "package.json"), "utf-8"),
           );
           const pkgName = loopxPkg.name as string;
-          const binJsPath = join(
+
+          // SPEC §4.10 guard: installed package root must be a real directory,
+          // not a symlink back into the dev tree.
+          const installedPkgRoot = join(
             globalPrefix,
             "lib",
             "node_modules",
             pkgName,
-            "bin.js",
           );
+          expect(lstatSync(installedPkgRoot).isSymbolicLink()).toBe(false);
+
+          const indexTs =
+            'import { output } from "loopx";\noutput({ stop: true });\n';
+          await writeFile(join(ralphDir, "index.ts"), indexTs, "utf-8");
+
+          const binJsPath = join(installedPkgRoot, "bin.js");
+
+          // Resolve the Bun interpreter's directory so we can scrub PATH
+          // without losing the ability to spawn `bun` from the installed
+          // loopx (execution.ts runs JS/TS workflow scripts via `bun`).
+          const bunDir = dirname(
+            execSync("command -v bun", { stdio: "pipe" })
+              .toString()
+              .trim(),
+          );
+
+          // SPEC §4.10: scrubbed spawn env — must not leak dev-tree binaries
+          // (e.g. tsx, bun devDependencies) into the installed loopx.
+          const scrubbedEnv: Record<string, string> = {
+            HOME: process.env.HOME ?? "",
+            PATH: [
+              join(globalPrefix, "bin"),
+              bunDir,
+              "/usr/local/bin",
+              "/usr/bin",
+              "/bin",
+            ].join(":"),
+          };
+          if (process.env.TMPDIR) scrubbedEnv.TMPDIR = process.env.TMPDIR;
+          if (process.env.GIT_CONFIG_GLOBAL) {
+            scrubbedEnv.GIT_CONFIG_GLOBAL = process.env.GIT_CONFIG_GLOBAL;
+          }
+
           execSync(`bun "${binJsPath}" run ralph`, {
             cwd: fixtureDir,
             stdio: "pipe",
-            env: {
-              ...process.env,
-              PATH: `${join(globalPrefix, "bin")}:${process.env.PATH}`,
-            },
+            env: scrubbedEnv,
             timeout: 30_000,
           });
         } finally {

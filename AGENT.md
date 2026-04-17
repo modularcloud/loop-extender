@@ -20,6 +20,7 @@
 - `runCLI` (tests/helpers/cli.ts) has a default 30s per-invocation timeout that rejects with an error; fixtures that loop forever fail as a timeout, not an exit-code mismatch. To assert "exit 1 once implementation catches up," make fixture scripts print `{"stop":true}` or exit 0.
 - Workflow fixtures: `createWorkflowScript(project, workflow, script, ext, content)`, `createBashWorkflowScript(project, workflow, script, body)`, `createWorkflowPackageJson(project, workflow, content)`. Legacy `createScript` / `createDirScript` / `createBashScript` were removed with ADR-0003 — do not reintroduce.
 - Version-check warning matchers in `tests/e2e/version-check.test.ts` are regex-based and overlap between categories. Keep runtime warning prose free of the mismatch trigger words (`version`, `mismatch`, `range`, `satisf`) for non-mismatch cases; include them only for the actual mismatch warning.
+- `tests/helpers/api-driver.ts` spawns `<repo>/node_modules/.bin/tsx` by absolute path, not via `npx`. When the consumer cwd has a `node_modules/` (even one containing only a symlinked package), `npm 11+` / `npx` skips auto-install and exits 127 with "tsx: command not found". Preserve the absolute-path spawn in that helper.
 
 ## Runtime Quirks
 
@@ -27,6 +28,7 @@
 - Bun is liberal about CJS in `.js` — `require()` would succeed even when the workflow tree sets `"type": "module"`. We force SPEC §6.3 rejection by passing `--define require:null` to Bun, so any `require(...)` call fails at parse-time substitution.
 - The npm package is named `loop-extender` but scripts import from `loopx`. `execution.ts` creates a per-process `$TMPDIR/loopx-nodepath-shim-<pid>/loopx -> <loopx package root>` symlink and prepends that directory to `NODE_PATH`, so both local and global installs resolve `import "loopx"` under Bun.
 - `getVersion()` in `bin.ts` resolves `process.argv[1]`'s adjacent `package.json` before falling back to `__dirname/package.json`. Node's default symlink resolution follows `node_modules/loopx/bin.js` back to `dist/bin.js`, so relying on `__dirname` alone would return the source tree's version rather than the delegated-to local version.
+- `scripts/postbuild.mjs` copies the repo `package.json` devDependency range for `tsx` into the published `dist/package.json` under `dependencies.tsx`. `src/execution.ts` spawns `tsx` for every JS/TS script, so removing that declared dep breaks `npm install -g loop-extender` lifecycle tests (T-INST-GLOBAL-01).
 
 ## Project Structure
 

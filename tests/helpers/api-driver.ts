@@ -76,9 +76,17 @@ export async function runAPIDriver(
     const driverPath = join(consumerDir, "driver.ts");
     await writeFile(driverPath, code, "utf-8");
 
-    // Spawn the driver
-    const command = runtime === "bun" ? "bun" : "npx";
-    const args = runtime === "bun" ? [driverPath] : ["tsx", driverPath];
+    // Spawn the driver. Under Node, invoke the repo's own `tsx` binary by
+    // absolute path rather than via `npx tsx`: with npm 11+, `npx` refuses
+    // to auto-install a missing package when the cwd already has a
+    // `node_modules/` directory, and consumer dirs here always do (for the
+    // `loopx` symlink). Resolving tsx via an absolute path sidesteps that
+    // quirk and makes the driver's runtime independent of the consumer's
+    // own tsx installation state.
+    const command = runtime === "bun"
+      ? "bun"
+      : resolve(process.cwd(), "node_modules", ".bin", "tsx");
+    const args = [driverPath];
 
     const mergedEnv = {
       ...process.env,
