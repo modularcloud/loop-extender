@@ -17,14 +17,9 @@ Per PROMPT.md: goal is to implement the test harness **first**; some tests are e
 
 ## Priority Ordering
 
-### P0 — Blockers (must do first)
+### ✅ P0 — Workflow fixture helpers (landed, commit 7cbe556)
 
-- [ ] **Add workflow fixture helpers to tests/helpers/fixtures.ts** per TEST-SPEC.md §2.3 lines 134-159:
-  - `createWorkflow(project, workflowName): string` — creates `.loopx/<workflowName>/`, returns absolute path.
-  - `createWorkflowScript(project, workflowName, scriptName, ext, content): string` — creates script inside workflow dir, auto-creates workflow dir.
-  - `createBashWorkflowScript(project, workflowName, scriptName, body): string` — shorthand with `#!/bin/bash` header + `chmod +x`.
-  - `createWorkflowPackageJson(project, workflowName, content): string` — creates package.json inside workflow dir.
-  - These are blockers for rewriting tests that currently use the flat `createScript` / `createDirScript`.
+All four workflow helpers in `tests/helpers/fixtures.ts` are implemented and exported via `tests/helpers/index.ts`: `createWorkflow`, `createWorkflowScript`, `createBashWorkflowScript`, `createWorkflowPackageJson`. Matches TEST-SPEC §2.3 lines 134-159.
 
 ### P0 — Test suite rewrite (workflow-model alignment)
 
@@ -41,9 +36,9 @@ Every implemented test currently uses the flat-script model. Samples confirmed: 
 - [ ] **Rewrite tests/e2e/env-vars.test.ts** — add `LOOPX_WORKFLOW` injection tests (T-ENV-20b, T-ENV-21d, and 6 missing IDs).
 - [ ] **Rewrite tests/e2e/module-resolution.test.ts** — workflow-local `node_modules/loopx` precedence (T-MOD-*, 13 missing).
 
-### P0 — New test files
+### ✅ P0 — New test files
 
-- [ ] **Create tests/e2e/version-check.test.ts** — covers T-VER-* (workflow-level version check, 66 missing IDs including T-VER-11b/c, T-VER-13b/c, T-VER-14a, T-VER-15a, T-VER-20, T-VER-20a, T-VER-24/24a/24b/24c/24d/24e, T-VER-25/25a/25b/25c).
+- [x] **Created tests/e2e/version-check.test.ts** — covers all 66 T-VER-* IDs. Runs 132 cases (66 × two runtimes), ~126 fail against the pre-ADR-0003 implementation as expected per PROMPT.md; the remaining ~6 pass incidentally (`run -h` path already skips version checking; `loopx install` already rejects unrecognized workflow layouts). Assertion style: name-scoped regex matchers over stderr lines — tolerant of specific warning wording while pinning down shape, workflow attribution, and per-workflow dedupe counts.
 
 ### P1 — Cleanup
 
