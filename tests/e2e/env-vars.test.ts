@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createTempProject,
-  createScript,
+  createWorkflowScript,
+  createBashWorkflowScript,
   type TempProject,
 } from "../helpers/fixtures.js";
 import { runCLI } from "../helpers/cli.js";
@@ -22,8 +23,20 @@ import {
 } from "../helpers/fixture-scripts.js";
 import { forEachRuntime } from "../helpers/runtime.js";
 
+// ============================================================================
+// TEST-SPEC §4.7 — Environment Variables (ADR-0003 workflow model)
+// Spec refs: 8.1–8.3
+//
+// All env tests use the workflow model: scripts live in
+// .loopx/<workflow>/<script>.<ext>, and invocation is `loopx run <workflow>`.
+// All env tests use `withGlobalEnv` or `withIsolatedHome` to isolate the
+// global env file from the real user config.
+// ============================================================================
+
+const IS_ROOT = process.getuid?.() === 0;
+
 // ---------------------------------------------------------------------------
-// SPEC: Global Env File
+// SPEC: Global Env File  (T-ENV-01 through T-ENV-05e)
 // ---------------------------------------------------------------------------
 
 describe("SPEC: Global Env File", () => {
@@ -31,64 +44,61 @@ describe("SPEC: Global Env File", () => {
 
   afterEach(async () => {
     if (project) {
-      await project.cleanup();
+      await project.cleanup().catch(() => {});
       project = null;
     }
   });
 
   forEachRuntime((runtime) => {
-    // T-ENV-01: Variable from env set available in script (marker file)
     it("T-ENV-01: variable from global env set is available in script", async () => {
       await withIsolatedHome(async () => {
-        // Set a global env variable via CLI
-        const setResult = await runCLI(["env", "set", "MY_GLOBAL_VAR", "globalvalue123"], {
-          runtime,
-        });
+        const setResult = await runCLI(
+          ["env", "set", "MY_GLOBAL_VAR", "globalvalue123"],
+          { runtime },
+        );
         expect(setResult.exitCode).toBe(0);
 
-        // Create a project with a script that reads the env var into a marker file
         project = await createTempProject();
         const markerPath = join(project.dir, "marker.txt");
-        await createScript(
+        await createWorkflowScript(
           project,
-          "check-env",
+          "ralph",
+          "index",
           ".sh",
           writeEnvToFile("MY_GLOBAL_VAR", markerPath),
         );
 
-        const result = await runCLI(["run", "-n", "1", "check-env"], {
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
         expect(existsSync(markerPath)).toBe(true);
-        const content = readFileSync(markerPath, "utf-8");
-        expect(content).toBe("globalvalue123");
+        expect(readFileSync(markerPath, "utf-8")).toBe("globalvalue123");
       });
     });
 
-    // T-ENV-02: Variable removed via env remove no longer available
     it("T-ENV-02: variable removed via env remove is no longer available in script", async () => {
       await withIsolatedHome(async () => {
-        // Set then remove a global env variable
         await runCLI(["env", "set", "EPHEMERAL_VAR", "tempval"], { runtime });
-        const removeResult = await runCLI(["env", "remove", "EPHEMERAL_VAR"], {
-          runtime,
-        });
+        const removeResult = await runCLI(
+          ["env", "remove", "EPHEMERAL_VAR"],
+          { runtime },
+        );
         expect(removeResult.exitCode).toBe(0);
 
-        // Create a project with a TS script that observes the env var
         project = await createTempProject();
         const markerPath = join(project.dir, "observe.json");
-        await createScript(
+        await createWorkflowScript(
           project,
-          "observe",
+          "ralph",
+          "index",
           ".ts",
           observeEnv("EPHEMERAL_VAR", markerPath),
         );
 
-        const result = await runCLI(["run", "-n", "1", "observe"], {
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
           cwd: project.dir,
           runtime,
         });
@@ -100,41 +110,36 @@ describe("SPEC: Global Env File", () => {
       });
     });
 
-    // T-ENV-03: XDG_CONFIG_HOME respected
     it("T-ENV-03: XDG_CONFIG_HOME is respected for global env file location", async () => {
-      // Create a fresh temp dir for XDG_CONFIG_HOME (no pre-existing env file)
       const customConfig = await mkdtemp(join(tmpdir(), "loopx-xdg-"));
       const originalXdg = process.env.XDG_CONFIG_HOME;
       process.env.XDG_CONFIG_HOME = customConfig;
 
       try {
-        // Run `loopx env set X Y` — this should create the file at $XDG_CONFIG_HOME/loopx/env
         const setResult = await runCLI(["env", "set", "X", "Y"], { runtime });
         expect(setResult.exitCode).toBe(0);
 
-        // Verify the file exists at the XDG-directed path
         const envFilePath = join(customConfig, "loopx", "env");
         expect(existsSync(envFilePath)).toBe(true);
 
-        // Optionally verify the variable is accessible to scripts
         project = await createTempProject();
         const markerPath = join(project.dir, "xdg-marker.txt");
-        await createScript(
+        await createWorkflowScript(
           project,
-          "check-xdg",
+          "ralph",
+          "index",
           ".sh",
           writeEnvToFile("X", markerPath),
         );
 
-        const result = await runCLI(["run", "-n", "1", "check-xdg"], {
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
         expect(existsSync(markerPath)).toBe(true);
-        const content = readFileSync(markerPath, "utf-8");
-        expect(content).toBe("Y");
+        expect(readFileSync(markerPath, "utf-8")).toBe("Y");
       } finally {
         if (originalXdg === undefined) {
           delete process.env.XDG_CONFIG_HOME;
@@ -145,11 +150,9 @@ describe("SPEC: Global Env File", () => {
       }
     });
 
-    // T-ENV-04: Fallback to ~/.config when XDG_CONFIG_HOME unset
     it("T-ENV-04: falls back to ~/.config/loopx/env when XDG_CONFIG_HOME is unset", async () => {
       await withIsolatedHome(async () => {
         const home = process.env.HOME!;
-        // Manually create the env file at ~/.config/loopx/env
         const configDir = join(home, ".config", "loopx");
         await mkdir(configDir, { recursive: true });
         await createEnvFile(join(configDir, "env"), {
@@ -158,32 +161,29 @@ describe("SPEC: Global Env File", () => {
 
         project = await createTempProject();
         const markerPath = join(project.dir, "fallback-marker.txt");
-        await createScript(
+        await createWorkflowScript(
           project,
-          "check-fallback",
+          "ralph",
+          "index",
           ".sh",
           writeEnvToFile("FALLBACK_VAR", markerPath),
         );
 
-        const result = await runCLI(["run", "-n", "1", "check-fallback"], {
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
           cwd: project.dir,
           runtime,
         });
 
         expect(result.exitCode).toBe(0);
         expect(existsSync(markerPath)).toBe(true);
-        const content = readFileSync(markerPath, "utf-8");
-        expect(content).toBe("fallback-value");
+        expect(readFileSync(markerPath, "utf-8")).toBe("fallback-value");
       });
     });
 
-    // T-ENV-05: Config dir created on first env set
     it("T-ENV-05: config directory is created on first env set", async () => {
       await withIsolatedHome(async () => {
         const home = process.env.HOME!;
         const configDir = join(home, ".config", "loopx");
-
-        // Verify the config directory does not exist yet
         expect(existsSync(configDir)).toBe(false);
 
         const setResult = await runCLI(["env", "set", "NEW_VAR", "newval"], {
@@ -191,72 +191,65 @@ describe("SPEC: Global Env File", () => {
         });
         expect(setResult.exitCode).toBe(0);
 
-        // Verify the config directory was created
         expect(existsSync(configDir)).toBe(true);
-        // Verify the env file was created with the variable
         const envPath = join(configDir, "env");
         expect(existsSync(envPath)).toBe(true);
       });
     });
 
-    // T-ENV-05a: Unreadable global env file -> exit 1 (conditional on non-root)
-    it("T-ENV-05a: unreadable global env file causes exit 1 when running a script", async () => {
-      // Skip if running as root since root can read any file
-      if (process.getuid?.() === 0) {
-        return;
-      }
+    it.skipIf(IS_ROOT)(
+      "T-ENV-05a: unreadable global env file causes exit 1 when running a script",
+      async () => {
+        await withGlobalEnv({ SOME_VAR: "some_val" }, async () => {
+          const xdg = process.env.XDG_CONFIG_HOME!;
+          const envPath = join(xdg, "loopx", "env");
+          await chmod(envPath, 0o000);
 
-      await withGlobalEnv({ SOME_VAR: "some_val" }, async () => {
-        // Make the global env file unreadable
-        const xdg = process.env.XDG_CONFIG_HOME!;
-        const envPath = join(xdg, "loopx", "env");
-        await chmod(envPath, 0o000);
+          project = await createTempProject();
+          const markerPath = join(project.dir, "marker.txt");
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            writeEnvToFile("SOME_VAR", markerPath),
+          );
 
-        project = await createTempProject();
-        const markerPath = join(project.dir, "marker.txt");
-        await createScript(
-          project,
-          "default",
-          ".sh",
-          writeEnvToFile("SOME_VAR", markerPath),
-        );
+          const result = await runCLI(["run", "-n", "1", "ralph"], {
+            cwd: project.dir,
+            runtime,
+          });
 
-        const result = await runCLI(["run", "-n", "1", "default"], {
-          cwd: project.dir,
-          runtime,
+          expect(result.exitCode).toBe(1);
+          expect(result.stderr.length).toBeGreaterThan(0);
+          expect(result.stderr.toLowerCase()).toMatch(
+            /unreadable|permission|denied|access|cannot read/i,
+          );
         });
+      },
+    );
 
-        expect(result.exitCode).toBe(1);
-        // Spec: "exits with code 1 and an error message about the unreadable file"
-        expect(result.stderr.length).toBeGreaterThan(0);
-        expect(result.stderr.toLowerCase()).toMatch(/unreadable|permission|denied|access|cannot read/i);
-      });
-    });
+    it.skipIf(IS_ROOT)(
+      "T-ENV-05b: unreadable global env via programmatic API causes run() to throw",
+      async () => {
+        await withGlobalEnv({ API_VAR: "api_val" }, async () => {
+          const xdg = process.env.XDG_CONFIG_HOME!;
+          const envPath = join(xdg, "loopx", "env");
+          await chmod(envPath, 0o000);
 
-    // T-ENV-05b: Unreadable global env via programmatic API (run() throws)
-    it("T-ENV-05b: unreadable global env via programmatic API causes run() to throw", async () => {
-      if (process.getuid?.() === 0) {
-        return;
-      }
+          project = await createTempProject();
+          await createBashWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            `echo ok`,
+          );
 
-      await withGlobalEnv({ API_VAR: "api_val" }, async () => {
-        const xdg = process.env.XDG_CONFIG_HOME!;
-        const envPath = join(xdg, "loopx", "env");
-        await chmod(envPath, 0o000);
-
-        project = await createTempProject();
-        await createScript(
-          project,
-          "default",
-          ".sh",
-          "#!/bin/bash\necho ok\n",
-        );
-
-        const driverCode = `
+          const driverCode = `
 import { run } from "loopx";
 
 try {
-  const gen = run("default", {
+  const gen = run("ralph", {
     maxIterations: 1,
     cwd: ${JSON.stringify(project.dir)},
   });
@@ -267,99 +260,94 @@ try {
 }
 `;
 
-        const result = await runAPIDriver(runtime, driverCode, {
-          env: { XDG_CONFIG_HOME: xdg },
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: { XDG_CONFIG_HOME: xdg },
+          });
+
+          expect(result.stdout).toMatch(/^THREW:/);
         });
+      },
+    );
 
-        // The API should throw, so stdout should start with "THREW:"
-        expect(result.stdout).toMatch(/^THREW:/);
-      });
-    });
+    it.skipIf(IS_ROOT)(
+      "T-ENV-05c: unreadable global env with env list causes exit 1",
+      async () => {
+        await withGlobalEnv({ LIST_VAR: "list_val" }, async () => {
+          const xdg = process.env.XDG_CONFIG_HOME!;
+          const envPath = join(xdg, "loopx", "env");
+          await chmod(envPath, 0o000);
 
-    // T-ENV-05c: Unreadable global env with env list -> exit 1
-    it("T-ENV-05c: unreadable global env with env list causes exit 1", async () => {
-      if (process.getuid?.() === 0) {
-        return;
-      }
-
-      await withGlobalEnv({ LIST_VAR: "list_val" }, async () => {
-        const xdg = process.env.XDG_CONFIG_HOME!;
-        const envPath = join(xdg, "loopx", "env");
-        await chmod(envPath, 0o000);
-
-        const result = await runCLI(["env", "list"], { runtime });
-        expect(result.exitCode).toBe(1);
-        // Spec: "exits with code 1 and an error message about the unreadable file"
-        expect(result.stderr.length).toBeGreaterThan(0);
-        expect(result.stderr.toLowerCase()).toMatch(/unreadable|permission|denied|access|cannot read/i);
-      });
-    });
-
-    // T-ENV-05d: Unreadable global env with env set -> exit 1
-    it("T-ENV-05d: unreadable global env with env set causes exit 1", async () => {
-      if (process.getuid?.() === 0) {
-        return;
-      }
-
-      await withGlobalEnv({ SET_VAR: "set_val" }, async () => {
-        const xdg = process.env.XDG_CONFIG_HOME!;
-        const envPath = join(xdg, "loopx", "env");
-        await chmod(envPath, 0o000);
-
-        const result = await runCLI(["env", "set", "NEW_VAR", "new_val"], {
-          runtime,
+          const result = await runCLI(["env", "list"], { runtime });
+          expect(result.exitCode).toBe(1);
+          expect(result.stderr.length).toBeGreaterThan(0);
+          expect(result.stderr.toLowerCase()).toMatch(
+            /unreadable|permission|denied|access|cannot read/i,
+          );
         });
-        expect(result.exitCode).toBe(1);
-        // Spec: "exits with code 1 and an error message about the unreadable file"
-        expect(result.stderr.length).toBeGreaterThan(0);
-        expect(result.stderr.toLowerCase()).toMatch(/unreadable|permission|denied|access|cannot read/i);
-      });
-    });
+      },
+    );
 
-    // T-ENV-05e: Unreadable global env with env remove -> exit 1
-    it("T-ENV-05e: unreadable global env with env remove causes exit 1", async () => {
-      if (process.getuid?.() === 0) {
-        return;
-      }
+    it.skipIf(IS_ROOT)(
+      "T-ENV-05d: unreadable global env with env set causes exit 1",
+      async () => {
+        await withGlobalEnv({ SET_VAR: "set_val" }, async () => {
+          const xdg = process.env.XDG_CONFIG_HOME!;
+          const envPath = join(xdg, "loopx", "env");
+          await chmod(envPath, 0o000);
 
-      await withGlobalEnv({ REM_VAR: "rem_val" }, async () => {
-        const xdg = process.env.XDG_CONFIG_HOME!;
-        const envPath = join(xdg, "loopx", "env");
-        await chmod(envPath, 0o000);
-
-        const result = await runCLI(["env", "remove", "REM_VAR"], {
-          runtime,
+          const result = await runCLI(["env", "set", "NEW_VAR", "new_val"], {
+            runtime,
+          });
+          expect(result.exitCode).toBe(1);
+          expect(result.stderr.length).toBeGreaterThan(0);
+          expect(result.stderr.toLowerCase()).toMatch(
+            /unreadable|permission|denied|access|cannot read/i,
+          );
         });
-        expect(result.exitCode).toBe(1);
-        // Spec: "exits with code 1 and an error message about the unreadable file"
-        expect(result.stderr.length).toBeGreaterThan(0);
-        expect(result.stderr.toLowerCase()).toMatch(/unreadable|permission|denied|access|cannot read/i);
-      });
-    });
+      },
+    );
+
+    it.skipIf(IS_ROOT)(
+      "T-ENV-05e: unreadable global env with env remove causes exit 1",
+      async () => {
+        await withGlobalEnv({ REM_VAR: "rem_val" }, async () => {
+          const xdg = process.env.XDG_CONFIG_HOME!;
+          const envPath = join(xdg, "loopx", "env");
+          await chmod(envPath, 0o000);
+
+          const result = await runCLI(["env", "remove", "REM_VAR"], {
+            runtime,
+          });
+          expect(result.exitCode).toBe(1);
+          expect(result.stderr.length).toBeGreaterThan(0);
+          expect(result.stderr.toLowerCase()).toMatch(
+            /unreadable|permission|denied|access|cannot read/i,
+          );
+        });
+      },
+    );
   });
 });
 
 // ---------------------------------------------------------------------------
-// SPEC: Env File Parsing
+// SPEC: Env File Parsing  (T-ENV-06 through T-ENV-15f)
 // ---------------------------------------------------------------------------
 
 describe("SPEC: Env File Parsing", () => {
   /**
-   * Helper: creates a self-contained project with a TS observe-env script,
-   * writes raw content to a temp global env file, runs the script, cleans
-   * up everything, and returns the parsed observation JSON.
+   * Helper: creates a self-contained workflow project with a TS observe-env
+   * script in .loopx/ralph/index.ts, writes raw content to a temp global env
+   * file, runs loopx against the workflow, cleans up, and returns the parsed
+   * observation JSON plus captured stderr.
    */
   async function parseEnvAndObserve(
     rawEnvContent: string,
     varname: string,
     runtime: "node" | "bun" = "node",
   ): Promise<{ present: boolean; value?: string; stderr: string }> {
-    const { mkdtemp, mkdir: mkdirAsync, rm } = await import("node:fs/promises");
-    const { tmpdir } = await import("node:os");
-
     const tempConfigHome = await mkdtemp(join(tmpdir(), "loopx-parse-"));
     const loopxConfigDir = join(tempConfigHome, "loopx");
-    await mkdirAsync(loopxConfigDir, { recursive: true });
+    await mkdir(loopxConfigDir, { recursive: true });
     const envFilePath = join(loopxConfigDir, "env");
     await writeEnvFileRaw(envFilePath, rawEnvContent);
 
@@ -370,14 +358,15 @@ describe("SPEC: Env File Parsing", () => {
 
     try {
       const markerPath = join(localProject.dir, "observe.json");
-      await createScript(
+      await createWorkflowScript(
         localProject,
-        "observe",
+        "ralph",
+        "index",
         ".ts",
         observeEnv(varname, markerPath),
       );
 
-      const result = await runCLI(["run", "-n", "1", "observe"], {
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
         cwd: localProject.dir,
         runtime,
       });
@@ -387,7 +376,7 @@ describe("SPEC: Env File Parsing", () => {
       const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
       return { ...observed, stderr: result.stderr };
     } finally {
-      await localProject.cleanup();
+      await localProject.cleanup().catch(() => {});
       if (originalXdg === undefined) {
         delete process.env.XDG_CONFIG_HOME;
       } else {
@@ -398,14 +387,16 @@ describe("SPEC: Env File Parsing", () => {
   }
 
   forEachRuntime((runtime) => {
-    // T-ENV-06: KEY=VALUE
     it("T-ENV-06: basic KEY=VALUE is parsed correctly", async () => {
-      const result = await parseEnvAndObserve("SIMPLE_KEY=simple_value\n", "SIMPLE_KEY", runtime);
+      const result = await parseEnvAndObserve(
+        "SIMPLE_KEY=simple_value\n",
+        "SIMPLE_KEY",
+        runtime,
+      );
       expect(result.present).toBe(true);
       expect(result.value).toBe("simple_value");
     });
 
-    // T-ENV-07: Comments
     it("T-ENV-07: comment lines starting with # are ignored", async () => {
       const content = `# This is a comment\nCOMMENT_VAR=present\n# Another comment\n`;
       const result = await parseEnvAndObserve(content, "COMMENT_VAR", runtime);
@@ -413,7 +404,6 @@ describe("SPEC: Env File Parsing", () => {
       expect(result.value).toBe("present");
     });
 
-    // T-ENV-08: Blank lines
     it("T-ENV-08: blank lines are ignored", async () => {
       const content = `\n\nBLANK_VAR=found\n\n\n`;
       const result = await parseEnvAndObserve(content, "BLANK_VAR", runtime);
@@ -421,7 +411,6 @@ describe("SPEC: Env File Parsing", () => {
       expect(result.value).toBe("found");
     });
 
-    // T-ENV-09: Duplicates (last wins)
     it("T-ENV-09: duplicate keys use last-wins semantics", async () => {
       const content = `DUP_VAR=first\nDUP_VAR=second\nDUP_VAR=third\n`;
       const result = await parseEnvAndObserve(content, "DUP_VAR", runtime);
@@ -429,7 +418,6 @@ describe("SPEC: Env File Parsing", () => {
       expect(result.value).toBe("third");
     });
 
-    // T-ENV-10: Double-quoted value
     it("T-ENV-10: double-quoted values have quotes stripped", async () => {
       const content = `DQ_VAR="quoted value"\n`;
       const result = await parseEnvAndObserve(content, "DQ_VAR", runtime);
@@ -437,7 +425,6 @@ describe("SPEC: Env File Parsing", () => {
       expect(result.value).toBe("quoted value");
     });
 
-    // T-ENV-11: Single-quoted value
     it("T-ENV-11: single-quoted values have quotes stripped", async () => {
       const content = `SQ_VAR='single quoted'\n`;
       const result = await parseEnvAndObserve(content, "SQ_VAR", runtime);
@@ -445,16 +432,13 @@ describe("SPEC: Env File Parsing", () => {
       expect(result.value).toBe("single quoted");
     });
 
-    // T-ENV-12: No escape sequences (literal \n)
     it("T-ENV-12: backslash-n is treated as literal characters, not a newline", async () => {
       const content = `ESC_VAR="hello\\nworld"\n`;
       const result = await parseEnvAndObserve(content, "ESC_VAR", runtime);
       expect(result.present).toBe(true);
-      // The value should contain a literal backslash and n, not a newline
       expect(result.value).toBe("hello\\nworld");
     });
 
-    // T-ENV-13: Inline # is part of value
     it("T-ENV-13: inline # character is part of the value, not a comment", async () => {
       const content = `HASH_VAR=value#with#hash\n`;
       const result = await parseEnvAndObserve(content, "HASH_VAR", runtime);
@@ -462,7 +446,6 @@ describe("SPEC: Env File Parsing", () => {
       expect(result.value).toBe("value#with#hash");
     });
 
-    // T-ENV-14: Trailing whitespace trimmed
     it("T-ENV-14: trailing whitespace on values is trimmed", async () => {
       const content = `TRAIL_VAR=value   \n`;
       const result = await parseEnvAndObserve(content, "TRAIL_VAR", runtime);
@@ -470,23 +453,16 @@ describe("SPEC: Env File Parsing", () => {
       expect(result.value).toBe("value");
     });
 
-    // T-ENV-15: No whitespace around = (key includes trailing space)
     it("T-ENV-15: KEY = value (spaces around =) treats key as 'KEY ' which is invalid", async () => {
-      // Spec: "KEY = value\n" — the key is "KEY " (with trailing space),
-      // which contains a space and is therefore invalid.
-      // This does NOT set KEY to "value". A warning is emitted.
       const content = `KEY = value\nGOOD_KEY=present\n`;
-      // Verify GOOD_KEY still works (the bad line doesn't break parsing)
       const goodResult = await parseEnvAndObserve(content, "GOOD_KEY", runtime);
       expect(goodResult.present).toBe(true);
       expect(goodResult.value).toBe("present");
       expect(goodResult.stderr).toMatch(/warning|invalid|ignored|malformed/i);
-      // Verify KEY is NOT set (the line with spaces around = was rejected)
       const keyResult = await parseEnvAndObserve(content, "KEY", runtime);
       expect(keyResult.present).toBe(false);
     });
 
-    // T-ENV-15a: Empty value KEY=
     it("T-ENV-15a: KEY= with no value sets the variable to empty string", async () => {
       const content = `EMPTY_VAR=\n`;
       const result = await parseEnvAndObserve(content, "EMPTY_VAR", runtime);
@@ -494,7 +470,6 @@ describe("SPEC: Env File Parsing", () => {
       expect(result.value).toBe("");
     });
 
-    // T-ENV-15b: Multiple = (split on first)
     it("T-ENV-15b: value containing = is split on first = only", async () => {
       const content = `MULTI_EQ=val=ue=extra\n`;
       const result = await parseEnvAndObserve(content, "MULTI_EQ", runtime);
@@ -502,21 +477,17 @@ describe("SPEC: Env File Parsing", () => {
       expect(result.value).toBe("val=ue=extra");
     });
 
-    // T-ENV-15c: Invalid key 1BAD=val (ignored with warning)
     it("T-ENV-15c: key starting with digit is invalid and ignored", async () => {
       const content = `1BAD=val\nVALID_KEY=ok\n`;
-      // 1BAD should be ignored; VALID_KEY should be present
       const result = await parseEnvAndObserve(content, "VALID_KEY", runtime);
       expect(result.present).toBe(true);
       expect(result.value).toBe("ok");
       expect(result.stderr).toMatch(/warning|invalid|ignored|malformed/i);
 
-      // Also verify 1BAD is not set
       const badResult = await parseEnvAndObserve(content, "1BAD", runtime);
       expect(badResult.present).toBe(false);
     });
 
-    // T-ENV-15d: Malformed line without = (ignored with warning)
     it("T-ENV-15d: malformed line without = is ignored", async () => {
       const content = `noequalssign\nOK_VAR=works\n`;
       const result = await parseEnvAndObserve(content, "OK_VAR", runtime);
@@ -525,16 +496,13 @@ describe("SPEC: Env File Parsing", () => {
       expect(result.stderr).toMatch(/warning|invalid|ignored|malformed/i);
     });
 
-    // T-ENV-15e: Unmatched quotes (literal, not stripped)
     it("T-ENV-15e: unmatched quotes are treated as literal characters", async () => {
       const content = `UNMATCH_VAR="unmatched\n`;
       const result = await parseEnvAndObserve(content, "UNMATCH_VAR", runtime);
       expect(result.present).toBe(true);
-      // Unmatched quote is preserved as a literal character
       expect(result.value).toBe('"unmatched');
     });
 
-    // T-ENV-15f: KEY= value (leading space preserved)
     it("T-ENV-15f: leading space in value after = is preserved", async () => {
       const content = `LEAD_VAR= value\n`;
       const result = await parseEnvAndObserve(content, "LEAD_VAR", runtime);
@@ -545,7 +513,7 @@ describe("SPEC: Env File Parsing", () => {
 });
 
 // ---------------------------------------------------------------------------
-// SPEC: Local Env Override
+// SPEC: Local Env Override  (T-ENV-16 through T-ENV-19)
 // ---------------------------------------------------------------------------
 
 describe("SPEC: Local Env Override", () => {
@@ -553,83 +521,65 @@ describe("SPEC: Local Env Override", () => {
 
   afterEach(async () => {
     if (project) {
-      await project.cleanup();
+      await project.cleanup().catch(() => {});
       project = null;
     }
   });
 
   forEachRuntime((runtime) => {
-    // T-ENV-16: -e loads vars into script env
     it("T-ENV-16: -e flag loads variables from a local env file into the script environment", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "local-env-marker.txt");
       const localEnvPath = join(project.dir, "local.env");
       await createEnvFile(localEnvPath, { LOCAL_VAR: "local-value-42" });
 
-      await createScript(
+      await createWorkflowScript(
         project,
-        "check-local",
+        "ralph",
+        "index",
         ".sh",
         writeEnvToFile("LOCAL_VAR", markerPath),
       );
 
-      const result = await runCLI(["run", "-e", "local.env", "-n", "1", "check-local"], {
-        cwd: project.dir,
-        runtime,
-      });
+      const result = await runCLI(
+        ["run", "-e", "local.env", "-n", "1", "ralph"],
+        { cwd: project.dir, runtime },
+      );
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
-      const content = readFileSync(markerPath, "utf-8");
-      expect(content).toBe("local-value-42");
+      expect(readFileSync(markerPath, "utf-8")).toBe("local-value-42");
     });
 
-    // T-ENV-17: -e nonexistent -> exit 1
     it("T-ENV-17: -e with nonexistent file causes exit 1", async () => {
       project = await createTempProject();
-      await createScript(
-        project,
-        "default",
-        ".sh",
-        "#!/bin/bash\necho ok\n",
-      );
+      await createBashWorkflowScript(project, "ralph", "index", `echo ok`);
 
-      const result = await runCLI(["run", "-e", "does-not-exist.env", "-n", "1", "default"], {
-        cwd: project.dir,
-        runtime,
-      });
+      const result = await runCLI(
+        ["run", "-e", "does-not-exist.env", "-n", "1", "ralph"],
+        { cwd: project.dir, runtime },
+      );
 
       expect(result.exitCode).toBe(1);
       expect(result.stderr.length).toBeGreaterThan(0);
     });
 
-    // T-ENV-17a: -e unreadable -> exit 1 (conditional on non-root)
-    it("T-ENV-17a: -e with unreadable file causes exit 1", async () => {
-      if (process.getuid?.() === 0) {
-        return;
-      }
-
+    it.skipIf(IS_ROOT)("T-ENV-17a: -e with unreadable file causes exit 1", async () => {
       project = await createTempProject();
       const localEnvPath = join(project.dir, "unreadable.env");
       await createEnvFile(localEnvPath, { KEY: "val" });
       await chmod(localEnvPath, 0o000);
 
-      await createScript(
-        project,
-        "default",
-        ".sh",
-        "#!/bin/bash\necho ok\n",
-      );
+      await createBashWorkflowScript(project, "ralph", "index", `echo ok`);
 
-      const result = await runCLI(["run", "-e", "unreadable.env", "-n", "1", "default"], {
-        cwd: project.dir,
-        runtime,
-      });
+      const result = await runCLI(
+        ["run", "-e", "unreadable.env", "-n", "1", "ralph"],
+        { cwd: project.dir, runtime },
+      );
 
       expect(result.exitCode).toBe(1);
     });
 
-    // T-ENV-18: Local overrides global on conflict
     it("T-ENV-18: local -e file overrides global env on key conflict", async () => {
       await withGlobalEnv({ CONFLICT_VAR: "global-value" }, async () => {
         project = await createTempProject();
@@ -637,26 +587,25 @@ describe("SPEC: Local Env Override", () => {
         const localEnvPath = join(project.dir, "local.env");
         await createEnvFile(localEnvPath, { CONFLICT_VAR: "local-value" });
 
-        await createScript(
+        await createWorkflowScript(
           project,
-          "check-conflict",
+          "ralph",
+          "index",
           ".sh",
           writeEnvToFile("CONFLICT_VAR", markerPath),
         );
 
         const result = await runCLI(
-          ["run", "-e", "local.env", "-n", "1", "check-conflict"],
+          ["run", "-e", "local.env", "-n", "1", "ralph"],
           { cwd: project.dir, runtime },
         );
 
         expect(result.exitCode).toBe(0);
         expect(existsSync(markerPath)).toBe(true);
-        const content = readFileSync(markerPath, "utf-8");
-        expect(content).toBe("local-value");
+        expect(readFileSync(markerPath, "utf-8")).toBe("local-value");
       });
     });
 
-    // T-ENV-19: Both global and local vars present
     it("T-ENV-19: both global and local env vars are present when no conflict", async () => {
       await withGlobalEnv({ GLOBAL_ONLY: "from-global" }, async () => {
         project = await createTempProject();
@@ -665,15 +614,20 @@ describe("SPEC: Local Env Override", () => {
         const localEnvPath = join(project.dir, "local.env");
         await createEnvFile(localEnvPath, { LOCAL_ONLY: "from-local" });
 
-        // Script writes both env vars to separate marker files
         const scriptContent = `#!/bin/bash
 printf '%s' "$GLOBAL_ONLY" > "${globalMarker}"
 printf '%s' "$LOCAL_ONLY" > "${localMarker}"
 `;
-        await createScript(project, "check-both", ".sh", scriptContent);
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          scriptContent,
+        );
 
         const result = await runCLI(
-          ["run", "-e", "local.env", "-n", "1", "check-both"],
+          ["run", "-e", "local.env", "-n", "1", "ralph"],
           { cwd: project.dir, runtime },
         );
 
@@ -688,7 +642,7 @@ printf '%s' "$LOCAL_ONLY" > "${localMarker}"
 });
 
 // ---------------------------------------------------------------------------
-// SPEC: Injection Precedence
+// SPEC: Injection Precedence  (T-ENV-20 through T-ENV-24b)
 // ---------------------------------------------------------------------------
 
 describe("SPEC: Injection Precedence", () => {
@@ -696,26 +650,26 @@ describe("SPEC: Injection Precedence", () => {
 
   afterEach(async () => {
     if (project) {
-      await project.cleanup();
+      await project.cleanup().catch(() => {});
       project = null;
     }
   });
 
   forEachRuntime((runtime) => {
-    // T-ENV-20: LOOPX_BIN overrides env file value
     it("T-ENV-20: LOOPX_BIN injected by runtime overrides env file value", async () => {
       await withGlobalEnv({ LOOPX_BIN: "env-file-bin-path" }, async () => {
         project = await createTempProject();
         const markerPath = join(project.dir, "bin-marker.txt");
 
-        await createScript(
+        await createWorkflowScript(
           project,
-          "check-bin",
+          "ralph",
+          "index",
           ".sh",
           writeEnvToFile("LOOPX_BIN", markerPath),
         );
 
-        const result = await runCLI(["run", "-n", "1", "check-bin"], {
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
           cwd: project.dir,
           runtime,
         });
@@ -729,19 +683,19 @@ describe("SPEC: Injection Precedence", () => {
       });
     });
 
-    // T-ENV-20a: LOOPX_BIN overrides system env
     it("T-ENV-20a: LOOPX_BIN injected by runtime overrides system env", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "bin-sys-marker.txt");
 
-      await createScript(
+      await createWorkflowScript(
         project,
-        "check-bin-sys",
+        "ralph",
+        "index",
         ".sh",
         writeEnvToFile("LOOPX_BIN", markerPath),
       );
 
-      const result = await runCLI(["run", "-n", "1", "check-bin-sys"], {
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
         cwd: project.dir,
         runtime,
         env: { LOOPX_BIN: "system-env-bin-path" },
@@ -755,46 +709,77 @@ describe("SPEC: Injection Precedence", () => {
       expect(content).toMatch(/loopx|bin/i);
     });
 
-    // T-ENV-21: LOOPX_PROJECT_ROOT overrides env file value
-    it("T-ENV-21: LOOPX_PROJECT_ROOT injected by runtime overrides env file value", async () => {
-      await withGlobalEnv({ LOOPX_PROJECT_ROOT: "/fake/env/path" }, async () => {
-        project = await createTempProject();
-        const markerPath = join(project.dir, "root-marker.txt");
+    it("T-ENV-20b: LOOPX_BIN injected by runtime overrides local env file (-e) value", async () => {
+      project = await createTempProject();
+      const markerPath = join(project.dir, "bin-local-marker.txt");
+      const localEnvPath = join(project.dir, "local.env");
+      await createEnvFile(localEnvPath, { LOOPX_BIN: "/tmp/fake-binary" });
 
-        await createScript(
-          project,
-          "check-root",
-          ".sh",
-          writeEnvToFile("LOOPX_PROJECT_ROOT", markerPath),
-        );
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeEnvToFile("LOOPX_BIN", markerPath),
+      );
 
-        const result = await runCLI(["run", "-n", "1", "check-root"], {
-          cwd: project.dir,
-          runtime,
-        });
+      const result = await runCLI(
+        ["run", "-e", "local.env", "-n", "1", "ralph"],
+        { cwd: project.dir, runtime },
+      );
 
-        expect(result.exitCode).toBe(0);
-        expect(existsSync(markerPath)).toBe(true);
-        const content = readFileSync(markerPath, "utf-8");
-        // LOOPX_PROJECT_ROOT should be the actual project dir, not the env file value
-        expect(content).not.toBe("/fake/env/path");
-        expect(content).toBe(project!.dir);
-      });
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(markerPath)).toBe(true);
+      const content = readFileSync(markerPath, "utf-8");
+      // Loopx-injected LOOPX_BIN must override the local -e value
+      expect(content).not.toBe("/tmp/fake-binary");
+      expect(content.length).toBeGreaterThan(0);
+      // The injected value points to a real executable path
+      expect(content).toMatch(/loopx|bin/i);
     });
 
-    // T-ENV-21a: LOOPX_PROJECT_ROOT overrides system env
+    it("T-ENV-21: LOOPX_PROJECT_ROOT injected by runtime overrides env file value", async () => {
+      await withGlobalEnv(
+        { LOOPX_PROJECT_ROOT: "/fake/env/path" },
+        async () => {
+          project = await createTempProject();
+          const markerPath = join(project.dir, "root-marker.txt");
+
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            writeEnvToFile("LOOPX_PROJECT_ROOT", markerPath),
+          );
+
+          const result = await runCLI(["run", "-n", "1", "ralph"], {
+            cwd: project.dir,
+            runtime,
+          });
+
+          expect(result.exitCode).toBe(0);
+          expect(existsSync(markerPath)).toBe(true);
+          const content = readFileSync(markerPath, "utf-8");
+          expect(content).not.toBe("/fake/env/path");
+          expect(content).toBe(project!.dir);
+        },
+      );
+    });
+
     it("T-ENV-21a: LOOPX_PROJECT_ROOT injected by runtime overrides system env", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "root-sys-marker.txt");
 
-      await createScript(
+      await createWorkflowScript(
         project,
-        "check-root-sys",
+        "ralph",
+        "index",
         ".sh",
         writeEnvToFile("LOOPX_PROJECT_ROOT", markerPath),
       );
 
-      const result = await runCLI(["run", "-n", "1", "check-root-sys"], {
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
         cwd: project.dir,
         runtime,
         env: { LOOPX_PROJECT_ROOT: "/fake/system/path" },
@@ -803,25 +788,107 @@ describe("SPEC: Injection Precedence", () => {
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
       const content = readFileSync(markerPath, "utf-8");
-      // LOOPX_PROJECT_ROOT should be the actual project dir, not the system env value
       expect(content).not.toBe("/fake/system/path");
       expect(content).toBe(project!.dir);
     });
 
-    // T-ENV-22: Global env overrides system env
+    it("T-ENV-21b: LOOPX_WORKFLOW injected by runtime overrides env file value", async () => {
+      await withGlobalEnv({ LOOPX_WORKFLOW: "fake" }, async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "workflow-marker.txt");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          writeEnvToFile("LOOPX_WORKFLOW", markerPath),
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(markerPath)).toBe(true);
+        const content = readFileSync(markerPath, "utf-8");
+        // Loopx-injected LOOPX_WORKFLOW must override the global env file value
+        expect(content).not.toBe("fake");
+        expect(content).toBe("ralph");
+      });
+    });
+
+    it("T-ENV-21c: LOOPX_WORKFLOW injected by runtime overrides local env file (-e) value", async () => {
+      project = await createTempProject();
+      const markerPath = join(project.dir, "workflow-local-marker.txt");
+      const localEnvPath = join(project.dir, "local.env");
+      await createEnvFile(localEnvPath, { LOOPX_WORKFLOW: "fake" });
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeEnvToFile("LOOPX_WORKFLOW", markerPath),
+      );
+
+      const result = await runCLI(
+        ["run", "-e", "local.env", "-n", "1", "ralph"],
+        { cwd: project.dir, runtime },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(markerPath)).toBe(true);
+      const content = readFileSync(markerPath, "utf-8");
+      // Loopx-injected LOOPX_WORKFLOW must override the local -e value
+      expect(content).not.toBe("fake");
+      expect(content).toBe("ralph");
+    });
+
+    it("T-ENV-21d: LOOPX_PROJECT_ROOT injected by runtime overrides local env file (-e) value", async () => {
+      project = await createTempProject();
+      const markerPath = join(project.dir, "root-local-marker.txt");
+      const localEnvPath = join(project.dir, "local.env");
+      await createEnvFile(localEnvPath, {
+        LOOPX_PROJECT_ROOT: "/tmp/fake-project-root",
+      });
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeEnvToFile("LOOPX_PROJECT_ROOT", markerPath),
+      );
+
+      const result = await runCLI(
+        ["run", "-e", "local.env", "-n", "1", "ralph"],
+        { cwd: project.dir, runtime },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(markerPath)).toBe(true);
+      const content = readFileSync(markerPath, "utf-8");
+      // Loopx-injected LOOPX_PROJECT_ROOT must override the local -e value
+      expect(content).not.toBe("/tmp/fake-project-root");
+      expect(content).toBe(project!.dir);
+    });
+
     it("T-ENV-22: global env file variable overrides same-named system env variable", async () => {
       await withGlobalEnv({ OVERRIDE_ME: "from-global-env" }, async () => {
         project = await createTempProject();
         const markerPath = join(project.dir, "override-marker.txt");
 
-        await createScript(
+        await createWorkflowScript(
           project,
-          "check-override",
+          "ralph",
+          "index",
           ".sh",
           writeEnvToFile("OVERRIDE_ME", markerPath),
         );
 
-        const result = await runCLI(["run", "-n", "1", "check-override"], {
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
           cwd: project.dir,
           runtime,
           env: { OVERRIDE_ME: "from-system-env" },
@@ -829,26 +896,24 @@ describe("SPEC: Injection Precedence", () => {
 
         expect(result.exitCode).toBe(0);
         expect(existsSync(markerPath)).toBe(true);
-        const content = readFileSync(markerPath, "utf-8");
-        expect(content).toBe("from-global-env");
+        expect(readFileSync(markerPath, "utf-8")).toBe("from-global-env");
       });
     });
 
-    // T-ENV-23: System env visible when no override
     it("T-ENV-23: system env variable is visible when not overridden by env files", async () => {
       await withIsolatedHome(async () => {
-        // No global env file exists in the isolated home
         project = await createTempProject();
         const markerPath = join(project.dir, "sysenv-marker.txt");
 
-        await createScript(
+        await createWorkflowScript(
           project,
-          "check-sysenv",
+          "ralph",
+          "index",
           ".sh",
           writeEnvToFile("SYSTEM_ONLY_VAR", markerPath),
         );
 
-        const result = await runCLI(["run", "-n", "1", "check-sysenv"], {
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
           cwd: project.dir,
           runtime,
           env: { SYSTEM_ONLY_VAR: "from-system" },
@@ -856,14 +921,11 @@ describe("SPEC: Injection Precedence", () => {
 
         expect(result.exitCode).toBe(0);
         expect(existsSync(markerPath)).toBe(true);
-        const content = readFileSync(markerPath, "utf-8");
-        expect(content).toBe("from-system");
+        expect(readFileSync(markerPath, "utf-8")).toBe("from-system");
       });
     });
 
-    // T-ENV-24: Full precedence chain with peel-off
     it("T-ENV-24: full precedence chain: local wins, then global wins, then system wins", async () => {
-      // Manually manage XDG_CONFIG_HOME so we can remove the global env file mid-test
       const tempConfigHome = await mkdtemp(join(tmpdir(), "loopx-config-"));
       const loopxConfigDir = join(tempConfigHome, "loopx");
       await mkdir(loopxConfigDir, { recursive: true });
@@ -879,41 +941,43 @@ describe("SPEC: Injection Precedence", () => {
         await createEnvFile(localEnvPath, { VAR: "from-local" });
 
         const markerPath = join(project.dir, "var-marker.txt");
-
-        await createScript(
+        await createWorkflowScript(
           project,
-          "check-var",
+          "ralph",
+          "index",
           ".sh",
           writeEnvToFile("VAR", markerPath),
         );
 
         const systemEnv = { VAR: "from-system" };
 
-        // --- Step 1: all three levels present -> local wins ---
+        // Step 1: local + global + system → local wins
         const r1 = await runCLI(
-          ["run", "-e", "local.env", "-n", "1", "check-var"],
+          ["run", "-e", "local.env", "-n", "1", "ralph"],
           { cwd: project.dir, runtime, env: systemEnv },
         );
         expect(r1.exitCode).toBe(0);
         expect(readFileSync(markerPath, "utf-8")).toBe("from-local");
 
-        // --- Step 2: remove local env file -> global wins ---
+        // Step 2: remove local → global wins
         unlinkSync(localEnvPath);
 
-        const r2 = await runCLI(
-          ["run", "-n", "1", "check-var"],
-          { cwd: project.dir, runtime, env: systemEnv },
-        );
+        const r2 = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: systemEnv,
+        });
         expect(r2.exitCode).toBe(0);
         expect(readFileSync(markerPath, "utf-8")).toBe("from-global");
 
-        // --- Step 3: remove global env file -> system wins ---
+        // Step 3: remove global → system wins
         unlinkSync(globalEnvPath);
 
-        const r3 = await runCLI(
-          ["run", "-n", "1", "check-var"],
-          { cwd: project.dir, runtime, env: systemEnv },
-        );
+        const r3 = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: systemEnv,
+        });
         expect(r3.exitCode).toBe(0);
         expect(readFileSync(markerPath, "utf-8")).toBe("from-system");
       } finally {
@@ -926,30 +990,32 @@ describe("SPEC: Injection Precedence", () => {
       }
     });
 
-    // T-ENV-24a: LOOPX_DELEGATED not visible to scripts
-    it("T-ENV-24a: LOOPX_DELEGATED is stripped from script environment", async () => {
+    it("T-ENV-24a: LOOPX_DELEGATED is visible in script execution environments when inherited", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "delegated-marker.json");
 
-      await createScript(
+      await createWorkflowScript(
         project,
-        "observe",
+        "ralph",
+        "index",
         ".ts",
         observeEnv("LOOPX_DELEGATED", markerPath),
       );
 
-      const result = await runCLI(["run", "-n", "1", "observe"], {
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
         cwd: project.dir,
         runtime,
         env: { LOOPX_DELEGATED: "1" },
       });
 
       expect(result.exitCode).toBe(0);
+      expect(existsSync(markerPath)).toBe(true);
       const data = JSON.parse(readFileSync(markerPath, "utf-8"));
-      expect(data).toEqual({ present: false });
+      // Per ADR-0003 / TEST-SPEC §4.7: loopx does NOT scrub LOOPX_DELEGATED
+      // from the script environment — it is inherited as-is.
+      expect(data).toEqual({ present: true, value: "1" });
     });
 
-    // T-ENV-24b: Empty-string in local env overrides non-empty global/system
     it("T-ENV-24b: empty string in local env file overrides global and system values", async () => {
       await withGlobalEnv({ MY_VAR: "global-value" }, async () => {
         project = await createTempProject();
@@ -958,18 +1024,22 @@ describe("SPEC: Injection Precedence", () => {
 
         await writeEnvFileRaw(localEnvPath, "MY_VAR=\n");
 
-        await createScript(
+        await createWorkflowScript(
           project,
-          "observe",
+          "ralph",
+          "index",
           ".ts",
           observeEnv("MY_VAR", markerPath),
         );
 
-        const result = await runCLI(["run", "-e", "local.env", "-n", "1", "observe"], {
-          cwd: project.dir,
-          runtime,
-          env: { MY_VAR: "system-value" },
-        });
+        const result = await runCLI(
+          ["run", "-e", "local.env", "-n", "1", "ralph"],
+          {
+            cwd: project.dir,
+            runtime,
+            env: { MY_VAR: "system-value" },
+          },
+        );
 
         expect(result.exitCode).toBe(0);
         const data = JSON.parse(readFileSync(markerPath, "utf-8"));
@@ -980,7 +1050,7 @@ describe("SPEC: Injection Precedence", () => {
 });
 
 // ---------------------------------------------------------------------------
-// SPEC: Env Caching
+// SPEC: Env Caching  (T-ENV-25 through T-ENV-25c)
 // ---------------------------------------------------------------------------
 
 describe("SPEC: Env Caching", () => {
@@ -988,13 +1058,12 @@ describe("SPEC: Env Caching", () => {
 
   afterEach(async () => {
     if (project) {
-      await project.cleanup();
+      await project.cleanup().catch(() => {});
       project = null;
     }
   });
 
   forEachRuntime((runtime) => {
-    // T-ENV-25: Global env not re-read during loop
     it("T-ENV-25: global env is loaded once and cached; modifications during loop are not seen", async () => {
       await withGlobalEnv({ CACHED_VAR: "original" }, async () => {
         const xdg = process.env.XDG_CONFIG_HOME!;
@@ -1005,26 +1074,26 @@ describe("SPEC: Env Caching", () => {
         const marker2 = join(project.dir, "iter2.txt");
         const counterFile = join(project.dir, "counter.txt");
 
-        // Script that:
-        // - Reads the iteration count
-        // - On first iteration: writes env var to marker1, then modifies the global env file
-        // - On second iteration: writes env var to marker2
         const scriptContent = `#!/bin/bash
-# Increment counter
 printf '1' >> "${counterFile}"
 COUNT=$(wc -c < "${counterFile}" | tr -d ' ')
 
 if [ "$COUNT" = "1" ]; then
   printf '%s' "$CACHED_VAR" > "${marker1}"
-  # Modify the global env file mid-loop
   echo "CACHED_VAR=modified" > "${envFilePath}"
 elif [ "$COUNT" = "2" ]; then
   printf '%s' "$CACHED_VAR" > "${marker2}"
 fi
 `;
-        await createScript(project, "cache-test", ".sh", scriptContent);
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          scriptContent,
+        );
 
-        const result = await runCLI(["run", "-n", "2", "cache-test"], {
+        const result = await runCLI(["run", "-n", "2", "ralph"], {
           cwd: project.dir,
           runtime,
         });
@@ -1033,13 +1102,11 @@ fi
         expect(existsSync(marker1)).toBe(true);
         expect(existsSync(marker2)).toBe(true);
 
-        // Both iterations should see the original value because env is cached
         expect(readFileSync(marker1, "utf-8")).toBe("original");
         expect(readFileSync(marker2, "utf-8")).toBe("original");
       });
     });
 
-    // T-ENV-25a: Local env not re-read during loop
     it("T-ENV-25a: local -e env is loaded once and cached; modifications during loop are not seen", async () => {
       project = await createTempProject();
       const localEnvPath = join(project.dir, "local.env");
@@ -1049,23 +1116,27 @@ fi
       const marker2 = join(project.dir, "local-iter2.txt");
       const counterFile = join(project.dir, "local-counter.txt");
 
-      // Script that modifies the local env file during the loop
       const scriptContent = `#!/bin/bash
 printf '1' >> "${counterFile}"
 COUNT=$(wc -c < "${counterFile}" | tr -d ' ')
 
 if [ "$COUNT" = "1" ]; then
   printf '%s' "$LOCAL_CACHED" > "${marker1}"
-  # Modify the local env file mid-loop
   echo "LOCAL_CACHED=modified-local" > "${localEnvPath}"
 elif [ "$COUNT" = "2" ]; then
   printf '%s' "$LOCAL_CACHED" > "${marker2}"
 fi
 `;
-      await createScript(project, "local-cache-test", ".sh", scriptContent);
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        scriptContent,
+      );
 
       const result = await runCLI(
-        ["run", "-e", "local.env", "-n", "2", "local-cache-test"],
+        ["run", "-e", "local.env", "-n", "2", "ralph"],
         { cwd: project.dir, runtime },
       );
 
@@ -1073,9 +1144,77 @@ fi
       expect(existsSync(marker1)).toBe(true);
       expect(existsSync(marker2)).toBe(true);
 
-      // Both iterations should see the original value because env is cached
       expect(readFileSync(marker1, "utf-8")).toBe("original-local");
       expect(readFileSync(marker2, "utf-8")).toBe("original-local");
+    });
+
+    it.skipIf(IS_ROOT)(
+      "T-ENV-25b: `loopx run -n 0 ralph` with an unreadable global env file exits 1 (env loads before -n 0 short-circuit)",
+      async () => {
+        await withGlobalEnv({ SOME_VAR: "some_val" }, async () => {
+          const xdg = process.env.XDG_CONFIG_HOME!;
+          const envPath = join(xdg, "loopx", "env");
+          await chmod(envPath, 0o000);
+
+          project = await createTempProject();
+          await createBashWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            `echo ok`,
+          );
+
+          const result = await runCLI(["run", "-n", "0", "ralph"], {
+            cwd: project.dir,
+            runtime,
+          });
+
+          expect(result.exitCode).toBe(1);
+          expect(result.stderr.length).toBeGreaterThan(0);
+          expect(result.stderr.toLowerCase()).toMatch(
+            /unreadable|permission|denied|access|cannot read/i,
+          );
+        });
+      },
+    );
+
+    it("T-ENV-25c: `loopx run -n 0 ralph` with a malformed-but-readable global env file exits 0 with a parser warning", async () => {
+      const tempConfigHome = await mkdtemp(join(tmpdir(), "loopx-parse-n0-"));
+      const loopxConfigDir = join(tempConfigHome, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const envFilePath = join(loopxConfigDir, "env");
+      // Include an invalid key that triggers a parser warning, plus a valid line.
+      await writeEnvFileRaw(envFilePath, "1BAD=val\nGOOD_KEY=ok\n");
+
+      const originalXdg = process.env.XDG_CONFIG_HOME;
+      process.env.XDG_CONFIG_HOME = tempConfigHome;
+
+      try {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `echo "should not run under -n 0"`,
+        );
+
+        const result = await runCLI(["run", "-n", "0", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        // The global env file was readable and parseable enough that the
+        // process exits 0 after parsing; the malformed line produced a warning.
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toMatch(/warning|invalid|ignored|malformed/i);
+      } finally {
+        if (originalXdg === undefined) {
+          delete process.env.XDG_CONFIG_HOME;
+        } else {
+          process.env.XDG_CONFIG_HOME = originalXdg;
+        }
+        await rm(tempConfigHome, { recursive: true, force: true });
+      }
     });
   });
 });
