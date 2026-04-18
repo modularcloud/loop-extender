@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$LOOPX_PROJECT_ROOT"
-FEEDBACK_FILE="$ROOT/.loopx/.feedback.tmp"
-CLAUDE_OUTPUT_FILE="$ROOT/.loopx/.claude-output.tmp"
+FEEDBACK_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.feedback.tmp"
+CLAUDE_OUTPUT_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.claude-output.tmp"
 
 if [[ ! -f "$FEEDBACK_FILE" ]]; then
   echo "Error: No feedback file found at $FEEDBACK_FILE" >&2

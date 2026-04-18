@@ -5,8 +5,8 @@ ROOT="$LOOPX_PROJECT_ROOT"
 ADR_0001="$ROOT/adr/0001-adr-process.md"
 ADR_0002="$ROOT/adr/0002-run-subcommand.md"
 SPEC="$ROOT/SPEC.md"
-FEEDBACK_FILE="$ROOT/.loopx/.feedback.tmp"
-PROMPT_FILE="$ROOT/.loopx/.prompt.tmp"
+FEEDBACK_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.feedback.tmp"
+PROMPT_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.prompt.tmp"
 
 : "${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN env var is required}"
 : "${TELEGRAM_CHAT_ID:?TELEGRAM_CHAT_ID env var is required}"
@@ -30,15 +30,12 @@ fi
 
 # Build the prompt and save to file (too long for a single Telegram message)
 cat <<PROMPT > "$PROMPT_FILE"
-Review ADR 0001, ADR 0002, and SPEC.md holistically and let me know if I can mark ADR 0002 as accepted or if I need to improve it further. Ask me clarifying questions if you have any doubts about my intentions for ADR 0002.
+ADR 0002 has been accepted. The next step in the process is to update SPEC.md to incorporate the changes described in ADR 0002. Review the current SPEC.md against ADR 0002 and let me know if the SPEC updates look correct and complete, or if anything else in the SPEC needs to be changed.
 
-adr/0001-adr-process.md:
-$(cat "$ADR_0001")
-
-adr/0002-run-subcommand.md:
+adr/0002-run-subcommand.md (accepted — do not modify):
 $(cat "$ADR_0002")
 
-SPEC.md:
+SPEC.md (target of updates):
 $(cat "$SPEC")
 PROMPT
 

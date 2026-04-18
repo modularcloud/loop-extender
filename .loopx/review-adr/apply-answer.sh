@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$LOOPX_PROJECT_ROOT"
-CLAUDE_OUTPUT_FILE="$ROOT/.loopx/.claude-output.tmp"
-ANSWER_FILE="$ROOT/.loopx/.answer.tmp"
+CLAUDE_OUTPUT_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.claude-output.tmp"
+ANSWER_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.answer.tmp"
 
 if [[ ! -f "$ANSWER_FILE" ]]; then
   echo "Error: No answer file found at $ANSWER_FILE" >&2

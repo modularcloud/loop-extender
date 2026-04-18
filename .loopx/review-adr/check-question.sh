@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$LOOPX_PROJECT_ROOT"
-CLAUDE_OUTPUT_FILE="$ROOT/.loopx/.claude-output.tmp"
-ANSWER_FILE="$ROOT/.loopx/.answer.tmp"
+CLAUDE_OUTPUT_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.claude-output.tmp"
+ANSWER_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.answer.tmp"
 
 : "${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN env var is required}"
 : "${TELEGRAM_CHAT_ID:?TELEGRAM_CHAT_ID env var is required}"
@@ -18,7 +18,7 @@ fi
 CLAUDE_OUTPUT=$(cat "$CLAUDE_OUTPUT_FILE")
 
 # Use Codex with output schema to deterministically classify the output
-SCHEMA="$ROOT/.loopx/check-question.schema.json"
+SCHEMA="$ROOT/.loopx/$LOOPX_WORKFLOW/check-question.schema.json"
 VERDICT=$(codex exec --output-schema "$SCHEMA" "Does the following text contain a question or request for clarification directed at the user?
 
 $CLAUDE_OUTPUT" 2>/dev/null)
@@ -30,7 +30,7 @@ if [[ "$HAS_QUESTION" == "true" ]]; then
 
   # Send as document if too long for a message, otherwise as text
   if [[ ${#CLAUDE_OUTPUT} -gt 4000 ]]; then
-    QUESTION_FILE="$ROOT/.loopx/.question.tmp"
+    QUESTION_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.question.tmp"
     echo "$CLAUDE_OUTPUT" > "$QUESTION_FILE"
     curl -s -X POST "${TELEGRAM_API}/sendDocument" \
       -F chat_id="$TELEGRAM_CHAT_ID" \

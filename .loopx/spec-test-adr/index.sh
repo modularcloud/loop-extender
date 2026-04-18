@@ -3,11 +3,11 @@ set -euo pipefail
 
 ROOT="$LOOPX_PROJECT_ROOT"
 ADR_0001="$ROOT/adr/0001-adr-process.md"
-ADR_0003="$ROOT/adr/0003-workflows.md"
+ADR_0002="$ROOT/adr/0002-run-subcommand.md"
 SPEC="$ROOT/SPEC.md"
 TEST_SPEC="$ROOT/TEST-SPEC.md"
-FEEDBACK_FILE="$ROOT/.loopx/.feedback.tmp"
-PROMPT_FILE="$ROOT/.loopx/.prompt.tmp"
+FEEDBACK_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.feedback.tmp"
+PROMPT_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.prompt.tmp"
 
 : "${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN env var is required}"
 : "${TELEGRAM_CHAT_ID:?TELEGRAM_CHAT_ID env var is required}"
@@ -19,8 +19,8 @@ if [[ ! -f "$ADR_0001" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$ADR_0003" ]]; then
-  echo "Error: adr/0003-workflows.md not found" >&2
+if [[ ! -f "$ADR_0002" ]]; then
+  echo "Error: adr/0002-run-subcommand.md not found" >&2
   exit 1
 fi
 
@@ -36,14 +36,14 @@ fi
 
 # Build the prompt and save to file (too long for a single Telegram message)
 cat <<PROMPT > "$PROMPT_FILE"
-ADR 0003 has been accepted and SPEC.md has already been updated to incorporate its changes (ADR status: "Spec Updated"). Per the ADR process in ADR-0001, the next step is to update TEST-SPEC.md to cover the new and changed spec behavior introduced by ADR-0003. In this cycle, TEST-SPEC.md is the only file that should be modified — SPEC.md and ADR-0003 are read-only references.
+ADR 0002 has been accepted and SPEC.md has already been updated to incorporate its changes (ADR status: "Spec Updated"). Per the ADR process in ADR-0001, the next step is to update TEST-SPEC.md to cover the new and changed spec behavior introduced by ADR-0002. In this cycle, TEST-SPEC.md is the only file that should be modified — SPEC.md and ADR-0002 are read-only references.
 
-Review the current TEST-SPEC.md against the updated SPEC.md and ADR-0003, and let me know whether TEST-SPEC.md already covers the ADR-0003 changes correctly and completely, or what needs to be added, changed, or removed. Do not suggest changes to SPEC.md or ADR-0003 — if something looks wrong in those, flag it but do not act on it.
+Review the current TEST-SPEC.md against the updated SPEC.md and ADR-0002, and let me know whether TEST-SPEC.md already covers the ADR-0002 changes correctly and completely, or what needs to be added, changed, or removed. Do not suggest changes to SPEC.md or ADR-0002 — if something looks wrong in those, flag it but do not act on it.
 
-adr/0003-workflows.md (accepted — read-only reference):
-$(cat "$ADR_0003")
+adr/0002-run-subcommand.md (accepted — read-only reference):
+$(cat "$ADR_0002")
 
-SPEC.md (already updated for ADR-0003 — read-only reference):
+SPEC.md (already updated for ADR-0002 — read-only reference):
 $(cat "$SPEC")
 
 TEST-SPEC.md (target of updates):
