@@ -12,7 +12,7 @@ fi
 
 FEEDBACK=$(cat "$FEEDBACK_FILE")
 
-PROMPT="I received the following feedback about ADR-0002 (run subcommand proposal) and its relationship to SPEC.md as defined by the the process laid out in ADR-0001. Incorporate this feedback to improve ADR-0002. If there is any ambiguity about my intentions, ask me clarifying questions. Think critically about this feedback and push back if warranted. Do not update any file other than ADR-0002 and do not mark it as accepted. After you finish, commit and push.
+PROMPT="I received the following feedback about ADR-0004 (run-scoped tmpdir and script args proposal) and its relationship to SPEC.md as defined by the the process laid out in ADR-0001. Incorporate this feedback to improve ADR-0004. If there is any ambiguity about my intentions, ask me clarifying questions. Think critically about this feedback and push back if warranted. Do not update any file other than ADR-0004 and do not mark it as accepted. After you finish, commit and push.
 
 Feedback:
 $FEEDBACK"

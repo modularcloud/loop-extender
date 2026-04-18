@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$LOOPX_PROJECT_ROOT"
 ADR_0001="$ROOT/adr/0001-adr-process.md"
-ADR_0002="$ROOT/adr/0002-run-subcommand.md"
+ADR_0004="$ROOT/adr/0004-tmpdir-and-args.md"
 SPEC="$ROOT/SPEC.md"
 FEEDBACK_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.feedback.tmp"
 PROMPT_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.prompt.tmp"
@@ -18,8 +18,8 @@ if [[ ! -f "$ADR_0001" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$ADR_0002" ]]; then
-  echo "Error: adr/0002-run-subcommand.md not found" >&2
+if [[ ! -f "$ADR_0004" ]]; then
+  echo "Error: adr/0004-tmpdir-and-args.md not found" >&2
   exit 1
 fi
 
@@ -30,13 +30,13 @@ fi
 
 # Build the prompt and save to file (too long for a single Telegram message)
 cat <<PROMPT > "$PROMPT_FILE"
-Review ADR 0001, ADR 0002, and SPEC.md holistically and let me know if I can mark ADR 0002 as accepted or if I need to improve it further. Ask me clarifying questions if you have any doubts about my intentions for ADR 0002.
+Review ADR 0001, ADR 0004, and SPEC.md holistically and let me know if I can mark ADR 0004 as accepted or if I need to improve it further. Ask me clarifying questions if you have any doubts about my intentions for ADR 0004.
 
 adr/0001-adr-process.md:
 $(cat "$ADR_0001")
 
-adr/0002-run-subcommand.md:
-$(cat "$ADR_0002")
+adr/0004-tmpdir-and-args.md:
+$(cat "$ADR_0004")
 
 SPEC.md:
 $(cat "$SPEC")
