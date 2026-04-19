@@ -18,26 +18,16 @@ if (!process.env.OPENAI_API_KEY) {
   process.exit(1);
 }
 
-const ADR_0001 = `${ROOT}/adr/0001-adr-process.md`;
-const ADR_0002 = `${ROOT}/adr/0002-run-subcommand.md`;
-const SPEC = `${ROOT}/SPEC.md`;
+const PROMPT_FILE = `${ROOT}/.loopx/${WORKFLOW}/.prompt.tmp`;
+const FEEDBACK_FILE = `${ROOT}/.loopx/${WORKFLOW}/.feedback.tmp`;
 
-for (const f of [ADR_0001, ADR_0002, SPEC]) {
-  if (!existsSync(f)) {
-    console.error(`Error: ${f} not found`);
-    process.exit(1);
-  }
+if (!existsSync(PROMPT_FILE)) {
+  console.error(`Error: prompt file not found at ${PROMPT_FILE}`);
+  process.exit(1);
 }
 
-const prompt = `ADR 0002 has been accepted. The next step in the process is to update SPEC.md to incorporate the changes described in ADR 0002. Review the current SPEC.md against ADR 0002 and let me know if the SPEC updates look correct and complete, or if anything else in the SPEC needs to be changed.
+const prompt = readFileSync(PROMPT_FILE, "utf8");
 
-adr/0002-run-subcommand.md (accepted — do not modify):
-${readFileSync(ADR_0002, "utf8")}
-
-SPEC.md (target of updates):
-${readFileSync(SPEC, "utf8")}`;
-
-const FEEDBACK_FILE = `${ROOT}/.loopx/${WORKFLOW}/.feedback.tmp`;
 if (existsSync(FEEDBACK_FILE)) rmSync(FEEDBACK_FILE);
 
 const client = new OpenAI();
@@ -108,6 +98,7 @@ const answer =
     .join("\n");
 
 writeFileSync(FEEDBACK_FILE, answer);
+rmSync(PROMPT_FILE);
 console.error("=== Feedback received from GPT-5.4-Pro ===");
 
 execFileSync(BIN, ["output", "--goto", "apply-feedback"], {

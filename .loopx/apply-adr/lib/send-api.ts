@@ -18,29 +18,16 @@ if (!process.env.OPENAI_API_KEY) {
   process.exit(1);
 }
 
-const ADR_0001 = `${ROOT}/adr/0001-adr-process.md`;
-const ADR_0004 = `${ROOT}/adr/0004-tmpdir-and-args.md`;
-const SPEC = `${ROOT}/SPEC.md`;
+const PROMPT_FILE = `${ROOT}/.loopx/${WORKFLOW}/.prompt.tmp`;
+const FEEDBACK_FILE = `${ROOT}/.loopx/${WORKFLOW}/.feedback.tmp`;
 
-for (const f of [ADR_0001, ADR_0004, SPEC]) {
-  if (!existsSync(f)) {
-    console.error(`Error: ${f} not found`);
-    process.exit(1);
-  }
+if (!existsSync(PROMPT_FILE)) {
+  console.error(`Error: prompt file not found at ${PROMPT_FILE}`);
+  process.exit(1);
 }
 
-const prompt = `Review ADR 0001, ADR 0004, and SPEC.md holistically and let me know if I can mark ADR 0004 as accepted or if I need to improve it further. Ask me clarifying questions if you have any doubts about my intentions for ADR 0004.
+const prompt = readFileSync(PROMPT_FILE, "utf8");
 
-adr/0001-adr-process.md:
-${readFileSync(ADR_0001, "utf8")}
-
-adr/0004-tmpdir-and-args.md:
-${readFileSync(ADR_0004, "utf8")}
-
-SPEC.md:
-${readFileSync(SPEC, "utf8")}`;
-
-const FEEDBACK_FILE = `${ROOT}/.loopx/${WORKFLOW}/.feedback.tmp`;
 if (existsSync(FEEDBACK_FILE)) rmSync(FEEDBACK_FILE);
 
 const client = new OpenAI();
@@ -111,6 +98,7 @@ const answer =
     .join("\n");
 
 writeFileSync(FEEDBACK_FILE, answer);
+rmSync(PROMPT_FILE);
 console.error("=== Feedback received from GPT-5.4-Pro ===");
 
 execFileSync(BIN, ["output", "--goto", "apply-feedback"], {

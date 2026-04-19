@@ -18,32 +18,16 @@ if (!process.env.OPENAI_API_KEY) {
   process.exit(1);
 }
 
-const ADR_0001 = `${ROOT}/adr/0001-adr-process.md`;
-const ADR_0002 = `${ROOT}/adr/0002-run-subcommand.md`;
-const SPEC = `${ROOT}/SPEC.md`;
-const TEST_SPEC = `${ROOT}/TEST-SPEC.md`;
+const PROMPT_FILE = `${ROOT}/.loopx/${WORKFLOW}/.prompt.tmp`;
+const FEEDBACK_FILE = `${ROOT}/.loopx/${WORKFLOW}/.feedback.tmp`;
 
-for (const f of [ADR_0001, ADR_0002, SPEC, TEST_SPEC]) {
-  if (!existsSync(f)) {
-    console.error(`Error: ${f} not found`);
-    process.exit(1);
-  }
+if (!existsSync(PROMPT_FILE)) {
+  console.error(`Error: prompt file not found at ${PROMPT_FILE}`);
+  process.exit(1);
 }
 
-const prompt = `ADR 0002 has been accepted and SPEC.md has already been updated to incorporate its changes (ADR status: "Spec Updated"). Per the ADR process in ADR-0001, the next step is to update TEST-SPEC.md to cover the new and changed spec behavior introduced by ADR-0002. In this cycle, TEST-SPEC.md is the only file that should be modified — SPEC.md and ADR-0002 are read-only references.
+const prompt = readFileSync(PROMPT_FILE, "utf8");
 
-Review the current TEST-SPEC.md against the updated SPEC.md and ADR-0002, and let me know whether TEST-SPEC.md already covers the ADR-0002 changes correctly and completely, or what needs to be added, changed, or removed. Do not suggest changes to SPEC.md or ADR-0002 — if something looks wrong in those, flag it but do not act on it.
-
-adr/0002-run-subcommand.md (accepted — read-only reference):
-${readFileSync(ADR_0002, "utf8")}
-
-SPEC.md (already updated for ADR-0002 — read-only reference):
-${readFileSync(SPEC, "utf8")}
-
-TEST-SPEC.md (target of updates):
-${readFileSync(TEST_SPEC, "utf8")}`;
-
-const FEEDBACK_FILE = `${ROOT}/.loopx/${WORKFLOW}/.feedback.tmp`;
 if (existsSync(FEEDBACK_FILE)) rmSync(FEEDBACK_FILE);
 
 const client = new OpenAI();
@@ -114,6 +98,7 @@ const answer =
     .join("\n");
 
 writeFileSync(FEEDBACK_FILE, answer);
+rmSync(PROMPT_FILE);
 console.error("=== Feedback received from GPT-5.4-Pro ===");
 
 execFileSync(BIN, ["output", "--goto", "apply-feedback"], {
