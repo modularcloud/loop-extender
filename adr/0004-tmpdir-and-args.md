@@ -32,7 +32,7 @@ The directory is created with mode `0700` (owner read/write/execute only).
 
 #### Scope and lifecycle
 
-- **Created:** once per `loopx run` invocation, immediately before the first iteration's child process is spawned. The directory is not created if no iteration will execute (see `-n 0` below).
+- **Created:** once per `loopx run` invocation, immediately before the first iteration's child process is spawned. Errors that occur before the first child process is spawned — including discovery errors, starting-target resolution failures, env-file loading failures, and `-n 0` / `maxIterations: 0` — do not create a `LOOPX_TMPDIR`, and no cleanup is needed for these cases.
 - **Shared:** a single directory serves the entire run. All scripts — the starting target, scripts reached via intra-workflow `goto`, scripts reached via cross-workflow `goto`, and re-executions of the starting target on loop reset — observe the same `LOOPX_TMPDIR` value.
 - **Persisted within the run:** the directory is not cleared between iterations. Files written by one script remain visible to subsequent scripts for the remainder of the run.
 - **Removed when the loop ends**, in all of the following cases:
@@ -40,10 +40,10 @@ The directory is created with mode `0700` (owner read/write/execute only).
   - Normal completion via `-n` / `maxIterations` reached.
   - Error exit: non-zero script exit, invalid `goto` target, missing workflow or script in a `goto` resolution.
   - SIGINT / SIGTERM: cleanup runs after the active child process group has exited (per the grace period in SPEC §7.3) and before loopx itself exits with the signal's exit code.
-  - Programmatic `AbortSignal` abort: cleanup runs before the generator throws or the promise rejects.
-  - Programmatic consumer-driven cancellation (`break` out of a `for await`, `generator.return()`): cleanup runs before the generator completes.
-- **Cleanup failure:** if the recursive removal fails (e.g., `EBUSY`, `EACCES`), loopx prints a single warning to stderr and proceeds. The loop's exit code is not changed by a cleanup failure.
-- **SIGKILL and host crash:** no cleanup is performed. Leaked directories in `os.tmpdir()` are expected to be reaped by OS temp-cleaning policy (e.g., `systemd-tmpfiles`, tmpfs reboot). loopx does not attempt to reap stale tmpdirs at startup.
+  - Programmatic `AbortSignal` abort: if a child process group is active, loopx first terminates it using the cancellation behavior defined in SPEC §9.1; cleanup runs only after the child process group has exited or been killed, and before the generator throws or the promise rejects.
+  - Programmatic consumer-driven cancellation (`break` out of a `for await`, `generator.return()`): if a child process group is active, loopx first terminates it using the cancellation behavior defined in SPEC §9.1; cleanup runs only after the child process group has exited or been killed, and before the generator completes.
+- **Cleanup failure:** if the recursive removal fails (e.g., `EBUSY`, `EACCES`), loopx prints a single warning to stderr and proceeds. The loop's exit code is not changed by a cleanup failure. Under the programmatic API, cleanup failure does not change the generator or promise outcome; the original success, error, or abort result is preserved.
+- **SIGKILL to loopx itself, and host crash:** no cleanup is performed. Leaked directories in `os.tmpdir()` are expected to be reaped by OS temp-cleaning policy (e.g., `systemd-tmpfiles`, tmpfs reboot). loopx does not attempt to reap stale tmpdirs at startup. This case is distinct from loopx sending `SIGKILL` to a child process group after the `SIGTERM` grace period (SPEC §7.3): in that case, loopx itself is still alive and performs cleanup after the process group exits.
 
 #### Concurrent runs
 
@@ -75,14 +75,14 @@ loopx run [options] <target> -- [args...]
 #### Parsing rules
 
 1. **Flags may appear anywhere before an explicit `--` separator.** Recognized run-scoped flags (`-n`, `-e`, `-h`, `--help`) are consumed as flags regardless of whether they appear before or after the target. This preserves the current SPEC's "options and the target may appear in any order" rule.
-2. **The first non-flag token is the target.** Unchanged from the current SPEC.
+2. **The first non-flag token is the target.** Unchanged from the current SPEC. The target must appear before the first explicit `--`. If `--` appears before any target token (e.g., `loopx run -- 0003`), all following tokens are args, no target is consumed, and the command is a missing-target usage error.
 3. **Subsequent non-flag tokens are args.** The current SPEC's "more than one positional argument is a usage error" rule is removed. Tokens after the target that are not recognized run-scoped flags (and not consumed as the value of a run-scoped flag like `-n <count>` or `-e <path>`) are appended to the arg vector in the order they appear.
 4. **The `--` separator ends all flag parsing.** Every token after `--` is an arg, including tokens that begin with `-`. The `--` token itself is consumed and not passed to the script. A literal `--` can be passed as an arg by using `--` twice: `loopx run foo -- -- bar` → args = `["--", "bar"]`.
 5. **Unrecognized flags before `--` remain usage errors** (exit code 1). To pass a token that begins with `-` as an arg, use `--`: `loopx run foo -- --anything`.
 6. **Duplicate run-scoped flags remain usage errors.** `loopx run -n 5 -n 10 foo 0003` is still a usage error for duplicate `-n`, independent of whether args are present.
 7. **The `-h` / `--help` short-circuit is preserved and is position-sensitive.** When `-h` appears **before** `--` (at any position), it triggers run help and exits 0, ignoring all other run-level tokens (target, other flags, and args). When `-h` appears **after** `--`, it is an arg with no special behavior.
 8. **Bare `-`** (a single hyphen with no other characters) is a non-flag token. It is treated as the target if no target has been consumed yet, otherwise as an arg. (In practice, `-` fails the workflow/script name restriction pattern and would cause a target-validation error if used as a target.)
-9. **Run-scoped flags that take values** (`-n`, `-e`) consume the next token as their value. This can capture a would-be arg: `loopx run foo -e 0003` binds `-e = "0003"` (a path that will likely fail env-file loading), not `args = ["0003"]`. To force `0003` as an arg, place it before `-e` or use `--`.
+9. **Run-scoped flags that take values** (`-n`, `-e`) consume the next token as their value. This can capture a would-be arg: `loopx run foo -e 0003` binds `-e = "0003"` (a path that will likely fail env-file loading), not `args = ["0003"]`. To force `0003` as an arg, place it before `-e` or use `--`. A value-taking flag consumes the next token as its value even if that token is `--`: `loopx run foo -n -- 5` binds `-n = "--"` (which then fails the non-negative-integer validation), and `loopx run foo -e -- bar` binds `-e = "--"` (which then fails env-file loading). The `--` token acts as the flag-parsing separator only when it is not consumed as a flag value.
 
 #### Exposure to scripts
 
@@ -93,7 +93,7 @@ Args are passed as real command-line arguments:
 
 #### Propagation
 
-The arg vector is captured at loop start (when `loopx run` parses its input, or when `RunOptions.args` is snapshotted in the programmatic API) and is immutable for the duration of the run.
+For the CLI, the arg vector is captured when `loopx run` parses its input. For the programmatic API, `RunOptions.args` is snapshotted when `run()` or `runPromise()` is called. The captured vector is immutable for the duration of the run.
 
 - **Starting target:** receives the full arg vector.
 - **Scripts reached via `goto`** (intra-workflow or cross-workflow): receive the same arg vector.
@@ -144,16 +144,19 @@ interface RunOptions {
 
 When this ADR is accepted, the following SPEC sections require updates:
 
-- **4.1 (Running Scripts)** — Update grammar to `loopx run [options] <target> [args...]` with `--` separator documented. Remove the "more than one positional argument is a usage error" rule. Add the arg parsing rules (§2 above), including `--` semantics, flags-anywhere behavior, and the `-h` short-circuit's position-sensitive interaction with `--`.
-- **4.2 (Options)** — Document that the `-h` / `--help` short-circuit applies only to `-h` occurrences before an explicit `--`. Clarify that unknown-flag rejection applies only before `--`. Clarify that run-scoped flags with values (`-n`, `-e`) continue to consume the next token, even when that token could otherwise have been an arg.
+- **4.1 (Running Scripts)** — Update grammar to `loopx run [options] <target> [args...]` with `--` separator documented. Remove the "more than one positional argument is a usage error" rule. Add the arg parsing rules (§2 above), including `--` semantics, flags-anywhere behavior, the rule that the target must appear before the first explicit `--`, and the `-h` short-circuit's position-sensitive interaction with `--`.
+- **4.2 (Options)** — Document that the `-h` / `--help` short-circuit applies only to `-h` occurrences before an explicit `--`. Clarify that unknown-flag rejection applies only before `--`. Clarify that run-scoped flags with values (`-n`, `-e`) continue to consume the next token, even when that token could otherwise have been an arg, and even when that token is `--` (in which case `--` is consumed as the flag value and subsequently fails the flag's own validation).
 - **4.3 (Subcommands / `loopx run`)** — Update grammar summary to match §4.1.
 - **6.2 (Bash Scripts)** — Note that args are available as `$1`, `$2`, …, `$@`, `$*`.
 - **6.3 (JS/TS Scripts)** — Note that args are appended to `process.argv`; `process.argv.slice(2)` is the arg vector. Behavior is identical under `tsx` and Bun.
 - **7.1 (Basic Loop)** — Add: the arg vector is captured at loop start from CLI positional args (or `RunOptions.args`) and is passed unchanged to every script executed during the run, including scripts reached via `goto` and the starting target on loop reset.
-- **8. Environment Variables** — Add a new subsection (e.g., "8.4 Temporary Directory") documenting `LOOPX_TMPDIR`: creation timing, location, mode, scope, lifecycle, cleanup cases, cleanup-failure handling, concurrency, and `-n 0` behavior.
-- **8.3 (Injection)** — Add `LOOPX_TMPDIR` to the injected variables table. Note that `LOOPX_TMPDIR` is not injected under `-n 0`.
-- **9.1 / 9.2 (Programmatic API)** — Document the `args` option and its lazy validation semantics for `run()` and `runPromise()`.
+- **7.3 (Signal Handling)** — Add: on SIGINT / SIGTERM, `LOOPX_TMPDIR` cleanup runs after the active child process group has exited (after the grace period, including the `SIGKILL` escalation to the process group if required) and before loopx itself exits with the signal's exit code.
+- **8. Environment Variables** — Add a new subsection (e.g., "8.4 Temporary Directory") documenting `LOOPX_TMPDIR`: creation timing (including non-creation for pre-spawn failures), location, mode, scope, lifecycle, cleanup cases, cleanup-failure handling, concurrency, and `-n 0` behavior.
+- **8.3 (Injection)** — Add `LOOPX_TMPDIR` to the injected variables table. Note that `LOOPX_TMPDIR` is not injected under `-n 0` or when pre-spawn failures prevent any iteration from starting.
+- **9.1 / 9.2 (Programmatic API)** — Document the `args` option and its lazy validation semantics for `run()` and `runPromise()`. Also document `LOOPX_TMPDIR` cleanup behavior under programmatic cancellation: for `AbortSignal` abort and consumer-driven cancellation (`break`, `generator.return()`), if a child process group is active, loopx first terminates it per §9.1's cancellation semantics; cleanup runs after the child process group has exited or been killed and before the generator settles (completes or throws) or the promise settles. Cleanup failure prints a warning to stderr and does not change the generator or promise outcome.
 - **9.5 (Types)** — Add `args?: string[]` to the `RunOptions` interface. Document the default (no args), non-string/non-array rejection, and call-time snapshotting.
+- **11.2 (Run Help)** — Replace the current statement that "`loopx run <target> -h` is equivalent to `loopx run -h`": after this ADR, that equivalence holds only when `-h` appears before an explicit `--`. `loopx run foo -- -h` does not trigger run help; `-h` is passed to the script as an arg.
+- **12 (Exit Codes)** — Remove `loopx run ralph bar` from the list of usage-error examples: after this ADR it parses as `target = ralph, args = ["bar"]` and is no longer a usage error. Add new usage errors introduced by this ADR: `loopx run -- 0003` (missing target), `loopx run -n -- 5` / `loopx run -e -- path` (value-taking flag consumed `--` and failed its own validation).
 - **13 (Summary of Reserved and Special Values)** — Add a row for `LOOPX_TMPDIR` env var. Add `--` as a reserved `run`-subcommand separator token.
 
 ## Test Recommendations
@@ -176,6 +179,12 @@ These highlight edge cases that are easy to overlook. They are not an exhaustive
 - Verify a user-supplied `LOOPX_TMPDIR` in the global env file is overridden by the injected value.
 - Verify a user-supplied `LOOPX_TMPDIR` in the `-e` local env file is overridden by the injected value.
 - Verify under `-n 0`, no tmpdir is created and no child process is spawned (and therefore no `LOOPX_TMPDIR` is observed).
+- Verify a discovery error (e.g., missing `.loopx/` directory) does not create a `LOOPX_TMPDIR`.
+- Verify a starting-target resolution failure (e.g., non-existent workflow or missing script) does not create a `LOOPX_TMPDIR`.
+- Verify an env-file loading failure (`-e` pointing to a missing or invalid file) does not create a `LOOPX_TMPDIR`.
+- Verify cleanup runs after the child process group has exited for programmatic `AbortSignal` abort mid-iteration (i.e., the tmpdir is not removed while a child is still running).
+- Verify cleanup runs after the child process group has exited for programmatic consumer-driven cancellation (`break` / `generator.return()`) mid-iteration.
+- Verify cleanup failure under the programmatic API prints a warning to stderr but does not change the generator's success/error/abort outcome.
 - Verify cleanup failure (simulate via making the tmpdir contents non-removable) prints a warning to stderr but does not change the loop's exit code.
 - Verify a workflow's own `node_modules/`, `.loopx/`, or other non-tmpdir state is not affected by cleanup.
 - Verify that scripts can write subdirectories, binary files, and Unix sockets/FIFOs under `$LOOPX_TMPDIR` without loopx interference.
@@ -194,13 +203,16 @@ These highlight edge cases that are easy to overlook. They are not an exhaustive
 - Verify `loopx run foo 0003 -n 5` sets `-n = 5` and `$1 == "0003"` ("flags anywhere" — `-n 5` after the arg is still consumed as a flag).
 - Verify `loopx run foo 0003 -- -n 5` sets no `-n` flag and produces `args = ["0003", "-n", "5"]`.
 - Verify `loopx run foo -e 0003` binds `-e = "0003"` (and fails if no such env file exists), not `args = ["0003"]`.
+- Verify `loopx run foo -n -- 5` binds `-n = "--"` and fails `-n` validation (not a non-negative integer); `--` is consumed as the flag value, not as the separator.
+- Verify `loopx run foo -e -- bar` binds `-e = "--"` and fails env-file loading; `--` is consumed as the flag value, not as the separator.
 - Verify `loopx run foo --unknown` is a usage error.
 - Verify `loopx run foo -- --unknown` is not a usage error; args = `["--unknown"]`.
 - Verify `loopx run -n 5 -n 10 foo 0003` remains a usage error (duplicate `-n`), regardless of the trailing arg.
 - Verify `loopx run -h foo 0003` shows run help and exits 0 (short-circuit; args ignored).
 - Verify `loopx run foo -h 0003` shows run help and exits 0.
 - Verify `loopx run foo 0003 -h` shows run help and exits 0.
-- Verify `loopx run foo -` (bare hyphen) treats `-` as the target and fails target validation because `-` does not match the name pattern.
+- Verify `loopx run foo -` sets `target = "foo"`, `args = ["-"]` (bare hyphen after the target is an arg).
+- Verify `loopx run -` treats `-` as the target and fails target validation because `-` does not match the name pattern.
 - Verify `loopx run foo 0003 -` sets `target = foo`, `args = ["0003", "-"]`.
 - Verify JS/TS scripts observe args via `process.argv.slice(2)` under both `tsx` and Bun runtimes.
 - Verify args are not exposed via any `LOOPX_*` environment variable.
