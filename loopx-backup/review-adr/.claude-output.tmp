@@ -1,0 +1,36 @@
+I've read ADR-0004 in full, SPEC §9.1, and ADR-0001. Before I make changes, I need to push back on parts of the feedback and clarify your intent on the genuinely ambiguous ones.
+
+## Where I agree with the reviewer
+
+- **Blocker 1 (snapshot timing):** Real. Line 67 (step 1 of programmatic pre-iteration) says loopx "snapshots `env`'s own enumerable string-keyed entries via `Object.keys(env)`" — as if snapshotting happens at step 1 (first iteration). But line 322, line 370, and tests at lines 559–560 all say snapshotting happens at call time. SPEC §9.1 also says "`run()` snapshots its options and `cwd` at call time." Call-time is clearly the intent; line 67 is just imprecise wording. I can align line 67 without asking.
+- **Stale `args?: string[]` reference (line 410):** Confirmed — SPEC.md has no such field. I'll remove that sentence.
+
+## Where I'd push back
+
+- **Clarifying Q3 (broader scope freeze is intentional?):** Already answered. The Decision Summary (lines 7–21) itemizes 8 normative commitments including options-shape validation, same-realm AbortSignal, and abort-dominance-over-`.return()`/`.throw()`. The Scope note at line 38 explicitly says these are in scope. A reviewer reading the ADR cannot accept it without encountering these. I don't think anything further needs to be said — unless you want me to cross-reference the Decision Summary from the scope note to double-signal.
+- **Clarifying Q4 (unrestricted env-overlay intentional?):** Already answered in the Decision Summary bullet (line 12) and section 2 "Scope of the feature" (line 196).
+- **Clarifying Q5 (same-realm-only AbortSignal intentional?):** Already answered at line 67 with two sentences of rationale and a bridging recommendation.
+
+For these three, the reviewer is asking you to confirm things the ADR already explicitly commits to. I don't plan to add more text unless you want me to.
+
+## Where I need your input
+
+**Question 1 — Accessor / getter / proxy behavior under call-time snapshotting.**
+Once we lock in "snapshot at call time", a throwing getter or proxy trap could make `run()` throw synchronously — which would conflict with SPEC §9.1's "`run()` call itself always returns a generator without throwing". Three options:
+
+- **(A)** Snapshot happens at call time; any synchronous throw during capture (getter throws, proxy `ownKeys`/`get` trap throws) is caught and surfaced lazily on first iteration as a step-1 field-validation error. Preserves the "always returns a generator" invariant.
+- **(B)** Snapshot happens at call time; throws from accessors/proxies propagate synchronously from `run()`. Cleaner for callers using plain objects but breaks the SPEC §9.1 invariant for the accessor edge case.
+- **(C)** Narrow accepted `env` to plain objects (prototype must be `Object.prototype` or `null`), rejecting proxies and accessor-having objects at step 1.
+
+I'd recommend **(A)**. It preserves SPEC §9.1, keeps the current permissive object-model contract, and is testable ("constructed `env` with a throwing getter surfaces lazily"). Do you want (A), (B), or (C)?
+
+**Question 2 — Title broadening.**
+Current title: "Run-Scoped Temporary Directory, Named Run Arguments, and **Pre-spawn** Cancellation Semantics". "Pre-spawn" literally excludes the abort-wins-until-terminal-settlement, consumer `.return()`/`.throw()`, and post-final-yield rules, which are iteration-time. Options:
+
+- Keep as is (rely on Decision Summary to carry the scope signal)
+- Broaden to "…and Programmatic Run Lifecycle" (covers pre-spawn, iteration, and final-yield window)
+- Broaden to "…and Programmatic Run Cancellation and Validation Semantics"
+
+Which do you want?
+
+Once you answer these two, I'll make the full edit pass, commit, and push.
