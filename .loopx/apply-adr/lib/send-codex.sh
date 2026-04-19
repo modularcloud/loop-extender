@@ -40,4 +40,4 @@ cat "$FEEDBACK_FILE" >&2
 echo "" >&2
 echo "--- End feedback ---" >&2
 
-$LOOPX_BIN output --goto "apply-feedback"
+$LOOPX_BIN output --goto "check-feedback-done"

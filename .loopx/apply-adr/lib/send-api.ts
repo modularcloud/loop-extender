@@ -101,6 +101,6 @@ writeFileSync(FEEDBACK_FILE, answer);
 rmSync(PROMPT_FILE);
 console.error("=== Feedback received from GPT-5.4-Pro ===");
 
-execFileSync(BIN, ["output", "--goto", "apply-feedback"], {
+execFileSync(BIN, ["output", "--goto", "check-feedback-done"], {
   stdio: "inherit",
 });

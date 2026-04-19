@@ -101,4 +101,4 @@ echo "--- Begin feedback ---" >&2
 echo "$COLLECTED" >&2
 echo "--- End feedback ---" >&2
 
-$LOOPX_BIN output --goto "apply-feedback"
+$LOOPX_BIN output --goto "check-feedback-done"
