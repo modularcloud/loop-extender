@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "has_question": {
+      "description": "true if the text contains a question or request for clarification directed at the user, false otherwise",
+      "type": "boolean"
+    }
+  },
+  "required": ["has_question"],
+  "additionalProperties": false
+}
