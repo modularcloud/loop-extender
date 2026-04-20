@@ -1,0 +1,42 @@
+{
+  "name": "loop-extender",
+  "version": "0.2.0",
+  "description": "A CLI tool that automates repeated execution (loops) of scripts, primarily designed to wrap agent CLIs.",
+  "type": "module",
+  "bin": {
+    "loopx": "./dist/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./internal": {
+      "types": "./dist/internal.d.ts",
+      "default": "./dist/internal.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/postbuild.mjs",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "tsx": "^4.19.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^5.8.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/modularcloud/loop-extender.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

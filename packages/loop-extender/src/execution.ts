@@ -46,25 +46,43 @@ function getBunClassicJsxConfig(): string {
 }
 
 // Add our node_modules/.bin to PATH so tsx is findable regardless of cwd.
-// Two layouts must be supported:
-//   - Nested: <pkg>/node_modules/.bin — npm `install -g` produces this,
-//     because the loopx package's runtime deps (tsx + its transitive deps)
-//     are nested under the loopx package root.
-//   - Flat: <pkg>/../node_modules/.bin — the dev-tree layout, where `dist/`
-//     sits next to the repo-root `node_modules/.bin` via `resolve(__dirname, "..")`.
-// Prepend both; missing entries on PATH are harmless.
-const LOOPX_NESTED_BIN_DIR = resolve(__dirname, "node_modules", ".bin");
+// __dirname is the compiled dist/ directory. Three layouts must be supported:
+//   - Global install: <pkg>/node_modules/.bin — `npm install -g loop-extender`
+//     nests tsx under the package root (one level above __dirname).
+//   - Workspace dev: <repo>/node_modules/.bin — npm workspaces hoist tsx to
+//     the repo root (three levels above __dirname).
+//   - Legacy flat: <__dirname>/node_modules/.bin — kept for backwards compat
+//     with old dist-as-package layouts.
+// Prepend all three; missing entries on PATH are harmless.
+const LOOPX_LEGACY_BIN_DIR = resolve(__dirname, "node_modules", ".bin");
 const LOOPX_FLAT_BIN_DIR = resolve(__dirname, "..", "node_modules", ".bin");
+const LOOPX_WORKSPACE_BIN_DIR = resolve(
+  __dirname,
+  "..",
+  "..",
+  "..",
+  "node_modules",
+  ".bin"
+);
 // NODE_PATH entries: loopx's own deps + parent dir (for global installs
-// where the parent node_modules/ contains the loopx package itself).
+// where the parent node_modules/ contains the loopx package itself) +
+// workspace-root node_modules (for dev via npm workspaces).
 const LOOPX_NODE_MODULES = resolve(__dirname, "..", "node_modules");
 const LOOPX_PACKAGE_PARENT = resolve(__dirname, "..", "..");
+const LOOPX_WORKSPACE_NODE_MODULES = resolve(
+  __dirname,
+  "..",
+  "..",
+  "..",
+  "node_modules"
+);
 
 // The npm package is published as "loop-extender" but scripts import from
 // "loopx" (SPEC §3.1, §3.3). When the package is globally installed there is
 // no `node_modules/loopx/` entry accessible to scripts, so Bun's NODE_PATH
 // lookup fails. Create a per-process shim dir that symlinks `loopx` to the
-// loopx package root (loopx's own __dirname, typically `.../loop-extender/`)
+// loop-extender package root (one level above __dirname, since __dirname is
+// the compiled dist/ dir and package.json with `exports` lives at the parent)
 // and prepend it to NODE_PATH.
 let loopxShimDir: string | null = null;
 function getLoopxShimDir(): string {
@@ -74,8 +92,9 @@ function getLoopxShimDir(): string {
   const dir = join(tmpdir(), `loopx-nodepath-shim-${process.pid}`);
   mkdirSync(dir, { recursive: true });
   const shim = join(dir, "loopx");
-  // __dirname here is the loopx package root (dist/ when installed).
-  const loopxPackageRoot = __dirname;
+  // __dirname is dist/ at runtime; the canonical package root with package.json
+  // (and its `exports` map) lives one level up.
+  const loopxPackageRoot = resolve(__dirname, "..");
   try {
     if (lstatSync(shim)) unlinkSync(shim);
   } catch {
@@ -86,7 +105,7 @@ function getLoopxShimDir(): string {
   return dir;
 }
 
-const LOOPX_NODE_PATH = `${getLoopxShimDir()}:${LOOPX_NODE_MODULES}:${LOOPX_PACKAGE_PARENT}`;
+const LOOPX_NODE_PATH = `${getLoopxShimDir()}:${LOOPX_NODE_MODULES}:${LOOPX_PACKAGE_PARENT}:${LOOPX_WORKSPACE_NODE_MODULES}`;
 
 export interface ExecResult {
   stdout: string;
@@ -143,11 +162,12 @@ export function executeScript(
     PATH: (() => {
       const pathEntries = currentPath.split(":");
       const prepend: string[] = [];
-      if (!pathEntries.includes(LOOPX_NESTED_BIN_DIR)) {
-        prepend.push(LOOPX_NESTED_BIN_DIR);
-      }
-      if (!pathEntries.includes(LOOPX_FLAT_BIN_DIR)) {
-        prepend.push(LOOPX_FLAT_BIN_DIR);
+      for (const dir of [
+        LOOPX_LEGACY_BIN_DIR,
+        LOOPX_FLAT_BIN_DIR,
+        LOOPX_WORKSPACE_BIN_DIR,
+      ]) {
+        if (!pathEntries.includes(dir)) prepend.push(dir);
       }
       return prepend.length === 0
         ? currentPath
