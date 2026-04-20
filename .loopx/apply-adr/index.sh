@@ -48,8 +48,15 @@ case "$MODE" in
     fi
     exec ./node_modules/.bin/tsx ./lib/send-api.ts
     ;;
+  batch)
+    if [[ ! -x ./node_modules/.bin/tsx ]]; then
+      echo "Error: ./node_modules/.bin/tsx not found. Run 'npm install' in $(pwd) to enable LOOPX_REVIEWER=batch." >&2
+      exit 1
+    fi
+    exec ./node_modules/.bin/tsx ./lib/send-batch.ts
+    ;;
   *)
-    echo "Error: unknown LOOPX_REVIEWER='$MODE' (expected unset, 'telegram', 'codex', or 'api')" >&2
+    echo "Error: unknown LOOPX_REVIEWER='$MODE' (expected unset, 'telegram', 'codex', 'api', or 'batch')" >&2
     exit 1
     ;;
 esac
