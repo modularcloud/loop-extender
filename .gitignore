@@ -2,6 +2,7 @@ node_modules/
 dist/
 coverage/
 .vitest/
+.turbo/
 tmp/
 *.tgz
 .loopx/.iteration.tmp

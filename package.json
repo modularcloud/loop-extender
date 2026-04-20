@@ -1,24 +1,33 @@
 {
-  "name": "loopx-tests",
+  "name": "loop-extender-monorepo",
   "version": "0.0.0",
-  "type": "module",
   "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && node scripts/postbuild.mjs",
-    "test": "vitest run",
-    "test:harness": "vitest run tests/harness/",
-    "test:unit": "vitest run tests/unit/",
-    "test:e2e": "vitest run tests/e2e/",
-    "test:fuzz": "vitest run tests/fuzz/",
-    "test:typecheck": "vitest typecheck"
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "test:harness": "turbo run test:harness",
+    "test:unit": "turbo run test:unit",
+    "test:e2e": "turbo run test:e2e",
+    "test:fuzz": "turbo run test:fuzz",
+    "test:typecheck": "turbo run test:typecheck",
+    "clean": "turbo run clean",
+    "changeset": "changeset",
+    "version": "changeset version",
+    "release": "turbo run build --filter=loop-extender && changeset publish"
   },
   "devDependencies": {
+    "@changesets/changelog-github": "^0.5.0",
+    "@changesets/cli": "^2.27.9",
     "@types/node": "^25.5.0",
-    "execa": "^9.5.2",
-    "fast-check": "^4.1.1",
-    "get-port": "^7.1.0",
-    "tsx": "^4.19.3",
-    "typescript": "^5.8.3",
-    "vitest": "^3.1.1"
-  }
+    "turbo": "^2.3.3"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "npm@10.9.0"
 }

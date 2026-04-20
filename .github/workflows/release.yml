@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    # Skip the workflow's own version-bump commits to avoid a no-op re-run loop.
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.1'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - name: Upgrade npm for OIDC publish support
+        run: npm install -g npm@latest
+
+      - run: npm ci
+
+      - name: Detect pending changesets
+        id: detect
+        run: |
+          shopt -s nullglob
+          pending=(.changeset/*.md)
+          has_changes=false
+          for f in "${pending[@]}"; do
+            [ "$(basename "$f")" = "README.md" ] && continue
+            has_changes=true
+            break
+          done
+          echo "has_changes=$has_changes" >> "$GITHUB_OUTPUT"
+
+      - name: Bump versions and changelog
+        if: steps.detect.outputs.has_changes == 'true'
+        run: npx changeset version
+
+      - name: Commit version bump
+        if: steps.detect.outputs.has_changes == 'true'
+        run: |
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          git commit -m "chore(release): version packages"
+          git push
+
+      - name: Publish to npm
+        if: steps.detect.outputs.has_changes == 'true'
+        run: npm run release
+        env:
+          NPM_CONFIG_PROVENANCE: 'true'

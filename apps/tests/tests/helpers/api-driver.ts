@@ -1,7 +1,12 @@
 import { spawn } from "node:child_process";
 import { mkdtemp, writeFile, mkdir, symlink, rm, access } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+
+// apps/tests/tests/helpers → walk up three levels to the repo root.
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
+const LOOPX_PACKAGE_ROOT = resolve(REPO_ROOT, "packages/loop-extender");
 
 export interface APIDriverResult {
   stdout: string;
@@ -50,6 +55,8 @@ export async function runAPIDriver(
     await mkdir(nodeModulesDir, { recursive: true });
 
     const candidates = [
+      LOOPX_PACKAGE_ROOT,
+      resolve(REPO_ROOT, "node_modules", "loopx"),
       resolve(process.cwd(), "dist"),
       resolve(process.cwd()),
       join(process.cwd(), "node_modules", "loopx"),
@@ -85,7 +92,7 @@ export async function runAPIDriver(
     // own tsx installation state.
     const command = runtime === "bun"
       ? "bun"
-      : resolve(process.cwd(), "node_modules", ".bin", "tsx");
+      : resolve(REPO_ROOT, "node_modules", ".bin", "tsx");
     const args = [driverPath];
 
     const mergedEnv = {
