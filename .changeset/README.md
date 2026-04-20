@@ -14,7 +14,10 @@ Pick the packages that changed, the semver bump (patch/minor/major), and describ
 
 ## How releases work
 
-1. On merge to `main`, the GitHub Action opens (or updates) a **"Version Packages"** PR that aggregates pending changesets, bumps `packages/loop-extender/package.json`, and regenerates `CHANGELOG.md`.
-2. Merging that PR triggers `npm publish` with provenance, creates a git tag, and publishes a GitHub Release with the changelog.
+On merge to `main`, the GitHub Action checks for pending `.changeset/*.md` files. If any exist, it:
 
-No manual tagging. No publish on every tag. The Version Packages PR is the human gate.
+1. Runs `changeset version` to bump `packages/loop-extender/package.json` and regenerate `CHANGELOG.md`.
+2. Commits the bump back to `main` as `chore(release): version packages`.
+3. Runs `npm publish` (with provenance) and creates the git tag.
+
+One PR, one merge, one release. The PR itself is the human gate — review the changeset and bump level before merging, because there is no second review step.

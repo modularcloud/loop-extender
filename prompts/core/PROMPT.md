@@ -16,7 +16,7 @@
 
 999999. As soon as there are no build or unexpected test errors:
    - Create a checkpoint tag in a non-release namespace: `git tag checkpoint/$(date -u +%Y%m%d-%H%M%S)` and push it. This is for rollback only. DO NOT create plain semver tags (`0.0.1`, `v0.1.44`, etc.) — those are reserved for the Changesets release flow and pushing one will NOT trigger a publish in this repo anymore.
-   - If the iteration changed user-facing behavior of `loop-extender` (anything a consumer would notice in npm: bug fix, new feature, breaking change), also run `npx changeset` to record a brief description and pick the bump level (`patch` / `minor` / `major`). Skip changesets for purely internal work (refactors, test-only changes, doc tweaks, CI config). Commit the generated `.changeset/*.md` file with the rest of your changes — it will be aggregated into the next "Version Packages" PR on merge to main, which the human merges to actually publish to npm.
+   - If the iteration changed user-facing behavior of `loop-extender` (anything a consumer would notice in npm: bug fix, new feature, breaking change), also run `npx changeset` to record a brief description and pick the bump level (`patch` / `minor` / `major`). Skip changesets for purely internal work (refactors, test-only changes, doc tweaks, CI config). Commit the generated `.changeset/*.md` file with the rest of your changes — when the human merges the PR to main, the release workflow will bump the version, tag, and publish to npm in one step. Pick the bump level carefully: there is no second review.
 
 999999999. You may add extra logging if required to be able to debug the issues.
 
