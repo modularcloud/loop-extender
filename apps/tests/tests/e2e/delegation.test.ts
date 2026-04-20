@@ -320,13 +320,20 @@ async function installFunctionalLocalLoopx(
     "utf-8",
   );
 
+  // Resolve bin path from the (custom) package.json so this helper survives
+  // layout changes (e.g. bin moving from package root → ./dist/bin.js after
+  // the monorepo restructure).
+  const binField =
+    typeof customPkg.bin === "string" ? customPkg.bin : customPkg.bin?.loopx;
+  const resolvedBinJs = resolve(loopxDir, binField ?? "bin.js");
+
   const binDir = join(projectDir, "node_modules", ".bin");
   await mkdir(binDir, { recursive: true });
   const binPath = join(binDir, "loopx");
   await writeFile(
     binPath,
     `#!/bin/bash
-exec node "${join(loopxDir, "bin.js")}" "$@"
+exec node "${resolvedBinJs}" "$@"
 `,
     "utf-8",
   );
