@@ -3,9 +3,16 @@ set -euo pipefail
 
 ROOT="$LOOPX_PROJECT_ROOT"
 ADR_0001="$ROOT/adr/0001-adr-process.md"
-ADR_0004="$ROOT/adr/0004-tmpdir-and-env.md"
+ADR_0004="$ROOT/adr/0004-tmpdir-and-args.md"
 SPEC="$ROOT/SPEC.md"
-PROMPT_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.prompt.tmp"
+SHARED_DIR="$ROOT/.loopx/shared"
+PROMPT_FILE="$SHARED_DIR/.prompt.tmp"
+CALLER_FILE="$SHARED_DIR/.caller.tmp"
+
+if [[ ! -d "$SHARED_DIR" ]]; then
+  echo "Error: shared workflow not found at $SHARED_DIR — install it with: loopx install -w shared modularcloud/sdg-workflows" >&2
+  exit 1
+fi
 
 if [[ ! -f "$ADR_0001" ]]; then
   echo "Error: adr/0001-adr-process.md not found" >&2
@@ -13,7 +20,7 @@ if [[ ! -f "$ADR_0001" ]]; then
 fi
 
 if [[ ! -f "$ADR_0004" ]]; then
-  echo "Error: adr/0004-tmpdir-and-env.md not found" >&2
+  echo "Error: adr/0004-tmpdir-and-args.md not found" >&2
   exit 1
 fi
 
@@ -22,44 +29,19 @@ if [[ ! -f "$SPEC" ]]; then
   exit 1
 fi
 
-# Build the prompt and save to file (too long for a single Telegram message)
+echo "$LOOPX_WORKFLOW" > "$CALLER_FILE"
+
 cat <<PROMPT > "$PROMPT_FILE"
 Review ADR 0001, ADR 0004, and SPEC.md holistically and let me know if I can mark ADR 0004 as accepted or if I need to improve it further. Ask me clarifying questions if you have any doubts about my intentions for ADR 0004.
 
 adr/0001-adr-process.md:
 $(cat "$ADR_0001")
 
-adr/0004-tmpdir-and-env.md:
+adr/0004-tmpdir-and-args.md:
 $(cat "$ADR_0004")
 
 SPEC.md:
 $(cat "$SPEC")
 PROMPT
 
-MODE="${LOOPX_REVIEWER:-telegram}"
-case "$MODE" in
-  telegram)
-    exec ./lib/send-telegram.sh
-    ;;
-  codex)
-    exec ./lib/send-codex.sh
-    ;;
-  api)
-    if [[ ! -x ./node_modules/.bin/tsx ]]; then
-      echo "Error: ./node_modules/.bin/tsx not found. Run 'npm install' in $(pwd) to enable LOOPX_REVIEWER=api." >&2
-      exit 1
-    fi
-    exec ./node_modules/.bin/tsx ./lib/send-api.ts
-    ;;
-  batch)
-    if [[ ! -x ./node_modules/.bin/tsx ]]; then
-      echo "Error: ./node_modules/.bin/tsx not found. Run 'npm install' in $(pwd) to enable LOOPX_REVIEWER=batch." >&2
-      exit 1
-    fi
-    exec ./node_modules/.bin/tsx ./lib/send-batch.ts
-    ;;
-  *)
-    echo "Error: unknown LOOPX_REVIEWER='$MODE' (expected unset, 'telegram', 'codex', 'api', or 'batch')" >&2
-    exit 1
-    ;;
-esac
+$LOOPX_BIN output --goto "shared:dispatch"

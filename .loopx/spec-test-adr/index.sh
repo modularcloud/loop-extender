@@ -6,7 +6,14 @@ ADR_0001="$ROOT/adr/0001-adr-process.md"
 ADR_0002="$ROOT/adr/0002-run-subcommand.md"
 SPEC="$ROOT/SPEC.md"
 TEST_SPEC="$ROOT/TEST-SPEC.md"
-PROMPT_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.prompt.tmp"
+SHARED_DIR="$ROOT/.loopx/shared"
+PROMPT_FILE="$SHARED_DIR/.prompt.tmp"
+CALLER_FILE="$SHARED_DIR/.caller.tmp"
+
+if [[ ! -d "$SHARED_DIR" ]]; then
+  echo "Error: shared workflow not found at $SHARED_DIR — install it with: loopx install -w shared modularcloud/sdg-workflows" >&2
+  exit 1
+fi
 
 if [[ ! -f "$ADR_0001" ]]; then
   echo "Error: adr/0001-adr-process.md not found" >&2
@@ -28,7 +35,8 @@ if [[ ! -f "$TEST_SPEC" ]]; then
   exit 1
 fi
 
-# Build the prompt and save to file (too long for a single Telegram message)
+echo "$LOOPX_WORKFLOW" > "$CALLER_FILE"
+
 cat <<PROMPT > "$PROMPT_FILE"
 ADR 0002 has been accepted and SPEC.md has already been updated to incorporate its changes (ADR status: "Spec Updated"). Per the ADR process in ADR-0001, the next step is to update TEST-SPEC.md to cover the new and changed spec behavior introduced by ADR-0002. In this cycle, TEST-SPEC.md is the only file that should be modified — SPEC.md and ADR-0002 are read-only references.
 
@@ -44,30 +52,4 @@ TEST-SPEC.md (target of updates):
 $(cat "$TEST_SPEC")
 PROMPT
 
-MODE="${LOOPX_REVIEWER:-telegram}"
-case "$MODE" in
-  telegram)
-    exec ./lib/send-telegram.sh
-    ;;
-  codex)
-    exec ./lib/send-codex.sh
-    ;;
-  api)
-    if [[ ! -x ./node_modules/.bin/tsx ]]; then
-      echo "Error: ./node_modules/.bin/tsx not found. Run 'npm install' in $(pwd) to enable LOOPX_REVIEWER=api." >&2
-      exit 1
-    fi
-    exec ./node_modules/.bin/tsx ./lib/send-api.ts
-    ;;
-  batch)
-    if [[ ! -x ./node_modules/.bin/tsx ]]; then
-      echo "Error: ./node_modules/.bin/tsx not found. Run 'npm install' in $(pwd) to enable LOOPX_REVIEWER=batch." >&2
-      exit 1
-    fi
-    exec ./node_modules/.bin/tsx ./lib/send-batch.ts
-    ;;
-  *)
-    echo "Error: unknown LOOPX_REVIEWER='$MODE' (expected unset, 'telegram', 'codex', 'api', or 'batch')" >&2
-    exit 1
-    ;;
-esac
+$LOOPX_BIN output --goto "shared:dispatch"

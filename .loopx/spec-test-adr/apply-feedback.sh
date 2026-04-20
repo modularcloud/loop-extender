@@ -2,8 +2,9 @@
 set -euo pipefail
 
 ROOT="$LOOPX_PROJECT_ROOT"
-FEEDBACK_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.feedback.tmp"
-CLAUDE_OUTPUT_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.claude-output.tmp"
+SHARED_DIR="$ROOT/.loopx/shared"
+FEEDBACK_FILE="$SHARED_DIR/.feedback.tmp"
+CLAUDE_OUTPUT_FILE="$SHARED_DIR/.claude-output.tmp"
 
 if [[ ! -f "$FEEDBACK_FILE" ]]; then
   echo "Error: No feedback file found at $FEEDBACK_FILE" >&2
@@ -38,4 +39,4 @@ echo "$CLAUDE_OUTPUT" > "$CLAUDE_OUTPUT_FILE"
 echo "" >&2
 echo "=== Claude finished applying feedback ===" >&2
 
-$LOOPX_BIN output --goto "check-question"
+$LOOPX_BIN output --goto "shared:check-question"
