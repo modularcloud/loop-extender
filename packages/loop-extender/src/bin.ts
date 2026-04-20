@@ -38,9 +38,12 @@ function getVersion(): string {
   // effective binary" + ADR-0003 §5 runtime validation semantics).
   const candidates: string[] = [];
   if (process.argv[1]) {
-    candidates.push(resolve(dirname(process.argv[1]), "package.json"));
+    const argvDir = dirname(process.argv[1]);
+    candidates.push(resolve(argvDir, "package.json"));
+    candidates.push(resolve(argvDir, "..", "package.json"));
   }
   candidates.push(resolve(__dirname, "package.json"));
+  candidates.push(resolve(__dirname, "..", "package.json"));
   for (const candidate of candidates) {
     try {
       const pkg = JSON.parse(readFileSync(candidate, "utf-8"));

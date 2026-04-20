@@ -1,0 +1,26 @@
+{
+  "name": "loopx-tests",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:harness": "vitest run --project harness",
+    "test:unit": "vitest run --project unit",
+    "test:e2e": "vitest run --project e2e --project signals",
+    "test:fuzz": "vitest run --project fuzz",
+    "test:typecheck": "vitest run --project typecheck"
+  },
+  "dependencies": {
+    "loop-extender": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "execa": "^9.5.2",
+    "fast-check": "^4.1.1",
+    "get-port": "^7.1.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  }
+}
