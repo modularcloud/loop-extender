@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$LOOPX_PROJECT_ROOT"
 ADR_0001="$ROOT/adr/0001-adr-process.md"
-ADR_0004="$ROOT/adr/0004-tmpdir-and-args.md"
+ADR_0004="$ROOT/adr/0004-tmpdir-and-env.md"
 SPEC="$ROOT/SPEC.md"
 PROMPT_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.prompt.tmp"
 
@@ -13,7 +13,7 @@ if [[ ! -f "$ADR_0001" ]]; then
 fi
 
 if [[ ! -f "$ADR_0004" ]]; then
-  echo "Error: adr/0004-tmpdir-and-args.md not found" >&2
+  echo "Error: adr/0004-tmpdir-and-env.md not found" >&2
   exit 1
 fi
 
@@ -29,7 +29,7 @@ Review ADR 0001, ADR 0004, and SPEC.md holistically and let me know if I can mar
 adr/0001-adr-process.md:
 $(cat "$ADR_0001")
 
-adr/0004-tmpdir-and-args.md:
+adr/0004-tmpdir-and-env.md:
 $(cat "$ADR_0004")
 
 SPEC.md:
