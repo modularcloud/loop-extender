@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT="$LOOPX_PROJECT_ROOT"
 ADR_0001="$ROOT/adr/0001-adr-process.md"
-ADR_0004="$ROOT/adr/0004-tmpdir-and-env.md"
 SPEC="$ROOT/SPEC.md"
 SHARED_DIR="$ROOT/.loopx/shared"
 PROMPT_FILE="$SHARED_DIR/.prompt.tmp"
@@ -19,26 +18,25 @@ if [[ ! -f "$ADR_0001" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$ADR_0004" ]]; then
-  echo "Error: adr/0004-tmpdir-and-env.md not found" >&2
-  exit 1
-fi
-
 if [[ ! -f "$SPEC" ]]; then
   echo "Error: SPEC.md not found" >&2
   exit 1
 fi
 
+RESOLVED=$("$SHARED_DIR/resolve-adr.sh")
+IFS=$'\t' read -r ADR_NUM ADR_FILE <<< "$RESOLVED"
+ADR_REL="adr/$(basename "$ADR_FILE")"
+
 echo "$LOOPX_WORKFLOW" > "$CALLER_FILE"
 
 cat <<PROMPT > "$PROMPT_FILE"
-Review ADR 0001, ADR 0004, and SPEC.md holistically and let me know if I can mark ADR 0004 as accepted or if I need to improve it further. Ask me clarifying questions if you have any doubts about my intentions for ADR 0004.
+Review ADR 0001, ADR $ADR_NUM, and SPEC.md holistically and let me know if I can mark ADR $ADR_NUM as accepted or if I need to improve it further. Ask me clarifying questions if you have any doubts about my intentions for ADR $ADR_NUM.
 
 adr/0001-adr-process.md:
 $(cat "$ADR_0001")
 
-adr/0004-tmpdir-and-env.md:
-$(cat "$ADR_0004")
+$ADR_REL:
+$(cat "$ADR_FILE")
 
 SPEC.md:
 $(cat "$SPEC")

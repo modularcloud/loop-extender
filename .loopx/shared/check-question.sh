@@ -115,7 +115,7 @@ else
     -d chat_id="$TELEGRAM_CHAT_ID" \
     -d text="Feedback applied. Ready for next review cycle." > /dev/null
 
-  rm -f "$CLAUDE_OUTPUT_FILE" "$ROOT/.loopx/$LOOPX_WORKFLOW/.caller.tmp"
+  rm -f "$CLAUDE_OUTPUT_FILE" "$ROOT/.loopx/$LOOPX_WORKFLOW/.caller.tmp" "$ROOT/.loopx/$LOOPX_WORKFLOW/.session.tmp"
   echo "=== No questions. Ready for next review cycle. ===" >&2
   $LOOPX_BIN output --result "Feedback applied. Ready for next review cycle."
 fi

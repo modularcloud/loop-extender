@@ -34,7 +34,7 @@ DONE=$(echo "$VERDICT" | jq -r '.done')
 
 if [[ "$DONE" == "true" ]]; then
   echo "=== Feedback indicates no further non-optional improvements — halting ===" >&2
-  rm -f "$FEEDBACK_FILE" "$CALLER_FILE"
+  rm -f "$FEEDBACK_FILE" "$CALLER_FILE" "$ROOT/.loopx/$LOOPX_WORKFLOW/.session.tmp"
   $LOOPX_BIN output --result "Feedback indicates no further non-optional improvements. Halting." --stop
 else
   echo "=== Feedback requires further improvements — applying ===" >&2
