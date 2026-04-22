@@ -22,9 +22,11 @@ else
 fi
 echo "$ITER" > "$ITER_FILE"
 
+JOB="$(basename "$ROOT") / ralph"
+
 curl -s -X POST "${TELEGRAM_API}/sendMessage" \
   -d chat_id="$TELEGRAM_CHAT_ID" \
-  --data-urlencode "text=Ralph loop: starting iteration ${ITER}" > /dev/null
+  --data-urlencode "text=[${JOB}] starting iteration ${ITER}" > /dev/null
 
 echo "=== Ralph iteration ${ITER} ===" >&2
 

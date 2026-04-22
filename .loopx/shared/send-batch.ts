@@ -123,7 +123,10 @@ const answer =
     .join("\n");
 
 writeFileSync(FEEDBACK_FILE, answer);
-rmSync(PROMPT_FILE);
+// force:true — external cleanup (reinstall, git clean, sibling workflow) can
+// remove the prompt file mid-run; crashing here would skip the goto to
+// check-feedback-done and strand the loop.
+rmSync(PROMPT_FILE, { force: true });
 console.error("=== Feedback received from GPT-5.4-Pro ===");
 
 execFileSync(BIN, ["output", "--goto", "check-feedback-done"], {

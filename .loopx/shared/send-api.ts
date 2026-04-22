@@ -128,8 +128,11 @@ if (!answer) {
 }
 
 writeFileSync(FEEDBACK_FILE, answer);
-rmSync(PROMPT_FILE);
-if (existsSync(RESPONSE_ID_FILE)) rmSync(RESPONSE_ID_FILE);
+// force:true — external cleanup (reinstall, git clean, sibling workflow) can
+// remove these scratch files mid-run; crashing here would skip the goto to
+// check-feedback-done and strand the loop.
+rmSync(PROMPT_FILE, { force: true });
+rmSync(RESPONSE_ID_FILE, { force: true });
 console.error("=== Feedback received from GPT-5.4-Pro ===");
 
 execFileSync(BIN, ["output", "--goto", "check-feedback-done"], {
