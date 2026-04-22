@@ -1,78 +1,20 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./telegram-lib.sh
+source "$SCRIPT_DIR/telegram-lib.sh"
+
 ROOT="$LOOPX_PROJECT_ROOT"
 PROMPT_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.prompt.tmp"
 FEEDBACK_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.feedback.tmp"
-
-: "${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN env var is required}"
-: "${TELEGRAM_CHAT_ID:?TELEGRAM_CHAT_ID env var is required}"
 
 if [[ ! -s "$PROMPT_FILE" ]]; then
   echo "Error: prompt file not found at $PROMPT_FILE" >&2
   exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TELEGRAM_API="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
-
-# Topic name: <cwd> / <workflow> [ / ADR-NNNN ]. One topic per (project,
-# workflow, optional ADR) so parallel runs in different repos can't collide.
-TOPIC_NAME="$(basename "$ROOT") / $LOOPX_WORKFLOW"
-if [[ -n "${ADR:-}" ]]; then
-  if ADR_RESOLVED=$("$SCRIPT_DIR/resolve-adr.sh" 2>/dev/null); then
-    ADR_PADDED=$(printf '%s' "$ADR_RESOLVED" | cut -f1)
-    TOPIC_NAME="$TOPIC_NAME / ADR-$ADR_PADDED"
-  fi
-fi
-
-# Per-bot cache: {"<chat_id>|<topic_name>": message_thread_id}. Flocked so
-# concurrent first-runs don't double-create the same topic.
-TOKEN_HASH=$(printf '%s' "$TELEGRAM_BOT_TOKEN" | sha256sum | cut -c1-12)
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/loopx-telegram"
-mkdir -p "$CACHE_DIR"
-CACHE_FILE="$CACHE_DIR/topics-$TOKEN_HASH.json"
-LOCK_FILE="$CACHE_DIR/topics-$TOKEN_HASH.lock"
-CACHE_KEY="${TELEGRAM_CHAT_ID}|${TOPIC_NAME}"
-
-resolve_topic_id() {
-  (
-    exec 9>"$LOCK_FILE"
-    flock -x 9
-    [[ -f "$CACHE_FILE" ]] || echo '{}' > "$CACHE_FILE"
-    local id
-    id=$(jq -r --arg k "$CACHE_KEY" '.[$k] // empty' "$CACHE_FILE")
-    if [[ -z "$id" ]]; then
-      local resp
-      resp=$(curl -s -X POST "${TELEGRAM_API}/createForumTopic" \
-        --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
-        --data-urlencode "name=$TOPIC_NAME")
-      if [[ "$(echo "$resp" | jq -r '.ok')" != "true" ]]; then
-        echo "Error: failed to create Telegram topic '$TOPIC_NAME': $resp" >&2
-        echo "Hint: TELEGRAM_CHAT_ID must point to a forum-enabled supergroup, and the bot must have 'Manage Topics' admin rights." >&2
-        exit 1
-      fi
-      id=$(echo "$resp" | jq -r '.result.message_thread_id // empty')
-      if [[ -z "$id" ]]; then
-        echo "Error: createForumTopic returned ok but no message_thread_id: $resp" >&2
-        exit 1
-      fi
-      jq --arg k "$CACHE_KEY" --argjson id "$id" '. + {($k): $id}' "$CACHE_FILE" > "$CACHE_FILE.tmp"
-      mv "$CACHE_FILE.tmp" "$CACHE_FILE"
-    fi
-    printf '%s' "$id"
-  )
-}
-
-forget_topic() {
-  (
-    exec 9>"$LOCK_FILE"
-    flock -x 9
-    [[ -f "$CACHE_FILE" ]] || exit 0
-    jq --arg k "$CACHE_KEY" 'del(.[$k])' "$CACHE_FILE" > "$CACHE_FILE.tmp"
-    mv "$CACHE_FILE.tmp" "$CACHE_FILE"
-  )
-}
+TOPIC_NAME=$(tg_topic_name)
 
 send_prompt() {
   curl -s -X POST "${TELEGRAM_API}/sendDocument" \
@@ -89,16 +31,16 @@ send_prompt() {
 # offset would delete updates queued for other parallel runs of this bot.
 SENTINEL=$(curl -s "${TELEGRAM_API}/getUpdates?offset=-1&limit=1" | jq -r '.result[-1].update_id // 0')
 
-THREAD_ID=$(resolve_topic_id)
+THREAD_ID=$(tg_resolve_topic_id "$TOPIC_NAME")
 
 SEND_RESPONSE=$(send_prompt "$THREAD_ID")
 if [[ "$(echo "$SEND_RESPONSE" | jq -r '.ok')" != "true" ]]; then
   DESC=$(echo "$SEND_RESPONSE" | jq -r '.description // ""')
   # User may have closed or deleted the topic between runs — invalidate cache and recreate.
-  if [[ "$DESC" == *"thread not found"* ]] || [[ "$DESC" == *"TOPIC_DELETED"* ]] || [[ "$DESC" == *"topic closed"* ]]; then
+  if tg_is_stale_thread_error "$DESC"; then
     echo "Warning: cached topic $THREAD_ID no longer usable — recreating..." >&2
-    forget_topic
-    THREAD_ID=$(resolve_topic_id)
+    tg_forget_topic "$TOPIC_NAME"
+    THREAD_ID=$(tg_resolve_topic_id "$TOPIC_NAME")
     SEND_RESPONSE=$(send_prompt "$THREAD_ID")
   fi
 fi

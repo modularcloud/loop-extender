@@ -1,14 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./telegram-lib.sh
+source "$SCRIPT_DIR/telegram-lib.sh"
+
 ROOT="$LOOPX_PROJECT_ROOT"
 CLAUDE_OUTPUT_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.claude-output.tmp"
 ANSWER_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.answer.tmp"
-
-: "${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN env var is required}"
-: "${TELEGRAM_CHAT_ID:?TELEGRAM_CHAT_ID env var is required}"
-
-TELEGRAM_API="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
 
 if [[ ! -f "$CLAUDE_OUTPUT_FILE" ]]; then
   echo "Error: No Claude output file found at $CLAUDE_OUTPUT_FILE" >&2
@@ -25,81 +24,115 @@ $CLAUDE_OUTPUT" 2>/dev/null)
 
 HAS_QUESTION=$(echo "$VERDICT" | jq -r '.has_question')
 
+TOPIC_NAME=$(tg_topic_name)
+ALERT_LABEL=$(tg_alert_label)
+
 if [[ "$HAS_QUESTION" == "true" ]]; then
-  echo "=== Claude has a question — sending to Telegram ===" >&2
+  echo "=== Claude has a question — sending to Telegram topic '$TOPIC_NAME' ===" >&2
 
-  # Send as document if too long for a message, otherwise as text
-  if [[ ${#CLAUDE_OUTPUT} -gt 4000 ]]; then
-    QUESTION_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.question.tmp"
-    echo "$CLAUDE_OUTPUT" > "$QUESTION_FILE"
-    curl -s -X POST "${TELEGRAM_API}/sendDocument" \
-      -F chat_id="$TELEGRAM_CHAT_ID" \
-      -F document=@"$QUESTION_FILE;filename=question.md" \
-      -F caption="Claude has a question — reply with your answer" > /dev/null
-    rm -f "$QUESTION_FILE"
-  else
-    curl -s -X POST "${TELEGRAM_API}/sendMessage" \
-      -d chat_id="$TELEGRAM_CHAT_ID" \
-      --data-urlencode "text=${CLAUDE_OUTPUT}" > /dev/null
+  THREAD_ID=$(tg_resolve_topic_id "$TOPIC_NAME")
+
+  # Watermark BEFORE sending so a near-instant reply isn't filtered out. Use
+  # negative offset to peek the tail without advancing the global confirmation
+  # pointer — confirming would delete updates queued for parallel runs.
+  SENTINEL=$(curl -s "${TELEGRAM_API}/getUpdates?offset=-1&limit=1" | jq -r '.result[-1].update_id // 0')
+
+  QUESTION_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.question.tmp"
+
+  send_question() {
+    if [[ ${#CLAUDE_OUTPUT} -gt 4000 ]]; then
+      printf '%s' "$CLAUDE_OUTPUT" > "$QUESTION_FILE"
+      curl -s -X POST "${TELEGRAM_API}/sendDocument" \
+        -F chat_id="$TELEGRAM_CHAT_ID" \
+        -F message_thread_id="$1" \
+        -F document=@"$QUESTION_FILE;filename=question.md" \
+        -F caption="Claude has a question — reply with your answer"
+    else
+      curl -s -X POST "${TELEGRAM_API}/sendMessage" \
+        -d chat_id="$TELEGRAM_CHAT_ID" \
+        -d message_thread_id="$1" \
+        --data-urlencode "text=${CLAUDE_OUTPUT}"
+    fi
+  }
+
+  SEND_RESPONSE=$(send_question "$THREAD_ID")
+  if [[ "$(echo "$SEND_RESPONSE" | jq -r '.ok')" != "true" ]]; then
+    DESC=$(echo "$SEND_RESPONSE" | jq -r '.description // ""')
+    if tg_is_stale_thread_error "$DESC"; then
+      echo "Warning: cached topic $THREAD_ID no longer usable — recreating..." >&2
+      tg_forget_topic "$TOPIC_NAME"
+      THREAD_ID=$(tg_resolve_topic_id "$TOPIC_NAME")
+      SEND_RESPONSE=$(send_question "$THREAD_ID")
+    fi
+  fi
+  rm -f "$QUESTION_FILE"
+  if [[ "$(echo "$SEND_RESPONSE" | jq -r '.ok')" != "true" ]]; then
+    echo "Error: Failed to send question to Telegram: $SEND_RESPONSE" >&2
+    exit 1
   fi
 
-  echo "Waiting for answer..." >&2
+  echo "Waiting for answer in topic '$TOPIC_NAME' (thread $THREAD_ID)..." >&2
 
-  # Flush old updates to get current offset
-  FLUSH_RESPONSE=$(curl -s "${TELEGRAM_API}/getUpdates?offset=-1")
-  LAST_UPDATE_ID=$(echo "$FLUSH_RESPONSE" | jq -r '.result[-1].update_id // empty')
-  if [[ -n "$LAST_UPDATE_ID" ]]; then
-    OFFSET=$((LAST_UPDATE_ID + 1))
-  else
-    OFFSET=0
-  fi
-
-  # Long-poll for a reply, collecting split messages over a 10s window
   COLLECTED=""
   DEADLINE=""
 
   while true; do
-    if [[ -n "$DEADLINE" ]]; then
-      NOW=$(date +%s)
-      if [[ $NOW -ge $DEADLINE ]]; then
-        break
-      fi
-      POLL_TIMEOUT=2
-    else
-      POLL_TIMEOUT=30
+    # Negative offset + sentinel: read the tail without advancing the global
+    # confirmation pointer, and filter per-run by thread_id so parallel review
+    # cycles don't steal each other's answers.
+    UPDATES=$(curl -s "${TELEGRAM_API}/getUpdates?offset=-100&limit=100")
+    if [[ "$(echo "$UPDATES" | jq -r '.ok // false')" != "true" ]]; then
+      sleep 2
+      continue
     fi
 
-    UPDATES=$(curl -s "${TELEGRAM_API}/getUpdates?offset=${OFFSET}&timeout=${POLL_TIMEOUT}")
-
-    MSG_COUNT=$(echo "$UPDATES" | jq --arg cid "$TELEGRAM_CHAT_ID" '
-      [.result[] | select(.message.chat.id == ($cid | tonumber) and .message.text != null)] | length
+    BATCH=$(echo "$UPDATES" | jq -r \
+      --arg cid "$TELEGRAM_CHAT_ID" \
+      --argjson thread "$THREAD_ID" \
+      --argjson sentinel "$SENTINEL" '
+      [.result[]
+        | select(.message.chat.id == ($cid|tonumber)
+                 and .message.text != null
+                 and (.message.message_thread_id // 0) == $thread
+                 and .update_id > $sentinel)]
+      | map(.message.text) | join("\n")
+    ')
+    MAX_ID=$(echo "$UPDATES" | jq -r \
+      --arg cid "$TELEGRAM_CHAT_ID" \
+      --argjson thread "$THREAD_ID" \
+      --argjson sentinel "$SENTINEL" '
+      [.result[]
+        | select(.message.chat.id == ($cid|tonumber)
+                 and .message.text != null
+                 and (.message.message_thread_id // 0) == $thread
+                 and .update_id > $sentinel)
+        | .update_id]
+      | max // 0
     ')
 
-    if [[ "$MSG_COUNT" -gt 0 ]]; then
-      NEW_TEXTS=$(echo "$UPDATES" | jq -r --arg cid "$TELEGRAM_CHAT_ID" '
-        [.result[] | select(.message.chat.id == ($cid | tonumber) and .message.text != null)]
-        | .[].message.text
-      ')
+    if [[ -n "$BATCH" ]]; then
       if [[ -n "$COLLECTED" ]]; then
         COLLECTED="${COLLECTED}
-${NEW_TEXTS}"
+${BATCH}"
       else
-        COLLECTED="$NEW_TEXTS"
+        COLLECTED="$BATCH"
       fi
-
+      if (( MAX_ID > SENTINEL )); then
+        SENTINEL=$MAX_ID
+      fi
       if [[ -z "$DEADLINE" ]]; then
         DEADLINE=$(( $(date +%s) + 10 ))
         echo "=== First message received, collecting for 10s... ===" >&2
       fi
     fi
 
-    NEW_LAST=$(echo "$UPDATES" | jq -r '.result[-1].update_id // empty')
-    if [[ -n "$NEW_LAST" ]]; then
-      OFFSET=$((NEW_LAST + 1))
+    if [[ -n "$DEADLINE" ]]; then
+      NOW=$(date +%s)
+      (( NOW >= DEADLINE )) && break
     fi
-  done
 
-  curl -s "${TELEGRAM_API}/getUpdates?offset=${OFFSET}" > /dev/null
+    sleep 2
+  done
 
   echo "$COLLECTED" > "$ANSWER_FILE"
   echo "=== Answer received from Telegram ===" >&2
@@ -110,10 +143,11 @@ ${NEW_TEXTS}"
   $LOOPX_BIN output --goto "apply-answer"
   exit 0
 else
-  # No question — notify and loop back to copy-prompt
+  # Terminal alert — route to General with the workflow label so it's clear
+  # which run is speaking. Per-run topic stays focused on the review dialog.
   curl -s -X POST "${TELEGRAM_API}/sendMessage" \
     -d chat_id="$TELEGRAM_CHAT_ID" \
-    -d text="Feedback applied. Ready for next review cycle." > /dev/null
+    --data-urlencode "text=[${ALERT_LABEL}] Feedback applied. Ready for next review cycle." > /dev/null
 
   rm -f "$CLAUDE_OUTPUT_FILE" "$ROOT/.loopx/$LOOPX_WORKFLOW/.caller.tmp" "$ROOT/.loopx/$LOOPX_WORKFLOW/.session.tmp"
   echo "=== No questions. Ready for next review cycle. ===" >&2
