@@ -72,9 +72,29 @@ const TERMINAL = new Set(["completed", "failed", "cancelled", "incomplete"]);
 // consecutive failures represents tens of minutes of sustained OpenAI
 // unavailability — wider than any single inference window.
 const MAX_POLL_FAILURES = 20;
+// Inference can take up to ~30 min at xhigh thinking; 1 h bounds worst-case
+// hangs where a response is accepted but never transitions to terminal.
+// Measured from response.created_at so resumes don't reset the clock.
+const DEADLINE_SECS = 60 * 60;
 let lastStatus: string | undefined;
 let pollFailures = 0;
 while (!TERMINAL.has(response.status ?? "")) {
+  const ageSecs = Math.floor(Date.now() / 1000) - response.created_at;
+  if (ageSecs > DEADLINE_SECS) {
+    console.error(
+      `${response.id} exceeded ${DEADLINE_SECS / 60}m deadline (age ${ageSecs}s, status ${response.status}); cancelling`,
+    );
+    try {
+      await client.responses.cancel(response.id);
+    } catch (err: any) {
+      const status = err?.status ?? err?.code ?? "error";
+      console.error(`cancel ${response.id} failed (${status})`);
+    }
+    rmSync(RESPONSE_ID_FILE, { force: true });
+    throw new Error(
+      `gpt-5.4-pro response ${response.id} did not complete within ${DEADLINE_SECS / 60} minutes (last status: ${response.status ?? "unknown"})`,
+    );
+  }
   if (response.status !== lastStatus) {
     console.error(`waiting for ${response.id} (${response.status})...`);
     lastStatus = response.status ?? undefined;

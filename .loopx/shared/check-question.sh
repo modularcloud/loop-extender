@@ -15,6 +15,7 @@ if [[ ! -f "$CLAUDE_OUTPUT_FILE" ]]; then
 fi
 
 CLAUDE_OUTPUT=$(cat "$CLAUDE_OUTPUT_FILE")
+CLAUDE_OUTPUT_HTML=$(printf '%s' "$CLAUDE_OUTPUT" | node "$SCRIPT_DIR/md-to-tg-html.mjs")
 
 # Use Codex with output schema to deterministically classify the output
 SCHEMA="$ROOT/.loopx/$LOOPX_WORKFLOW/check-question.schema.json"
@@ -37,22 +38,58 @@ if [[ "$HAS_QUESTION" == "true" ]]; then
   # pointer — confirming would delete updates queued for parallel runs.
   SENTINEL=$(curl -s "${TELEGRAM_API}/getUpdates?offset=-1&limit=1" | jq -r '.result[-1].update_id // 0')
 
-  QUESTION_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.question.tmp"
-
+  # Telegram caps sendMessage text at 4096 chars; chunk at 4000 to leave headroom
+  # for UTF-16 surrogate pairs (${#var} counts code points, not code units).
   send_question() {
-    if [[ ${#CLAUDE_OUTPUT} -gt 4000 ]]; then
-      printf '%s' "$CLAUDE_OUTPUT" > "$QUESTION_FILE"
-      curl -s -X POST "${TELEGRAM_API}/sendDocument" \
-        -F chat_id="$TELEGRAM_CHAT_ID" \
-        -F message_thread_id="$1" \
-        -F document=@"$QUESTION_FILE;filename=question.md" \
-        -F caption="Claude has a question — reply with your answer"
-    else
-      curl -s -X POST "${TELEGRAM_API}/sendMessage" \
+    local thread="$1"
+    local max=4000
+    local remaining="$CLAUDE_OUTPUT_HTML"
+    local response=""
+    local first=1
+    while (( ${#remaining} > 0 )); do
+      local chunk
+      if (( ${#remaining} <= max )); then
+        chunk="$remaining"
+        remaining=""
+      else
+        local window="${remaining:0:$max}"
+        local trimmed="${window%$'\n'*}"
+        if [[ "$trimmed" != "$window" && ${#trimmed} -gt $((max / 2)) ]]; then
+          chunk="${trimmed}"$'\n'
+        else
+          chunk="$window"
+        fi
+        remaining="${remaining:${#chunk}}"
+      fi
+      response=$(curl -s -X POST "${TELEGRAM_API}/sendMessage" \
         -d chat_id="$TELEGRAM_CHAT_ID" \
-        -d message_thread_id="$1" \
-        --data-urlencode "text=${CLAUDE_OUTPUT}"
-    fi
+        -d message_thread_id="$thread" \
+        -d parse_mode=HTML \
+        --data-urlencode "text=${chunk}")
+      # Chunking can split inside an HTML tag; on a parse error fall back to
+      # plain text for that chunk so the message still lands.
+      if [[ "$(echo "$response" | jq -r '.ok')" != "true" ]]; then
+        local desc
+        desc=$(echo "$response" | jq -r '.description // ""')
+        if [[ "$desc" == *"can't parse entities"* || "$desc" == *"Can't parse entities"* ]]; then
+          response=$(curl -s -X POST "${TELEGRAM_API}/sendMessage" \
+            -d chat_id="$TELEGRAM_CHAT_ID" \
+            -d message_thread_id="$thread" \
+            --data-urlencode "text=${chunk}")
+        fi
+      fi
+      if [[ "$(echo "$response" | jq -r '.ok')" != "true" ]]; then
+        # First-chunk failure bubbles up so the caller can retry on stale thread.
+        # Later-chunk failures can't be undone, so warn and keep going.
+        if (( first )); then
+          echo "$response"
+          return
+        fi
+        echo "Warning: failed to send follow-up chunk: $response" >&2
+      fi
+      first=0
+    done
+    echo "$response"
   }
 
   SEND_RESPONSE=$(send_question "$THREAD_ID")
@@ -65,7 +102,6 @@ if [[ "$HAS_QUESTION" == "true" ]]; then
       SEND_RESPONSE=$(send_question "$THREAD_ID")
     fi
   fi
-  rm -f "$QUESTION_FILE"
   if [[ "$(echo "$SEND_RESPONSE" | jq -r '.ok')" != "true" ]]; then
     echo "Error: Failed to send question to Telegram: $SEND_RESPONSE" >&2
     exit 1

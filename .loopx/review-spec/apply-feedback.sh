@@ -14,7 +14,7 @@ fi
 
 FEEDBACK=$(cat "$FEEDBACK_FILE")
 
-PROMPT="I got this feedback from a review of @SPEC.md please incorporate this feedback, clarify with me as needed if you have any questions about my intentions, and think critically and push back if needed. Only modify SPEC.md and after you are done, commit and push:
+PROMPT="I got this feedback from a review of @SPEC.md please incorporate this feedback. Use your judgement to make implementation decisions as long as they are aligned with my product vision. If there is any ambiguity about my intentions, ask me clarifying questions from a product perspective rather than an implementation perspective. Think critically and push back if needed. Only modify SPEC.md and after you are done, commit and push:
 
 $FEEDBACK"
 
