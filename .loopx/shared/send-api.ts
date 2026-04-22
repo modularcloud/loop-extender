@@ -30,7 +30,7 @@ const prompt = readFileSync(PROMPT_FILE, "utf8");
 
 if (existsSync(FEEDBACK_FILE)) rmSync(FEEDBACK_FILE);
 
-const client = new OpenAI();
+const client = new OpenAI({ timeout: 60_000, maxRetries: 4 });
 
 // Resume a prior background response if one was persisted from an earlier run
 // that died before the response reached a terminal state. Background responses
@@ -60,20 +60,37 @@ if (!response) {
     reasoning: { effort: THINKING },
     input: prompt,
     background: true,
+    prompt_cache_key: WORKFLOW,
+    prompt_cache_retention: "24h",
   });
   writeFileSync(RESPONSE_ID_FILE, response.id);
   console.error(`submitted background response ${response.id}`);
 }
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "incomplete"]);
+// Each failed retrieve has already been through the SDK's 4 retries, so 20
+// consecutive failures represents tens of minutes of sustained OpenAI
+// unavailability — wider than any single inference window.
+const MAX_POLL_FAILURES = 20;
 let lastStatus: string | undefined;
+let pollFailures = 0;
 while (!TERMINAL.has(response.status ?? "")) {
   if (response.status !== lastStatus) {
     console.error(`waiting for ${response.id} (${response.status})...`);
     lastStatus = response.status ?? undefined;
   }
   await new Promise((r) => setTimeout(r, 2000));
-  response = await client.responses.retrieve(response.id);
+  try {
+    response = await client.responses.retrieve(response.id);
+    pollFailures = 0;
+  } catch (err: any) {
+    pollFailures++;
+    const status = err?.status ?? err?.code ?? "error";
+    console.error(
+      `poll ${response.id} failed (${status}); retry ${pollFailures}/${MAX_POLL_FAILURES}`,
+    );
+    if (pollFailures >= MAX_POLL_FAILURES) throw err;
+  }
 }
 
 if (response.status !== "completed") {
@@ -85,6 +102,15 @@ if (response.status !== "completed") {
         : "";
   throw new Error(
     `gpt-5.4-pro response ${response.id} ended in status ${response.status}${detail}`,
+  );
+}
+
+const cachedTokens = response.usage?.input_tokens_details?.cached_tokens ?? 0;
+const inputTokens = response.usage?.input_tokens ?? 0;
+if (inputTokens > 0) {
+  const pct = Math.round((100 * cachedTokens) / inputTokens);
+  console.error(
+    `tokens: input=${inputTokens} cached=${cachedTokens} (${pct}%) output=${response.usage?.output_tokens ?? 0}`,
   );
 }
 

@@ -18,7 +18,7 @@ RESOLVED=$("$SHARED_DIR/resolve-adr.sh")
 IFS=$'\t' read -r ADR_NUM ADR_FILE <<< "$RESOLVED"
 ADR_REL="adr/$(basename "$ADR_FILE")"
 
-PROMPT="I received the following feedback about ADR-$ADR_NUM ($ADR_REL) and its relationship to SPEC.md as defined by the process laid out in ADR-0001. Incorporate this feedback to improve ADR-$ADR_NUM. If there is any ambiguity about my intentions, ask me clarifying questions. Think critically about this feedback and push back if warranted. Do not update any file other than ADR-$ADR_NUM and do not mark it as accepted. After you finish, commit and push.
+PROMPT="I received the following feedback about ADR-$ADR_NUM ($ADR_REL) and its relationship to SPEC.md as defined by the process laid out in ADR-0001. Incorporate this feedback to improve ADR-$ADR_NUM. Use your judgement on the best implementation details to achieve the product goals; if there is any ambiguity about my intentions, ask me clarifying questions from a product perspective rather than an implementation perspective. Think critically about this feedback and push back if warranted. Don't include migration details for existing users. Only include what is necessary to thoroughly update SPEC.md — keep additional information (such as testing considerations) to a minimum, because the primary purpose of this ADR is to be used to update SPEC.md. Do not update any file other than ADR-$ADR_NUM and do not mark it as accepted. After you finish, commit and push.
 
 Feedback:
 $FEEDBACK"

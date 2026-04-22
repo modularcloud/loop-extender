@@ -25,7 +25,7 @@ CALLER=$(cat "$CALLER_FILE")
 
 FEEDBACK=$(cat "$FEEDBACK_FILE")
 
-VERDICT=$(codex exec --output-schema "$SCHEMA" "I received this feedback for my specs. Is it requiring that I continue making improvements before calling this stage of feedback done? Ignore optional feedback. Return done=true only if the response says we can be done explicitly and/or there are no further non-optional pieces of feedback. Note: if it says 'make this important change and then you are done', that does NOT count as done — return done=false.
+VERDICT=$(codex exec --sandbox read-only --output-schema "$SCHEMA" "I received this feedback for my specs. Is it requiring that I continue making improvements before calling this stage of feedback done? Ignore optional feedback. Return done=true only if the response says we can be done explicitly and/or there are no further non-optional pieces of feedback. Note: if it says 'make this important change and then you are done', that does NOT count as done — return done=false.
 
 Feedback:
 $FEEDBACK" 2>/dev/null)

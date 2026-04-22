@@ -19,7 +19,7 @@ CLAUDE_OUTPUT=$(cat "$CLAUDE_OUTPUT_FILE")
 
 # Use Codex with output schema to deterministically classify the output
 SCHEMA="$ROOT/.loopx/$LOOPX_WORKFLOW/check-question.schema.json"
-VERDICT=$(codex exec --output-schema "$SCHEMA" "Does the following text contain a question or request for clarification directed at the user?
+VERDICT=$(codex exec --sandbox read-only --output-schema "$SCHEMA" "Does the following text contain a question or request for clarification directed at the user?
 
 $CLAUDE_OUTPUT" 2>/dev/null)
 
