@@ -85,7 +85,7 @@ The `main` field is no longer used to determine the entry point. The entry point
 
 The `type` field (`"module"`) continues to be relevant for Node.js module resolution within the workflow.
 
-**Failure modes:** If a workflow's `package.json` is absent, unreadable, contains invalid JSON, or declares an invalid semver range for `loopx`, see section 3.2 for the defined behavior. A broken `package.json` degrades version checking but does not prevent the workflow from being used or installed; a malformed or unreadable `package.json` also causes `loopx install`'s auto-install step to skip that workflow (section 10.10).
+**Failure modes:** If a workflow's `package.json` is absent, unreadable, contains invalid JSON, or declares an invalid semver range for `loopx`, see section 3.2 for the defined behavior. A broken `package.json` degrades version checking but does not prevent the workflow from being used or installed; an unreadable `package.json`, invalid JSON, or an invalid `loopx` semver range also causes `loopx install`'s auto-install step to skip that workflow (section 10.10).
 
 ### 2.2 Loop
 
@@ -779,7 +779,7 @@ If the directory or file does not exist, loopx treats it as having no global var
 
 ### 8.2 Local Override (`-e`)
 
-When `-e <path>` is specified during execution (`loopx run <target>` or the programmatic API), the file at `<path>` is read using the same `.env` format rules. If the file does not exist, loopx exits with an error.
+When a local env file is specified during execution — via `-e <path>` on the CLI or `RunOptions.envFile` in the programmatic API — the file is read using the same `.env` format rules. If the file does not exist, loopx exits with an error.
 
 **Note:** Under the `loopx run -h` short-circuit, `-e` is not parsed or validated — a missing env file is not an error in that context (see section 4.2).
 
@@ -1130,7 +1130,7 @@ Top-level help does **not** inspect `.loopx/` or perform discovery.
 
 `loopx run -h` / `loopx run --help` prints run-specific usage information:
 
-- `run` syntax and options (`-n`, `-e`)
+- `run` syntax and options (`-n`, `-e`). Per section 4.1, `run` does not accept `--` as an end-of-options marker and does not accept a named-argument tail; the shell env prefix (`key=value loopx run <target>`) is the sole CLI surface for per-run parameterization. The printed usage reflects these limits.
 - A dynamically generated list of workflows and their scripts discovered in the current `.loopx/` directory. If a workflow has an `index` script, it is indicated as the default entry point.
 
 Run help performs **non-fatal discovery and validation**:
