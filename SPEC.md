@@ -190,7 +190,7 @@ A local install provides two guarantees:
 
 #### Project root
 
-For loopx, the **project root** is the invocation cwd. This is the same directory where `.loopx/` lives (when it exists), but the project root is determined by cwd alone — it does not depend on `.loopx/` existing. This means delegation, version pinning, and all project-root-relative behavior work regardless of whether `.loopx/` has been initialized.
+For loopx, the **project root** depends on the invocation path: under the CLI it is `process.cwd()` at invocation, and under the programmatic API it is the resolved `RunOptions.cwd` when supplied, otherwise `process.cwd()` at call time. This is the same directory where `.loopx/` lives (when it exists), but the project root is determined by those rules alone — it does not depend on `.loopx/` existing. This means delegation, version pinning, and all project-root-relative behavior work regardless of whether `.loopx/` has been initialized.
 
 **Project-root resolution.** Two paths set the project root:
 
@@ -364,6 +364,8 @@ Within `run`, options and the target may appear in any order.
 - Target requirements are suppressed (zero or multiple positionals are not errors).
 - `-n` and `-e` values are not parsed or validated (including duplicates and invalid values).
 - Unknown flags are ignored.
+- `--` in any position is ignored (not rejected as the unrecognized flag it would otherwise be under section 4.1).
+- `name=value` positional tokens in any position are ignored (not rejected as extra positionals or as invalid target strings).
 - Examples:
   - `loopx run -h ralph` — shows run help (target ignored).
   - `loopx run ralph -h` — shows run help (`-h` after target still triggers help short-circuit).
@@ -373,6 +375,8 @@ Within `run`, options and the target may appear in any order.
   - `loopx run -h -n 5 -n 10` — shows run help (duplicate `-n` not rejected).
   - `loopx run -h foo bar` — shows run help (extra positional not rejected).
   - `loopx run -h --unknown` — shows run help (unknown flag not rejected).
+  - `loopx run -h -- ralph` — shows run help (`--` not rejected).
+  - `loopx run -h ralph adr=0003` — shows run help (`name=value` token not rejected).
 
 #### `install`-scoped options
 
@@ -758,7 +762,7 @@ Global environment variables are stored in the loopx configuration directory at:
 $XDG_CONFIG_HOME/loopx/env
 ```
 
-If `XDG_CONFIG_HOME` is not set, it defaults to `~/.config`, resulting in `~/.config/loopx/env`.
+If `XDG_CONFIG_HOME` is not set, the fallback is `$HOME/.config`, resulting in `$HOME/.config/loopx/env`. `HOME` is read from the inherited environment on the same schedule as `XDG_CONFIG_HOME` (see the snapshot-timing paragraph below).
 
 The file uses `.env` format with the following rules:
 
@@ -1095,7 +1099,7 @@ When `-w` is used, only the selected workflow is validated. Invalid sibling work
 
 ### 10.10 Auto-install Workflow Dependencies
 
-After the commit phase (section 10.7) completes, loopx runs a post-commit auto-install pass over the committed workflows so that workflows declaring dependencies have a populated `node_modules/` before `loopx run` first spawns one of their scripts.
+After the commit phase (section 10.7) completes, loopx runs a post-commit auto-install pass over the committed workflows so that every committed workflow with a top-level `package.json` has a populated `node_modules/` before `loopx run` first spawns one of its scripts. The trigger is the presence of a top-level `package.json`; whether that file declares any dependencies is not inspected.
 
 - **Trigger.** Runs once per committed workflow whose top-level `package.json` exists at `.loopx/<workflow-name>/package.json`, sequentially in commit order, with cwd set to the workflow directory. Workflows without a top-level `package.json` are skipped silently — no warning, no `npm install` invocation, no `.gitignore` synthesis. When `-w <name>` restricts the install to a single workflow, auto-install considers only that workflow.
 - **Package manager.** `npm install` unconditionally. loopx does not inspect `bun.lockb`, `pnpm-lock.yaml`, `yarn.lock`, or a `packageManager` field to select a different manager, and does not pass `--production` / `--omit=dev` / `--ignore-scripts` / any other flags — whatever the workflow's `package.json` and the user's npm configuration prescribe is what runs. Workflow authors needing a different manager pass `--no-install` and invoke their preferred tool manually.
