@@ -29,7 +29,13 @@
 
 **Platform scope: POSIX-only (macOS, Linux).** Per SPEC 1, v1 is POSIX-only and Windows is not supported. This test suite is correspondingly **POSIX-only by design** — tests exercise POSIX behaviors (process groups, `getcwd(3)` canonicalization, `realpath`, signal disposition, `os.tmpdir()` under `TMPDIR` semantics, `stat(3)` device/inode identity, unix file modes, symlinks, shell-managed `$PWD`, etc.) and are not expected to pass on Windows. CI runs POSIX matrix only (macOS, Linux × Node.js ≥ 20.6 and Bun ≥ 1.0). No Windows coverage is targeted or advertised. If a test happens to pass on Windows it is incidental, not a guarantee; if it fails, that is not a bug against this suite.
 
-This suite is the **implementation-driving** test suite — it defines the behavior that must pass before a feature is considered complete. It targets **near-complete coverage** of SPEC.md requirements — complete except for explicitly marked known gaps that depend on test-only seams not yet specified at the implementation level or on privileged operations unavailable in standard CI. The known gaps are enumerated in-line at the relevant sections (tmpdir creation sub-steps T-TMP-12d / T-TMP-12e, cleanup-failure branches T-TMP-40 / T-TMP-41 / T-TMP-42, cleanup idempotence / warning cardinality T-TMP-38 / T-TMP-39, and mount-point non-detection T-TMP-43 — see section 4.7) and again in the Appendix A traceability matrix's "Known gaps" annotations on rows 7.2 and 7.4. Beyond those tracked gaps, the suite covers, including:
+This suite is the **implementation-driving** test suite — it defines the behavior that must pass before a feature is considered complete. It targets **near-complete coverage** of SPEC.md requirements — complete except for explicitly marked known gaps that depend on test-only seams not yet specified at the implementation level or on privileged operations unavailable in standard CI. The known gaps are enumerated in-line at the relevant sections (tmpdir creation
+sub-steps T-TMP-12d / T-TMP-12e, cleanup-failure branches T-TMP-40 / T-TMP-41 /
+T-TMP-42, cleanup idempotence / warning cardinality T-TMP-38 / T-TMP-39, and
+mount-point non-detection T-TMP-43 — see section 4.7; the pre-handler-installation
+signal-window clause T-SIG-26 — see section 4.11; and implementation-private
+install staging-directory cleanup T-INST-79a — see section 4.10) and again in the
+Appendix A traceability matrix's "Known gaps" annotations. Beyond those tracked gaps, the suite covers, including:
 
 - **Spec 3.1 (Global Install):** Covered by T-INST-GLOBAL-01, which exercises the full `npm pack` → install into isolated global prefix → run against fixture project workflow. This runs in CI on every build.
 
@@ -302,12 +308,14 @@ interface FakeNpmOptions {
   // the 2nd invocation of a 3-workflow install).
   exitCodeOnInvocation?: Record<number, number>;
   // If true (global) or list of invocation indices (per-invocation), the shim
-  // file is missing / targeted shim invocations fail to spawn (tests "npm
-  // spawn failure"). When `spawnFailure: true`, no shim is created at all
-  // (all invocations fail to spawn with ENOENT). When `spawnFailureOnInvocation`
-  // is supplied, the shim is created but is internally routed per-invocation
-  // via a PATH wrapper so listed invocations fail spawn while others succeed —
-  // used by T-INST-114b (spawn failure only for one workflow among several).
+  // simulates an `npm` spawn failure. This must be deterministic even when the
+  // host machine has a real `npm` on PATH:
+  // - when `spawnFailure: true`, the helper constrains PATH for `fn` so `npm`
+  //   resolution fails with ENOENT and no shim is created;
+  // - when `spawnFailureOnInvocation` is supplied, the helper installs a
+  //   dispatcher shim so listed invocations fail with ENOENT while other
+  //   invocations succeed normally.
+  // Used by T-INST-114a / T-INST-114b.
   spawnFailure?: boolean;               // default false
   spawnFailureOnInvocation?: number[];
   // Optional stdout/stderr the shim writes before exiting.
@@ -331,6 +339,13 @@ interface FakeNpmOptions {
   // child after the grace window. This mirrors the `signal-trap-ignore` fixture
   // in section 2.4 applied to the npm shim context.
   trapSignals?: Array<"TERM" | "INT">;
+  // If true, the shim spawns a long-lived background grandchild process
+  // (for example `sleep 3600 &`), writes that PID to `grandchildPidFile`,
+  // writes "ready" to stderr, then waits. Used by T-INST-116e to verify
+  // that loopx forwards signals to the npm child's process group, not only
+  // to the npm shim process itself.
+  spawnGrandchild?: boolean;
+  grandchildPidFile?: string;
   // Optional relative file paths (resolved against the shim's cwd) to create
   // before the shim sleeps and/or exits. Parent directories are created as
   // needed. Used to simulate partial `node_modules/` state that loopx must not
@@ -358,6 +373,11 @@ interface FakeNpmInvocation {
 ```
 
 The shim is implemented as a small Bash script (or a `tsx`-driven Node/Bun script when `npm` might need to behave differently per runtime). Tests that need both invocation recording *and* signal/ready synchronization combine `sleepSeconds` with the standard ready-protocol (`waitForStderr("ready")`) documented for the signal fixtures in section 2.4.
+
+This helper must also be able to make `npm` resolution fail deterministically
+on hosts that already have a real `npm` installed, so `spawnFailure` /
+`spawnFailureOnInvocation` are implemented by PATH control or dispatcher-shim
+behavior rather than by merely "omitting the shim".
 
 This helper is the primary seam for Spec 10.10 auto-install coverage (`T-INST-110` block below). Without it, auto-install tests would be flaky (depending on real npm + registry availability) or impossible (`spawnFailure`, signal-during-npm-install, and `PATH`-controlled spawn behavior cannot be driven deterministically by the real `npm`).
 
@@ -653,6 +673,8 @@ Within `run`, `-h` / `--help` is a full short-circuit: when present, loopx shows
 - **T-CLI-33**: `loopx ralph` is a usage error (unrecognized subcommand, no implicit fallback to `run`). Create `.loopx/ralph/index.sh` that writes a known value to a marker file. Assert exit code 1 AND assert the marker file does not exist (proving the script was not executed despite being present). *(Spec 4.1)*
 - **T-CLI-34**: `loopx --unknown` is a usage error (unrecognized top-level flag). Exit code 1. *(Spec 4.2)*
 - **T-CLI-71**: `loopx -x` is a usage error (unrecognized top-level short flag). Exit code 1. *(Spec 4.2)*
+- **T-CLI-71a**: `loopx --unknown -h` is a usage error (exit code 1). The first argument is an unrecognized top-level flag, so the top-level help short-circuit does not apply. *(Spec 4.2)*
+- **T-CLI-71b**: `loopx --unknown --help` is a usage error (exit code 1). The first argument is an unrecognized top-level flag, so the top-level help short-circuit does not apply. *(Spec 4.2)*
 - **T-CLI-36**: `loopx -n 5 ralph` is a usage error (top-level `-n` rejected — only `-h` is recognized at top level). Exit code 1. *(Spec 4.2)*
 - **T-CLI-37**: `loopx -e .env ralph` is a usage error (top-level `-e` rejected). Exit code 1. *(Spec 4.2)*
 - **T-CLI-07b**: `loopx -n 5 -h` is a usage error (exit code 1). The first argument is `-n`, which is not `-h` and not a recognized subcommand, so top-level parsing fails before `-h` is reached. *(Spec 4.2)*
@@ -1261,6 +1283,7 @@ Spec 6.1 and 8.3 make `LOOPX_WORKFLOW_DIR` a script-protocol-protected variable 
 - **T-WFDIR-11**: Symlinked `.loopx` directory — discovery-time spelling is preserved. Create real workflows at `/tmp/real-loopx/ralph/index.sh`. Symlink `<project>/.loopx → /tmp/real-loopx`. Run `loopx run ralph`. Assert `LOOPX_WORKFLOW_DIR` uses the symlinked spelling (`<project>/.loopx/ralph`), not `/tmp/real-loopx/ralph`. *(Spec 6.1)*
 - **T-WFDIR-12**: Symlinked entry script file — discovery-time spelling is preserved. Create a real script at `/tmp/real-script.sh`. Symlink `<project>/.loopx/ralph/index.sh → /tmp/real-script.sh`. Run `loopx run ralph`. Assert `LOOPX_WORKFLOW_DIR` is the symlinked workflow directory (`<project>/.loopx/ralph`), independent of the entry-script symlink target. Additionally (from T-WFDIR-09's normative Bash equality), `$(dirname "$0")` must equal `LOOPX_WORKFLOW_DIR`. *(Spec 6.1)*
 - **T-WFDIR-13**: Top-level script and a sourced helper both observe the same `LOOPX_WORKFLOW_DIR`. `.loopx/ralph/index.sh` sources `.loopx/ralph/lib/helper.sh`. Both the top-level script and the helper (sourced into the same process) write `LOOPX_WORKFLOW_DIR` to separate marker files. Assert both markers contain identical values. Env vars are injected once per child spawn and inherited by the whole process. *(Spec 6.1)*
+- **T-WFDIR-13a**: Top-level JS/TS script and an imported helper module both observe the same `LOOPX_WORKFLOW_DIR`. `.loopx/ralph/index.ts` imports `./lib/helper.ts`; both write `process.env.LOOPX_WORKFLOW_DIR` to separate marker files before `output({ stop: true })`. Assert both markers contain identical values. This is the JS/TS import counterpart to T-WFDIR-13's sourced-shell-helper case. *(Spec 6.1)*
 - **T-WFDIR-14**: `LOOPX_WORKFLOW_DIR` is a cross-workflow rendezvous anti-pattern sanity check. `alpha:index` writes a file `<LOOPX_WORKFLOW_DIR>/shared.tmp` then gotos `beta:index`. `beta:index` reads from its **own** `LOOPX_WORKFLOW_DIR/shared.tmp`. Assert `beta:index` reports file-not-found — `LOOPX_WORKFLOW_DIR` always points at the currently-spawned script's own workflow and is not a rendezvous point. Documents Spec 6.1's "Cross-workflow rendezvous" clarification that `$LOOPX_TMPDIR` (or a shared fixed location) is the correct rendezvous surface. *(Spec 6.1)*
 
 #### `LOOPX_TMPDIR` (Run-Scoped Temporary Directory)
@@ -1901,6 +1924,7 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 - **T-INST-08f**: `loopx install https://github.com/org/repo/tree/main` → rejected. Known-host git detection only matches exact `/<owner>/<repo>` or `/<owner>/<repo>.git` paths. A URL with additional path segments (like `/tree/main`) is not treated as a git repo. Since it is also not a tarball URL, it is rejected with an error (exit code 1). *(Spec 10.1)*
 - **T-INST-08g**: `loopx install https://github.com/org/repo?x=1` → treated as git (known host, query string does not alter source classification). Per SPEC 10.1 rule 2, known-host git detection matches on the URL pathname and is unaffected by query string or fragment. Verify via `withGitURLRewrite` to redirect to a local bare repo, and assert workflows are installed into `.loopx/`. Query-string counterpart to T-INST-02 (bare known-host URL). Together with T-INST-08c (trailing slash), this pins down that both of the "same-path" URL variants (`?…` and `/`) classify as git on a known host. *(Spec 10.1)*
 - **T-INST-08h**: `loopx install https://github.com/org/repo.git/` → treated as git (known host, `.git` pathname with trailing slash). Per SPEC 10.1 rule 2, the pathname `/<owner>/<repo>.git` with optional trailing slash is the explicit `.git`-form of the known-host rule. T-INST-05 covers the generic `.git`-suffix rule (rule 3), T-INST-02 covers the no-`.git` known-host form, and T-INST-08c covers the trailing-slash variant without `.git`; this test closes the `.git/`-with-trailing-slash variant on a known host. *(Spec 10.1)*
+- **T-INST-08i**: `loopx install org/repo/extra` → rejected with an error. The `org/repo` shorthand matches only exactly one slash with no additional path segments; this input is not shorthand and is not a supported URL source. *(Spec 10.1)*
 
 #### Install CLI Parsing
 
@@ -2085,6 +2109,15 @@ All install tests use local servers (HTTP, file:// git repos). No network access
 - **T-INST-80i**: `-y` does not override same-base-name collisions within a workflow. `loopx install -y <source>` where the source contains a workflow with `check.sh` and `check.ts` (same base name, different extensions) → error, exit code 1, regardless of `-y`. *(Spec 10.4, 10.7)*
 - **T-INST-80j**: `-y` does not override an invalid workflow name. `loopx install -y <source>` where the derived workflow name violates `[a-zA-Z0-9_][a-zA-Z0-9_-]*` (e.g., source directory named `bad.name`) → error, exit code 1, regardless of `-y`. *(Spec 10.4, 10.7)*
 
+##### Staging-directory Cleanup Visibility (Known Gap)
+
+SPEC 10.7 / 10.9 require the temporary staging directory itself to be removed on
+staging / pre-commit failure. Current tests assert the externally visible contract
+(`.loopx/` remains unchanged) but do not directly observe the implementation-private
+staging directory, whose location and naming are unspecified.
+
+- **T-INST-79a (not yet directly covered)**: Temporary staging directory is removed after a staging-phase failure. Deterministic coverage would require a test-only seam that exposes the staging-directory path.
+
 #### Tarball Install
 
 - **T-INST-81**: Multi-workflow tarball install with exact name derivation. Create a `.tar.gz` whose source root (after any wrapper-directory stripping) contains subdirectories `ralph/` (with `index.sh`) and `other/` (with `index.sh`). Install the tarball. Assert installed paths are exactly `.loopx/ralph/` and `.loopx/other/`, with the expected scripts present. Workflow names are derived from the source-root subdirectory names. *(Spec 10.2)*
@@ -2154,7 +2187,7 @@ All tests in this block use `withFakeNpm` (section 2.3) to control `npm`'s behav
 
 ##### Environment Purity
 
-- **T-INST-115**: `npm install` inherits loopx's `process.env` only — no `LOOPX_*`, no env-file injection, no `RunOptions.env`. Set loopx's inherited `MYVAR=inherited`. Create a global env file with `INJECTED_GLOBAL=yes`. Create a local env file (loaded via `-e local.env`) with `INJECTED_LOCAL=yes`. Call... wait — `RunOptions.env` applies only to the programmatic API, not CLI. For the CLI case, install doesn't have `RunOptions.env`. Instead, test the CLI path: set `MYVAR=inherited` and a global env file with `INJECTED_GLOBAL=yes`. Use `withFakeNpm({ logFile })` where the shim's log records the child's `MYVAR`, `INJECTED_GLOBAL`, and all `LOOPX_*` variables. Run `loopx install <source>`. Assert: the recorded child env shows (a) `MYVAR=inherited`, (b) **no** `INJECTED_GLOBAL` — the global env file was loaded for script execution, not for auto-install, (c) **no** `LOOPX_*` variables (no `LOOPX_BIN`, `LOOPX_PROJECT_ROOT`, `LOOPX_WORKFLOW`, `LOOPX_WORKFLOW_DIR`, `LOOPX_TMPDIR` in the npm child). Per Spec 10.10 "The `npm install` child inherits loopx's own `process.env` unchanged. `LOOPX_*` protocol variables, `RunOptions.env`, and env-file entries are not injected". *(Spec 10.10, 8.3)*
+- **T-INST-115**: `npm install` inherits loopx's own `process.env` only — no script-execution injection of `LOOPX_*`, no env-file injection, no `RunOptions.env`. Run this test with loopx's inherited environment explicitly scrubbed of any pre-existing `LOOPX_*` names so the absence assertions are meaningful. Set inherited `MYVAR=inherited`. Create a global env file with `INJECTED_GLOBAL=yes`. Use `withFakeNpm({ logFile })` where the shim's log records the child's `MYVAR`, `INJECTED_GLOBAL`, and `LOOPX_*` variables. Run `loopx install <source>`. Assert: the recorded child env shows (a) `MYVAR=inherited`, (b) **no** `INJECTED_GLOBAL`, and (c) **no loopx-injected protocol variables** (`LOOPX_BIN`, `LOOPX_PROJECT_ROOT`, `LOOPX_WORKFLOW`, `LOOPX_WORKFLOW_DIR`, `LOOPX_TMPDIR`). Per Spec 10.10, the `npm install` child inherits loopx's own `process.env` unchanged, but script-execution protocol variables and env-file entries are not injected into the auto-install child. *(Spec 10.10, 8.3)*
 
 ##### Signal During `npm install`
 
@@ -2163,6 +2196,7 @@ All tests in this block use `withFakeNpm` (section 2.3) to control `npm`'s behav
 - **T-INST-116b**: Signal during `npm install` — remaining workflows are not processed. Multi-workflow source `alpha/`, `beta/`, `gamma/`. Use `withFakeNpm({ sleepSecondsOnInvocation: { 1: 30 }, logFile })` so the shim sleeps only on the first invocation (`alpha/`). Send SIGINT while `alpha/`'s shim is sleeping. Assert: (a) exit 130, (b) shim log shows only one invocation (for `alpha/`) — `beta/` and `gamma/` were not reached. Per Spec 10.10 "Remaining committed workflows are not processed". *(Spec 10.10, 7.3)*
 - **T-INST-116c**: SIGKILL escalation when the `npm install` child ignores SIGTERM beyond the 5-second grace period. SPEC 10.10 "Signals during `npm install`" states: "the section 7.3 grace period and SIGKILL escalation rules apply by analogy" — i.e., after loopx forwards the signal to the npm child's process group, it waits 5 seconds for the group to exit and then sends SIGKILL. T-INST-116 / T-INST-116a cover the clean-exit path (the shim sleeps passively and is terminated by the forwarded signal); this test covers the escalation path. Extend `withFakeNpm` options so the shim installs a SIGTERM trap that ignores the signal (equivalent to the `signal-trap-ignore` fixture in section 2.4), writes its PID to the marker file, writes `"ready"` to stderr, then sleeps indefinitely (e.g., `sleepSeconds: 30` combined with a `trapSignals: ["TERM", "INT"]` flag that installs `trap '' TERM INT` in the shim's Bash preamble). Run `loopx install <multi-workflow source>` via `runCLIWithSignal`. Wait for `"ready"` on stderr, record the shim PID, then send SIGTERM to loopx. Assert: (a) loopx waits approximately 5 seconds before the shim is terminated (the grace-period window — the test may allow a tolerance of 4–7 seconds to account for scheduling jitter), (b) after that window, the shim process is no longer running (verified via `kill -0 <shim-pid>` returning non-zero, indicating SIGKILL took effect since the shim was trapping/ignoring SIGTERM), (c) loopx exits with code 143 (128 + 15 for SIGTERM), and (d) the aggregate-failure-report branch from SPEC 10.10 is not triggered (the install was interrupted by a signal, not by a non-zero npm exit). This pins down that the SPEC 7.3 "5 seconds, then SIGKILL" escalation applies identically to the `npm install` child. `@flaky-retry(2)` due to the real-time 5-second wait. *(Spec 10.10, 7.3)*
 - **T-INST-116d**: Signal during `npm install` does not clean partial `node_modules/` state already produced by the interrupted install. Single-workflow source with top-level `package.json`. Use `withFakeNpm({ createFiles: ["node_modules/partial-file"], sleepSeconds: 30, logFile })` so the shim creates `node_modules/partial-file`, writes `"ready"` to stderr, then sleeps. Run `loopx install <source>` via `runCLIWithSignal`, wait for `"ready"`, send SIGINT, and assert: (a) loopx exits 130, and (b) `.loopx/<name>/node_modules/partial-file` still exists after loopx exits. Per SPEC 10.10, partial `node_modules/` state produced before interruption is not cleaned up by loopx. *(Spec 10.10, 7.3)*
+- **T-INST-116e**: Signal during `npm install` is forwarded to the npm child's **process group**, not just the npm shim process. Single-workflow source with top-level `package.json`. Use `withFakeNpm({ spawnGrandchild: true, grandchildPidFile, sleepSeconds: 30, logFile })` so the shim spawns a long-lived background child, writes the grandchild PID to `grandchildPidFile`, writes `"ready"` to stderr, then blocks. Run `loopx install <source>` via `runCLIWithSignal`, wait for `"ready"`, send SIGTERM to loopx, and assert: (a) loopx exits with code 143, (b) the npm shim PID is no longer running, and (c) the recorded grandchild PID is also no longer running. This is the auto-install/process-group counterpart to T-SIG-06. *(Spec 10.10, 7.3)*
 
 ##### No Rollback on Auto-install Failure
 
@@ -2225,6 +2259,15 @@ All tests in this block use `runCLIWithSignal` to deliver the signal during the 
 - **T-SIG-23**: Signal during pre-iteration wins over tmpdir creation failure. Configure `TMPDIR` to an unwritable path (like T-TMP-12a), and a valid target. Deliver SIGINT during pre-iteration. Assert exit code 130 (not 1 for tmpdir creation failure). Additionally assert no `loopx-*` directory is left behind under any parent (signal-wins still honors the best-effort cleanup clause from SPEC 7.4). `@flaky-retry(3)`. **Conditional on `process.getuid() !== 0`.** *(Spec 7.3, 7.4)*
 - **T-SIG-24**: Signal during pre-iteration wins over missing `.loopx/` directory. SPEC 7.3 enumerates `.loopx/` discovery as one of the non-signal pre-iteration failure modes displaced by the signal-wins rule. Set the fixture cwd to a directory with **no** `.loopx/` subdirectory (the standard missing-`.loopx/` condition from T-CLI-42 / T-DISC-10a). Target any workflow (e.g., `loopx run ralph`). Start loopx via `runCLIWithSignal`, deliver SIGINT during the pre-iteration window (synchronize via the sentinel stderr marker). Assert: (a) exit code 130 (not 1 for missing `.loopx/`), (b) stderr does not surface the missing-`.loopx/` error as the fatal-exit reason — the signal displaced it. Discovery-failure counterpart to T-SIG-20 (missing env file) and T-SIG-21 (missing workflow). `@flaky-retry(3)`. *(Spec 7.3, 5.1)*
 - **T-SIG-25**: Signal during pre-iteration wins over discovery-time sibling validation failure. Set up a `.loopx/` layout where the target workflow (`ralph`) is valid, but a sibling workflow has an invalid script name (e.g., `.loopx/broken/-bad.sh`) or invalid workflow name (e.g., `.loopx/-bad-workflow/index.sh`) that would cause discovery validation to fail (T-DISC-47a / T-DISC-47b territory). Target `loopx run ralph`. Deliver SIGINT during the pre-iteration window while discovery is scanning. Assert: (a) exit code 130 (not 1 for the discovery validation failure), (b) stderr does not surface the discovery-validation error as the fatal-exit reason — the signal displaced it. This is the sibling-validation counterpart to T-SIG-24 (missing `.loopx/`): both exercise the SPEC 7.3 enumerated "`.loopx/` discovery" failure mode, but T-SIG-25 hits the validation-scope sub-path (SPEC 5.4) rather than the existence sub-path. `@flaky-retry(3)`. *(Spec 7.3, 5.1, 5.3, 5.4)*
+
+#### Pre-handler-installation Window (Known Gap)
+
+SPEC 7.3 also defines behavior for signals delivered **before** loopx has installed its
+pre-iteration signal handlers: those signals are outside the signal-wins precedence rule,
+and either default POSIX signal termination or a parser-level usage error is conforming.
+That startup window is not widened or exposed by the current harness.
+
+- **T-SIG-26 (not yet directly covered)**: Signal delivered before pre-iteration signal-handler installation. Deterministic coverage would require a startup-delay seam before handler installation; without that seam, this clause remains an explicit known gap rather than claimed coverage.
 
 ### 4.12 CLI Delegation
 
@@ -2545,13 +2588,13 @@ Maps each SPEC.md section to the test IDs that verify it. Per section 1.3, this 
 | 3.3 | Module Resolution | T-MOD-01–03, T-MOD-03a–03d, T-DEL-06, T-INST-GLOBAL-01, T-INST-GLOBAL-01a |
 | 3.4 | Bash Script Binary Access | T-MOD-19–21, T-MOD-20a, T-MOD-21a |
 | 4.1 | Running Scripts (run subcommand, target validation) | T-CLI-11–13, T-CLI-27–33, T-CLI-59–60, T-CLI-64–66, T-CLI-78a–78d, T-CLI-80–81, T-CLI-85, T-CLI-96, T-CLI-107–118, T-CLI-109a, T-CLI-111a, T-CLI-114a, T-CLI-118a, T-CLI-118b, T-CLI-119a–119b, T-CLI-119d, T-CLI-119g–119h, T-CLI-119i–119k, T-CLI-RUN-DASHDASH-01, T-CLI-RUN-DASHDASH-02, T-CLI-RUN-DASHDASH-03, T-CLI-RUN-DASHDASH-04, T-CLI-RUN-DASHDASH-05, T-CLI-RUN-NAMEVAL-01, T-CLI-RUN-NAMEVAL-02, T-CLI-RUN-NAMEVAL-03, T-CLI-RUN-ORDER-01, T-CLI-RUN-ORDER-02, T-DISC-33–37, T-API-08c–08d, T-API-08n, T-API-08n1, T-API-08r, T-API-08t5, T-API-08t6–08t8, T-API-08v, T-API-08w–08y, T-API-08z, T-API-08z2–08z4, T-API-14f–14h, T-API-14j5, T-API-14j6–14j8, T-API-14l, T-API-14m–14o, T-API-14p, T-API-14p2–14p4, T-API-20j–20k, T-API-20j2, T-API-20p2, T-API-20p3, T-API-20r, T-API-20s, T-API-35a–35f, T-API-36a, T-API-40–48, T-API-45a, T-API-47a, T-API-48a, T-API-44a–44c, T-LOOP-30a, T-LOOP-31a, T-LOOP-31c, T-LOOP-38–42, T-VER-24b, T-VER-24c, T-VER-24d, T-VER-24e, T-VER-25b, T-VER-25c, T-VER-26, T-VER-26a–26c, T-VER-27, T-VER-27a–27c |
-| 4.2 | Options (-n, -e, run -h, install -h, top-level -h, --no-install) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22f, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–100, T-CLI-78a–78d, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-119–119h, T-CLI-119i–119k, T-CLI-RUN-DASHDASH-01, T-CLI-RUN-DASHDASH-02, T-CLI-RUN-DASHDASH-03, T-CLI-RUN-DASHDASH-04, T-CLI-RUN-DASHDASH-05, T-CLI-RUN-ORDER-01, T-CLI-RUN-ORDER-02, T-ENV-25b–25c, T-INST-40–49, T-INST-40a–40f, T-INST-44a, T-INST-44b, T-INST-44c, T-INST-44d, T-INST-45a, T-INST-49a–49g, T-INST-41a, T-INST-42a–42l, T-INST-43a–43b, T-INST-57a, T-INST-59a–59b, T-INST-60n, T-API-08e–08q, T-API-20d2, T-API-20e2 |
+| 4.2 | Options (-n, -e, run -h, install -h, top-level -h, --no-install) | T-CLI-02–06, T-CLI-07b–07c, T-CLI-07e–07g, T-CLI-07j, T-CLI-14–22f, T-CLI-19a, T-CLI-20a–20b, T-CLI-28, T-CLI-34–100, T-CLI-71a–71b, T-CLI-78a–78d, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-119–119h, T-CLI-119i–119k, T-CLI-RUN-DASHDASH-01, T-CLI-RUN-DASHDASH-02, T-CLI-RUN-DASHDASH-03, T-CLI-RUN-DASHDASH-04, T-CLI-RUN-DASHDASH-05, T-CLI-RUN-ORDER-01, T-CLI-RUN-ORDER-02, T-ENV-25b–25c, T-INST-40–49, T-INST-40a–40f, T-INST-44a, T-INST-44b, T-INST-44c, T-INST-44d, T-INST-45a, T-INST-49a–49g, T-INST-41a, T-INST-42a–42l, T-INST-43a–43b, T-INST-57a, T-INST-59a–59b, T-INST-60n, T-API-08e–08q, T-API-20d2, T-API-20e2 |
 | 4.3 | Subcommands | T-SUB-01–19, T-SUB-02a–02k, T-SUB-06a–06b, T-SUB-14a–14k, T-SUB-14l, T-SUB-20–23, T-CLI-66, T-CLI-80–81, T-MOD-21a |
 | 5.1 | Discovery | T-DISC-01–16, T-DISC-10a–10g, T-DISC-14a–14b, T-DISC-38–42g, T-DISC-39a, T-DISC-40a–40i, T-DISC-48, T-DISC-48a, T-CLI-42–43, T-CLI-104–104e, T-CLI-121–122, T-SIG-24, T-SIG-25 |
 | 5.2 | Name Collision | T-DISC-21–24, T-DISC-21a, T-DISC-40e, T-CLI-22b, T-CLI-43, T-CLI-43a, T-API-08h |
 | 5.3 | Name Restrictions | T-DISC-15a–15b, T-DISC-25–32, T-DISC-26a–26b, T-DISC-40c–40d, T-DISC-40f–40i, T-DISC-47a, T-DISC-47b, T-CLI-44, T-CLI-22d–22e, T-CLI-102, T-CLI-120, T-CLI-120a, T-CLI-120b, T-LOOP-40–42, T-EDGE-05, T-API-08i–08j, T-API-20l–20o, T-INST-52b, T-INST-60d, T-INST-60m, T-INST-63a–63e, T-SIG-25 |
 | 5.4 | Validation Scope | T-DISC-43–47, T-DISC-47a, T-DISC-47b, T-SUB-02h, T-SUB-06, T-SUB-13, T-SUB-19, T-SUB-20, T-SUB-21, T-SUB-22, T-SUB-23, T-CLI-28, T-CLI-114a, T-CLI-118b, T-API-20l–20o, T-SIG-25. **Note:** T-API-35c / 35f / 44b / 44c do **not** appear here — SPEC 4.1 leaves programmatic-API pre-iteration error ordering implementation-defined (outside of the pinned section 9.3 rules), so those tests no longer assert sibling-validation-wins ordering on the API surface. CLI T-CLI-114a / T-CLI-118b remain as the validation-scope-ordering surface. |
-| 6.1 | Working Directory (project-root-unified cwd) | T-EXEC-01–03, T-EXEC-03a, T-EXEC-03b, T-EXEC-16, T-EXEC-16b, T-EXEC-16c, T-API-07, T-API-07a, T-API-07b, T-API-47b, T-WFDIR-01–14, T-PWD-01–06, T-SYM-01–05, T-SYM-06, T-SYM-07, T-SYM-07a |
+| 6.1 | Working Directory (project-root-unified cwd) | T-EXEC-01–03, T-EXEC-03a, T-EXEC-03b, T-EXEC-16, T-EXEC-16b, T-EXEC-16c, T-API-07, T-API-07a, T-API-07b, T-API-47b, T-WFDIR-01–14, T-WFDIR-13a, T-PWD-01–06, T-SYM-01–05, T-SYM-06, T-SYM-07, T-SYM-07a |
 | 6.2 | Bash Scripts | T-EXEC-05–07 |
 | 6.3 | JS/TS Scripts | T-EXEC-08–14, T-EXEC-13c, T-EXEC-13d, T-SYM-07, T-SYM-07a |
 | 6.4 | output() Function | T-MOD-04–14a, T-MOD-05a, T-MOD-13a–13p |
@@ -2560,7 +2603,7 @@ Maps each SPEC.md section to the test IDs that verify it. Per section 1.3, this 
 | 6.7 | Initial Input | T-LOOP-14 |
 | 7.1 | Basic Loop | T-LOOP-01–10, T-LOOP-25, T-CLI-119a–119b, T-CLI-119g–119h, T-CLI-119i–119k, T-VER-24–25, T-VER-24a, T-VER-24b, T-VER-24c, T-VER-24d, T-VER-24e, T-VER-25a, T-VER-25b, T-VER-25c, T-API-08w–08y, T-API-14m–14o, T-API-20p, T-API-20p2, T-API-20p3, T-API-20q, T-API-20q2, T-API-20r, T-API-20s |
 | 7.2 | Error Handling | T-LOOP-18–24, T-LOOP-18a, T-LOOP-19a, T-LOOP-31c, T-LOOP-34–42, T-DISC-42a–42g, T-TMP-12a, T-TMP-12b, T-TMP-12c, T-ENV-26, T-ENV-26a, T-ENV-27, T-ENV-27a, T-VER-25b, T-VER-25c. **Known gaps (not directly covered):** T-TMP-38, T-TMP-39 — cleanup-attempt idempotence and cleanup-warning cardinality across racing terminal triggers (seam required; see section 4.7 "Cleanup Idempotence and Warning Cardinality"). |
-| 7.3 | Signal Handling | T-SIG-01–08, T-SIG-20, T-SIG-21, T-SIG-22, T-SIG-23, T-SIG-24, T-SIG-25, T-INST-116, T-INST-116a, T-INST-116b, T-INST-116c, T-INST-116d |
+| 7.3 | Signal Handling | T-SIG-01–08, T-SIG-20, T-SIG-21, T-SIG-22, T-SIG-23, T-SIG-24, T-SIG-25, T-INST-116, T-INST-116a, T-INST-116b, T-INST-116c, T-INST-116d, T-INST-116e. **Known gap (not directly covered):** T-SIG-26 — the pre-handler-installation window described in the final paragraph of Spec 7.3 remains untested without a startup-delay seam. |
 | 7.4 | Run-scoped Temporary Directory (LOOPX_TMPDIR) | T-TMP-01–29, T-TMP-12a, T-TMP-12b, T-TMP-12c, T-TMP-16a, T-TMP-24a, T-TMP-24b, T-TMP-30, T-TMP-31, T-TMP-32, T-TMP-33, T-TMP-34, T-TMP-35, T-TMP-36, T-TMP-37, T-SIG-23, T-API-60, T-ENV-21h. **Known gaps (not directly covered):** T-TMP-12d (identity-capture sub-step failure), T-TMP-12e (mode-securing sub-step failure), T-TMP-38 / T-TMP-39 (cleanup idempotence / warning cardinality), T-TMP-40 (top-level `lstat` failure non-ENOENT), T-TMP-41 (symlink `unlink` failure during cleanup), T-TMP-42 (recursive removal failure on identity-matched directory), T-TMP-43 (mount-point non-detection inside `$LOOPX_TMPDIR`) — all require test-only seams or privileged environments to be deterministically exercised (see section 4.7 coverage-gap blocks). |
 | 8.1 | Global Env Storage | T-ENV-01–15f, T-ENV-05a–05e, T-ENV-21e, T-ENV-21f, T-ENV-21g, T-ENV-21h, T-ENV-25–25c, T-ENV-27, T-ENV-27a, T-CLI-22c, F-ENV-01–05, T-API-08k–08m, T-API-08l2, T-API-59, T-API-59a, T-API-73, T-API-73a, T-API-73b, T-API-73c, T-SUB-14l |
 | 8.2 | Local Env Override | T-ENV-16–19, T-ENV-17a, T-ENV-25a, T-ENV-26, T-ENV-26a, T-CLI-22f, T-API-08p, T-API-08p2, T-API-20d2, T-API-20e2 |
@@ -2570,16 +2613,16 @@ Maps each SPEC.md section to the test IDs that verify it. Per section 1.3, this 
 | 9.3 | API Error Behavior | T-API-15–19, T-API-20a–20s, T-API-20d2, T-API-20e2, T-API-20p2, T-API-20p3, T-API-20q2, T-API-21c–21d, T-API-57, T-API-57a, T-API-57c, T-API-64, T-API-65–65e, T-API-65f, T-API-65g, T-API-66a, T-API-66b, T-TMP-24a |
 | 9.4 | output() and input() (script-side) | *(Same as 6.4/6.5)* |
 | 9.5 | Types / RunOptions (incl. RunOptions.env) | T-API-07–08, T-API-07a, T-API-07b, T-API-08b–08r, T-API-08n1, T-API-08v, T-API-08w–08y, T-API-10–10c, T-API-14b2–14b4, T-API-14f–14h, T-API-14l, T-API-14m–14o, T-API-20d–20e, T-API-20d2, T-API-20e2, T-API-21–21b, T-API-22–25b, T-API-23a, T-API-24a–24b, T-API-47b, T-API-50–50d, T-API-51a–51e, T-API-52, T-API-52a, T-API-52b, T-API-53–55, T-API-53a–53d, T-API-54a–54c, T-API-55a, T-API-55b, T-API-56, T-API-56a, T-API-56b, T-API-57, T-API-57a, T-API-57b, T-API-57c, T-API-58, T-API-58a, T-API-59, T-API-59a, T-API-60, T-API-61–67, T-API-61a–61e, T-API-62a–62g, T-API-62h, T-API-62h2, T-API-62h3, T-API-62h4, T-API-62h5, T-API-63, T-API-63a, T-API-64–64e, T-API-64f, T-API-64g, T-API-65–66, T-API-65a–65e, T-API-65f, T-API-65g, T-API-66a, T-API-66b, T-API-67a–67c, T-API-68–69c, T-API-68f, T-API-70, T-API-71, T-API-71a, T-API-72, T-DISC-48a, T-TYPE-01–07 |
-| 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08f, T-INST-08g, T-INST-08h, T-INST-41, T-INST-42k, T-INST-42l |
+| 10.1 | Source Detection | T-INST-01–01a, T-INST-02–08f, T-INST-08g, T-INST-08h, T-INST-08i, T-INST-41, T-INST-42k, T-INST-42l |
 | 10.2 | Source Type Details | T-INST-52d, T-INST-54d, T-INST-56b, T-INST-57c, T-INST-81–89, T-INST-83a, T-INST-85a–85b, T-INST-86a, T-INST-87 |
 | 10.3 | Workflow Classification | T-INST-50–56, T-INST-50a–50b, T-INST-52a, T-INST-52c, T-INST-52d, T-INST-53a–53c, T-INST-54a–54d, T-INST-55a–55e, T-INST-56a–56e, T-INST-57b, T-INST-60o, T-INST-63e, T-INST-64, T-INST-64b, T-INST-80g, T-INST-83a, T-INST-85b |
 | 10.4 | Install-time Validation | T-INST-52a–52d, T-INST-61–64, T-INST-62a, T-INST-63a–63e, T-INST-64a–64d, T-INST-72a, T-INST-73a, T-INST-74a, T-INST-75a, T-INST-76a, T-INST-80h–80j, T-INST-60a, T-INST-60e, T-INST-60g, T-INST-60h, T-INST-60n |
 | 10.5 | Collision Handling | T-INST-65–71, T-INST-67a, T-INST-70a–70d, T-INST-71a, T-INST-97c, T-INST-60c, T-INST-60k, T-INST-60l, T-INST-60p |
 | 10.6 | Version Checking on Install | T-INST-72–76, T-INST-72a, T-INST-73a, T-INST-74a, T-INST-75a, T-INST-76a, T-INST-97b, T-INST-111b, T-VER-12–13, T-VER-12a–12b, T-VER-13a, T-VER-13b, T-VER-13c, T-VER-15, T-VER-15a, T-VER-17, T-VER-22, T-VER-23a, T-INST-80d–80f, T-INST-54b, T-INST-54d, T-INST-60b, T-INST-60f, T-INST-60i, T-INST-60j, T-INST-60q–60s, T-DEL-25 |
-| 10.7 | Install Atomicity | T-INST-63e, T-INST-77–80j |
+| 10.7 | Install Atomicity | T-INST-63e, T-INST-77–80j. **Known gap (not directly covered):** T-INST-79a — removal of the implementation-private temporary staging directory itself is not observed; current tests assert the externally visible `.loopx/`-unchanged contract. |
 | 10.8 | Selective Workflow Installation | T-INST-57–60, T-INST-57a–57c, T-INST-59a–59b, T-INST-60a–60p, T-INST-60q–60s, T-INST-64c |
-| 10.9 | Common Rules (stage-then-commit leaves `.loopx/` unchanged on pre-commit failure) | T-INST-90, T-INST-92–97b, T-INST-97a, T-INST-97a2 |
-| 10.10 | Auto-install Workflow Dependencies | T-EXEC-15a, T-EXEC-15b, T-INST-44a, T-INST-44b, T-INST-44c, T-INST-44d, T-INST-110, T-INST-110a, T-INST-110b, T-INST-110c, T-INST-111, T-INST-111a, T-INST-111b, T-INST-112, T-INST-112a, T-INST-112b, T-INST-112c, T-INST-113, T-INST-113a, T-INST-113b, T-INST-114, T-INST-114a, T-INST-114b, T-INST-115, T-INST-116, T-INST-116a, T-INST-116b, T-INST-116c, T-INST-116d, T-INST-117, T-INST-117a, T-INST-118, T-INST-118a, T-INST-118b, T-INST-118c, T-INST-119, T-INST-120, T-INST-120a |
+| 10.9 | Common Rules (stage-then-commit leaves `.loopx/` unchanged on pre-commit failure) | T-INST-90, T-INST-92–97b, T-INST-97a, T-INST-97a2. **Known gap (not directly covered):** T-INST-79a — removal of the implementation-private temporary staging directory itself is not observed; current tests assert the externally visible `.loopx/`-unchanged contract. |
+| 10.10 | Auto-install Workflow Dependencies | T-EXEC-15a, T-EXEC-15b, T-INST-44a, T-INST-44b, T-INST-44c, T-INST-44d, T-INST-110, T-INST-110a, T-INST-110b, T-INST-110c, T-INST-111, T-INST-111a, T-INST-111b, T-INST-112, T-INST-112a, T-INST-112b, T-INST-112c, T-INST-113, T-INST-113a, T-INST-113b, T-INST-114, T-INST-114a, T-INST-114b, T-INST-115, T-INST-116, T-INST-116a, T-INST-116b, T-INST-116c, T-INST-116d, T-INST-116e, T-INST-117, T-INST-117a, T-INST-118, T-INST-118a, T-INST-118b, T-INST-118c, T-INST-119, T-INST-120, T-INST-120a |
 | 11.1 | Top-Level Help | T-CLI-02–06, T-CLI-07e–07g, T-CLI-07j, T-CLI-28, T-CLI-39, T-CLI-61, T-CLI-65, T-CLI-90–91 |
 | 11.2 | Run Help | T-CLI-40–43a, T-CLI-40a, T-CLI-40b, T-CLI-62, T-CLI-67–78, T-CLI-84, T-CLI-92–95, T-CLI-101–102, T-CLI-101a, T-CLI-104–106, T-CLI-104a–104e, T-CLI-120–122, T-CLI-120a, T-CLI-120b, T-DISC-10d–10g, T-DISC-15b, T-DISC-38, T-DISC-40b–40e, T-DISC-40g–40i, T-VER-19, T-VER-19a–19c |
 | 11.3 | Install Help | T-INST-41–42, T-INST-41a, T-INST-42a–42l, T-INST-44b, T-INST-44c, T-INST-44d, T-INST-49a–49g |
