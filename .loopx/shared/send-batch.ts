@@ -33,11 +33,11 @@ if (existsSync(FEEDBACK_FILE)) rmSync(FEEDBACK_FILE);
 const client = new OpenAI({ timeout: 60_000, maxRetries: 4 });
 
 const batchLine = JSON.stringify({
-  custom_id: `gpt54-${randomUUID()}`,
+  custom_id: `gpt55-${randomUUID()}`,
   method: "POST",
   url: "/v1/responses",
   body: {
-    model: "gpt-5.4-pro",
+    model: "gpt-5.5-pro",
     reasoning: { effort: THINKING },
     input: prompt,
     prompt_cache_key: WORKFLOW,
@@ -127,7 +127,7 @@ writeFileSync(FEEDBACK_FILE, answer);
 // remove the prompt file mid-run; crashing here would skip the goto to
 // check-feedback-done and strand the loop.
 rmSync(PROMPT_FILE, { force: true });
-console.error("=== Feedback received from GPT-5.4-Pro ===");
+console.error("=== Feedback received from GPT-5.5-Pro ===");
 
 execFileSync(BIN, ["output", "--goto", "check-feedback-done"], {
   stdio: "inherit",

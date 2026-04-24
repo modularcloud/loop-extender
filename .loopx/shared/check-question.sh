@@ -19,7 +19,13 @@ CLAUDE_OUTPUT_HTML=$(printf '%s' "$CLAUDE_OUTPUT" | node "$SCRIPT_DIR/md-to-tg-h
 
 # Use Codex with output schema to deterministically classify the output
 SCHEMA="$ROOT/.loopx/$LOOPX_WORKFLOW/check-question.schema.json"
-VERDICT=$(codex exec --sandbox read-only --output-schema "$SCHEMA" "Does the following text contain a question or request for clarification directed at the user?
+VERDICT=$(codex exec --sandbox read-only --output-schema "$SCHEMA" "Does the following text contain an actual question that blocks completion of the work — i.e., the agent cannot continue or finish until the user answers?
+
+Do NOT count these as blocking questions:
+- Sign-offs that report work as complete and invite post-hoc corrections (e.g., \"I finished X, let me know if anything is wrong\" or \"Tell me if I got something wrong\"). Correcting wrong assumptions is not a priority — treat these as has_question=false.
+- General invitations for follow-up feedback after the work is already done.
+
+Return has_question=true only when the text is paused on a pending question the agent needs an answer to before proceeding. When in doubt, prefer has_question=false.
 
 $CLAUDE_OUTPUT" 2>/dev/null)
 

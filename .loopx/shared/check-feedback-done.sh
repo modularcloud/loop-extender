@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./telegram-lib.sh
+source "$SCRIPT_DIR/telegram-lib.sh"
+
 ROOT="$LOOPX_PROJECT_ROOT"
 FEEDBACK_FILE="$ROOT/.loopx/$LOOPX_WORKFLOW/.feedback.tmp"
 SCHEMA="$ROOT/.loopx/$LOOPX_WORKFLOW/check-feedback-done.schema.json"
@@ -34,6 +38,12 @@ DONE=$(echo "$VERDICT" | jq -r '.done')
 
 if [[ "$DONE" == "true" ]]; then
   echo "=== Feedback indicates no further non-optional improvements — halting ===" >&2
+
+  ALERT_LABEL=$(tg_alert_label)
+  curl -s -X POST "${TELEGRAM_API}/sendMessage" \
+    -d chat_id="$TELEGRAM_CHAT_ID" \
+    --data-urlencode "text=[${ALERT_LABEL}] Feedback indicates no further non-optional improvements. Halting." > /dev/null
+
   rm -f "$FEEDBACK_FILE" "$CALLER_FILE" "$ROOT/.loopx/$LOOPX_WORKFLOW/.session.tmp"
   $LOOPX_BIN output --result "Feedback indicates no further non-optional improvements. Halting." --stop
 else
