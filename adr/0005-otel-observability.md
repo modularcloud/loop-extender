@@ -189,6 +189,21 @@ function isOtelEnabled(): boolean;
 - `withSpan` parent context is determined by, in order: (1) the innermost in-progress local `withSpan` in the same process, (2) `TRACEPARENT` (and `TRACESTATE`) in `process.env` if no local active span, (3) otherwise root.
 - `addEvent`, `setAttribute`, `recordException` operate on **the innermost in-progress local `withSpan` in the same process**. If no local active span exists, they no-op. They cannot mutate spans owned by a different process (e.g., the parent loopx process's `loopx.script.exec` span), since the OTel SDK does not expose a remote-span-mutation surface.
 - `counter` / `histogram` use the SDK's meter; metric instruments are lazily created and cached by name + attribute-key shape.
+- `isOtelEnabled()` returns `true` when the process-wide SDK has been initialized in this process. It does not reflect per-run gating: a process whose SDK was initialized by an earlier or concurrent run continues to return `true` even while a specific run has telemetry suppressed via `options.otel.enabled=false`. Per-run gating (§11) governs whether loopx emits its own `loopx.*` spans for that run; user-side `withSpan` / `counter` / `histogram` calls in the same process continue to record against the shared SDK regardless.
+
+**`withSpan` lifecycle and error handling (when enabled):**
+
+- The span starts before `fn` is invoked and ends once `fn`'s return value settles. For a synchronous return, the span ends synchronously after `fn` returns. For a returned Promise, the span ends when the Promise settles (resolves or rejects). `withSpan` returns the same Promise identity (no wrapping or `.then`-chained replacement); a caller using `Promise.race` or identity checks observes the original Promise object.
+- When `fn` throws synchronously or its returned Promise rejects, `withSpan` automatically calls `recordException(err)` on the span and sets the span status to `ERROR` (with `description` set to the error's `message` when one is available) before ending the span. The thrown / rejected value then propagates unchanged to the caller. An explicit `setStatus` call inside `fn` is preserved — automatic ERROR status is applied only when `fn` did not set its own terminal status before throwing.
+- A `withSpan` whose `fn` returns a thenable that never settles never ends its span; this matches OTel SDK behavior and is not a leak loopx introduces.
+
+**Interaction with `output()` (child processes).**
+
+When the child-process OTel SDK has been initialized (because the child observed effective `LOOPX_OTEL_ENABLED=true` in its environment) and a script calls `output()` (SPEC §6.4) — which terminates the process via `process.exit(0)` — `output()` first invokes `forceFlush()` followed by `shutdown()` on the child's SDK with a 5-second deadline (matching §10's parent-process deadline) before exiting. This ensures spans, events, and metric data points emitted by `withSpan` / `counter` / `histogram` / `addEvent` / `setAttribute` / `recordException` calls in the script are exported before `process.exit()` skips async I/O. A shutdown timeout in this path produces a single stderr warning per the §10 warning policy and does not affect the exit code.
+
+When the child-process OTel SDK has not been initialized, `output()` behavior is unchanged — there is no flush step and no measurable overhead.
+
+A standalone `flushOtel()` helper is not provided in v1. The natural flush points are span end (`withSpan` returning) and `output()`. Scripts that exit naturally (returning from `main`, awaiting completion before exit) rely on the SDK's standard process-exit hooks; scripts that emit telemetry and *then* call `output()` rely on the flush-on-exit path described here.
 
 **SDK initialization timing in the JS API:**
 
@@ -216,7 +231,9 @@ Iteration counting follows SPEC §7.1 — every target execution counts, includi
 
 Created on entry to the iteration phase, **after the entire pre-iteration sequence completes** (discovery, env-file loading, target resolution, starting-workflow version check, tmpdir creation) and immediately before the first child spawn. Closed on terminal outcome. This is the single, normative ordering.
 
-Pre-iteration failures (discovery error, target resolution error, env-file failure, starting-workflow version-mismatch warning, tmpdir-creation failure) occur before SDK initialization and are not represented in OTel; they remain stderr-only per existing SPEC sections. The `version_mismatch.warning` event applies only to **cross-workflow** version checks fired during iteration (where the SDK is live); it appears on the `loopx.iteration` span — see below.
+Pre-iteration failures (discovery error, target resolution error, env-file failure, tmpdir-creation failure) occur before SDK initialization and are not represented in OTel; they remain stderr-only per existing SPEC sections. The non-fatal starting-workflow version-mismatch warning (per SPEC §3.2) is also pre-SDK-init and is not represented in OTel — note that this is a warning, not a failure. The `version_mismatch.warning` event applies only to **cross-workflow** version checks fired during iteration (where the SDK is live); it appears on the `loopx.iteration` span — see below.
+
+**Parent context.** When OTel is enabled and a `TRACEPARENT` is present in the loopx process's `process.env` at SDK init that parses as a valid W3C trace-context string, `loopx.run` is created as a child of that inherited context (and inherits `TRACESTATE` if also present). When no inherited `TRACEPARENT` is present or it is malformed, `loopx.run` is a root span. `options.otel.parentContext` (§11), when supplied, takes precedence over inherited `TRACEPARENT`. For `run()` and `runPromise()`, the relevant `process.env.TRACEPARENT` snapshot follows the option-snapshot schedule defined in SPEC §9.1 / §9.2; for the CLI, it is read once during the pre-iteration sequence alongside other inherited-env reads. A malformed inherited `TRACEPARENT` is silently treated as absent (no warning), matching OTel SDK propagator behavior; only an invalid `options.otel.parentContext` surfaces via the pre-iteration error path (§11).
 
 **Attributes:**
 
@@ -245,7 +262,7 @@ Pre-iteration failures (discovery error, target resolution error, env-file failu
 
 #### `loopx.iteration`
 
-One per iteration. Parent: `loopx.run`. Created immediately before child spawn, closed after structured output is parsed (or after the failure that prevented parsing).
+One per iteration. Parent: `loopx.run`. Created immediately before child spawn. Closed after structured output parsing **and** transition / terminal-decision resolution — that is, after `goto` validation (target syntax, target workflow / script existence in cached discovery), `goto.transition` event emission, or the determination that the iteration ends without a transition (loop reset or terminal `stop` / `maxIterations`). When a failure prevents parsing (non-zero child exit, spawn failure), the iteration span closes after that failure is recorded. This ordering is normative: invalid-`goto` errors, missing target workflow / script during goto resolution, and `goto.transition` events all fire on the iteration span before it closes.
 
 **Attributes:**
 
@@ -327,13 +344,12 @@ Attached to all telemetry emitted by the loopx process:
 | `process.runtime.name` | `node` \| `bun` |
 | `process.runtime.version` | runtime version string |
 | `host.name` | best-effort hostname (`os.hostname()`) |
-| `loopx.project_root` | absolute project root |
 
 User-supplied `OTEL_RESOURCE_ATTRIBUTES` are merged on top of these (standard OTel SDK behavior — user-supplied wins on key conflict, except for `service.name` which is governed by `OTEL_SERVICE_NAME`).
 
-`service.instance.id` is process-scoped, not per-run. Per-run identity in the trace tree is carried by the `loopx.run.id` span attribute (§4).
+`service.instance.id` is process-scoped, not per-run. Per-run identity in the trace tree is carried by the `loopx.run.id` span attribute (§4). The project root is recorded as a span attribute (`loopx.project_root` on `loopx.run` — §4), not a resource attribute, because concurrent or sequential runs in the same programmatic process may pass different `RunOptions.cwd` values; a process-wide resource attribute would be stale or wrong after the first SDK-initializing run. The per-run truth lives on `loopx.run`.
 
-CLI helpers running inside a loopx-spawned child each initialize their own short-lived SDK (§2). They produce a distinct `service.instance.id` from the parent's; correlation back to the parent run happens via `TRACEPARENT` parentage and shared `loopx.project_root`. User-side spans created via the JS programmatic helpers in the *same* process inherit that process's resource directly.
+CLI helpers running inside a loopx-spawned child each initialize their own short-lived SDK (§2). They produce a distinct `service.instance.id` from the parent's; correlation back to the parent run happens via `TRACEPARENT` parentage. User-side spans created via the JS programmatic helpers in the *same* process inherit that process's resource directly.
 
 ### 7. Metrics
 
@@ -362,16 +378,23 @@ Default sampler: `parentbased_always_on`. Honors `OTEL_TRACES_SAMPLER` / `OTEL_T
 
 ### 9. Env-var merging into child scripts
 
-When `LOOPX_OTEL_ENABLED=true` **and** `LOOPX_OTEL_PROPAGATE_TO_SCRIPTS=true`, the otel config file's contents are merged into child script environments at a new tier inserted between `RunOptions.env` (existing tier 2) and the local env file (existing tier 3). Updated SPEC §8.3 precedence (highest wins):
+When **effective** `LOOPX_OTEL_ENABLED` is `true` (i.e., telemetry is enabled for the run, regardless of whether the source was the otel config file or `options.otel.enabled=true`) **and** `LOOPX_OTEL_PROPAGATE_TO_SCRIPTS` is `true`, the run's resolved otel configuration is merged into child script environments at a new tier inserted between `RunOptions.env` (existing tier 2) and the local env file (existing tier 3). Updated SPEC §8.3 precedence (highest wins):
 
 1. **loopx-injected protocol variables** — `LOOPX_BIN`, `LOOPX_PROJECT_ROOT`, `LOOPX_WORKFLOW`, `LOOPX_WORKFLOW_DIR`, `LOOPX_TMPDIR`, plus `TRACEPARENT` / `TRACESTATE` when otel is enabled.
 2. **`RunOptions.env`** (programmatic API).
-3. **Otel config file** (`$XDG_CONFIG_HOME/loopx/otel`) — only when otel is enabled and propagation is on. Includes both `OTEL_*` keys and the `LOOPX_OTEL_*` knobs.
+3. **Resolved otel configuration** — only when otel is enabled and propagation is on (see resolution rules below).
 4. **Local env file** (`-e` / `RunOptions.envFile`).
 5. **Global loopx env** (`$XDG_CONFIG_HOME/loopx/env`).
 6. **Inherited system environment** (snapshotted once per run).
 
-When otel is disabled or propagation is off, tier 3 is empty. Trace linkage (`TRACEPARENT` / `TRACESTATE`) is still injected at tier 1 when otel is enabled regardless of propagation mode.
+**What tier 3 contains (resolution rules):**
+
+- `LOOPX_OTEL_ENABLED` — set to `"true"` to mirror the **effective** enabled state. This makes `options.otel.enabled=true` (programmatic enable, even with no otel config file present) light up child-side helpers — `loopx otel counter` / `histogram` / `span` and JS/TS `withSpan` / `counter` / `histogram` calls in child scripts will export, matching the parent's behavior.
+- All recognized `LOOPX_OTEL_*` knobs from the otel config file (e.g., `LOOPX_OTEL_CAPTURE_RESULT`, `LOOPX_OTEL_PROPAGATE_TO_SCRIPTS` itself). `LOOPX_OTEL_*` values supplied via `options.otel` are not in scope for v1 — only `enabled` and `parentContext` are programmatically settable; the capture-mode knobs come from the file or are at default.
+- All `OTEL_*` keys consulted by the parent SDK at init: the union of the otel config file's `OTEL_*` keys and the inherited `process.env` `OTEL_*` keys at snapshot time, with config-file values winning on conflict. Inherited `OTEL_*` would already reach children at tier 6, but propagating them at tier 3 ensures a consistent SDK configuration survives `RunOptions.env` (tier 2) and env-file (tier 4) overrides of unrelated keys.
+- Unrecognized keys in the otel config file (those matching `[A-Za-z_][A-Za-z0-9_]*` but not `OTEL_*` and not on the recognized `LOOPX_OTEL_*` list) are **not** propagated. They are silently retained at the file level (per `loopx otel set`, §2) but have no semantic meaning to loopx or the SDK and are not surfaced to children.
+
+**When tier 3 is empty:** any of (a) effective `LOOPX_OTEL_ENABLED` is `false`, (b) `LOOPX_OTEL_PROPAGATE_TO_SCRIPTS` is `false`, or (c) otel is disabled outright. In all three cases, no `OTEL_*` / `LOOPX_OTEL_*` are propagated by loopx. Trace linkage (`TRACEPARENT` / `TRACESTATE`) is still injected at tier 1 when otel is enabled, regardless of propagation mode; when otel is disabled, no `TRACEPARENT` is injected (an inherited value passes through via tier 6).
 
 Helpers running inside a child where propagation is off receive `TRACEPARENT` but no `OTEL_*` configuration from the otel config file. Such helpers can still self-export only if `OTEL_*` reaches them via another tier (local env file, global env, inherited shell). When no SDK configuration is reachable, the `span` helper falls through to `exec`, and `counter` / `histogram` no-op silently.
 
@@ -381,28 +404,41 @@ The otel config tier sits below `RunOptions.env` so a programmatic caller can ov
 
 **Initialization.**
 
-- Deferred until the iteration phase begins. `loopx version`, `loopx env *`, `loopx otel list`/`set`/`enable`/`disable`/`show`, `loopx -h`, `loopx run -h`, `loopx install` (any subcommand other than the actual install execution) do not initialize the SDK.
+- Deferred until the iteration phase begins. `loopx version`, `loopx env *`, `loopx otel list`/`set`/`enable`/`disable`/`show`, `loopx -h`, `loopx run -h`, and **`loopx install` in all forms** do not initialize the SDK. `loopx install` (including the post-commit `npm install` pass and `.gitignore` synthesis under SPEC §10.10) is out of scope for telemetry — the only `loopx otel ...` command that initializes the SDK eagerly is `loopx otel test`.
 - `loopx run <target>` (and the programmatic equivalents) initialize the SDK after the pre-iteration sequence completes (discovery, env-file loading, target resolution, starting-workflow version check, tmpdir creation) and immediately before opening `loopx.run` — i.e., immediately before the first child spawn.
-- SDK initialization failure is non-fatal: a single stderr warning is emitted, the run proceeds with telemetry disabled for its lifetime, and exit code is unaffected.
+- SDK initialization failure is non-fatal: a single stderr warning is emitted (per the warning policy below), the run proceeds with telemetry disabled for its lifetime, and exit code is unaffected.
 - `loopx otel test` initializes immediately, bypassing the deferred path.
 - The SDK is process-wide. Once initialized, it persists for the process lifetime.
 
 **Export pipeline.**
 
-- Traces: `BatchSpanProcessor` over OTLP HTTP/protobuf (default) or whatever `OTEL_TRACES_EXPORTER` selects. Async, batched, bounded queue. Drops on overflow with the SDK's standard `dropped_spans` warning.
+- Traces: `BatchSpanProcessor` over OTLP HTTP/protobuf (default) or whatever `OTEL_TRACES_EXPORTER` selects. Async, batched, bounded queue. Drops on queue overflow per the failure-isolation rule below; the SDK's standard `dropped_spans` warning is suppressed.
 - Metrics: `PeriodicExportingMetricReader` over OTLP HTTP/protobuf (default).
 - Logs: not enabled in v1.
 
-**Shutdown.**
+**Per-run flush vs. process-exit shutdown.**
 
-- A process-exit hook (e.g., `process.on('exit')` plus signal-driven equivalents) shuts down the SDK once. This runs after final `LOOPX_TMPDIR` cleanup (per SPEC §7.4) and before the loopx process actually exits / throws / rejects.
-- Hard 5-second deadline; expiration prints a single stderr warning ("otel exporter shutdown timed out after 5s") and proceeds. Does not affect exit code, generator outcome, or promise rejection.
-- Idempotent (parallel to SPEC §7.2 cleanup idempotence): at most one shutdown attempt per process.
-- For each individual run reaching a terminal outcome, loopx invokes `forceFlush()` on the trace and metric providers (with the same 5-second deadline as a soft per-run flush) to push out buffered telemetry before any subsequent `runPromise()` call observes the next state. `forceFlush()` does not shut down the SDK; concurrent runs in the same process are unaffected.
+These are two distinct lifecycle events with different scope:
+
+- **Per-run flush.** Each individual run reaching a terminal outcome (CLI exit, `run()` settling, `runPromise()` resolving or rejecting, consumer cancellation, abort) closes its own spans and invokes `forceFlush()` on the trace and metric providers with a 5-second deadline. `forceFlush()` does **not** shut down the SDK; concurrent runs in the same process are unaffected. `forceFlush()` runs whether the run is normal or error: throwing from `run()` or rejecting from `runPromise()` flushes the run's spans but does not shut down the shared SDK. A `forceFlush()` timeout does not produce a separate stderr warning; pending telemetry is left to the eventual process-exit shutdown (or is lost if the process is killed before then).
+- **Process-exit shutdown.** A process-exit hook (`process.on('exit')` plus signal-driven equivalents) calls SDK `shutdown()` exactly once when the loopx process is *actually* exiting. This runs after final `LOOPX_TMPDIR` cleanup (per SPEC §7.4) and before the process exits. For the CLI, the run terminal outcome and the process exit coincide, so SDK shutdown happens at the end of every CLI run. For the programmatic API, the host program controls process lifetime; SDK shutdown fires when the host process exits, not when an individual `run()` / `runPromise()` settles. Throwing from `run()` or rejecting from `runPromise()` does not trigger SDK shutdown.
+- **Shutdown deadline.** Hard 5-second deadline; expiration prints a single stderr warning ("otel exporter shutdown timed out after 5s") and proceeds. Does not affect CLI exit code, generator outcome, or promise rejection.
+- **Idempotence.** SDK shutdown is idempotent (parallel to SPEC §7.2 cleanup idempotence): at most one shutdown attempt per process.
 
 **Failure isolation.**
 
-- All exporter failures (transport errors, deadline-exceeded, malformed configuration detected at runtime, queue overflow, SDK-internal exceptions) are caught and discarded. They do not affect the loop, do not change the `loopx.run` terminal outcome, and do not surface in stderr beyond the single shutdown warning. The single documented exception is `loopx otel test` (§2), which surfaces SDK errors deliberately.
+All runtime exporter failures — transport errors, deadline-exceeded, malformed configuration detected at runtime, queue overflow / dropped spans, SDK-internal exceptions during export — are caught and discarded. They do not affect the loop, do not change the `loopx.run` terminal outcome, and do not surface in stderr. `loopx otel test` (§2) is the single documented exception and surfaces SDK errors deliberately.
+
+**Warning policy.**
+
+When OTel is enabled, loopx may emit the following stderr warnings; when disabled, none of these fire (config is not parsed, SDK is not initialized).
+
+- *Config-time validation* (each emitted at most once per init, one per offending item): otel config file unreadable; invalid env-var name in the otel config file (per offending line, line ignored); invalid `LOOPX_OTEL_*` value (per offending key, fallback to default); SDK-side warnings for invalid `OTEL_*` values surfaced at startup.
+- *SDK initialization failure*: emitted at most once.
+- *Reserved metric-instrument-name violation* (§12): emitted at most once per run.
+- *Process-exit shutdown timeout*: emitted at most once.
+
+`loopx otel test` is the documented exception: SDK / exporter errors surface on stderr and are reflected in the exit code, by design. All other stderr noise from runtime exporter failures (including queue overflow / dropped spans) is suppressed.
 
 ### 11. Programmatic API integration
 
@@ -420,10 +456,17 @@ interface RunOptions {
 }
 ```
 
-- **`options.otel.enabled`** — when set, overrides the config-file-derived enabled state for this run only. `false` suppresses telemetry even if the config file enables it; `true` enables even if the config file does not. A `true` override on a process where no otel config file exists initializes the SDK with whatever `OTEL_*` configuration is reachable from inherited `process.env`; if no usable endpoint is reachable, the SDK runs but exports fail silently per the failure-isolation rule. Once the process-wide SDK is initialized, it persists; subsequent runs in the same process inherit it regardless of their own `options.otel` values, except that a `false` override still gates whether *that run* emits `loopx.*` spans.
-- **`options.otel.parentContext`** — when supplied, `loopx.run` becomes a child of the provided context. This is the path for an embedding application that runs many `runPromise()` calls inside its own outer span. An invalid `TRACEPARENT` string (failing W3C trace-context format) is captured and surfaced via the standard pre-iteration error path (SPEC §9.1), identical to other option-snapshot errors.
+- **`options.otel.enabled`** — when set, overrides the config-file-derived enabled state for this run only. `false` suppresses telemetry even if the config file enables it; `true` enables even if the config file does not. A `true` override on a process where no otel config file exists initializes the SDK with whatever `OTEL_*` configuration is reachable from inherited `process.env`; if no usable endpoint is reachable, the SDK runs but exports fail silently per the failure-isolation rule. Once the process-wide SDK is initialized, it persists; subsequent runs in the same process inherit it regardless of their own `options.otel` values, except that a `false` override still gates whether *that run* emits `loopx.*` spans and whether its children receive trace-context / OTel propagation per §5 / §9.
+- **`options.otel.parentContext`** — when supplied, `loopx.run` becomes a child of the provided context. This is the path for an embedding application that runs many `runPromise()` calls inside its own outer span. `options.otel.parentContext` overrides any inherited `TRACEPARENT` parent (§4 `loopx.run`).
 
-`options.otel` is read on the same option-snapshot schedule as other option fields (SPEC §9.1). It sits **after** `options.signal` and is otherwise implementation-defined in order. A throwing getter on `options.otel` or any of its sub-fields is captured and surfaced via the standard pre-iteration error path.
+**Validation.**
+
+- `options.otel`, when present and not `undefined`, must be a non-null, non-array, non-function object. Non-conforming values (null, array, function, primitive) are captured at call time and surfaced via the standard pre-iteration error path (SPEC §9.1), identical to `options.env` shape errors.
+- `options.otel.enabled`, when present and not `undefined`, must be a boolean. A non-boolean value is captured and surfaced via the pre-iteration error path.
+- `options.otel.parentContext`, when present and not `undefined`, must be a string. A non-string value is captured and surfaced via the pre-iteration error path. A string that does not match the W3C trace-context format is captured at snapshot time regardless of whether `enabled` is `true` for this run — an invalid `parentContext` is invalid as a value, even when unused. The format check happens at the option-snapshot point.
+- A throwing getter on `options.otel` itself, or on any of its sub-fields (`enabled`, `parentContext`), is captured and surfaced via the pre-iteration error path.
+
+`options.otel` is read on the same option-snapshot schedule as other option fields (SPEC §9.1). It sits **after** `options.signal` and is otherwise implementation-defined in order.
 
 The pre-first-`next()` consumer-cancellation carve-out (ADR-0004 §1, SPEC §9.1) suppresses `options.otel` snapshot errors the same way it suppresses other captured pre-iteration errors. The abort-wins-over-pre-iteration-failures rule (SPEC §9.3) applies unchanged.
 
@@ -441,20 +484,24 @@ The pre-first-`next()` consumer-cancellation carve-out (ADR-0004 §1, SPEC §9.1
 
 The following SPEC sections need updates when this ADR is accepted; this list is the mechanical update target.
 
+- **§3.3 (Module Resolution for Scripts)** — note that the importable `"loopx"` package surface now includes the OTel helpers (`withSpan`, `addEvent`, `setAttribute`, `recordException`, `counter`, `histogram`, `isOtelEnabled`) in addition to `output()` / `input()` / `run()` / `runPromise()`. No change to the resolution mechanism itself.
 - **§3.4 (Bash Script Binary Access)** — extend the `LOOPX_BIN` example list with `$LOOPX_BIN otel span ... -- cmd`, `$LOOPX_BIN otel counter ...`, `$LOOPX_BIN otel histogram ...`.
 - **§4.3 (Subcommands)** — add `loopx otel` and all its sub-subcommands with synopses. Add `loopx otel -h` to the help-flag short-circuit pattern.
 - **§5.4 (Validation Scope)** — add a row for `loopx otel *`: does not require `.loopx/`, performs no discovery, no validation.
-- **§6.4 / §6.5** — add a cross-reference to the new observability chapter; clarify that `output()` / `input()` continue to be the only stdout-protocol helpers and that the otel helpers do not write to stdout (their export channel is OTLP).
+- **§6.4 / §6.5** — add a cross-reference to the new observability chapter. Clarify that `output()` / `input()` continue to be the only stdout-protocol helpers; `counter` / `histogram` (CLI and JS/TS) export only via OTLP and write nothing to stdout, while `loopx otel span ... -- <command>` inherits the wrapped command's stdout (which therefore can still affect the script's structured-output stdout — wrapping a command that produces structured stdout requires the same care as any other process-substitution pattern). Add the `output()` flush-on-exit behavior described in §3 of this ADR (on initialized child SDK, `output()` calls `forceFlush()` + `shutdown()` with a 5-second deadline before `process.exit(0)`).
 - **§7.1 (Basic Loop)** — insert SDK initialization between tmpdir creation (current step 6) and the first child spawn (current step 7); insert SDK shutdown after final `LOOPX_TMPDIR` cleanup and before CLI exit. Both are conditional on effective `LOOPX_OTEL_ENABLED`.
-- **§7.2 (Error Handling)** — add SDK initialization failure as a non-fatal warning. Add SDK shutdown timeout as a non-fatal warning.
+- **§7.2 (Error Handling)** — add SDK initialization failure as a non-fatal warning. Add SDK process-exit shutdown timeout as a non-fatal warning.
 - **§7.3 (Signal Handling)** — clarify that SDK shutdown runs after tmpdir cleanup and before signal-exit, and that the 5s otel shutdown deadline runs concurrently with (not in addition to) any subsequent process exit.
 - **§7.4 (`LOOPX_TMPDIR`)** — note that otel shutdown follows tmpdir cleanup in the terminal-outcome ordering.
 - **§8.1 (Global Storage)** — add a sibling subsection for the new `$XDG_CONFIG_HOME/loopx/otel` config file, with the same fallback rules, concurrent-mutation caveats, and the additional `0600` permission requirement.
 - **§8.3 (Injection)** — replace the precedence list with the 6-tier list in §9 of this ADR. Add `TRACEPARENT` / `TRACESTATE` to the protocol-variable table (with the "only when otel enabled" qualifier).
-- **§9.1 / §9.2** — add `options.otel` to the option-snapshot rules (read order, snapshot timing, error path).
-- **§9.3** — add SDK shutdown to the cleanup ordering note (cleanup runs before throw/reject; otel shutdown runs after cleanup and before throw/reject).
-- **§9.5 (`RunOptions`)** — add the `otel` field to the type and validation rules. Invalid `parentContext` follows the standard pre-iteration error path.
-- **§13** — add `TRACEPARENT`, `TRACESTATE` rows. Add a paragraph reserving the `loopx.*` attribute and metric-instrument-name namespaces.
+- **§9.1 / §9.2** — add `options.otel` to the option-snapshot rules (read order, snapshot timing, error path). Note that the inherited `TRACEPARENT` consulted for `loopx.run` parent context (§4) is captured on the same option-snapshot schedule.
+- **§9.3** — add per-run `forceFlush()` to the cleanup ordering note. Per-run flush runs before throw/reject (alongside `LOOPX_TMPDIR` cleanup); SDK shutdown is a separate process-exit-only event, not part of per-run cleanup.
+- **§9.4** — note that the importable `"loopx"` surface now extends beyond `output()` / `input()` / `run()` / `runPromise()` to include the OTel helpers in §3.
+- **§9.5 (`RunOptions`)** — add the `otel` field to the type and validation rules. Specify validation for non-object `otel`, non-boolean `enabled`, non-string `parentContext`, throwing getters on `otel` / `enabled` / `parentContext`, and invalid (non-W3C-format) `parentContext` regardless of `enabled` state.
+- **§11.1 (Top-level Help)** — add `otel` to the listed top-level subcommands.
+- **§12 (Exit Codes)** — note that `loopx otel test` exits 1 on disabled / unreachable backends (the documented exception to exporter-failure isolation, §2). `loopx otel span -- <command>` preserves the wrapped command's exit code byte-for-byte (any value, not just 0/1) regardless of OTel state; `loopx otel counter` / `histogram` exit 0 silently when disabled or unreachable; usage errors (malformed value, missing arguments, unrecognized flags) on any `loopx otel` helper still exit 1.
+- **§13** — add `TRACEPARENT`, `TRACESTATE` rows (conditionally script-protocol-protected when otel is enabled). Add a paragraph reserving the `loopx.*` attribute and metric-instrument-name namespaces.
 - **New §N (Observability)** — full chapter for the §1–§11 content of this ADR.
 
 ## Consequences
@@ -494,3 +541,8 @@ Easy-to-overlook cases worth covering:
 - **Token-usage instrumentation.** `loopx otel counter "agent.tokens.input" 1234 --attr provider=claude --attr model=opus-4.7` emits one counter data point with the supplied attributes. `histogram` analog works similarly. Both no-op (exit 0) when otel is disabled.
 - **`loopx.*` namespace reservation.** A user `withSpan("x", s => s.setAttribute("loopx.injected", "v"), ...)` produces a span without that attribute; no stderr warning fires for the dropped attribute. A `counter("loopx.foo", ...)` call suppresses the metric and produces a single per-run stderr warning.
 - **`loopx otel test` behaves as a connectivity check.** Endpoint unreachable produces exit 1 within ~5s with the SDK error on stderr; this is the documented exception to exporter-failure isolation.
+- **Programmatic enable propagates to children.** `runPromise("ralph", { otel: { enabled: true } })` with no otel config file present causes child scripts to observe effective `LOOPX_OTEL_ENABLED=true` plus the resolved `OTEL_*` configuration in their environment, so `loopx otel counter` calls inside child bash and JS/TS `withSpan` / `counter` / `histogram` calls inside child scripts both export. Conversely, `runPromise("ralph", { otel: { enabled: false } })` with a config file that enables otel produces a run with no `loopx.*` spans, no `TRACEPARENT` injection, and an empty tier 3 in child env merging.
+- **Inherited `TRACEPARENT` becomes parent of `loopx.run`.** With `TRACEPARENT` in the loopx process's `process.env` at SDK init and otel enabled, the resulting `loopx.run` is a child of that context (matching `trace_id` and a `parent_span_id` equal to the inherited span id). With no inherited `TRACEPARENT`, `loopx.run` is a root span. With both an inherited `TRACEPARENT` and `options.otel.parentContext` supplied, `options.otel.parentContext` wins.
+- **Iteration span captures invalid-`goto` errors.** A script outputting `{"goto": "missing-workflow:foo"}` produces a `loopx.iteration` span with status `ERROR` and the failure recorded; the iteration span closes after transition resolution, not after parse, so the ERROR status and any `goto.transition` event ordering are observable on the same span.
+- **`output()` flushes child OTel SDK.** A JS/TS script with `LOOPX_OTEL_ENABLED=true` in its environment that calls `withSpan(...)` and then `output({ result: "x" })` produces an exported span — the data is not lost to `process.exit(0)` truncation. With OTel uninitialized in the child, `output()` exhibits no measurable additional latency.
+- **`RunOptions.otel` validation.** `runPromise("ralph", { otel: 5 as any })` rejects on the standard pre-iteration error path; same for `{ otel: { enabled: "true" as any } }`, `{ otel: { parentContext: 42 as any } }`, and a `parentContext` string that does not match W3C trace-context format. A throwing getter on `options.otel` or `options.otel.enabled` is captured and surfaced via the same path. Under `run()`, all of these are suppressed by the pre-first-`next()` consumer-cancellation carve-out (SPEC §9.1).
