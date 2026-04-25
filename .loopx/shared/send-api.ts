@@ -9,6 +9,7 @@ const THINKING = (process.env.GPT_PRO_THINKING ?? "medium") as
   | "medium"
   | "high"
   | "xhigh";
+const FLEX = process.env.OPENAI_FLEX === "true";
 
 if (!process.env.OPENAI_API_KEY) {
   console.error(
@@ -30,7 +31,7 @@ const prompt = readFileSync(PROMPT_FILE, "utf8");
 
 if (existsSync(FEEDBACK_FILE)) rmSync(FEEDBACK_FILE);
 
-const client = new OpenAI();
+const client = new OpenAI({ timeout: 60_000, maxRetries: 4 });
 
 // Resume a prior background response if one was persisted from an earlier run
 // that died before the response reached a terminal state. Background responses
@@ -54,26 +55,66 @@ if (existsSync(RESPONSE_ID_FILE)) {
 }
 
 if (!response) {
-  console.error(`requesting gpt-5.4-pro (thinking=${THINKING})...`);
+  console.error(
+    `requesting gpt-5.5-pro (thinking=${THINKING}${FLEX ? ", flex" : ""})...`,
+  );
   response = await client.responses.create({
-    model: "gpt-5.4-pro",
+    model: "gpt-5.5-pro",
     reasoning: { effort: THINKING },
     input: prompt,
     background: true,
+    prompt_cache_key: WORKFLOW,
+    prompt_cache_retention: "24h",
+    ...(FLEX ? { service_tier: "flex" } : {}),
   });
   writeFileSync(RESPONSE_ID_FILE, response.id);
   console.error(`submitted background response ${response.id}`);
 }
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "incomplete"]);
+// Each failed retrieve has already been through the SDK's 4 retries, so 20
+// consecutive failures represents tens of minutes of sustained OpenAI
+// unavailability — wider than any single inference window.
+const MAX_POLL_FAILURES = 20;
+// Inference can take up to ~30 min at xhigh thinking; 1 h bounds worst-case
+// hangs where a response is accepted but never transitions to terminal.
+// Measured from response.created_at so resumes don't reset the clock.
+const DEADLINE_SECS = 60 * 60;
 let lastStatus: string | undefined;
+let pollFailures = 0;
 while (!TERMINAL.has(response.status ?? "")) {
+  const ageSecs = Math.floor(Date.now() / 1000) - response.created_at;
+  if (ageSecs > DEADLINE_SECS) {
+    console.error(
+      `${response.id} exceeded ${DEADLINE_SECS / 60}m deadline (age ${ageSecs}s, status ${response.status}); cancelling`,
+    );
+    try {
+      await client.responses.cancel(response.id);
+    } catch (err: any) {
+      const status = err?.status ?? err?.code ?? "error";
+      console.error(`cancel ${response.id} failed (${status})`);
+    }
+    rmSync(RESPONSE_ID_FILE, { force: true });
+    throw new Error(
+      `gpt-5.5-pro response ${response.id} did not complete within ${DEADLINE_SECS / 60} minutes (last status: ${response.status ?? "unknown"})`,
+    );
+  }
   if (response.status !== lastStatus) {
     console.error(`waiting for ${response.id} (${response.status})...`);
     lastStatus = response.status ?? undefined;
   }
   await new Promise((r) => setTimeout(r, 2000));
-  response = await client.responses.retrieve(response.id);
+  try {
+    response = await client.responses.retrieve(response.id);
+    pollFailures = 0;
+  } catch (err: any) {
+    pollFailures++;
+    const status = err?.status ?? err?.code ?? "error";
+    console.error(
+      `poll ${response.id} failed (${status}); retry ${pollFailures}/${MAX_POLL_FAILURES}`,
+    );
+    if (pollFailures >= MAX_POLL_FAILURES) throw err;
+  }
 }
 
 if (response.status !== "completed") {
@@ -84,7 +125,16 @@ if (response.status !== "completed") {
         ? `: ${response.error.message}`
         : "";
   throw new Error(
-    `gpt-5.4-pro response ${response.id} ended in status ${response.status}${detail}`,
+    `gpt-5.5-pro response ${response.id} ended in status ${response.status}${detail}`,
+  );
+}
+
+const cachedTokens = response.usage?.input_tokens_details?.cached_tokens ?? 0;
+const inputTokens = response.usage?.input_tokens ?? 0;
+if (inputTokens > 0) {
+  const pct = Math.round((100 * cachedTokens) / inputTokens);
+  console.error(
+    `tokens: input=${inputTokens} cached=${cachedTokens} (${pct}%) output=${response.usage?.output_tokens ?? 0}`,
   );
 }
 
@@ -98,13 +148,16 @@ const answer =
     .join("\n");
 
 if (!answer) {
-  throw new Error("gpt-5.4-pro returned no output text");
+  throw new Error("gpt-5.5-pro returned no output text");
 }
 
 writeFileSync(FEEDBACK_FILE, answer);
-rmSync(PROMPT_FILE);
-if (existsSync(RESPONSE_ID_FILE)) rmSync(RESPONSE_ID_FILE);
-console.error("=== Feedback received from GPT-5.4-Pro ===");
+// force:true — external cleanup (reinstall, git clean, sibling workflow) can
+// remove these scratch files mid-run; crashing here would skip the goto to
+// check-feedback-done and strand the loop.
+rmSync(PROMPT_FILE, { force: true });
+rmSync(RESPONSE_ID_FILE, { force: true });
+console.error("=== Feedback received from GPT-5.5-Pro ===");
 
 execFileSync(BIN, ["output", "--goto", "check-feedback-done"], {
   stdio: "inherit",

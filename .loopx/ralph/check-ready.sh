@@ -19,10 +19,11 @@ echo "=== Readiness verdict: ${VERDICT} ===" >&2
 
 if echo "$VERDICT" | grep -qw "READY"; then
   ITER=$(cat "$ITER_FILE" 2>/dev/null || echo "?")
+  JOB="$(basename "$ROOT") / ralph"
 
   curl -s -X POST "${TELEGRAM_API}/sendMessage" \
     -d chat_id="$TELEGRAM_CHAT_ID" \
-    --data-urlencode "text=Ralph loop: production ready after iteration ${ITER}. Halting." > /dev/null
+    --data-urlencode "text=[${JOB}] production ready after iteration ${ITER}. Halting." > /dev/null
 
   rm -f "$ITER_FILE"
   echo "=== Production ready — halting loop ===" >&2
