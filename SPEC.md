@@ -1124,6 +1124,24 @@ If the commit phase fails after committing only a subset of workflows, the post-
 - **Signals during `npm install`.** SIGINT / SIGTERM received while an `npm install` child is active propagates to the child's process group. loopx waits for the child to exit (the section 7.3 grace period and SIGKILL escalation rules apply by analogy) and then exits with the signal's code. Remaining committed workflows are not processed (no further `.gitignore` synthesis or `npm install` invocations). Partial `node_modules/` state produced before interruption is not cleaned up by loopx.
 - **Trust profile.** Because `npm install` may execute arbitrary code via `preinstall` / `install` / `postinstall` scripts declared in the workflow's dependency graph, `loopx install` inherits the same trust profile as a manual `npm install` in the same directory. Users installing from untrusted sources should pass `--no-install` and inspect the workflow before running `npm install` themselves.
 
+### 10.11 Install Source Symlinks
+
+Install source symlinks are handled explicitly during classification, validation, staging, and copy. This rule applies after a git source has been cloned or a tarball source has been extracted and any wrapper directory has been stripped.
+
+For install-time workflow and script discovery, loopx follows symlinks using the same entry-type policy as runtime discovery: a symlinked workflow directory can qualify as a workflow, and a symlinked script file can qualify as a script. Names are derived from the symlink entry's own name, not from the target's basename.
+
+During the staging / copy phase, loopx does **not** preserve symlink entries as symlinks in installed workflows. Any symlink that is part of a selected workflow is resolved and materialized into the destination as a regular copied file or directory:
+
+- A selected top-level workflow entry that is a symlink to a directory is installed as a real directory at `.loopx/<workflow-name>/`, containing a copy of the symlink target's workflow contents.
+- A selected script entry that is a symlink to a file is installed as a real file at the corresponding destination script path, containing a copy of the symlink target's file contents.
+- Symlinked non-script files or directories inside a selected workflow's copied content are likewise materialized as real files or directories.
+
+Symlink targets must resolve to existing paths within the install source root. loopx must reject the install with a preflight / validation error when a symlink that is part of a selected workflow is broken, forms a cycle, or resolves outside the source root. This prevents installed workflows from depending on the temporary clone / extraction directory or from copying arbitrary files outside the source.
+
+When `-w <name>` / `--workflow <name>` is used, only symlinks that are part of the selected workflow are validated and materialized. Symlinks in unselected workflow directories or source-root support directories are ignored, consistent with the selective validation rule in section 10.8.
+
+Installed workflow symlinks are therefore not preserved as symlinks, and no installed symlink points back into loopx's temporary acquisition or staging directories.
+
 ---
 
 ## 11. Help
