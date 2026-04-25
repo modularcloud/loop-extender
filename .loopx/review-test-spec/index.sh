@@ -33,9 +33,9 @@ else
 fi
 
 cat <<PROMPT > "$PROMPT_FILE"
-Review TEST-SPEC.md against SPEC.md and let me know whether TEST-SPEC.md covers the behavior described in SPEC.md correctly and completely, or what needs to be added, changed, or removed. Also work to resolve any problems in SPEC-PROBLEMS.md (if present) — call out which entries appear addressable in this cycle and which still require a SPEC change. In this cycle, TEST-SPEC.md is the only file that should be modified — SPEC.md is a read-only reference. Do not suggest changes to SPEC.md; if something looks wrong in it, flag it but do not act on it.
+Review TEST-SPEC.md against SPEC.md and let me know whether TEST-SPEC.md covers the behavior described in SPEC.md correctly and completely, or what needs to be added, changed, or removed. Also work to resolve any problems in SPEC-PROBLEMS.md (if present) — call out which entries appear addressable in this cycle and which still require a SPEC change. If SPEC-PROBLEMS.md exists, you may also propose specific changes to SPEC.md that would resolve the listed ambiguities — include the proposed SPEC.md edits in your feedback so they can be applied alongside the TEST-SPEC.md updates. SPEC.md is otherwise the authoritative reference for behavior; do not propose unrelated changes to it.
 
-SPEC.md (read-only reference):
+SPEC.md (authoritative reference; SPEC.md edits are permitted only to resolve SPEC-PROBLEMS.md entries):
 $(cat "$SPEC")
 
 ${SPEC_PROBLEMS_BLOCK}TEST-SPEC.md (target of updates):
