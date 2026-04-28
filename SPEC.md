@@ -906,6 +906,8 @@ The programmatic API has different behavior from the CLI:
 
 **Abort after final yield.** An `AbortSignal` that aborts after the final `Output` has been yielded (via `stop: true` or `maxIterations` reached) but before the generator settles via `{ done: true }` produces the abort error on the next generator interaction — `g.next()`, `.return()`, or `.throw()`. Normal completion is fixed only at settlement, not at the final yield. `LOOPX_TMPDIR` cleanup runs before the abort error is surfaced.
 
+The abort-after-final-yield rule above applies only when the abort is the first-observed terminal trigger after the final yield — observed before any post-final-yield consumer `.return()` / `.throw()` interaction. If loopx has already observed a post-final-yield `.return()` / `.throw()` first and begun settlement / cleanup, a later abort observed before settlement is a racing terminal trigger governed by the §7.2 first-observed-wins residual rule; it does not displace the already-observed consumer interaction outcome (which falls under §9.1's silent-clean-completion rule for consumer cancellation when no child is active). Cleanup idempotence and warning cardinality (sections 7.2 and 7.4) are unaffected by which observation order applies.
+
 ### 9.4 `output(value)` and `input()`
 
 These functions are documented in sections 6.4 and 6.5. They are designed for use **inside scripts**, not in application code that calls `run()` / `runPromise()`.
@@ -931,6 +933,8 @@ interface RunOptions {
 ```
 
 **`options` validity.** `options` must be omitted, `undefined`, or a non-null, non-array, non-function object. Non-conforming values, including throwing getters on the options object, are captured at call time and surfaced via the standard pre-iteration error path rather than escaping at the call site.
+
+**Outer `options` field access.** Recognized fields on the outer `options` object (`signal`, `env`, `cwd`, `envFile`, `maxIterations`) are read using ordinary ECMAScript `[[Get]]` semantics, equivalent to `options.signal`, `options.env`, `options.cwd`, `options.envFile`, `options.maxIterations`. Inherited (prototype-chain) recognized fields and inherited getters are therefore honored on the outer `options` object; field enumerability is irrelevant for the outer object's recognized fields. (This rule is separate from `options.env` entry enumeration, which remains own-enumerable string-keyed only per the `env` clause below.) Each recognized field is read at most once per call, consistent with §9.1's option-snapshot-timing rule.
 
 **`signal`.**
 
