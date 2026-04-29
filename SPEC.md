@@ -496,11 +496,19 @@ Name validation and same-base-name collision detection apply only after an entry
 
 This rule applies only to runtime discovery. Install-source symlink failures are governed by section 10.11.
 
+**Project-root `.loopx` entry failures during runtime discovery.** The project-root `.loopx` entry itself is the discovery root, not a candidate workflow. If the entry is absent; is a symlink whose resolution fails because the target is missing or the symlink chain is cyclic; is a symlink that resolves to a non-directory; or exists as a non-directory non-symlink entry (regular file, FIFO, socket, or other non-directory entry), runtime discovery treats the project as having no usable `.loopx/` directory.
+
+For `loopx run <target>`, this is surfaced as the same missing-`.loopx/` discovery failure described in sections 5.4 and 7.2, subject to the CLI pre-iteration signal-precedence rule in section 7.3. For `run()` and `runPromise()`, the same discovery failure surfaces through the standard pre-iteration error path, subject to the pre-first-`next()` consumer-cancellation carve-out and abort-precedence rules in sections 9.1 and 9.3. For `loopx run -h`, loopx follows the same behavior as the missing-`.loopx/` help case in section 11.2: run help is displayed, the discovered workflow list is omitted, and a warning is emitted. Diagnostic wording may describe the condition as missing, unusable, not a directory, or equivalent; exact wording is implementation-defined.
+
+This rule applies only to runtime discovery. Install-source symlinks and install-time source validation are governed by section 10.11.
+
 **Discovery metadata is cached at loop start for the duration of the loop.** This means:
 
 - Workflows and scripts added, removed, or renamed during loop execution are not detected until the next invocation.
 - **Edits to the contents of an already-discovered script file take effect on subsequent iterations**, because the child process reads the file from disk each time it is spawned.
 - **If a discovered script's underlying file is removed or renamed mid-loop**, execution uses the cached entry path and fails at spawn time. This is a child launch / spawn failure under section 7.2 (not a non-zero exit, since the child never starts running user code).
+
+If the project-root `.loopx` entry successfully resolves to a directory during runtime discovery, loopx caches the discovery results and cached absolute discovery-time script paths for the duration of the run. Later replacement, removal, or retargeting of the project-root `.loopx` entry does not cause re-discovery. Later spawns continue to use the cached script path strings; normal filesystem path resolution at spawn time determines whether those cached paths still launch a file. If a cached path no longer resolves to a launchable script, the outcome is a child launch / spawn failure under section 7.2. Workflows or scripts made reachable only by the later replacement are not discovered until a later invocation.
 
 Discovery runs at loop start for `loopx run <target>` and during `loopx run -h`. Discovery does **not** run for top-level help (`loopx -h` / `loopx --help` / bare `loopx`).
 
@@ -675,7 +683,7 @@ The first script invocation in a loop receives **no input**. Stdin is empty.
 - **Non-zero exit code from a script:** The loop **stops immediately**. loopx exits with code 1. The script's stderr has already been passed through to the terminal. Any stdout produced by the script before it failed is not parsed as structured output. `LOOPX_TMPDIR` cleanup runs before exit per section 7.4.
 - **Missing workflow / missing script / missing default entry point:** If the starting target resolves to a workflow that does not exist, a script that does not exist in that workflow, or a bare workflow invocation where `index` is missing, loopx exits with code 1 and prints an error to stderr. These checks occur during target resolution (step 3 in section 7.1) before any iterations run.
 - **Invalid `goto` target:** If `goto` contains an invalid target string (section 4.1), references a workflow that does not exist in the cached discovery results, or references a script that does not exist within the target workflow, loopx prints an error message to stderr and exits with code 1. `LOOPX_TMPDIR` cleanup runs before exit.
-- **Missing `.loopx/` directory:** When executing via `loopx run <target>`, if `.loopx/` does not exist, loopx exits with an error instructing the user to create it.
+- **Missing or unusable `.loopx/` directory:** When executing via `loopx run <target>`, if `.loopx/` does not exist or is not usable as a directory per section 5.1, loopx exits with an error instructing the user to create it.
 - **`LOOPX_TMPDIR` creation failure:** If any step of the tmpdir creation sequence (per section 7.4) fails, loopx does not spawn any child; the CLI exits with code 1, `run()` throws on first iteration, and `runPromise()` rejects. Best-effort cleanup runs on any partial directory per section 7.4 without masking the original creation error.
 - **Child launch / spawn failure after tmpdir creation:** If a child cannot be launched after `LOOPX_TMPDIR` has been created — including a discovered script removed or renamed mid-loop per section 5.1, runtime rejection of a child environment entry from any env tier (most reliably an entry whose name or value contains an embedded NUL byte; the runtime does not distinguish tiers), `exec` failure, or any other pre-first-line-of-user-code spawn-path error — loopx exits with code 1 (CLI), throws (`run()`), or rejects (`runPromise()`). `LOOPX_TMPDIR` cleanup runs before exit.
 
@@ -1189,7 +1197,7 @@ Top-level help does **not** inspect `.loopx/` or perform discovery.
 
 Run help performs **non-fatal discovery and validation**:
 
-- If `.loopx/` does not exist, run help is still displayed with a warning that the directory was not found. The discovered-workflows section is omitted.
+- If `.loopx/` does not exist or is not usable as a directory per section 5.1, run help is still displayed with a warning that the directory was not found or not usable. The discovered-workflows section is omitted.
 - If `.loopx/` exists but contains validation issues (name collisions, name restriction violations), run help is displayed with warnings for the problematic entries.
 
 `loopx run <target> -h` is equivalent to `loopx run -h` — the target argument is ignored due to the `-h` short-circuit (section 4.2).
