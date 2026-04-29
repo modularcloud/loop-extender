@@ -490,6 +490,12 @@ Legacy layouts are not recognized: loose script files placed directly in `.loopx
 
 **Symlink policy:** Symlinks within `.loopx/` are followed during discovery to determine entry types — a symlinked `.loopx` directory, a symlinked `.loopx/<workflow>` directory, and a symlinked entry script file are all treated identically to their non-symlinked equivalents for purposes of "is this a workflow / script?". The discovered path spelling is preserved (no `realpath` / canonicalization is applied), and that preserved spelling is what loopx caches for spawn-time invocation, `LOOPX_WORKFLOW_DIR` injection (section 6.1), and Bash `$0` derivation (section 6.2). Symlink resolution does not affect workflow or script naming — names are derived from the symlink's own name, not its target.
 
+**Failed symlink resolution during runtime discovery.** When loopx follows a symlinked candidate workflow entry under `.loopx/` or a symlinked top-level script entry inside a candidate workflow to determine its entry type, and that resolution fails because the target is missing or because the symlink chain is cyclic, loopx treats the candidate as absent for runtime discovery purposes. The entry is not a workflow / script, is skipped silently in both `loopx run` and `loopx run -h`, and no warning is emitted.
+
+Name validation and same-base-name collision detection apply only after an entry successfully resolves to a discovered workflow or script. Therefore an invalid alias name on a broken or cyclic symlink that is skipped under this rule is not itself reported as a name-restriction violation. If a user later targets a skipped workflow or script name, the normal missing workflow or missing script error surfaces during target resolution.
+
+This rule applies only to runtime discovery. Install-source symlink failures are governed by section 10.11.
+
 **Discovery metadata is cached at loop start for the duration of the loop.** This means:
 
 - Workflows and scripts added, removed, or renamed during loop execution are not detected until the next invocation.
