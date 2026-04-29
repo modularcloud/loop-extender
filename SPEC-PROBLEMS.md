@@ -1,0 +1,29 @@
+# SPEC Problems
+
+This file tracks ambiguities, gaps, or under-specified clauses in `SPEC.md` that were identified during TEST-SPEC review and could not be resolved within the originating ADR cycle. Each entry is scoped to the ADR that surfaced it; resolution happens in a follow-up cycle (either a SPEC clarification or a deliberate decision that the existing SPEC text is sufficient).
+
+## P-0004-08: Runtime discovery behavior for broken / cyclic symlinks under `.loopx/` (ADR-0004)
+
+**SPEC reference:** SPEC §5.1 ("Discovery" / "Symlink policy") — `Symlinks within '.loopx/' are followed during discovery to determine entry types — a symlinked '.loopx' directory, a symlinked '.loopx/<workflow>' directory, and a symlinked entry script file are all treated identically to their non-symlinked equivalents for purposes of "is this a workflow / script?". The discovered path spelling is preserved (no realpath / canonicalization is applied), and that preserved spelling is what loopx caches for spawn-time invocation, LOOPX_WORKFLOW_DIR injection (section 6.1), and Bash $0 derivation (section 6.2).`
+
+**Problem.** SPEC §5.1's symlink policy specifies positively that runtime discovery follows symlinks to determine entry types and preserves the discovered (symlink-spelling) path for spawn-time invocation, `LOOPX_WORKFLOW_DIR` injection, and Bash `$0` derivation. But it does **not** specify what happens when the symlink resolution itself **fails** at runtime discovery time. Several runtime configurations are unspecified:
+
+- `.loopx/<workflow>` is a **broken** symlink (target does not exist).
+- `.loopx/<workflow>` is **cyclic** (chain of symlinks that never terminates at a real entry).
+- `.loopx/<workflow>/<script>.sh` is a **broken** or **cyclic** symlink at the script-entry layer.
+- The interaction with `loopx run <target>` vs `loopx run -h`: do these failure modes surface as fatal errors in `loopx run`, non-fatal warnings in `loopx run -h` (per the existing SPEC §5.4 fatal-vs-warning split for validation failures), or are they silently ignored as "not a workflow" / "not a script" per SPEC §5.1's existing entry-type-policy rule (which already covers a symlink-to-non-directory or symlink-to-non-file as silently ignored)?
+- Whether invalid alias names are validated **before** or **after** failed type resolution: e.g., a `.loopx/-bad-alias/` directory entry that is itself a broken symlink could be validated either as a name-restriction error (per SPEC §5.3, before the symlink is followed) or skipped as a non-workflow per SPEC §5.1's entry-type-policy rule (after the symlink is followed and the followed-through type can't be determined). The existing T-DISC-40f (valid-name symlink to non-workflow target — silently ignored) and T-DISC-40c (invalid-name symlink to **valid** workflow target — fatal name-restriction error) bracket the two endpoints, but the "invalid-name symlink whose follow fails" middle ground is unspecified.
+
+This is ADR-0004-scoped because ADR-0004 explicitly changed / clarified runtime symlink discovery and discovery-time path spelling for script execution and `LOOPX_WORKFLOW_DIR` (per the §5.1 / §6.1 / §6.2 / §6.3 amendments listed in the ADR's "Affected SPEC Sections" section), so the runtime symlink-resolution failure surface is in scope for resolution in the ADR-0004 cycle even though the existing SPEC text inherits the gap from a pre-ADR-0004 state.
+
+**Question for SPEC.** For each of the runtime symlink-resolution-failure variants (broken / cyclic at the workflow-directory entry layer, broken / cyclic at the script-entry layer, in `loopx run` vs `loopx run -h`, with valid vs. invalid alias names), what is the intended behavior?
+
+- Plausible candidate (a) — **silently ignore** under SPEC §5.1's entry-type-policy rule: a broken / cyclic symlink whose followed-through type cannot be determined is treated as "not a workflow" / "not a script" and skipped silently, with no fatal error in `loopx run` and no warning in `loopx run -h`. This matches the existing T-DISC-40a / T-DISC-40b silent-ignore behavior for symlinks to non-workflow / non-script targets and would preserve the §5.1 "no warning for non-workflow source-root subdirectories" symmetry.
+- Plausible candidate (b) — **fatal in `loopx run`, warning in `loopx run -h`** under SPEC §5.4's fatal-vs-warning split for "anything that prevents discovery from completing": broken / cyclic symlinks are surfaced as discovery failures because they prevent loopx from determining entry types definitively. This matches the existing fatal-vs-warning split for name-restriction violations and same-base-name collisions and may better serve workflow authors by surfacing actionable misconfigurations.
+- Plausible candidate (c) — **per-failure-class differentiation**: e.g., broken symlinks silently ignored (the target is simply absent, like a deleted file) but cycles surfaced as fatal (because cycle detection requires bounded traversal and surfacing the cycle is a clearer signal of misconfiguration than letting it appear identical to a non-existent target).
+
+The relative ordering of name-restriction validation vs. failed-type-resolution for an invalid-named broken symlink is a separate but related question that the SPEC clarification needs to address.
+
+**Resolution path.** A SPEC clarification on this question would let TEST-SPEC.md add coverage that pins the chosen behavior: T-DISC-style tests for each of the failure variants, with the assertion shape (silently ignored / fatal / per-class differentiated) determined by the SPEC choice. Per the reviewer's recommendation, no tests or SPEC edits are added in the originating cycle until the intended behavior is decided; this entry tracks the gap so a follow-up cycle can resolve it.
+
+**Surfaced by.** TEST-SPEC review of ADR-0004 (post-acceptance feedback cycle).
