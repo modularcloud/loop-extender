@@ -937,6 +937,8 @@ interface RunOptions {
 
 **Outer `options` field access.** Recognized fields on the outer `options` object (`signal`, `env`, `cwd`, `envFile`, `maxIterations`) are read using ordinary ECMAScript `[[Get]]` semantics, equivalent to `options.signal`, `options.env`, `options.cwd`, `options.envFile`, `options.maxIterations`. Inherited (prototype-chain) recognized fields and inherited getters are therefore honored on the outer `options` object; field enumerability is irrelevant for the outer object's recognized fields. (This rule is separate from `options.env` entry enumeration, which remains own-enumerable string-keyed only per the `env` clause below.) Each recognized field is read at most once per call, consistent with §9.1's option-snapshot-timing rule.
 
+**Unrecognized outer `options` fields.** Loopx reads only the recognized outer `RunOptions` fields listed above (`signal`, `env`, `cwd`, `envFile`, `maxIterations`). Unrecognized own or inherited properties on the outer `options` object are ignored and are not read, enumerated, validated, or otherwise inspected by loopx's option-snapshot pass. Getters or proxy traps reachable only through unrecognized outer property names are not invoked; in particular, loopx does not invoke outer-object `ownKeys` / descriptor enumeration traps merely to discover extra option fields. This rule applies only to the outer `options` object; the value of the recognized `env` field, when supplied, is still enumerated according to the `env` rules below.
+
 **`signal`.**
 
 - When present and not `undefined`, `signal` must be an `AbortSignal`-compatible object. Compatibility requires:
