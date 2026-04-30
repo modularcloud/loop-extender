@@ -747,7 +747,7 @@ Cleanup failure during creation-failure handling emits at most one warning but d
 
 For `run()`, cleanup on normal completion is guaranteed only once the generator is driven to settlement (`{ done: true }`, `.return()`, `.throw()`, or a `for await` loop that runs to completion). The final yielded `Output` is not itself settlement; a caller that consumes the final output and abandons the generator may leak the tmpdir.
 
-Cleanup does **not** run when loopx itself is killed via SIGKILL or the host crashes; leaked tmpdirs are expected to be reaped by OS temp-cleaning policy. **loopx does not reap stale tmpdirs at startup.**
+Cleanup does **not** run when loopx itself is killed via SIGKILL or the host crashes; leaked tmpdirs are expected to be reaped by OS temp-cleaning policy. **loopx does not reap stale tmpdirs during CLI startup, CLI `loopx run` setup, or any per-run setup performed for `run()` / `runPromise()`.** A run setup creates only its own `mkdtemp` directory under the selected parent and does not scan for, validate, or remove pre-existing `loopx-*` entries under that parent.
 
 **Identity-fingerprint cleanup safety.** Cleanup is path-based and best-effort — not a sandbox against actively racing same-user processes. At cleanup time, loopx `lstat`s the `LOOPX_TMPDIR` path and dispatches on the outcome:
 
