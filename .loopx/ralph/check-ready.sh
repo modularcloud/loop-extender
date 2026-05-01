@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$LOOPX_PROJECT_ROOT"
-ITER_FILE="$ROOT/.loopx/.iteration.tmp"
+ITER_FILE="$ROOT/.loopx/ralph/.iteration.tmp"
 
 : "${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN env var is required}"
 : "${TELEGRAM_CHAT_ID:?TELEGRAM_CHAT_ID env var is required}"
@@ -20,6 +20,10 @@ echo "=== Readiness verdict: ${VERDICT} ===" >&2
 if echo "$VERDICT" | grep -qw "READY"; then
   ITER=$(cat "$ITER_FILE" 2>/dev/null || echo "?")
   JOB="$(basename "$ROOT") / ralph"
+  [[ -n "${STAGE:-}" ]] && JOB="$JOB / $STAGE"
+  if [[ -n "${ADR:-}" && "$ADR" =~ ^[0-9]+$ ]]; then
+    JOB="$JOB / ADR-$(printf '%04d' "$((10#$ADR))")"
+  fi
 
   curl -s -X POST "${TELEGRAM_API}/sendMessage" \
     -d chat_id="$TELEGRAM_CHAT_ID" \
