@@ -1,6 +1,7 @@
 import { join, resolve } from "node:path";
 import { readFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { tmpdir as osTmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import type { Output, RunOptions } from "./types.js";
 import { discoverScripts } from "./discovery.js";
@@ -11,6 +12,16 @@ import { makeAbortError } from "./abort.js";
 import { getLoopxBin, ensureLoopxPackageJson } from "./bin-path.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Internal options carried alongside the public `RunOptions` to plumb
+ * snapshot-timing carve-outs through `run()` → `runInternal()` → `runLoop()`.
+ * Not part of the public API.
+ */
+interface InternalRunOptions {
+  /** Tmpdir parent captured eagerly at the `runPromise()` call site. */
+  tmpdirParent?: string;
+}
 
 function getRunningVersion(): string {
   try {
@@ -38,6 +49,14 @@ export function run(
   target: string,
   options?: RunOptions
 ): AsyncGenerator<Output> {
+  return runWithInternal(target, options, undefined);
+}
+
+function runWithInternal(
+  target: string,
+  options: RunOptions | undefined,
+  internal: InternalRunOptions | undefined
+): AsyncGenerator<Output> {
   const cwd = options?.cwd ?? process.cwd();
   const maxIterations = options?.maxIterations;
   const envFile = options?.envFile;
@@ -55,7 +74,8 @@ export function run(
     maxIterations,
     envFile,
     effectiveSignal,
-    loopxBin
+    loopxBin,
+    internal?.tmpdirParent
   );
 
   let returnCalled = false;
@@ -103,7 +123,8 @@ async function* runInternal(
   maxIterations: number | undefined,
   envFile: string | undefined,
   signal: AbortSignal,
-  loopxBin: string
+  loopxBin: string,
+  tmpdirParent: string | undefined
 ): AsyncGenerator<Output> {
   if (maxIterations !== undefined) {
     if (
@@ -209,6 +230,7 @@ async function* runInternal(
     loopxBin,
     runningVersion: getRunningVersion(),
     signal,
+    tmpdirParent,
   });
 }
 
@@ -225,7 +247,14 @@ export async function runPromise(
     throw makeAbortError(signal);
   }
 
-  const gen = run(target, options);
+  // SPEC §9.2: tmpdir-parent snapshot is EAGER under runPromise — captured
+  // synchronously at the call site. Mutations to process.env.TMPDIR after
+  // runPromise() returns must not affect the tmpdir parent for this run.
+  const eagerTmpdirParent = osTmpdir();
+
+  const gen = runWithInternal(target, options, {
+    tmpdirParent: eagerTmpdirParent,
+  });
   const outputs: Output[] = [];
 
   if (signal) {
