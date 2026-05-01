@@ -6,6 +6,8 @@ import {
   statSync,
 } from "node:fs";
 import {
+  chmod,
+  mkdir,
   mkdtemp,
   rm,
   writeFile,
@@ -34,6 +36,100 @@ import { forEachRuntime } from "../helpers/runtime.js";
 // ============================================================================
 
 const extraCleanups: Array<() => Promise<void>> = [];
+
+const IS_ROOT = process.getuid?.() === 0;
+
+/**
+ * Programmatic surfaces over which T-TMP-12 sub-cases are parameterized.
+ * SPEC §9.1 / §9.2 give different snapshot timing for the two surfaces
+ * (lazy first-next() under run(), eager call-site under runPromise()),
+ * but the no-tmpdir-creation contract is identical, so each sub-case is
+ * exercised on both surfaces with the same fixture and snapshot harness.
+ */
+const SURFACES = ["runPromise", "run"] as const;
+type Surface = (typeof SURFACES)[number];
+
+/**
+ * Builds a driver script that snapshots `parent` for `loopx-*` entries
+ * before and after invoking `callExpr` on the given programmatic surface,
+ * captures any rejection / first-next() throw, and prints a JSON envelope
+ * to stdout.
+ */
+function noTmpdirDriver(args: {
+  surface: Surface;
+  parent: string;
+  preamble?: string;
+  callExpr: string;
+}): string {
+  const callBlock =
+    args.surface === "runPromise"
+      ? `try { await ${args.callExpr}; } catch (__e) { caught = true; errMsg = __e instanceof Error ? __e.message : String(__e); errName = __e instanceof Error ? (__e.name || "") : ""; }`
+      : `try { const __gen = ${args.callExpr}; await __gen.next(); } catch (__e) { caught = true; errMsg = __e instanceof Error ? __e.message : String(__e); errName = __e instanceof Error ? (__e.name || "") : ""; }`;
+  return `
+import { run, runPromise } from "loopx";
+import { readdirSync } from "node:fs";
+const parent = ${JSON.stringify(args.parent)};
+function snap() {
+  try {
+    return readdirSync(parent)
+      .filter((e) => e.startsWith("loopx-"))
+      .filter(
+        (e) =>
+          !e.startsWith("loopx-nodepath-shim-") &&
+          !e.startsWith("loopx-bun-jsx-") &&
+          !e.startsWith("loopx-install-"),
+      );
+  } catch { return []; }
+}
+${args.preamble ?? ""}
+const before = snap();
+let caught = false;
+let errMsg = "";
+let errName = "";
+${callBlock}
+const after = snap();
+console.log(JSON.stringify({ caught, errMsg, errName, before, after }));
+`;
+}
+
+/**
+ * Runs a driver that exercises a pre-iteration failure mode and asserts
+ * (a) the call rejected / threw, (b) the optional error-message regex
+ * matched, and (c) no new `loopx-*` entry appeared under the test-isolated
+ * tmpdir parent during the call.
+ */
+async function assertNoTmpdirCreated(args: {
+  runtime: "node" | "bun";
+  surface: Surface;
+  parent: string;
+  preamble?: string;
+  callExpr: string;
+  expectErrMatch?: RegExp;
+  extraEnv?: Record<string, string>;
+}) {
+  const driverCode = noTmpdirDriver({
+    surface: args.surface,
+    parent: args.parent,
+    preamble: args.preamble,
+    callExpr: args.callExpr,
+  });
+  const result = await runAPIDriver(args.runtime, driverCode, {
+    env: { TMPDIR: args.parent, ...(args.extraEnv ?? {}) },
+  });
+  expect(result.exitCode).toBe(0);
+  const data = JSON.parse(result.stdout) as {
+    caught: boolean;
+    errMsg: string;
+    errName: string;
+    before: string[];
+    after: string[];
+  };
+  expect(data.caught).toBe(true);
+  if (args.expectErrMatch) {
+    expect(data.errMsg).toMatch(args.expectErrMatch);
+  }
+  expect(data.after.slice().sort()).toEqual(data.before.slice().sort());
+}
 
 /**
  * Creates a per-test isolated TMPDIR parent directory and pairs it with a
@@ -825,6 +921,607 @@ console.log(JSON.stringify({ before, betweenSync, after }));
       // either, so the post-.return() set is also unchanged.
       expect(data.after.sort()).toEqual(data.before.sort());
     });
+
+    // ========================================================================
+    // Pre-iteration Failures Must Not Create LOOPX_TMPDIR (T-TMP-12, 26 sub-cases)
+    //
+    // Each sub-case is parameterized over both `runPromise` and `run` surfaces.
+    // SPEC §7.1 step 6 (tmpdir creation) runs after steps 1–5 (discovery, env
+    // loading, target resolution, version check, option snapshot in 9.1/9.2),
+    // so any pre-iteration failure must surface before the tmpdir is ever
+    // created. The fixture is otherwise valid (a complete `.loopx/ralph/index.sh`)
+    // except where the sub-case itself is the discovery / target / env-file
+    // failure under test.
+    // ========================================================================
+
+    for (const surface of SURFACES) {
+      // --- env-loading branch ---
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-env-file: env-file load failure (missing file).
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-env-file (${surface}): missing env-file does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}("ralph", { envFile: "nonexistent.env", maxIterations: 1, cwd: ${JSON.stringify(project.dir)} })`,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-env-file-unreadable: env-file load failure (mode 000).
+      // Conditional on non-root: root reads mode-000 files unconditionally.
+      // ----------------------------------------------------------------------
+      it.skipIf(IS_ROOT)(
+        `T-TMP-12-env-file-unreadable (${surface}): unreadable env-file does not create tmpdir`,
+        async () => {
+          const { project, tmpdirParent } = await setupTmpdirTest();
+          await createBashWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            `printf '{"stop":true}'`,
+          );
+          const unreadable = join(project.dir, "unreadable.env");
+          await writeFile(unreadable, "FOO=bar\n", "utf-8");
+          await chmod(unreadable, 0o000);
+          try {
+            await assertNoTmpdirCreated({
+              runtime,
+              surface,
+              parent: tmpdirParent,
+              callExpr: `${surface}("ralph", { envFile: ${JSON.stringify(unreadable)}, maxIterations: 1, cwd: ${JSON.stringify(project.dir)} })`,
+            });
+          } finally {
+            await chmod(unreadable, 0o644).catch(() => {});
+          }
+        },
+      );
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-global-env-unreadable: unreadable global env file under
+      // an isolated XDG_CONFIG_HOME passed via the inherited environment.
+      // ----------------------------------------------------------------------
+      it.skipIf(IS_ROOT)(
+        `T-TMP-12-global-env-unreadable (${surface}): unreadable global env file does not create tmpdir`,
+        async () => {
+          const { project, tmpdirParent } = await setupTmpdirTest();
+          await createBashWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            `printf '{"stop":true}'`,
+          );
+          const xdg = join(project.dir, "xdg-config");
+          await mkdir(join(xdg, "loopx"), { recursive: true });
+          const globalEnv = join(xdg, "loopx", "env");
+          await writeFile(globalEnv, "FOO=bar\n", "utf-8");
+          await chmod(globalEnv, 0o000);
+          try {
+            await assertNoTmpdirCreated({
+              runtime,
+              surface,
+              parent: tmpdirParent,
+              callExpr: `${surface}("ralph", { maxIterations: 1, cwd: ${JSON.stringify(project.dir)} })`,
+              extraEnv: { XDG_CONFIG_HOME: xdg },
+            });
+          } finally {
+            await chmod(globalEnv, 0o644).catch(() => {});
+          }
+        },
+      );
+
+      // --- target-resolution branch ---
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-missing-workflow: target resolves to a workflow that does
+      // not exist under .loopx/.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-missing-workflow (${surface}): missing workflow does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}("nonexistent-workflow", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })`,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-missing-script: workflow exists but the qualified script
+      // (`ralph:check`) does not — a distinct target-resolution sub-path.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-missing-script (${surface}): missing script in existing workflow does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}("ralph:check", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })`,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-missing-default-index: workflow exists but has no `index.*`
+      // entry — bare target `"ralph"` resolves to `ralph:index` and fails.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-missing-default-index (${surface}): workflow without index.* does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "check",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })`,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-target-validation: leading-colon target violates SPEC 4.1
+      // delimiter syntax.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-target-validation (${surface}): leading-colon target does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}(":script", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })`,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-target-name-invalid: name-pattern violation (`.` is not
+      // in the SPEC 4.1 `[a-zA-Z0-9_][a-zA-Z0-9_-]*` workflow-name pattern).
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-target-name-invalid (${surface}): name-pattern violation does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}("bad.name", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })`,
+        });
+      });
+
+      // --- option-snapshot value-validation branch ---
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-invalid-maxIterations: negative `maxIterations` invalid
+      // per SPEC 9.5.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-invalid-maxIterations (${surface}): negative maxIterations does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}("ralph", { maxIterations: -1, cwd: ${JSON.stringify(project.dir)} })`,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-invalid-options-shape: `options = null` — SPEC 9.5 requires
+      // omitted, undefined, or a non-null non-array non-function object.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-invalid-options-shape (${surface}): null options does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}("ralph", null)`,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-invalid-env-shape: `env = null` violates SPEC 9.5.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-invalid-env-shape (${surface}): null env does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}("ralph", { env: null, cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })`,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-invalid-env-value: per-entry value validation — non-string.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-invalid-env-value (${surface}): non-string env value does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}("ralph", { env: { KEY: 42 }, cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })`,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-invalid-signal: non-AbortSignal-compatible signal.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-invalid-signal (${surface}): non-AbortSignal signal does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}("ralph", { signal: "not-an-AbortSignal", cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })`,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-invalid-target: non-string target argument (undefined).
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-invalid-target (${surface}): non-string target does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}(undefined, { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })`,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-invalid-cwd: non-string `cwd` value.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-invalid-cwd (${surface}): non-string cwd does not create tmpdir`, async () => {
+        const { project: _project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          _project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}("ralph", { cwd: 42, maxIterations: 1 })`,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-invalid-envFile: non-string `envFile` value.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-invalid-envFile (${surface}): non-string envFile does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}("ralph", { envFile: 42, cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })`,
+        });
+      });
+
+      // --- option-snapshot throwing-getter / throwing-trap branch ---
+      // Construction: getters / Proxy traps must be defined on the SAME
+      // object passed to run() / runPromise() (not invoked at the test
+      // call site by an object spread) — see TEST-SPEC §1.3.
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-throwing-options-getter: throwing getter on options.env
+      // (recognized field on the outer options object).
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-throwing-options-getter (${surface}): throwing options.env getter does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          preamble: `const opts = {};
+Object.defineProperty(opts, "env", { enumerable: true, configurable: true, get() { throw new Error("throwing-options-env-getter-boom"); } });
+opts.cwd = ${JSON.stringify(project.dir)};
+opts.maxIterations = 1;`,
+          callExpr: `${surface}("ralph", opts)`,
+          expectErrMatch: /throwing-options-env-getter-boom/,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-throwing-signal-getter.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-throwing-signal-getter (${surface}): throwing options.signal getter does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          preamble: `const opts = {};
+Object.defineProperty(opts, "signal", { enumerable: true, configurable: true, get() { throw new Error("throwing-signal-getter-boom"); } });
+opts.cwd = ${JSON.stringify(project.dir)};
+opts.maxIterations = 1;`,
+          callExpr: `${surface}("ralph", opts)`,
+          expectErrMatch: /throwing-signal-getter-boom/,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-throwing-cwd-getter.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-throwing-cwd-getter (${surface}): throwing options.cwd getter does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          preamble: `const opts = {};
+Object.defineProperty(opts, "cwd", { enumerable: true, configurable: true, get() { throw new Error("throwing-cwd-getter-boom"); } });
+opts.maxIterations = 1;`,
+          callExpr: `${surface}("ralph", opts)`,
+          expectErrMatch: /throwing-cwd-getter-boom/,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-throwing-envFile-getter.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-throwing-envFile-getter (${surface}): throwing options.envFile getter does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          preamble: `const opts = {};
+Object.defineProperty(opts, "envFile", { enumerable: true, configurable: true, get() { throw new Error("throwing-envFile-getter-boom"); } });
+opts.cwd = ${JSON.stringify(project.dir)};
+opts.maxIterations = 1;`,
+          callExpr: `${surface}("ralph", opts)`,
+          expectErrMatch: /throwing-envFile-getter-boom/,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-throwing-maxIterations-getter.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-throwing-maxIterations-getter (${surface}): throwing options.maxIterations getter does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          preamble: `const opts = {};
+Object.defineProperty(opts, "maxIterations", { enumerable: true, configurable: true, get() { throw new Error("throwing-maxIterations-getter-boom"); } });
+opts.cwd = ${JSON.stringify(project.dir)};`,
+          callExpr: `${surface}("ralph", opts)`,
+          expectErrMatch: /throwing-maxIterations-getter-boom/,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-throwing-env-entry-getter: throwing enumerable getter on
+      // an entry inside `options.env`.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-throwing-env-entry-getter (${surface}): throwing env entry getter does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          preamble: `const env = { A: "a" };
+Object.defineProperty(env, "B", { enumerable: true, configurable: true, get() { throw new Error("throwing-env-entry-getter-boom"); } });`,
+          callExpr: `${surface}("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, env })`,
+          expectErrMatch: /throwing-env-entry-getter-boom/,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-throwing-env-proxy-ownKeys: Proxy `ownKeys` trap throws.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-throwing-env-proxy-ownKeys (${surface}): throwing env Proxy ownKeys does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          preamble: `const env = new Proxy({ A: "a" }, { ownKeys() { throw new Error("throwing-env-proxy-ownKeys-boom"); } });`,
+          callExpr: `${surface}("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, env })`,
+          expectErrMatch: /throwing-env-proxy-ownKeys-boom/,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-throwing-env-proxy-get: Proxy `get` trap throws on an
+      // included string key.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-throwing-env-proxy-get (${surface}): throwing env Proxy get does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          preamble: `const env = new Proxy({ A: "a", B: "b" }, {
+  ownKeys() { return ["A", "B"]; },
+  getOwnPropertyDescriptor(_t, _k) { return { enumerable: true, configurable: true, value: undefined, writable: true }; },
+  get(_t, _k) { throw new Error("throwing-env-proxy-get-boom"); }
+});`,
+          callExpr: `${surface}("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, env })`,
+          expectErrMatch: /throwing-env-proxy-get-boom/,
+        });
+      });
+
+      // --- discovery branch (programmatic surface) ---
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-programmatic-discovery-missing-loopx: project root with
+      // no `.loopx/` directory at all.
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-programmatic-discovery-missing-loopx (${surface}): missing .loopx/ does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest({ withLoopxDir: false });
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })`,
+        });
+      });
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12-programmatic-discovery-validation: discovery-time global
+      // validation failure (sibling workflow with a name-collision in two
+      // extensions).
+      // ----------------------------------------------------------------------
+      it(`T-TMP-12-programmatic-discovery-validation (${surface}): discovery validation failure does not create tmpdir`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        // Sibling workflow with a name collision: broken/check.sh + broken/check.ts.
+        await createBashWorkflowScript(
+          project,
+          "broken",
+          "check",
+          `printf '{"stop":true}'`,
+        );
+        await createWorkflowScript(
+          project,
+          "broken",
+          "check",
+          ".ts",
+          `console.log('{"stop":true}');`,
+        );
+        await assertNoTmpdirCreated({
+          runtime,
+          surface,
+          parent: tmpdirParent,
+          callExpr: `${surface}("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })`,
+        });
+      });
+    }
 
     // ========================================================================
     // Cleanup on Normal Completion (T-TMP-13..14a)
