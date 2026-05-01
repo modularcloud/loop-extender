@@ -30,6 +30,10 @@ if echo "$VERDICT" | grep -qw "READY"; then
     --data-urlencode "text=[${JOB}] production ready after iteration ${ITER}. Halting." > /dev/null
 
   rm -f "$ITER_FILE"
+  echo "=== Response classified as READY ===" >&2
+  echo "--- begin classified output ---" >&2
+  printf '%s\n' "$RALPH_OUTPUT" >&2
+  echo "--- end classified output ---" >&2
   echo "=== Production ready — halting loop ===" >&2
   $LOOPX_BIN output --result "Production ready after iteration ${ITER}." --stop
 else
