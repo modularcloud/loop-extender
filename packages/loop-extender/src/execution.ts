@@ -148,8 +148,9 @@ export function executeScript(
     signal,
   } = options;
 
-  // SPEC §6.1: scripts always run with the workflow directory as cwd.
-  const cwd = workflowDir;
+  // SPEC §6.1 (ADR-0004): scripts always run with the project root as cwd.
+  // The workflow directory is exposed via LOOPX_WORKFLOW_DIR.
+  const cwd = projectRoot;
 
   const currentPath = env.PATH ?? process.env.PATH ?? "";
   const currentNodePath = env.NODE_PATH ?? "";
@@ -159,6 +160,7 @@ export function executeScript(
     LOOPX_BIN: loopxBin,
     LOOPX_PROJECT_ROOT: projectRoot,
     LOOPX_WORKFLOW: workflowName,
+    LOOPX_WORKFLOW_DIR: workflowDir,
     PATH: (() => {
       const pathEntries = currentPath.split(":");
       const prepend: string[] = [];
