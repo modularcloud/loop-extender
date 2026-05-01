@@ -382,6 +382,340 @@ function listLoopxEntries(parent: string): string[] {
   }
 }
 
+/**
+ * The five SPEC §3.2 normatively-warning `package.json` failure-mode branches
+ * over which T-TMP-12f / T-TMP-12f2 / T-TMP-12f3 / T-TMP-12f4 / T-TMP-12f5
+ * (CLI surface) and T-TMP-12g / T-TMP-12h (programmatic surfaces) are
+ * parameterized:
+ *
+ *   - "unsatisfied-range": valid JSON, valid semver range, but the running
+ *     loopx version does not satisfy it (e.g., `>=999.0.0`).
+ *   - "invalid-json":      `package.json` content is not parseable JSON.
+ *   - "invalid-semver":    valid JSON, but the `loopx` dependency value is
+ *                          not a valid semver range string.
+ *   - "unreadable":        valid `package.json` content `chmod 000`'d, so
+ *                          the version-check `readFile` returns EACCES.
+ *                          (Conditional on non-root: root reads mode-000
+ *                          files unconditionally, defeating the setup.)
+ *   - "non-regular":       `package.json/` is a directory (the simplest
+ *                          non-regular sub-case reachable through ordinary
+ *                          fixtures), containing a placeholder file. SPEC
+ *                          §3.2 step-5 `lstat` dispatch observes the
+ *                          non-regular entry kind and emits the new
+ *                          P-0004-03 warning branch.
+ *
+ * SPEC §3.2 does not require category-distinct warning text per failure
+ * class; predicates per `pkgJsonVariantWarningRegex` are intentionally
+ * lenient and consistent with the predicates in `e2e/version-check.test.ts`.
+ */
+const PKG_JSON_VARIANTS = [
+  "unsatisfied-range",
+  "invalid-json",
+  "invalid-semver",
+  "unreadable",
+  "non-regular",
+] as const;
+type PkgJsonVariant = (typeof PKG_JSON_VARIANTS)[number];
+
+/**
+ * Stable test-ID label per (surface × variant) combination. The CLI surface
+ * splits the variants across five sub-IDs (T-TMP-12f / 12f2 / 12f3 / 12f4 /
+ * 12f5); the programmatic surfaces use one ID per surface (T-TMP-12g for
+ * `run()`, T-TMP-12h for `runPromise()`) parameterized over all five
+ * variants.
+ */
+function pkgJsonVariantTestId(
+  surface: TmpdirFaultSurface,
+  variant: PkgJsonVariant,
+): string {
+  if (surface === "cli") {
+    switch (variant) {
+      case "unsatisfied-range":
+        return "T-TMP-12f";
+      case "invalid-json":
+        return "T-TMP-12f2";
+      case "invalid-semver":
+        return "T-TMP-12f3";
+      case "unreadable":
+        return "T-TMP-12f4";
+      case "non-regular":
+        return "T-TMP-12f5";
+    }
+  }
+  return surface === "run" ? "T-TMP-12g" : "T-TMP-12h";
+}
+
+/**
+ * Create the variant-specific `.loopx/<workflow>/package.json` fixture in
+ * `project`. Returns the on-disk path of the created entry (the regular
+ * file for variants i–iv, the directory for variant v). The unwritable-
+ * parent TMPDIR setup that wraps this suite already requires non-root for
+ * every variant, and the "unreadable" variant additionally requires non-
+ * root for the `chmod 000` to be effective; both are subsumed by the
+ * caller's `it.skipIf(IS_ROOT)` wrapper.
+ */
+async function setupPkgJsonVariantFixture(
+  project: TempProject,
+  workflow: string,
+  variant: PkgJsonVariant,
+): Promise<string> {
+  const wfDir = await createWorkflow(project, workflow);
+  const pkgPath = join(wfDir, "package.json");
+  switch (variant) {
+    case "unsatisfied-range":
+      await writeFile(
+        pkgPath,
+        JSON.stringify({ dependencies: { loopx: ">=999.0.0" } }, null, 2),
+        "utf-8",
+      );
+      break;
+    case "invalid-json":
+      await writeFile(pkgPath, "{broken", "utf-8");
+      break;
+    case "invalid-semver":
+      await writeFile(
+        pkgPath,
+        JSON.stringify({ dependencies: { loopx: "not-a-range!!!" } }, null, 2),
+        "utf-8",
+      );
+      break;
+    case "unreadable":
+      await writeFile(
+        pkgPath,
+        JSON.stringify({ dependencies: { loopx: "*" } }, null, 2),
+        "utf-8",
+      );
+      await chmod(pkgPath, 0o000);
+      break;
+    case "non-regular":
+      await mkdir(pkgPath, { recursive: true });
+      await writeFile(join(pkgPath, "README"), "placeholder", "utf-8");
+      break;
+  }
+  return pkgPath;
+}
+
+/**
+ * Returns true iff `stderr` contains the variant's expected SPEC §3.2
+ * `package.json` warning text, scoped to a stderr line that mentions the
+ * starting workflow's name (`ralph` in this suite). SPEC §3.2 leaves
+ * warning prose implementation-defined, so predicates are lenient — the
+ * same shape used by the version-check warning matchers in
+ * `e2e/version-check.test.ts`. The workflow-name scoping prevents
+ * spurious matches on unrelated stderr lines (e.g., the pre-ADR-0004
+ * `loopx-nodepath-shim-<pid>` `mkdirSync` error under an unwritable
+ * `TMPDIR` happens to contain `EACCES` / `permission denied` text but
+ * does not mention the workflow name).
+ *
+ * The `ralph`-scoping mirrors `hasUnreadableWarning(stderr, workflowName)`
+ * et al. in `e2e/version-check.test.ts`. The predicate intentionally
+ * matches against any line in `stderr` that mentions `ralph` AND matches
+ * the variant-specific keyword pattern; SPEC §3.2 does not require
+ * category-distinct text, so the per-variant predicates overlap by
+ * design (e.g., "invalid-json" and "non-regular" both accept lines
+ * mentioning `package.json`).
+ */
+function stderrHasPkgJsonVariantWarning(
+  stderr: string,
+  workflowName: string,
+  variant: PkgJsonVariant,
+): boolean {
+  if (!stderr.includes(workflowName)) {
+    return false;
+  }
+  const keywordRegex: RegExp = (() => {
+    switch (variant) {
+      case "unsatisfied-range":
+        return /version|mismatch|range|satisf/i;
+      case "invalid-json":
+        return /(invalid.*json|parse|parsing|package\.json)/i;
+      case "invalid-semver":
+        return /(semver|range|invalid)/i;
+      case "unreadable":
+        return /(unreadable|cannot.*read|read.*fail|package\.json)/i;
+      case "non-regular":
+        return /(package\.json|directory|EISDIR|ENOTREG|not.*a.*file|non-regular)/i;
+    }
+  })();
+  return keywordRegex.test(stderr);
+}
+
+/**
+ * Drives one of T-TMP-12f / T-TMP-12f2 / T-TMP-12f3 / T-TMP-12f4 / T-TMP-12f5
+ * (CLI surface) or T-TMP-12g / T-TMP-12h (programmatic surfaces) across a
+ * single (surface, variant) combination. Encapsulates the shared harness
+ * shape:
+ *
+ *   1. Create a temp project with a valid `.loopx/ralph/index.sh` fixture
+ *      that writes a marker file when executed (proves no child spawns).
+ *   2. Create the variant-specific `.loopx/ralph/package.json` fixture so
+ *      SPEC §7.1 step 5 (starting-workflow version check) emits exactly
+ *      one of the SPEC §3.2 warning branches.
+ *   3. Create an unwritable parent and chmod it to 0500 so SPEC §7.1
+ *      step 6 (`mkdtemp(<parent>/loopx-)`) fails with EACCES.
+ *   4. Drive the surface-appropriate invocation with
+ *      `TMPDIR=<unwritable-parent>` and `NODE_ENV=test`.
+ *   5. Assert:
+ *        (a) the surface-appropriate terminal failure surfaces (CLI exit 1
+ *            with non-empty stderr / generator throws / promise rejects);
+ *        (b) stderr contains the variant's `package.json` warning text —
+ *            proving step 5 ran to completion before step 6 failed;
+ *        (c) the marker file does not exist (no child spawned — step 7
+ *            not reached);
+ *        (d) no `loopx-*` directory was created under the unwritable
+ *            parent;
+ *        (e) for the non-regular variant, the directory at
+ *            `.loopx/ralph/package.json/` is preserved unchanged with its
+ *            placeholder file intact.
+ *
+ * Skip semantics: the unwritable-parent setup requires `process.getuid()
+ * !== 0` for every variant, and the "unreadable" variant additionally
+ * requires non-root for the `chmod 000` setup; both are subsumed by the
+ * caller's `it.skipIf(IS_ROOT)` wrapper, so this helper does not consult
+ * `IS_ROOT` itself.
+ */
+async function runPkgJsonVariantBeforeTmpdirTest(args: {
+  runtime: "node" | "bun";
+  surface: TmpdirFaultSurface;
+  variant: PkgJsonVariant;
+}) {
+  const project = await createTempProject();
+  const unwritableParent = await mkdtemp(
+    join(tmpdir(), "loopx-test-unwritable-"),
+  );
+  const marker = join(project.dir, "child-ran.txt");
+  const wfDir = join(project.loopxDir, "ralph");
+  const wfPkgPath = join(wfDir, "package.json");
+
+  const cleanupTask = async () => {
+    // Restore the package.json mode under the "unreadable" variant before
+    // recursive removal so the cleanup itself doesn't trip on EACCES.
+    if (args.variant === "unreadable") {
+      await chmod(wfPkgPath, 0o644).catch(() => {});
+    }
+    // Restore the parent's writable mode before rm so it can be removed.
+    await chmod(unwritableParent, 0o700).catch(() => {});
+    await rm(unwritableParent, { recursive: true, force: true }).catch(
+      () => {},
+    );
+    await project.cleanup().catch(() => {});
+  };
+  extraCleanups.push(cleanupTask);
+
+  await createBashWorkflowScript(
+    project,
+    "ralph",
+    "index",
+    `printf 'ran' > "${marker}"\nprintf '{"stop":true}'`,
+  );
+
+  await setupPkgJsonVariantFixture(project, "ralph", args.variant);
+
+  // Make the parent unwritable AFTER fixture creation so the fixture tree
+  // is writable and only the SPEC §7.1 step 6 `mkdtemp` fails.
+  await chmod(unwritableParent, 0o500);
+
+  const before = listLoopxEntries(unwritableParent);
+
+  let stderr: string;
+  let markerExists: boolean;
+
+  if (args.surface === "cli") {
+    const result = await runCLI(["run", "-n", "1", "ralph"], {
+      cwd: project.dir,
+      runtime: args.runtime,
+      env: { TMPDIR: unwritableParent, NODE_ENV: "test" },
+    });
+    // (a) exit code 1 — tmpdir creation failure is the terminal error
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.length).toBeGreaterThan(0);
+    stderr = result.stderr;
+    markerExists = existsSync(marker);
+  } else {
+    const callBlock =
+      args.surface === "runPromise"
+        ? `await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });`
+        : `const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  await gen.next();`;
+    const driverCode = `
+import { ${args.surface} } from "loopx";
+import { existsSync, readdirSync } from "node:fs";
+const parent = ${JSON.stringify(unwritableParent)};
+const marker = ${JSON.stringify(marker)};
+function snap() {
+  try {
+    return readdirSync(parent)
+      .filter((e) => e.startsWith("loopx-"))
+      .filter(
+        (e) =>
+          !e.startsWith("loopx-nodepath-shim-") &&
+          !e.startsWith("loopx-bun-jsx-") &&
+          !e.startsWith("loopx-install-"),
+      );
+  } catch { return []; }
+}
+const beforeSnap = snap();
+let caught = false;
+let errMsg = "";
+let errName = "";
+try {
+  ${callBlock}
+} catch (e) {
+  caught = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? (e.name || "") : "";
+}
+const afterSnap = snap();
+console.log(JSON.stringify({ caught, errMsg, errName, beforeSnap, afterSnap, markerExists: existsSync(marker) }));
+`;
+    const result = await runAPIDriver(args.runtime, driverCode, {
+      env: { TMPDIR: unwritableParent, NODE_ENV: "test" },
+    });
+    // The driver process must complete cleanly to print its JSON envelope.
+    // Pre-ADR-0004 implementations with eager TMPDIR-dependent module-load
+    // work (e.g., a NODE_PATH shim) crash on import and fail this assertion
+    // — the test correctly fails until the implementation decouples shim
+    // location from `LOOPX_TMPDIR` parent or makes shim creation lazy /
+    // failure-tolerant.
+    expect(result.exitCode).toBe(0);
+    const data = JSON.parse(result.stdout) as {
+      caught: boolean;
+      errMsg: string;
+      errName: string;
+      beforeSnap: string[];
+      afterSnap: string[];
+      markerExists: boolean;
+    };
+    // (a) the surface-appropriate terminal failure surfaces
+    expect(data.caught).toBe(true);
+    expect(data.errMsg.length).toBeGreaterThan(0);
+    stderr = result.stderr;
+    markerExists = data.markerExists;
+  }
+
+  const after = listLoopxEntries(unwritableParent);
+
+  // (b) stderr contains the variant's package.json warning — proving
+  //     SPEC §7.1 step 5 ran to completion before step 6 failed.
+  //     Scoped to a line that mentions the workflow name so the pre-
+  //     ADR-0004 nodepath-shim mkdirSync EACCES error (which has
+  //     "permission denied" text but no workflow name) does not
+  //     spuriously satisfy the predicate.
+  expect(
+    stderrHasPkgJsonVariantWarning(stderr, "ralph", args.variant),
+  ).toBe(true);
+  // (c) no child spawned (marker absent — step 7 not reached)
+  expect(markerExists).toBe(false);
+  // (d) no loopx-* directory created under the unwritable parent
+  expect(after.slice().sort()).toEqual(before.slice().sort());
+  // (v-only) directory at .loopx/ralph/package.json/ preserved unchanged
+  if (args.variant === "non-regular") {
+    expect(existsSync(wfPkgPath)).toBe(true);
+    expect(statSync(wfPkgPath).isDirectory()).toBe(true);
+    expect(existsSync(join(wfPkgPath, "README"))).toBe(true);
+  }
+}
+
 describe("TEST-SPEC §4.7 LOOPX_TMPDIR", () => {
   afterEach(async () => {
     for (const cleanup of extraCleanups.splice(0)) {
@@ -2444,6 +2778,71 @@ console.log(JSON.stringify({ caught, errMsg, errName, beforeSnap, afterSnap, mar
         expect(cleanupWarnings.length).toBe(0);
       },
     );
+
+    // ========================================================================
+    // Version-Check-Before-Tmpdir-Creation Ordering
+    // (T-TMP-12f / 12f2 / 12f3 / 12f4 / 12f5 — CLI surface;
+    //  T-TMP-12g — run() surface; T-TMP-12h — runPromise() surface)
+    //
+    // SPEC §7.1 normatively orders pre-iteration steps: step 5 is the
+    // starting workflow's version check, step 6 is `LOOPX_TMPDIR` creation.
+    // When step 5 produces a SPEC §3.2 `package.json` warning *and* step 6
+    // fails, loopx must still emit the version-check warning — proving
+    // step 5 ran to completion before step 6 attempted `mkdtemp`. A buggy
+    // implementation that reordered the steps (e.g., creating the tmpdir
+    // first and bailing out before the version check) would suppress the
+    // warning and fail (b) on each variant.
+    //
+    // The fixture composes:
+    //   - an unwritable tmpdir parent (chmod 0500) so SPEC §7.1 step 6's
+    //     `mkdtemp(<parent>/loopx-)` fails with EACCES (sub-step 1 of SPEC
+    //     §7.4 "Creation order"); same setup as T-TMP-12a / 12b / 12c.
+    //   - a `.loopx/ralph/package.json` matching one of SPEC §3.2's five
+    //     normatively-warning failure-mode branches:
+    //       (i)   unsatisfied range  — version mismatch
+    //       (ii)  invalid JSON       — parse failure
+    //       (iii) invalid semver     — range parse failure
+    //       (iv)  unreadable         — chmod 000 (non-root only)
+    //       (v)   non-regular path   — `package.json/` is a directory
+    //                                  (the new P-0004-03 warning branch)
+    //   - a valid `.loopx/ralph/index.sh` that writes a marker file when
+    //     executed (proves no child spawns).
+    //
+    // The CLI surface splits across five test IDs (T-TMP-12f / 12f2 / 12f3
+    // / 12f4 / 12f5), one per variant; the programmatic surfaces use one
+    // ID per surface (T-TMP-12g for `run()`, T-TMP-12h for `runPromise()`)
+    // parameterized over all five variants.
+    //
+    // All sub-cases are conditional on `process.getuid() !== 0`: the
+    // unwritable-parent setup needs non-root for every variant, and the
+    // unreadable variant additionally needs non-root for the `chmod 000`
+    // setup. One conditional covers both per the SPEC.
+    // ========================================================================
+
+    for (const surface of TMPDIR_FAULT_SURFACES) {
+      for (const variant of PKG_JSON_VARIANTS) {
+        const id = pkgJsonVariantTestId(surface, variant);
+        const surfaceLabel =
+          surface === "cli"
+            ? "CLI"
+            : surface === "run"
+              ? "run()"
+              : "runPromise()";
+        // Per-test name retains both the SPEC ID and the variant label.
+        // Example names:
+        //   "T-TMP-12f (CLI, unsatisfied-range): version warning surfaces..."
+        //   "T-TMP-12g (run(), invalid-json): version warning surfaces..."
+        //   "T-TMP-12h (runPromise(), non-regular): version warning surfaces..."
+        const testName = `${id} (${surfaceLabel}, ${variant}): version-check warning surfaces despite tmpdir creation failure`;
+        it.skipIf(IS_ROOT)(testName, async () => {
+          await runPkgJsonVariantBeforeTmpdirTest({
+            runtime,
+            surface,
+            variant,
+          });
+        });
+      }
+    }
 
     // ========================================================================
     // Tmpdir Creation Sub-step Coverage
