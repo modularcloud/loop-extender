@@ -16,7 +16,7 @@ The following tests had been encoded against pre-ADR-0004 behavior (workflow-dir
 
 ## P1 — Entire ADR-0004 test suites missing
 
-- **T-WFDIR-01..09d** — `LOOPX_WORKFLOW_DIR` env-var suite: injection, per-spawn refresh, cross-workflow goto, deeper chains, symlink behavior. No test file exists.
+- **T-WFDIR-01..14** — implemented in `apps/tests/tests/e2e/wfdir.test.ts`. 36/40 currently fail (pre-ADR-0004 impl lacks `LOOPX_WORKFLOW_DIR` injection and `RunOptions.env` support); the 4 passes are T-WFDIR-09b/09c × {node, bun} (existing $0-spelling behavior).
 - **T-TMP-\*** — full `LOOPX_TMPDIR` suite: creation; identity-fingerprint cleanup; cleanup triggers; cleanup safety under symlink/non-directory replacement; mode 0700; parent selection; naming; isolation across concurrent runs; settlement-based cleanup on `run()`; signal handling; abort handling; idempotence; cleanup-warning cardinality.
 - **T-API-50..57i** — `RunOptions.env` block (~80 IDs): shape validation, lifetime/snapshot semantics, merge-position precedence, protocol-variable override, NUL-byte rejection through `RunOptions.env`.
 - **T-API-58..59i** — Inherited-env snapshot timing (lazy under `run()`, eager under `runPromise()`).

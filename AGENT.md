@@ -2,7 +2,7 @@
 
 ## Build & Test Commands
 
-- Install dependencies: `npm install`
+- Install dependencies: `npm install` (can wipe out `node_modules/loopx` symlink; turbo's build cache may then report a hit without re-creating it. If `Cannot find module '.../node_modules/loopx/dist/bin.js'` appears, run `node packages/loop-extender/scripts/postbuild.mjs`.)
 - Run all tests: `npm run test`
 - Run harness tests only: `npm run test:harness`
 - Run unit tests only: `npm run test:unit`
