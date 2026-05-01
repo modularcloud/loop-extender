@@ -716,6 +716,110 @@ console.log(JSON.stringify({ caught, errMsg, errName, beforeSnap, afterSnap, mar
   }
 }
 
+/**
+ * Build the bash fixture body shared across T-TMP-16..16j: ralph workflow's
+ * `index.sh` observes `$LOOPX_TMPDIR` into a marker file (path external to
+ * the tmpdir, so it survives cleanup) and then emits the given `goto` JSON
+ * value. Used by every T-TMP-16* test on every surface.
+ */
+function buildGotoCleanupScript(marker: string, gotoValue: string): string {
+  return `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '${gotoValue.replace(/'/g, "'\\''")}'
+`;
+}
+
+/**
+ * Drive `runPromise("ralph", { cwd: project.dir, maxIterations: 2 })` via
+ * `runAPIDriver` and return the captured rejection state plus the marker
+ * file's contents and existence of the recorded path.
+ *
+ * Used by T-TMP-16c / 16d / 16h and the runPromise sub-cases of T-TMP-16b /
+ * T-TMP-16j. The driver process always exits 0 regardless of the
+ * runPromise() rejection — its job is to print the JSON envelope so the
+ * test can parse it.
+ */
+async function driveRunPromiseGotoCleanup(args: {
+  runtime: "node" | "bun";
+  projectDir: string;
+  tmpdirParent: string;
+  marker: string;
+}): Promise<{
+  rejected: boolean;
+  errMsg: string;
+  observed: string;
+  exist: boolean;
+}> {
+  const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(args.marker)};
+let rejected = false;
+let errMsg = "";
+try {
+  await runPromise("ralph", { cwd: ${JSON.stringify(args.projectDir)}, maxIterations: 2 });
+} catch (e) {
+  rejected = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+let observed = "";
+try { observed = readFileSync(marker, "utf-8"); } catch {}
+const exist = observed ? existsSync(observed) : false;
+console.log(JSON.stringify({ rejected, errMsg, observed, exist }));
+`;
+  const result = await runAPIDriver(args.runtime, driverCode, {
+    env: { TMPDIR: args.tmpdirParent },
+  });
+  expect(result.exitCode).toBe(0);
+  return JSON.parse(result.stdout);
+}
+
+/**
+ * Drive `run("ralph", { cwd: project.dir, maxIterations: 2 })` driven via
+ * `for await` until the goto-resolution failure surfaces as a thrown error.
+ * Returns the captured throw state plus the marker contents and existence
+ * of the recorded path.
+ *
+ * Used by T-TMP-16e / 16f / 16i and the run() sub-cases of T-TMP-16b /
+ * T-TMP-16j. The driver process always exits 0 regardless of the generator
+ * throw — its job is to print the JSON envelope so the test can parse it.
+ */
+async function driveRunGotoCleanup(args: {
+  runtime: "node" | "bun";
+  projectDir: string;
+  tmpdirParent: string;
+  marker: string;
+}): Promise<{
+  thrown: boolean;
+  errMsg: string;
+  observed: string;
+  exist: boolean;
+}> {
+  const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(args.marker)};
+let thrown = false;
+let errMsg = "";
+try {
+  const gen = run("ralph", { cwd: ${JSON.stringify(args.projectDir)}, maxIterations: 2 });
+  for await (const _ of gen) { /* drain */ }
+} catch (e) {
+  thrown = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+let observed = "";
+try { observed = readFileSync(marker, "utf-8"); } catch {}
+const exist = observed ? existsSync(observed) : false;
+console.log(JSON.stringify({ thrown, errMsg, observed, exist }));
+`;
+  const result = await runAPIDriver(args.runtime, driverCode, {
+    env: { TMPDIR: args.tmpdirParent },
+  });
+  expect(result.exitCode).toBe(0);
+  return JSON.parse(result.stdout);
+}
+
 describe("TEST-SPEC §4.7 LOOPX_TMPDIR", () => {
   afterEach(async () => {
     for (const cleanup of extraCleanups.splice(0)) {
@@ -3263,6 +3367,544 @@ console.log(JSON.stringify({ thrown, errMsg, observed, exist: existsSync(observe
       expect(result.exitCode).toBe(0);
       const data = JSON.parse(result.stdout);
       expect(data.thrown).toBe(true);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ========================================================================
+    // Cleanup on Goto Resolution Failure (T-TMP-16..16j)
+    //
+    // SPEC §7.4 enumerates two distinct cleanup triggers in the goto
+    // resolution path:
+    //   - "missing workflow or script during `goto` resolution" — covered by
+    //     T-TMP-16 / 16a / 16c / 16d / 16e / 16f (qualified targets) and
+    //     T-TMP-16g / 16h / 16i (bare targets in current workflow).
+    //   - "invalid `goto` target" — covered by T-TMP-16b (delimiter-syntax:
+    //     multi-colon) and T-TMP-16j (name-restriction: leading dash) on all
+    //     three execution surfaces (CLI / run() / runPromise()).
+    //
+    // Each test follows the same shape: ralph/index.sh observes
+    // `$LOOPX_TMPDIR` into a marker external to the tmpdir, then emits the
+    // failure-mode goto value. The harness asserts the surface-appropriate
+    // failure surfaces, the error mentions the expected category-distinct
+    // phrasing, the marker captured a non-empty tmpdir path (proving
+    // LOOPX_TMPDIR was injected — fails until ADR-0004 is implemented), and
+    // the recorded path no longer exists (proving cleanup ran on the
+    // failure path — fails until ADR-0004 is implemented).
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16: CLI cleanup on missing-workflow goto (qualified target).
+    // ------------------------------------------------------------------------
+    it("T-TMP-16: CLI cleanup on missing-workflow goto", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(
+          marker,
+          '{"goto":"nonexistent-workflow:script"}',
+        ),
+      );
+
+      const result = await runCLI(["run", "-n", "2", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(1);
+      // Stderr distinguishes "missing workflow" from delimiter-syntax /
+      // name-restriction errors via the workflow name and "not found".
+      expect(result.stderr).toMatch(/nonexistent-workflow/);
+      expect(result.stderr).toMatch(/not found|workflow/i);
+      const observed = readFileSync(marker, "utf-8");
+      expect(observed.length).toBeGreaterThan(0);
+      expect(existsSync(observed)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16a: CLI cleanup on missing-script goto in an existing workflow.
+    // The qualified-target form `other:missing` reaches the missing-script
+    // branch via cross-workflow resolution: workflow `other` exists, script
+    // `missing` does not.
+    // ------------------------------------------------------------------------
+    it("T-TMP-16a: CLI cleanup on missing-script goto (qualified)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(marker, '{"goto":"other:missing"}'),
+      );
+      await createWorkflowScript(
+        project,
+        "other",
+        "index",
+        ".sh",
+        `#!/bin/bash\nprintf '{"stop":true}'\n`,
+      );
+
+      const result = await runCLI(["run", "-n", "2", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(1);
+      // Stderr mentions the missing script `missing` and the existing
+      // workflow `other` — distinct from the missing-workflow phrasing.
+      expect(result.stderr).toMatch(/missing/);
+      expect(result.stderr).toMatch(/other/);
+      const observed = readFileSync(marker, "utf-8");
+      expect(observed.length).toBeGreaterThan(0);
+      expect(existsSync(observed)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16b (CLI): truly malformed goto — delimiter-syntax violation.
+    // The target `a:b:c` has multiple colons (violating SPEC 4.1's
+    // "at most one colon" rule) and is rejected at the delimiter-counting
+    // stage of `parseGoto()` — never reaches workflow resolution.
+    // ------------------------------------------------------------------------
+    it("T-TMP-16b (CLI): cleanup on malformed goto (multi-colon)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(marker, '{"goto":"a:b:c"}'),
+      );
+
+      const result = await runCLI(["run", "-n", "2", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(1);
+      // Failure must be about the target shape (multi-colon / delimiter),
+      // not target resolution ("workflow not found").
+      expect(result.stderr).toMatch(
+        /multiple colons|only one .* delimiter|delimiter|invalid (goto|target)/i,
+      );
+      expect(result.stderr).not.toMatch(/not found in \.loopx\//);
+      const observed = readFileSync(marker, "utf-8");
+      expect(observed.length).toBeGreaterThan(0);
+      expect(existsSync(observed)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16b (run): same fixture as the CLI sub-case, but driven via the
+    // `run()` async-generator surface. The first iteration's emitted goto
+    // surfaces as a throw on the next `next()` after iteration 1's yield —
+    // here we drive via `for await`, which re-raises the throw at the loop
+    // boundary. SPEC §9.1 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-16b (run): cleanup on malformed goto (multi-colon)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(marker, '{"goto":"a:b:c"}'),
+      );
+
+      const data = await driveRunGotoCleanup({
+        runtime,
+        projectDir: project.dir,
+        tmpdirParent,
+        marker,
+      });
+      expect(data.thrown).toBe(true);
+      expect(data.errMsg).toMatch(
+        /multiple colons|only one .* delimiter|delimiter|invalid (goto|target)/i,
+      );
+      expect(data.errMsg).not.toMatch(/not found in \.loopx\//);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16b (runPromise): same fixture, driven via `runPromise()`. SPEC
+    // §9.2 / §9.3 — the multi-colon goto-resolution failure surfaces as
+    // promise rejection.
+    // ------------------------------------------------------------------------
+    it("T-TMP-16b (runPromise): cleanup on malformed goto (multi-colon)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(marker, '{"goto":"a:b:c"}'),
+      );
+
+      const data = await driveRunPromiseGotoCleanup({
+        runtime,
+        projectDir: project.dir,
+        tmpdirParent,
+        marker,
+      });
+      expect(data.rejected).toBe(true);
+      expect(data.errMsg).toMatch(
+        /multiple colons|only one .* delimiter|delimiter|invalid (goto|target)/i,
+      );
+      expect(data.errMsg).not.toMatch(/not found in \.loopx\//);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16c: runPromise() cleanup on missing-workflow goto. Programmatic
+    // counterpart to T-TMP-16. SPEC §7.4 / §9.2 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-16c: runPromise() cleanup on missing-workflow goto", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(
+          marker,
+          '{"goto":"nonexistent-workflow:script"}',
+        ),
+      );
+
+      const data = await driveRunPromiseGotoCleanup({
+        runtime,
+        projectDir: project.dir,
+        tmpdirParent,
+        marker,
+      });
+      expect(data.rejected).toBe(true);
+      expect(data.errMsg).toMatch(/nonexistent-workflow/);
+      expect(data.errMsg).toMatch(/not found|workflow/i);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16d: runPromise() cleanup on missing-script goto (qualified).
+    // Programmatic counterpart to T-TMP-16a. SPEC §7.4 / §9.2 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-16d: runPromise() cleanup on missing-script goto (qualified)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(marker, '{"goto":"other:missing"}'),
+      );
+      await createWorkflowScript(
+        project,
+        "other",
+        "index",
+        ".sh",
+        `#!/bin/bash\nprintf '{"stop":true}'\n`,
+      );
+
+      const data = await driveRunPromiseGotoCleanup({
+        runtime,
+        projectDir: project.dir,
+        tmpdirParent,
+        marker,
+      });
+      expect(data.rejected).toBe(true);
+      expect(data.errMsg).toMatch(/missing/);
+      expect(data.errMsg).toMatch(/other/);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16e: run() cleanup on missing-workflow goto. Generator-surface
+    // counterpart to T-TMP-16c. SPEC §7.4 / §9.1 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-16e: run() cleanup on missing-workflow goto", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(
+          marker,
+          '{"goto":"nonexistent-workflow:script"}',
+        ),
+      );
+
+      const data = await driveRunGotoCleanup({
+        runtime,
+        projectDir: project.dir,
+        tmpdirParent,
+        marker,
+      });
+      expect(data.thrown).toBe(true);
+      expect(data.errMsg).toMatch(/nonexistent-workflow/);
+      expect(data.errMsg).toMatch(/not found|workflow/i);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16f: run() cleanup on missing-script goto (qualified). Generator-
+    // surface counterpart to T-TMP-16d. Together with T-TMP-16 / 16a (CLI),
+    // T-TMP-16b (malformed-goto, three surfaces), T-TMP-16c/16d (runPromise),
+    // and T-TMP-16e/16f (run()), the missing-workflow / missing-script /
+    // malformed-goto cleanup triggers are pinned across all three surfaces.
+    // SPEC §7.4 / §9.1 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-16f: run() cleanup on missing-script goto (qualified)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(marker, '{"goto":"other:missing"}'),
+      );
+      await createWorkflowScript(
+        project,
+        "other",
+        "index",
+        ".sh",
+        `#!/bin/bash\nprintf '{"stop":true}'\n`,
+      );
+
+      const data = await driveRunGotoCleanup({
+        runtime,
+        projectDir: project.dir,
+        tmpdirParent,
+        marker,
+      });
+      expect(data.thrown).toBe(true);
+      expect(data.errMsg).toMatch(/missing/);
+      expect(data.errMsg).toMatch(/other/);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16g: CLI cleanup on bare-name goto resolving to a missing script
+    // in the **current** workflow. The bare form `missing` is a same-
+    // workflow lookup (not a cross-workflow lookup): the resolver does not
+    // consult the workflow registry, only the current workflow's script set.
+    // A buggy implementation that skipped cleanup on the same-workflow lookup
+    // path would pass T-TMP-16a (qualified) but fail this test. SPEC §7.4 /
+    // §7.2 / §4.1 / §2.2.
+    // ------------------------------------------------------------------------
+    it("T-TMP-16g: CLI cleanup on bare-name missing-script goto", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(marker, '{"goto":"missing"}'),
+      );
+
+      const result = await runCLI(["run", "-n", "2", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(1);
+      // Stderr mentions the missing script `missing` in the **current**
+      // workflow `ralph` — distinct from T-TMP-16a's qualified phrasing
+      // (script in `other`) and from T-TMP-16's missing-workflow phrasing.
+      expect(result.stderr).toMatch(/missing/);
+      expect(result.stderr).toMatch(/ralph/);
+      const observed = readFileSync(marker, "utf-8");
+      expect(observed.length).toBeGreaterThan(0);
+      expect(existsSync(observed)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16h: runPromise() cleanup on bare-name goto resolving to a
+    // missing script in the current workflow. Programmatic counterpart to
+    // T-TMP-16g. Mirrors T-TMP-16d (qualified) on the bare-name lookup
+    // path. SPEC §7.4 / §9.2 / §9.3 / §2.2.
+    // ------------------------------------------------------------------------
+    it("T-TMP-16h: runPromise() cleanup on bare-name missing-script goto", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(marker, '{"goto":"missing"}'),
+      );
+
+      const data = await driveRunPromiseGotoCleanup({
+        runtime,
+        projectDir: project.dir,
+        tmpdirParent,
+        marker,
+      });
+      expect(data.rejected).toBe(true);
+      expect(data.errMsg).toMatch(/missing/);
+      expect(data.errMsg).toMatch(/ralph/);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16i: run() cleanup on bare-name goto resolving to a missing
+    // script in the current workflow. Generator-surface counterpart to
+    // T-TMP-16g / 16h. Together they close the bare-name missing-script
+    // cleanup branch across all three surfaces. SPEC §7.4 / §9.1 / §9.3 /
+    // §2.2.
+    // ------------------------------------------------------------------------
+    it("T-TMP-16i: run() cleanup on bare-name missing-script goto", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(marker, '{"goto":"missing"}'),
+      );
+
+      const data = await driveRunGotoCleanup({
+        runtime,
+        projectDir: project.dir,
+        tmpdirParent,
+        marker,
+      });
+      expect(data.thrown).toBe(true);
+      expect(data.errMsg).toMatch(/missing/);
+      expect(data.errMsg).toMatch(/ralph/);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16j (CLI): cleanup on goto whose target violates the SPEC 4.1
+    // **name-restriction pattern** (distinct from the delimiter-syntax
+    // violations covered by T-TMP-16b). Target `-bad` has zero colons (so
+    // delimiter checks pass), but the bare name `-bad` begins with `-`,
+    // violating the `[a-zA-Z0-9_]` first-character requirement of SPEC 4.1.
+    // A buggy implementation that wired up cleanup on the delimiter branch
+    // but missed it on the name-restriction branch (e.g., dispatched the two
+    // validation steps through different error paths) would pass T-TMP-16b
+    // and fail this test. SPEC §7.4 / §7.2 / §4.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-16j (CLI): cleanup on goto with name-restriction violation", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(marker, '{"goto":"-bad"}'),
+      );
+
+      const result = await runCLI(["run", "-n", "2", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(1);
+      // Stderr mentions the invalid target / name-restriction violation —
+      // distinct from "workflow not found" (T-TMP-16) and from "multiple
+      // colons" / "delimiter" (T-TMP-16b).
+      expect(result.stderr).toMatch(
+        /must match \[a-zA-Z|name.?restriction|name pattern|invalid (goto|target)/i,
+      );
+      expect(result.stderr).toMatch(/-bad/);
+      expect(result.stderr).not.toMatch(/not found in \.loopx\//);
+      expect(result.stderr).not.toMatch(
+        /multiple colons|only one .* delimiter/i,
+      );
+      const observed = readFileSync(marker, "utf-8");
+      expect(observed.length).toBeGreaterThan(0);
+      expect(existsSync(observed)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16j (run): same fixture as the CLI sub-case, driven via the
+    // `run()` async-generator surface. SPEC §7.4 / §9.1 / §9.3 / §4.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-16j (run): cleanup on goto with name-restriction violation", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(marker, '{"goto":"-bad"}'),
+      );
+
+      const data = await driveRunGotoCleanup({
+        runtime,
+        projectDir: project.dir,
+        tmpdirParent,
+        marker,
+      });
+      expect(data.thrown).toBe(true);
+      expect(data.errMsg).toMatch(
+        /must match \[a-zA-Z|name.?restriction|name pattern|invalid (goto|target)/i,
+      );
+      expect(data.errMsg).toMatch(/-bad/);
+      expect(data.errMsg).not.toMatch(/not found in \.loopx\//);
+      expect(data.errMsg).not.toMatch(
+        /multiple colons|only one .* delimiter/i,
+      );
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-16j (runPromise): same fixture, driven via `runPromise()`. Closes
+    // both syntactic-invalidity families enumerated by SPEC 4.1 (delimiter
+    // + name-restriction) across all three surfaces. SPEC §7.4 / §9.2 /
+    // §9.3 / §4.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-16j (runPromise): cleanup on goto with name-restriction violation", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildGotoCleanupScript(marker, '{"goto":"-bad"}'),
+      );
+
+      const data = await driveRunPromiseGotoCleanup({
+        runtime,
+        projectDir: project.dir,
+        tmpdirParent,
+        marker,
+      });
+      expect(data.rejected).toBe(true);
+      expect(data.errMsg).toMatch(
+        /must match \[a-zA-Z|name.?restriction|name pattern|invalid (goto|target)/i,
+      );
+      expect(data.errMsg).toMatch(/-bad/);
+      expect(data.errMsg).not.toMatch(/not found in \.loopx\//);
+      expect(data.errMsg).not.toMatch(
+        /multiple colons|only one .* delimiter/i,
+      );
       expect(data.observed.length).toBeGreaterThan(0);
       expect(data.exist).toBe(false);
     });
