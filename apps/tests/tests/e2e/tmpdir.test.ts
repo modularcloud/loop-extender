@@ -93,6 +93,50 @@ console.log(JSON.stringify({ caught, errMsg, errName, before, after }));
 }
 
 /**
+ * Runs a CLI invocation in `cwd` and asserts (a) the expected exit code,
+ * (b) optional stderr / stdout regex matches, and (c) no new `loopx-*`
+ * entry appeared under the test-isolated tmpdir parent during the call.
+ *
+ * Used by the T-TMP-12-cli and T-TMP-12-cli-usage CLI counterparts to
+ * the programmatic T-TMP-12 sub-cases. SPEC §7.4 says tmpdir creation
+ * runs only "for each `loopx run` ... that reaches execution", and SPEC
+ * §7.1 step 6 (tmpdir creation) sits after steps 1–5; the CLI parser
+ * layer (SPEC §4.1) and `-h` / `--help` short-circuit (SPEC §4.2) sit
+ * even further upstream of that. None of those failure modes may create
+ * a `LOOPX_TMPDIR`.
+ */
+async function assertCLINoTmpdirCreated(args: {
+  runtime: "node" | "bun";
+  cwd: string;
+  parent: string;
+  cliArgs: string[];
+  expectExitCode: number;
+  expectStderrMatch?: RegExp;
+  expectStdoutMatch?: RegExp;
+  expectStderrNonEmpty?: boolean;
+  extraEnv?: Record<string, string>;
+}) {
+  const before = listLoopxEntries(args.parent);
+  const result = await runCLI(args.cliArgs, {
+    cwd: args.cwd,
+    runtime: args.runtime,
+    env: { TMPDIR: args.parent, ...(args.extraEnv ?? {}) },
+  });
+  const after = listLoopxEntries(args.parent);
+  expect(result.exitCode).toBe(args.expectExitCode);
+  if (args.expectStderrNonEmpty) {
+    expect(result.stderr.length).toBeGreaterThan(0);
+  }
+  if (args.expectStderrMatch) {
+    expect(result.stderr).toMatch(args.expectStderrMatch);
+  }
+  if (args.expectStdoutMatch) {
+    expect(result.stdout).toMatch(args.expectStdoutMatch);
+  }
+  expect(after.slice().sort()).toEqual(before.slice().sort());
+}
+
+/**
  * Runs a driver that exercises a pre-iteration failure mode and asserts
  * (a) the call rejected / threw, (b) the optional error-message regex
  * matched, and (c) no new `loopx-*` entry appeared under the test-isolated
@@ -1522,6 +1566,435 @@ Object.defineProperty(env, "B", { enumerable: true, configurable: true, get() { 
         });
       });
     }
+
+    // ========================================================================
+    // CLI Pre-iteration Failures Must Not Create LOOPX_TMPDIR
+    // (T-TMP-12-cli, 10 sub-cases; T-TMP-12-cli-usage, 6 sub-cases)
+    //
+    // CLI counterpart to T-TMP-12. SPEC §7.4 says tmpdir creation runs only
+    // "for each `loopx run` ... that reaches execution"; SPEC §7.1 step 6
+    // (tmpdir creation) follows steps 1–5; SPEC §4.1 / §4.2 parser-layer and
+    // help-short-circuit boundaries precede the execution pre-iteration
+    // sequence entirely. None of those failure modes may create a tmpdir.
+    //
+    // Each sub-case follows the same harness shape: snapshot the test-
+    // isolated TMPDIR parent for `loopx-*` entries before the run, run the
+    // CLI invocation, then snapshot again and assert no new `loopx-*` entry
+    // was created. The `loopx-nodepath-shim-<pid>` / `loopx-bun-jsx-<pid>`
+    // / `loopx-install-*` prefixes are filtered out by `listLoopxEntries`
+    // — see the AGENT.md note on this.
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-env-file: missing -e local env file (ENOENT branch).
+    // ------------------------------------------------------------------------
+    it("T-TMP-12-cli-env-file: missing -e env file does not create tmpdir", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      await assertCLINoTmpdirCreated({
+        runtime,
+        cwd: project.dir,
+        parent: tmpdirParent,
+        cliArgs: ["run", "-e", "nonexistent.env", "ralph"],
+        expectExitCode: 1,
+        expectStderrNonEmpty: true,
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-env-file-unreadable: existing-but-unreadable -e local env
+    // file (EACCES branch). Conditional on non-root: root reads mode-000
+    // files unconditionally, defeating the unreadable-file setup.
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-TMP-12-cli-env-file-unreadable: unreadable -e env file does not create tmpdir",
+      async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        const unreadable = join(project.dir, "unreadable.env");
+        await writeFile(unreadable, "FOO=bar\n", "utf-8");
+        await chmod(unreadable, 0o000);
+        try {
+          await assertCLINoTmpdirCreated({
+            runtime,
+            cwd: project.dir,
+            parent: tmpdirParent,
+            cliArgs: ["run", "-e", unreadable, "ralph"],
+            expectExitCode: 1,
+            expectStderrNonEmpty: true,
+          });
+        } finally {
+          await chmod(unreadable, 0o644).catch(() => {});
+        }
+      },
+    );
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-missing-workflow: target resolves to a workflow that does
+    // not exist under .loopx/ (target-resolution failure).
+    // ------------------------------------------------------------------------
+    it("T-TMP-12-cli-missing-workflow: missing workflow does not create tmpdir", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      await assertCLINoTmpdirCreated({
+        runtime,
+        cwd: project.dir,
+        parent: tmpdirParent,
+        cliArgs: ["run", "nonexistent-workflow"],
+        expectExitCode: 1,
+        expectStderrNonEmpty: true,
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-missing-script: workflow exists but qualified script
+    // (`ralph:check`) does not — distinct target-resolution sub-path.
+    // ------------------------------------------------------------------------
+    it("T-TMP-12-cli-missing-script: missing script in existing workflow does not create tmpdir", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      await assertCLINoTmpdirCreated({
+        runtime,
+        cwd: project.dir,
+        parent: tmpdirParent,
+        cliArgs: ["run", "ralph:check"],
+        expectExitCode: 1,
+        expectStderrNonEmpty: true,
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-missing-default-index: workflow exists but has no `index.*`
+    // entry — bare target resolves to `ralph:index` and fails on missing
+    // default entry point.
+    // ------------------------------------------------------------------------
+    it("T-TMP-12-cli-missing-default-index: workflow without index.* does not create tmpdir", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "check",
+        `printf '{"stop":true}'`,
+      );
+      await assertCLINoTmpdirCreated({
+        runtime,
+        cwd: project.dir,
+        parent: tmpdirParent,
+        cliArgs: ["run", "ralph"],
+        expectExitCode: 1,
+        expectStderrNonEmpty: true,
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-target-validation: leading-colon target violates SPEC 4.1
+    // delimiter syntax.
+    // ------------------------------------------------------------------------
+    it("T-TMP-12-cli-target-validation: leading-colon target does not create tmpdir", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      await assertCLINoTmpdirCreated({
+        runtime,
+        cwd: project.dir,
+        parent: tmpdirParent,
+        cliArgs: ["run", ":script"],
+        expectExitCode: 1,
+        expectStderrNonEmpty: true,
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-target-name-invalid: name-pattern violation (`.` is not
+    // in the SPEC §4.1 `[a-zA-Z0-9_][a-zA-Z0-9_-]*` workflow-name pattern).
+    // ------------------------------------------------------------------------
+    it("T-TMP-12-cli-target-name-invalid: name-pattern violation does not create tmpdir", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      await assertCLINoTmpdirCreated({
+        runtime,
+        cwd: project.dir,
+        parent: tmpdirParent,
+        cliArgs: ["run", "bad.name"],
+        expectExitCode: 1,
+        expectStderrNonEmpty: true,
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-discovery: discovery-time global validation failure
+    // (sibling workflow with name-collision in two extensions). SPEC §5.4:
+    // global validation is fatal in run mode, so the target-workflow run
+    // fails before tmpdir creation.
+    // ------------------------------------------------------------------------
+    it("T-TMP-12-cli-discovery: discovery validation failure does not create tmpdir", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      // Sibling workflow with a name collision: broken/check.sh + broken/check.ts.
+      await createBashWorkflowScript(
+        project,
+        "broken",
+        "check",
+        `printf '{"stop":true}'`,
+      );
+      await createWorkflowScript(
+        project,
+        "broken",
+        "check",
+        ".ts",
+        `console.log('{"stop":true}');`,
+      );
+      await assertCLINoTmpdirCreated({
+        runtime,
+        cwd: project.dir,
+        parent: tmpdirParent,
+        cliArgs: ["run", "ralph"],
+        expectExitCode: 1,
+        expectStderrNonEmpty: true,
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-missing-loopx: project root contains no `.loopx/` at all.
+    // SPEC §7.2 missing-`.loopx/`-directory is fatal in run mode; SPEC §7.1
+    // step 1 (discovery) runs before step 6 (tmpdir creation).
+    // ------------------------------------------------------------------------
+    it("T-TMP-12-cli-missing-loopx: missing .loopx/ does not create tmpdir", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest({
+        withLoopxDir: false,
+      });
+      await assertCLINoTmpdirCreated({
+        runtime,
+        cwd: project.dir,
+        parent: tmpdirParent,
+        cliArgs: ["run", "ralph"],
+        expectExitCode: 1,
+        expectStderrNonEmpty: true,
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-global-env-unreadable: unreadable global env file under
+    // an isolated XDG_CONFIG_HOME. SPEC §8.1: "If the file exists but is
+    // unreadable ... loopx exits with code 1". Conditional on non-root.
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-TMP-12-cli-global-env-unreadable: unreadable global env file does not create tmpdir",
+      async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        const xdg = join(project.dir, "xdg-config");
+        await mkdir(join(xdg, "loopx"), { recursive: true });
+        const globalEnv = join(xdg, "loopx", "env");
+        await writeFile(globalEnv, "FOO=bar\n", "utf-8");
+        await chmod(globalEnv, 0o000);
+        try {
+          await assertCLINoTmpdirCreated({
+            runtime,
+            cwd: project.dir,
+            parent: tmpdirParent,
+            cliArgs: ["run", "-n", "1", "ralph"],
+            expectExitCode: 1,
+            expectStderrNonEmpty: true,
+            extraEnv: { XDG_CONFIG_HOME: xdg },
+          });
+        } finally {
+          await chmod(globalEnv, 0o644).catch(() => {});
+        }
+      },
+    );
+
+    // ========================================================================
+    // T-TMP-12-cli-usage (parser-layer failures + run-help short-circuit).
+    //
+    // Parser-error invocations never enter the SPEC §7.1 execution pre-
+    // iteration sequence; help short-circuits exit before execution. SPEC
+    // §11.2 permits run-help to perform non-fatal display-side discovery,
+    // but that does not create a `LOOPX_TMPDIR`.
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-no-target: bare `loopx run` (no positional, no flags) →
+    // usage error, exit 1. The parser rejects the missing-target invocation
+    // per SPEC §4.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-12-cli-no-target: bare `loopx run` does not create tmpdir", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      await assertCLINoTmpdirCreated({
+        runtime,
+        cwd: project.dir,
+        parent: tmpdirParent,
+        cliArgs: ["run"],
+        expectExitCode: 1,
+        expectStderrNonEmpty: true,
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-unknown-flag: `loopx run --unknown ralph` → usage error,
+    // exit 1 (per T-CLI-35). The parser rejects `--unknown` before reaching
+    // pre-iteration.
+    // ------------------------------------------------------------------------
+    it("T-TMP-12-cli-unknown-flag: unknown flag does not create tmpdir", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      await assertCLINoTmpdirCreated({
+        runtime,
+        cwd: project.dir,
+        parent: tmpdirParent,
+        cliArgs: ["run", "--unknown", "ralph"],
+        expectExitCode: 1,
+        expectStderrNonEmpty: true,
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-duplicate-n: `loopx run -n 3 -n 5 ralph` → usage error,
+    // exit 1 (per T-CLI-20a). Duplicate `-n` is rejected at the parser
+    // layer before pre-iteration.
+    // ------------------------------------------------------------------------
+    it("T-TMP-12-cli-duplicate-n: duplicate -n does not create tmpdir", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      await assertCLINoTmpdirCreated({
+        runtime,
+        cwd: project.dir,
+        parent: tmpdirParent,
+        cliArgs: ["run", "-n", "3", "-n", "5", "ralph"],
+        expectExitCode: 1,
+        expectStderrNonEmpty: true,
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-duplicate-e: `loopx run -e a.env -e b.env ralph` → usage
+    // error, exit 1 (per T-CLI-20b). Duplicate `-e` is rejected at the
+    // parser layer before either env-file is loaded.
+    // ------------------------------------------------------------------------
+    it("T-TMP-12-cli-duplicate-e: duplicate -e does not create tmpdir", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      await writeFile(join(project.dir, "a.env"), "A=1\n", "utf-8");
+      await writeFile(join(project.dir, "b.env"), "B=2\n", "utf-8");
+      await assertCLINoTmpdirCreated({
+        runtime,
+        cwd: project.dir,
+        parent: tmpdirParent,
+        cliArgs: ["run", "-e", "a.env", "-e", "b.env", "ralph"],
+        expectExitCode: 1,
+        expectStderrNonEmpty: true,
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-help-with-unknown: `loopx run -h --unknown` → run-help
+    // short-circuit, exit 0 (per T-CLI-54). The `-h` short-circuit does
+    // not enter the execution pre-iteration sequence: no env-file loading,
+    // no target resolution, no version check, no tmpdir creation, no
+    // script spawn. SPEC §11.2 permits non-fatal display-side discovery,
+    // but that does not create a `LOOPX_TMPDIR`.
+    // ------------------------------------------------------------------------
+    it("T-TMP-12-cli-help-with-unknown: run -h --unknown does not create tmpdir", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      await assertCLINoTmpdirCreated({
+        runtime,
+        cwd: project.dir,
+        parent: tmpdirParent,
+        cliArgs: ["run", "-h", "--unknown"],
+        expectExitCode: 0,
+        expectStdoutMatch: /-n\b[\s\S]*-e\b|-e\b[\s\S]*-n\b/i,
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12-cli-help-with-dashdash: `loopx run --help -- ralph` → run-help
+    // short-circuit, exit 0 (per T-CLI-69a). Same short-circuit semantics
+    // as T-TMP-12-cli-help-with-unknown but with the long-form `--help` and
+    // a `--` token that would otherwise be a usage error.
+    // ------------------------------------------------------------------------
+    it("T-TMP-12-cli-help-with-dashdash: run --help -- target does not create tmpdir", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      await assertCLINoTmpdirCreated({
+        runtime,
+        cwd: project.dir,
+        parent: tmpdirParent,
+        cliArgs: ["run", "--help", "--", "ralph"],
+        expectExitCode: 0,
+        expectStdoutMatch: /-n\b[\s\S]*-e\b|-e\b[\s\S]*-n\b/i,
+      });
+    });
 
     // ========================================================================
     // Cleanup on Normal Completion (T-TMP-13..14a)
