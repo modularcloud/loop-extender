@@ -1,6 +1,6 @@
 # ADR-0004: Script Execution Context, CLI Grammar, and Workflow Auto-Install
 
-**Status:** Proposed
+**Status:** Test Specified
 
 ---
 
