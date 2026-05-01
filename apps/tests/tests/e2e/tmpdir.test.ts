@@ -1997,6 +1997,287 @@ Object.defineProperty(env, "B", { enumerable: true, configurable: true, get() { 
     });
 
     // ========================================================================
+    // Tmpdir Creation Failure (T-TMP-12a / T-TMP-12b / T-TMP-12c)
+    //
+    // SPEC §7.2 / §7.4 specify that when any step of the tmpdir creation
+    // sequence fails, loopx does not spawn any child, the CLI exits 1,
+    // run() throws on first next(), and runPromise() rejects. These three
+    // tests force a real `mkdtemp` failure (sub-step 1 of SPEC §7.4's
+    // creation order) by setting `TMPDIR` to a parent directory whose mode
+    // is `0500` — readable but not writable. mkdtemp(<parent>/loopx-) then
+    // fails with EACCES, no path is created, and "no path exists, so no
+    // cleanup is needed" per SPEC §7.4. The tests assert (a) the surface-
+    // appropriate terminal failure surfaces, (b) stderr is non-empty (the
+    // tmpdir-creation-failure error text is implementation-defined per
+    // SPEC §7.4), (c) the ralph:index marker file does not exist (no
+    // child spawned), (d) no `loopx-*` directory was created under the
+    // unwritable parent, and (e) zero `LOOPX_TEST_CLEANUP_WARNING\t…`
+    // marker lines on stderr — per SPEC §7.4, when `mkdtemp` itself fails
+    // "no path exists, so no cleanup is needed"; the cleanup-warning path
+    // must not be entered. (e) uses the test-only structured marker
+    // contract from TEST-SPEC §1.4 (cleanup-warning lines are gated on
+    // `NODE_ENV=test` and prefixed with `LOOPX_TEST_CLEANUP_WARNING\t`).
+    //
+    // All three sub-cases are conditional on `process.getuid() !== 0`:
+    // root can write into a mode-0500 directory unconditionally,
+    // defeating the unwritable-parent setup.
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12a: CLI — tmpdir creation failure causes exit 1 with no child
+    // spawned and no spurious cleanup warning.
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-TMP-12a: CLI tmpdir creation failure exits 1 with no child spawned and no cleanup warning",
+      async () => {
+        const project = await createTempProject();
+        const unwritableParent = await mkdtemp(
+          join(tmpdir(), "loopx-test-unwritable-"),
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        const cleanupTask = async () => {
+          await chmod(unwritableParent, 0o700).catch(() => {});
+          await rm(unwritableParent, { recursive: true, force: true }).catch(
+            () => {},
+          );
+          await project.cleanup().catch(() => {});
+        };
+        extraCleanups.push(cleanupTask);
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'ran' > "${marker}"\nprintf '{"stop":true}'`,
+        );
+
+        // Make the parent unwritable AFTER fixture creation so the bash
+        // script and project tree are writable, but mkdtemp under TMPDIR
+        // will fail with EACCES.
+        await chmod(unwritableParent, 0o500);
+
+        const before = listLoopxEntries(unwritableParent);
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: { TMPDIR: unwritableParent, NODE_ENV: "test" },
+        });
+        const after = listLoopxEntries(unwritableParent);
+
+        // (a) exit code 1
+        expect(result.exitCode).toBe(1);
+        // (b) stderr contains an error message (impl-defined text per §7.4)
+        expect(result.stderr.length).toBeGreaterThan(0);
+        // (c) the ralph:index marker file does NOT exist (no child spawned)
+        expect(existsSync(marker)).toBe(false);
+        // (d) no loopx-* directory was created under the unwritable parent
+        expect(after.slice().sort()).toEqual(before.slice().sort());
+        // (e) zero LOOPX_TEST_CLEANUP_WARNING\t lines on stderr — SPEC §7.4:
+        //     "no path exists, so no cleanup is needed". A buggy impl that
+        //     emitted a spurious cleanup warning despite no path to clean
+        //     up would fail this assertion.
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(0);
+      },
+    );
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12b: run() — tmpdir creation failure throws on first next().
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-TMP-12b: run() tmpdir creation failure throws on first next() with no child spawned and no cleanup warning",
+      async () => {
+        const project = await createTempProject();
+        const unwritableParent = await mkdtemp(
+          join(tmpdir(), "loopx-test-unwritable-"),
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        const cleanupTask = async () => {
+          await chmod(unwritableParent, 0o700).catch(() => {});
+          await rm(unwritableParent, { recursive: true, force: true }).catch(
+            () => {},
+          );
+          await project.cleanup().catch(() => {});
+        };
+        extraCleanups.push(cleanupTask);
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'ran' > "${marker}"\nprintf '{"stop":true}'`,
+        );
+
+        await chmod(unwritableParent, 0o500);
+
+        const before = listLoopxEntries(unwritableParent);
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync, readdirSync } from "node:fs";
+const parent = ${JSON.stringify(unwritableParent)};
+const marker = ${JSON.stringify(marker)};
+function snap() {
+  try {
+    return readdirSync(parent)
+      .filter((e) => e.startsWith("loopx-"))
+      .filter(
+        (e) =>
+          !e.startsWith("loopx-nodepath-shim-") &&
+          !e.startsWith("loopx-bun-jsx-") &&
+          !e.startsWith("loopx-install-"),
+      );
+  } catch { return []; }
+}
+const beforeSnap = snap();
+let caught = false;
+let errMsg = "";
+let errName = "";
+try {
+  const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  await gen.next();
+} catch (e) {
+  caught = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? (e.name || "") : "";
+}
+const afterSnap = snap();
+console.log(JSON.stringify({ caught, errMsg, errName, beforeSnap, afterSnap, markerExists: existsSync(marker) }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: unwritableParent, NODE_ENV: "test" },
+        });
+        const after = listLoopxEntries(unwritableParent);
+
+        // The driver process must complete cleanly to print its JSON
+        // envelope. Pre-ADR-0004 implementations that have eager TMPDIR-
+        // dependent module-load work (e.g., a NODE_PATH shim) crash on
+        // import and fail this assertion — the test correctly fails
+        // until the impl decouples shim location from LOOPX_TMPDIR
+        // parent or makes the shim creation lazy / failure-tolerant.
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout) as {
+          caught: boolean;
+          errMsg: string;
+          errName: string;
+          beforeSnap: string[];
+          afterSnap: string[];
+          markerExists: boolean;
+        };
+        // (a) the generator threw a tmpdir-creation-failure error
+        expect(data.caught).toBe(true);
+        expect(data.errMsg.length).toBeGreaterThan(0);
+        // (b) no child spawned (marker absent)
+        expect(data.markerExists).toBe(false);
+        // (c) no loopx-* entries appeared during the call
+        expect(data.afterSnap.slice().sort()).toEqual(
+          data.beforeSnap.slice().sort(),
+        );
+        // (host-side) the unwritable parent has no loopx-* entries either
+        expect(after.slice().sort()).toEqual(before.slice().sort());
+        // (d) zero LOOPX_TEST_CLEANUP_WARNING\t lines on stderr
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(0);
+      },
+    );
+
+    // ------------------------------------------------------------------------
+    // T-TMP-12c: runPromise() — tmpdir creation failure rejects.
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-TMP-12c: runPromise() tmpdir creation failure rejects with no child spawned and no cleanup warning",
+      async () => {
+        const project = await createTempProject();
+        const unwritableParent = await mkdtemp(
+          join(tmpdir(), "loopx-test-unwritable-"),
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        const cleanupTask = async () => {
+          await chmod(unwritableParent, 0o700).catch(() => {});
+          await rm(unwritableParent, { recursive: true, force: true }).catch(
+            () => {},
+          );
+          await project.cleanup().catch(() => {});
+        };
+        extraCleanups.push(cleanupTask);
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'ran' > "${marker}"\nprintf '{"stop":true}'`,
+        );
+
+        await chmod(unwritableParent, 0o500);
+
+        const before = listLoopxEntries(unwritableParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, readdirSync } from "node:fs";
+const parent = ${JSON.stringify(unwritableParent)};
+const marker = ${JSON.stringify(marker)};
+function snap() {
+  try {
+    return readdirSync(parent)
+      .filter((e) => e.startsWith("loopx-"))
+      .filter(
+        (e) =>
+          !e.startsWith("loopx-nodepath-shim-") &&
+          !e.startsWith("loopx-bun-jsx-") &&
+          !e.startsWith("loopx-install-"),
+      );
+  } catch { return []; }
+}
+const beforeSnap = snap();
+let caught = false;
+let errMsg = "";
+let errName = "";
+try {
+  await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) {
+  caught = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? (e.name || "") : "";
+}
+const afterSnap = snap();
+console.log(JSON.stringify({ caught, errMsg, errName, beforeSnap, afterSnap, markerExists: existsSync(marker) }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: unwritableParent, NODE_ENV: "test" },
+        });
+        const after = listLoopxEntries(unwritableParent);
+
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout) as {
+          caught: boolean;
+          errMsg: string;
+          errName: string;
+          beforeSnap: string[];
+          afterSnap: string[];
+          markerExists: boolean;
+        };
+        // (a) the promise rejected with a tmpdir-creation-failure error
+        expect(data.caught).toBe(true);
+        expect(data.errMsg.length).toBeGreaterThan(0);
+        // (b) no child spawned (marker absent)
+        expect(data.markerExists).toBe(false);
+        // (c) no loopx-* entries appeared during the call
+        expect(data.afterSnap.slice().sort()).toEqual(
+          data.beforeSnap.slice().sort(),
+        );
+        expect(after.slice().sort()).toEqual(before.slice().sort());
+        // (d) zero LOOPX_TEST_CLEANUP_WARNING\t lines on stderr
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(0);
+      },
+    );
+
+    // ========================================================================
     // Cleanup on Normal Completion (T-TMP-13..14a)
     // ========================================================================
 
