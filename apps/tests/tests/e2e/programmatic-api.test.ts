@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { chmod } from "node:fs/promises";
 import { execSync } from "node:child_process";
 import { join, resolve } from "node:path";
@@ -323,16 +323,19 @@ console.log(JSON.stringify(results));
       expect(readFileSync(markerPath, "utf-8")).toBe(project.dir);
     });
 
-    // T-API-07a: RunOptions.cwd does not control script execution cwd — scripts run with
-    //            the workflow directory as their cwd, not the provided RunOptions.cwd.
-    it("T-API-07a: RunOptions.cwd does not control script execution cwd", async () => {
+    // T-API-07a: RunOptions.cwd controls script execution cwd (project-root-unified per
+    //            ADR-0004 §3 / SPEC 9.5). Script execution cwd equals the project root,
+    //            and LOOPX_WORKFLOW_DIR exposes the workflow-relative path independently.
+    it("T-API-07a: RunOptions.cwd controls script execution cwd (project-root-unified)", async () => {
       project = await createTempProject();
-      const markerPath = join(project.dir, "cwd-marker.txt");
+      const cwdMarker = join(project.dir, "cwd-marker.txt");
+      const wfdirMarker = join(project.dir, "wfdir-marker.txt");
       await createBashWorkflowScript(
         project,
         "ralph",
         "index",
-        `printf '%s' "$PWD" > "${markerPath}"
+        `printf '%s' "$(/bin/pwd -P)" > "${cwdMarker}"
+printf '%s' "$LOOPX_WORKFLOW_DIR" > "${wfdirMarker}"
 printf '{"stop":true}'`,
       );
 
@@ -345,12 +348,19 @@ console.log("done");
 `;
       const result = await runAPIDriver(runtime, driverCode);
       expect(result.exitCode).toBe(0);
-      expect(existsSync(markerPath)).toBe(true);
-      // Script's cwd must be the workflow dir (.loopx/ralph), NOT projectA.
-      // Use realpath-tolerant comparison: resolve both sides.
-      const actualCwd = readFileSync(markerPath, "utf-8");
-      expect(resolve(actualCwd)).toBe(resolve(workflowDir));
-      expect(resolve(actualCwd)).not.toBe(resolve(project.dir));
+      expect(existsSync(cwdMarker)).toBe(true);
+      // Per SPEC 9.5 (rewritten by ADR-0004 §3): RunOptions.cwd specifies BOTH
+      // the project root and the script execution cwd. The previous "cwd does
+      // not control script execution cwd" disclaimer no longer applies.
+      // /bin/pwd -P returns the kernel-canonical form, so compare against
+      // realpath(project.dir).
+      const actualCwd = readFileSync(cwdMarker, "utf-8");
+      const expectedRoot = realpathSync(project.dir);
+      expect(actualCwd).toBe(expectedRoot);
+      expect(actualCwd).not.toBe(workflowDir);
+      // The workflow-relative path is exposed via LOOPX_WORKFLOW_DIR, not cwd.
+      expect(existsSync(wfdirMarker)).toBe(true);
+      expect(readFileSync(wfdirMarker, "utf-8")).toBe(workflowDir);
     });
 
     // T-API-08: maxIterations: 0 → completes immediately, no yields, no child spawn.
@@ -2111,15 +2121,17 @@ console.log(JSON.stringify(outputs));
       expect(outputs[0].result).toBe("no-index-ok");
     });
 
-    // T-API-47b: RunOptions.cwd sets LOOPX_PROJECT_ROOT; script still runs with workflow dir as cwd.
-    it("T-API-47b: runPromise — cwd sets LOOPX_PROJECT_ROOT, script cwd is workflow dir", async () => {
+    // T-API-47b: runPromise — RunOptions.cwd sets BOTH LOOPX_PROJECT_ROOT and the
+    //            script execution cwd. LOOPX_WORKFLOW_DIR independently exposes the
+    //            workflow-relative path.
+    it("T-API-47b: runPromise — cwd sets LOOPX_PROJECT_ROOT and script execution cwd", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cwd-marker.txt");
       await createBashWorkflowScript(
         project,
         "ralph",
         "index",
-        `printf '{"cwd":"%s","root":"%s"}' "$PWD" "$LOOPX_PROJECT_ROOT" > "${markerPath}"
+        `printf '{"cwd":"%s","root":"%s","wfdir":"%s"}' "$(/bin/pwd -P)" "$LOOPX_PROJECT_ROOT" "$LOOPX_WORKFLOW_DIR" > "${markerPath}"
 printf '{"stop":true}'`,
       );
       const workflowDir = join(project.loopxDir, "ralph");
@@ -2133,8 +2145,14 @@ console.log("done");
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
       const parsed = JSON.parse(readFileSync(markerPath, "utf-8"));
-      expect(resolve(parsed.cwd)).toBe(resolve(workflowDir));
-      expect(resolve(parsed.root)).toBe(resolve(project.dir));
+      // Per SPEC 9.5 (rewritten by ADR-0004 §3): RunOptions.cwd specifies BOTH
+      // the project root AND the script execution cwd. /bin/pwd -P yields the
+      // kernel-canonical form, so the cwd assertion uses realpath(project.dir).
+      const expectedRoot = realpathSync(project.dir);
+      expect(parsed.cwd).toBe(expectedRoot);
+      expect(parsed.root).toBe(project.dir);
+      // LOOPX_WORKFLOW_DIR exposes the workflow-relative path (independent of cwd).
+      expect(parsed.wfdir).toBe(workflowDir);
     });
   });
 });

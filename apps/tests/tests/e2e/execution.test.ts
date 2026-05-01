@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -19,14 +19,16 @@ import { runAPIDriver } from "../helpers/api-driver.js";
 import { forEachRuntime, isRuntimeAvailable } from "../helpers/runtime.js";
 
 // ============================================================================
-// TEST-SPEC §4.4 — Script Execution (ADR-0003 workflow model)
-// Spec refs: 6.1–6.5, 8.3, 2.1, 2.2
+// TEST-SPEC §4.4 — Script Execution
+// Spec refs: 6.1–6.5, 8.3, 2.1, 2.2 (and ADR-0004 §3 / §4 for cwd + WORKFLOW_DIR)
 //
-// Under the workflow model, all scripts live in workflow subdirectories of
-// .loopx/ (e.g. .loopx/ralph/index.sh). Scripts execute with the workflow
-// directory as cwd. LOOPX_PROJECT_ROOT always points to the invocation
-// directory; LOOPX_WORKFLOW always contains the current workflow's name and
-// is refreshed on every cross-workflow transition (including loop reset).
+// All scripts live in workflow subdirectories of .loopx/ (e.g.
+// .loopx/ralph/index.sh). Per SPEC 6.1 (rewritten by ADR-0004), every spawned
+// script runs with LOOPX_PROJECT_ROOT as its working directory — not the
+// workflow directory. The workflow-relative path is exposed via
+// LOOPX_WORKFLOW_DIR. LOOPX_WORKFLOW always contains the current workflow's
+// name and is refreshed on every cross-workflow transition (including loop
+// reset).
 // ============================================================================
 
 // ----------------------------------------------------------------------------
@@ -44,7 +46,7 @@ describe("TEST-SPEC §4.4 Working Directory", () => {
   });
 
   forEachRuntime((runtime) => {
-    it("T-EXEC-01: script in ralph workflow runs with $PWD = .loopx/ralph/", async () => {
+    it("T-EXEC-01: script in ralph workflow runs with cwd = project root (not workflow dir)", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cwd-marker.txt");
 
@@ -64,12 +66,17 @@ describe("TEST-SPEC §4.4 Working Directory", () => {
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
       const recordedCwd = readFileSync(markerPath, "utf-8");
+      // Per SPEC 6.1 (rewritten by ADR-0004 §3): every script spawn uses
+      // LOOPX_PROJECT_ROOT — the loopx-observed process.cwd() at invocation —
+      // as its cwd. /bin/pwd -P returns the kernel-canonical form, so compare
+      // against realpath of the project dir (loopx's process.cwd() at spawn).
+      const expectedRoot = realpathSync(project.dir);
       const workflowDir = join(project.loopxDir, "ralph");
-      expect(recordedCwd).toBe(workflowDir);
-      expect(recordedCwd).not.toBe(project.dir);
+      expect(recordedCwd).toBe(expectedRoot);
+      expect(recordedCwd).not.toBe(workflowDir);
     });
 
-    it("T-EXEC-02: script in 'other' workflow runs with $PWD = .loopx/other/", async () => {
+    it("T-EXEC-02: script in 'other' workflow also runs with cwd = project root", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cwd-other.txt");
 
@@ -89,8 +96,12 @@ describe("TEST-SPEC §4.4 Working Directory", () => {
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
       const recordedCwd = readFileSync(markerPath, "utf-8");
+      // Multiple workflows in the same run all spawn with project-root cwd —
+      // cwd does not differ by workflow (SPEC 6.1).
+      const expectedRoot = realpathSync(project.dir);
       const otherDir = join(project.loopxDir, "other");
-      expect(recordedCwd).toBe(otherDir);
+      expect(recordedCwd).toBe(expectedRoot);
+      expect(recordedCwd).not.toBe(otherDir);
     });
 
     it("T-EXEC-03: $LOOPX_PROJECT_ROOT equals invocation directory, not workflow directory", async () => {
@@ -680,7 +691,7 @@ process.stdout.write(JSON.stringify({ result: greeting }));
       expect(readFileSync(markerPath, "utf-8")).toBe("hello-from-local-dep");
     });
 
-    it("T-EXEC-16: workflow cwd equals the workflow directory (TS, via process.cwd())", async () => {
+    it("T-EXEC-16: script cwd is the project root in JS/TS runtimes too", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "ts-cwd-marker.txt");
 
@@ -702,8 +713,16 @@ process.stdout.write(JSON.stringify({ result: "ok" }));
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
+      const recordedCwd = readFileSync(markerPath, "utf-8");
+      // Per SPEC 6.1 (rewritten by ADR-0004 §3): JS/TS scripts also spawn at
+      // project-root cwd. process.cwd() returns the runtime-canonicalized
+      // (getcwd(3)) form per SPEC 6.1 "Directory identity vs. string spelling";
+      // compare against realpath of project.dir (loopx's process.cwd() at
+      // invocation when supplied via the CLI).
+      const expectedRoot = realpathSync(project.dir);
       const workflowDir = join(project.loopxDir, "ralph");
-      expect(readFileSync(markerPath, "utf-8")).toBe(workflowDir);
+      expect(recordedCwd).toBe(expectedRoot);
+      expect(recordedCwd).not.toBe(workflowDir);
     });
 
     it("T-EXEC-16a: workflow importing a package not present in its node_modules fails with exit 1", async () => {
@@ -729,9 +748,10 @@ process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
       expect(result.exitCode).toBe(1);
     });
 
-    it("T-EXEC-16b: cross-workflow goto switches cwd to the target workflow's directory", async () => {
+    it("T-EXEC-16b: cross-workflow goto preserves project-root cwd (does NOT switch cwd)", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cross-cwd-marker.txt");
+      const wfdirMarkerPath = join(project.dir, "cross-wfdir-marker.txt");
 
       // ralph:index transitions into other:check
       await createBashWorkflowScript(
@@ -740,14 +760,16 @@ process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
         "index",
         `printf '{"goto":"other:check"}'`,
       );
-      // other:check records its own $PWD, then stops so the chain ends.
+      // other:check records its own kernel cwd (/bin/pwd -P) and the
+      // injected LOOPX_WORKFLOW_DIR, then stops so the chain ends.
       await createWorkflowScript(
         project,
         "other",
         "check",
         ".sh",
         `#!/bin/bash
-printf '%s' "$PWD" > "${markerPath}"
+printf '%s' "$(/bin/pwd -P)" > "${markerPath}"
+printf '%s' "$LOOPX_WORKFLOW_DIR" > "${wfdirMarkerPath}"
 printf '{"stop":true}'
 `,
       );
@@ -760,12 +782,17 @@ printf '{"stop":true}'
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
       const recordedCwd = readFileSync(markerPath, "utf-8");
+      // Per SPEC 6.1 (rewritten by ADR-0004 §3): cross-workflow goto changes
+      // LOOPX_WORKFLOW / LOOPX_WORKFLOW_DIR but NOT cwd; every spawn in the
+      // run uses project-root cwd.
+      const expectedRoot = realpathSync(project.dir);
       const otherDir = join(project.loopxDir, "other");
-      const ralphDir = join(project.loopxDir, "ralph");
-      // After crossing into 'other', the script must execute in .loopx/other/,
-      // not in ralph's directory.
-      expect(recordedCwd).toBe(otherDir);
-      expect(recordedCwd).not.toBe(ralphDir);
+      expect(recordedCwd).toBe(expectedRoot);
+      expect(recordedCwd).not.toBe(otherDir);
+      // LOOPX_WORKFLOW_DIR did refresh to the target workflow — cwd and
+      // LOOPX_WORKFLOW_DIR are independent surfaces.
+      expect(existsSync(wfdirMarkerPath)).toBe(true);
+      expect(readFileSync(wfdirMarkerPath, "utf-8")).toBe(otherDir);
     });
   });
 });

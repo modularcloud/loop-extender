@@ -1,19 +1,47 @@
 # Implementation Plan for loopx Test Harness
 
-**Status: spec-conformant as of 2026-04-17. No open P0/P1.**
+**Status: NOT spec-conformant. P0 backwards assertions resolved this iteration; large P1 gaps in ADR-0004 coverage remain.**
 
-The 2026-04-17 breadth audit of `tests/` against TEST-SPEC.md found 0 unconditional skips of spec-required tests, 0 placeholder assertions, and 0 TODO/FIXME markers; all 42 conditional skips map to spec-documented conditions; 30/30 sampled spec IDs were located in test files. Per-file ADR-0003 migration state is recorded in git history and does not need to live here.
+## P0 — RESOLVED this iteration
 
-## P2 — Follow-ups (non-blocking)
+The following tests had been encoded against pre-ADR-0004 behavior (workflow-dir cwd) and were rewritten to assert the project-root-unified cwd from ADR-0004 §3 / SPEC §6.1 / §9.5. With these fixes, the tests now correctly **fail** against the existing pre-ADR-0004 implementation — that is the expected state until the implementation catches up to ADR-0004:
 
-- **Permission-000 coverage under root.** Several tests use `it.skipIf(IS_ROOT)` for unreadable-file paths; if CI ever runs as non-root these activate automatically.
-- **Tarball fixtures via `python3`** in `install.test.ts` — external-tool dependency; consider a JS-only implementation if the Python assumption becomes inconvenient.
-- **`loopx` NODE_PATH shim under `$TMPDIR`** — per-process directory; verify abnormal-exit cleanup stays acceptable.
+- T-EXEC-01, T-EXEC-02 — bash cwd assertions (project root, not workflow dir).
+- T-EXEC-16 — JS/TS cwd assertion (project root, not workflow dir).
+- T-EXEC-16b — cross-workflow goto preserves project-root cwd; LOOPX_WORKFLOW_DIR refreshes independently.
+- T-API-07a — `RunOptions.cwd` controls script execution cwd (project-root-unified).
+- T-API-47b — `runPromise` cwd sets LOOPX_PROJECT_ROOT AND script execution cwd; LOOPX_WORKFLOW_DIR independent.
+- `writeCwdToFile` helper now uses `/bin/pwd -P` (per SPEC 6.1 — `$PWD` non-authoritative).
+- §4.4 header comment in `execution.test.ts` rewritten to describe ADR-0004 cwd behavior.
+
+## P1 — Entire ADR-0004 test suites missing
+
+- **T-WFDIR-01..09d** — `LOOPX_WORKFLOW_DIR` env-var suite: injection, per-spawn refresh, cross-workflow goto, deeper chains, symlink behavior. No test file exists.
+- **T-TMP-\*** — full `LOOPX_TMPDIR` suite: creation; identity-fingerprint cleanup; cleanup triggers; cleanup safety under symlink/non-directory replacement; mode 0700; parent selection; naming; isolation across concurrent runs; settlement-based cleanup on `run()`; signal handling; abort handling; idempotence; cleanup-warning cardinality.
+- **T-API-50..57i** — `RunOptions.env` block (~80 IDs): shape validation, lifetime/snapshot semantics, merge-position precedence, protocol-variable override, NUL-byte rejection through `RunOptions.env`.
+- **T-API-58..59i** — Inherited-env snapshot timing (lazy under `run()`, eager under `runPromise()`).
+- **T-API-60..62i4** — Pre-iteration ordering and options-snapshot tests (~60 tests).
+- **T-API-63..69u** — Abort precedence, generator lifecycle, promise rejection (~150 tests).
+- **T-API-70..74c** — 15 remaining programmatic API tests.
+- **T-INST-110..120e** — Auto-install ADR-0004 (~100 tests): `npm install`, `--no-install`, `.gitignore` safeguard, malformed `package.json` skip, npm-install failure handling, signals during npm install, no-rollback semantics, `-y` interaction, environment isolation, streaming passthrough, npm-only manager selection.
+- **T-INST-55f..55zj** — symlink source validation (~40 tests).
+- **T-INST-40f, T-INST-44a..44f** — `--no-install` CLI parsing (duplicate rejection, help interaction, no short alias).
+- **T-INST-DASHDASH-01..04** — `--` rejection on install.
+- **T-INST-42m, 42n** — install help-text content pins.
+
+## P2 — Supplementary tests for established sections
+
+- **Loop state**: T-LOOP-13a, 15b, 24a, 44, 45, 46.
+- **Discovery**: T-DISC-07a, 07c, 09a, 09b, 24a, 24b, 42d-42g, 49a-49k, 40j-40w (project-root `.loopx` entry failures and symlink edges).
+- **Output parsing**: T-PARSE-04a, 13a, 17a; T-MOD-13q.
+- **Execution edge cases**: T-EXEC-03b, 03c, 07a, 07b, 13c-13m (CJS/`require` rejection), 15a/15b/15c (no auto-install at run time), 16c, 16d.
+- **Signals**: T-SIG-04a, 05a, 06a, 07a (SIGINT parity); T-SIG-20..31 (full pre-iteration signal-wins precedence).
+- **Types**: T-TYPE-08 (compile-time check for `output()`/`input()`).
+- **Env**: T-ENV-05f, 08a, 15g..15n; T-ENV-21e..21h; T-ENV-24a2..24a6; T-ENV-26..26g (NUL bytes); T-ENV-27..27e (`RunOptions.env` tier interaction); T-ENV-28..29a.
+- **Exit codes**: T-EXIT-17 (invalid target string).
+- **Source detection**: T-INST-05a, 08g..08m.
+- **Other install**: T-INST-56f..56i, 60t/60u, 63f/63g, 64e, 70e, 76b, 79a, 80c2, 80f2, 83b, 92a..92c, 97a2, 97c.
 
 ## Notes
 
-- `.loopx/.iteration.tmp` appears in `git status` — left by a prior loopx run, not part of this work. Not tracked.
-
-## Recent
-
-**2026-04-17 — T-INST-GLOBAL-01 / 01a conformance + tsx runtime dep + api-driver npx trap.** TEST-SPEC §4.10 was tightened to forbid `process.env` / unchanged `PATH` leakage and to require a symlink-liveness assertion on the installed package root. Both global-install smoke tests in `tests/e2e/install.test.ts` were updated to spawn with a scrubbed env (only `HOME`, `TMPDIR`, `GIT_CONFIG_GLOBAL`, and an explicit `PATH` of `${globalPrefix}/bin:${dirname(runtime)}:/usr/local/bin:/usr/bin:/bin`) and to `lstat` the installed package root. Landing the scrubbed-PATH version surfaced a real `spawn tsx ENOENT` failure — `src/execution.ts` spawns `tsx` for every `.ts`/`.js`/`.jsx`/`.tsx` script but `loop-extender` did not declare `tsx` as a runtime dependency. Resolved on the src side: `scripts/postbuild.mjs` now injects `tsx` into the published package's `dependencies` (version sourced from the repo `package.json` devDependencies so test and runtime stay in lockstep), and `src/execution.ts` prepends two bin dirs to `PATH` — `<__dirname>/node_modules/.bin` (nested layout, the `npm install -g` case) and `<__dirname>/../node_modules/.bin` (flat layout, the dev-tree dist/ case) — via `LOOPX_NESTED_BIN_DIR` + `LOOPX_FLAT_BIN_DIR`, de-duplicated against the incoming PATH. A separate pre-existing bug in `tests/helpers/api-driver.ts` was also resolved: under npm 11+, `npx tsx` exits 127 ("tsx: command not found") when the cwd has a `node_modules/` directory, even if that directory only contains a symlinked package — the helper now spawns `<repo>/node_modules/.bin/tsx` by absolute path for Node. Full suite green: e2e 1818/1818, fuzz 48/48, unit+harness 172/172.
+- `.loopx/.iteration.tmp` and `.loopx/ralph/.tmp/` appear in `git status` — left by prior loopx runs, not part of this work. Not tracked.
