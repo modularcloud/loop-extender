@@ -176,6 +176,174 @@ async function assertNoTmpdirCreated(args: {
 }
 
 /**
+ * Three execution surfaces over which T-TMP-12d / T-TMP-12d2 / T-TMP-12e /
+ * T-TMP-12e2 / T-TMP-12e3 are parameterized. Unlike T-TMP-12 (which only
+ * exercises the two programmatic surfaces), the sub-step coverage tests
+ * exercise the full SPEC §7.4 creation-failure × cleanup-safety surface
+ * across all three loopx execution paths.
+ */
+const TMPDIR_FAULT_SURFACES = ["cli", "run", "runPromise"] as const;
+type TmpdirFaultSurface = (typeof TMPDIR_FAULT_SURFACES)[number];
+
+/**
+ * Drives one of T-TMP-12d / T-TMP-12d2 / T-TMP-12e / T-TMP-12e2 / T-TMP-12e3
+ * across a single execution surface. Encapsulates the shared harness shape:
+ *
+ *   1. Create a temp project with a valid `.loopx/ralph/index.sh` fixture
+ *      that writes a marker file when executed.
+ *   2. Create a writable test-isolated TMPDIR parent (so `mkdtemp` itself
+ *      succeeds — the seam, not the parent's mode, drives the sub-step
+ *      failure under test). `setupTmpdirTest` registers the parent for
+ *      `afterEach` removal, so any partial `loopx-*` residue left behind
+ *      by T-TMP-12d2 / T-TMP-12e2 / T-TMP-12e3 is cleaned up automatically.
+ *   3. Snapshot `loopx-*` entries under the parent before the run.
+ *   4. Drive the surface-appropriate invocation with the test-only seam env
+ *      vars in `faultEnv` plus `NODE_ENV=test` (required for the seam to
+ *      be honored per §1.4 of TEST-SPEC).
+ *   5. Snapshot again and assert:
+ *        (a) the surface-appropriate terminal failure surfaces (CLI exit 1
+ *            / generator throws / promise rejects, all with implementation-
+ *            defined non-empty error text);
+ *        (b) the marker file does not exist (no child spawned — SPEC §7.1
+ *            step 7 not reached because step 6 failed);
+ *        (c) residue presence/absence matches `expectResidue` — `false` for
+ *            the success-cleanup paths (12d / 12e: rmdir / recursive-remove
+ *            succeeded), `true` for the failed-cleanup paths (12d2 / 12e2 /
+ *            12e3: rmdir / recursive-remove / lstat failed, leaving the
+ *            partial directory in place per SPEC §7.4 "leaves the path in
+ *            place" / "no further changes");
+ *        (d) the count of `LOOPX_TEST_CLEANUP_WARNING\t…` lines on stderr
+ *            matches `expectCleanupWarnings` — `0` for the success-cleanup
+ *            paths (no warning is normative when cleanup completes cleanly)
+ *            and `1` for the failed-cleanup paths (SPEC §7.4 "single stderr
+ *            warning" combined with "Per-cleanup-attempt warning cardinality
+ *            is at most one"). The warning text itself is implementation-
+ *            defined per SPEC §7.4; the `LOOPX_TEST_CLEANUP_WARNING\t`
+ *            prefix is the implementation-neutral detection predicate
+ *            documented in TEST-SPEC §1.4 "Cleanup-warning structured
+ *            marker".
+ */
+async function runTmpdirFaultTest(args: {
+  runtime: "node" | "bun";
+  surface: TmpdirFaultSurface;
+  faultEnv: Record<string, string>;
+  expectCleanupWarnings: number;
+  expectResidue: boolean;
+}) {
+  const { project, tmpdirParent } = await setupTmpdirTest();
+  const marker = join(project.dir, "child-ran.txt");
+  await createBashWorkflowScript(
+    project,
+    "ralph",
+    "index",
+    `printf 'ran' > "${marker}"\nprintf '{"stop":true}'`,
+  );
+
+  const before = listLoopxEntries(tmpdirParent);
+  const env: Record<string, string> = {
+    TMPDIR: tmpdirParent,
+    NODE_ENV: "test",
+    ...args.faultEnv,
+  };
+
+  let stderr: string;
+  let markerExists: boolean;
+
+  if (args.surface === "cli") {
+    const result = await runCLI(["run", "-n", "1", "ralph"], {
+      cwd: project.dir,
+      runtime: args.runtime,
+      env,
+    });
+    // (a) CLI exit 1 with non-empty stderr (implementation-defined error text)
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.length).toBeGreaterThan(0);
+    stderr = result.stderr;
+    markerExists = existsSync(marker);
+  } else {
+    const callBlock =
+      args.surface === "runPromise"
+        ? `await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });`
+        : `const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  await gen.next();`;
+    const driverCode = `
+import { ${args.surface} } from "loopx";
+import { existsSync, readdirSync } from "node:fs";
+const parent = ${JSON.stringify(tmpdirParent)};
+const marker = ${JSON.stringify(marker)};
+function snap() {
+  try {
+    return readdirSync(parent)
+      .filter((e) => e.startsWith("loopx-"))
+      .filter(
+        (e) =>
+          !e.startsWith("loopx-nodepath-shim-") &&
+          !e.startsWith("loopx-bun-jsx-") &&
+          !e.startsWith("loopx-install-"),
+      );
+  } catch { return []; }
+}
+const beforeSnap = snap();
+let caught = false;
+let errMsg = "";
+let errName = "";
+try {
+  ${callBlock}
+} catch (e) {
+  caught = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? (e.name || "") : "";
+}
+const afterSnap = snap();
+console.log(JSON.stringify({ caught, errMsg, errName, beforeSnap, afterSnap, markerExists: existsSync(marker) }));
+`;
+    const result = await runAPIDriver(args.runtime, driverCode, { env });
+    expect(result.exitCode).toBe(0);
+    const data = JSON.parse(result.stdout) as {
+      caught: boolean;
+      errMsg: string;
+      errName: string;
+      beforeSnap: string[];
+      afterSnap: string[];
+      markerExists: boolean;
+    };
+    // (a) generator throws / promise rejects with non-empty error text
+    //     (the original tmpdir-creation-failure error per SPEC §7.4
+    //     "does not mask the original creation error" for 12d2 / 12e2 /
+    //     12e3; the seam-injected creation error for 12d / 12e).
+    expect(data.caught).toBe(true);
+    expect(data.errMsg.length).toBeGreaterThan(0);
+    stderr = result.stderr;
+    markerExists = data.markerExists;
+  }
+
+  const after = listLoopxEntries(tmpdirParent);
+  const newEntries = after.filter((e) => !before.includes(e));
+
+  // (b) no child spawned (SPEC §7.1 step 7 not reached)
+  expect(markerExists).toBe(false);
+
+  // (c) residue presence/absence
+  if (args.expectResidue) {
+    // SPEC §7.4: failed-cleanup paths "leave the path in place" / "no
+    // further changes". Exactly one new partial `loopx-*` directory.
+    expect(newEntries.length).toBe(1);
+    expect(newEntries[0]?.startsWith("loopx-")).toBe(true);
+  } else {
+    // SPEC §7.4: success-cleanup paths leave no residue (rmdir or
+    // recursive-remove completed cleanly).
+    expect(newEntries.length).toBe(0);
+  }
+
+  // (d) cleanup-warning marker-line count (TEST-SPEC §1.4 "Cleanup-warning
+  // structured marker" — implementation-neutral detection predicate).
+  const cleanupWarnings = stderr
+    .split("\n")
+    .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+  expect(cleanupWarnings.length).toBe(args.expectCleanupWarnings);
+}
+
+/**
  * Creates a per-test isolated TMPDIR parent directory and pairs it with a
  * project. Tests must inject the parent as `TMPDIR` on loopx's inherited
  * environment so that `os.tmpdir()` evaluated by loopx resolves to this
@@ -2276,6 +2444,144 @@ console.log(JSON.stringify({ caught, errMsg, errName, beforeSnap, afterSnap, mar
         expect(cleanupWarnings.length).toBe(0);
       },
     );
+
+    // ========================================================================
+    // Tmpdir Creation Sub-step Coverage
+    // (T-TMP-12d / T-TMP-12d2 / T-TMP-12e / T-TMP-12e2 / T-TMP-12e3)
+    //
+    // SPEC §7.4 "Creation order" specifies three sub-steps with distinct
+    // failure-handling behavior:
+    //   1. mkdtemp itself fails → no path exists, no cleanup needed.
+    //      (covered by T-TMP-12a / 12b / 12c via unwritable parent.)
+    //   2. Identity capture fails (after mkdtemp succeeded) → loopx
+    //      attempts a single non-recursive rmdir on the path.
+    //   3. Mode-securing fails (after mkdtemp + identity capture succeeded)
+    //      → loopx runs the full identity-fingerprint cleanup-safety
+    //      routine on the partial directory.
+    //
+    // T-TMP-12d / T-TMP-12e exercise the success-cleanup branches of
+    // sub-steps 2 and 3 via the `LOOPX_TEST_TMPDIR_FAULT` seam (TEST-SPEC
+    // §1.4). T-TMP-12d2 covers the cleanup-failure-during-creation-failure
+    // axis for sub-step 2 via the compound `identity-capture-fail-rmdir-
+    // fail` seam value. T-TMP-12e2 / T-TMP-12e3 cover the same axis for
+    // sub-step 3's two reachable cleanup-safety failure branches —
+    // rule-4 recursive-removal and top-level lstat — via composition with
+    // `LOOPX_TEST_CLEANUP_FAULT`.
+    //
+    // Each sub-case is parameterized over three execution surfaces (CLI /
+    // run() / runPromise()) and (per the outer `forEachRuntime`) over node
+    // and bun.
+    // ========================================================================
+
+    for (const surface of TMPDIR_FAULT_SURFACES) {
+      // ----------------------------------------------------------------------
+      // T-TMP-12d: identity-capture-fail seam — mkdtemp succeeds, identity
+      // capture fails, the single non-recursive rmdir on the empty partial
+      // directory succeeds. No residue, no cleanup warning.
+      // ----------------------------------------------------------------------
+      it(
+        `T-TMP-12d (${surface}): identity-capture-fail — partial directory removed via single rmdir, no cleanup warning`,
+        async () => {
+          await runTmpdirFaultTest({
+            runtime,
+            surface,
+            faultEnv: { LOOPX_TEST_TMPDIR_FAULT: "identity-capture-fail" },
+            expectCleanupWarnings: 0,
+            expectResidue: false,
+          });
+        },
+      );
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12d2: identity-capture-fail × rmdir-fail compound seam —
+      // mkdtemp succeeds, identity capture fails, the single non-recursive
+      // rmdir itself fails. Residue remains; exactly one cleanup warning.
+      // The original tmpdir-creation-failure error is surfaced (not the
+      // rmdir cleanup failure) per SPEC §7.4 "does not mask the original
+      // creation error".
+      // ----------------------------------------------------------------------
+      it(
+        `T-TMP-12d2 (${surface}): identity-capture-fail-rmdir-fail — partial directory remains, exactly one cleanup warning`,
+        async () => {
+          await runTmpdirFaultTest({
+            runtime,
+            surface,
+            faultEnv: {
+              LOOPX_TEST_TMPDIR_FAULT: "identity-capture-fail-rmdir-fail",
+            },
+            expectCleanupWarnings: 1,
+            expectResidue: true,
+          });
+        },
+      );
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12e: mode-secure-fail seam — mkdtemp + identity capture both
+      // succeed, mode-securing fails, the full identity-fingerprint cleanup-
+      // safety routine runs and recursively removes the partial directory
+      // under rule 4 (identity matches). No residue, no cleanup warning.
+      // ----------------------------------------------------------------------
+      it(
+        `T-TMP-12e (${surface}): mode-secure-fail — full cleanup-safety routine recursively removes partial directory, no cleanup warning`,
+        async () => {
+          await runTmpdirFaultTest({
+            runtime,
+            surface,
+            faultEnv: { LOOPX_TEST_TMPDIR_FAULT: "mode-secure-fail" },
+            expectCleanupWarnings: 0,
+            expectResidue: false,
+          });
+        },
+      );
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12e2: mode-secure-fail × recursive-remove-fail composition —
+      // full cleanup-safety routine reaches rule 4 (identity matches), and
+      // the recursive removal itself fails with EACCES. Residue remains;
+      // exactly one cleanup warning. The original tmpdir-creation-failure
+      // error is surfaced (not the recursive-remove cleanup failure) per
+      // SPEC §7.4 "does not mask the original creation error".
+      // ----------------------------------------------------------------------
+      it(
+        `T-TMP-12e2 (${surface}): mode-secure-fail × recursive-remove-fail — residue remains, exactly one cleanup warning`,
+        async () => {
+          await runTmpdirFaultTest({
+            runtime,
+            surface,
+            faultEnv: {
+              LOOPX_TEST_TMPDIR_FAULT: "mode-secure-fail",
+              LOOPX_TEST_CLEANUP_FAULT: "recursive-remove-fail",
+            },
+            expectCleanupWarnings: 1,
+            expectResidue: true,
+          });
+        },
+      );
+
+      // ----------------------------------------------------------------------
+      // T-TMP-12e3: mode-secure-fail × lstat-fail composition — full
+      // cleanup-safety routine starts but the top-level lstat itself fails
+      // with EACCES, so rule dispatch never proceeds. Partial directory
+      // remains; exactly one cleanup warning. The original tmpdir-creation-
+      // failure error is surfaced (not the lstat cleanup failure) per
+      // SPEC §7.4 "does not mask the original creation error".
+      // ----------------------------------------------------------------------
+      it(
+        `T-TMP-12e3 (${surface}): mode-secure-fail × lstat-fail — partial directory remains, exactly one cleanup warning`,
+        async () => {
+          await runTmpdirFaultTest({
+            runtime,
+            surface,
+            faultEnv: {
+              LOOPX_TEST_TMPDIR_FAULT: "mode-secure-fail",
+              LOOPX_TEST_CLEANUP_FAULT: "lstat-fail",
+            },
+            expectCleanupWarnings: 1,
+            expectResidue: true,
+          });
+        },
+      );
+    }
 
     // ========================================================================
     // Cleanup on Normal Completion (T-TMP-13..14a)
