@@ -1,6 +1,5 @@
-import { join, resolve } from "node:path";
+import { join, resolve, isAbsolute, dirname } from "node:path";
 import { readFileSync } from "node:fs";
-import { dirname } from "node:path";
 import { tmpdir as osTmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import type { Output, RunOptions } from "./types.js";
@@ -13,14 +12,200 @@ import { getLoopxBin, ensureLoopxPackageJson } from "./bin-path.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-/**
- * Internal options carried alongside the public `RunOptions` to plumb
- * snapshot-timing carve-outs through `run()` → `runInternal()` → `runLoop()`.
- * Not part of the public API.
- */
 interface InternalRunOptions {
-  /** Tmpdir parent captured eagerly at the `runPromise()` call site. */
   tmpdirParent?: string;
+}
+
+interface OptionSnapshot {
+  error?: unknown;
+  signal?: AbortSignal;
+  env?: Record<string, string>;
+  cwd?: string;
+  envFile?: string;
+  maxIterations?: number;
+}
+
+function isAbortSignalCompatible(signal: unknown): boolean {
+  if (signal === null) return false;
+  const t = typeof signal;
+  if (t !== "object" && t !== "function") return false;
+  let aborted: unknown;
+  try {
+    aborted = (signal as { aborted?: unknown }).aborted;
+  } catch {
+    return false;
+  }
+  if (typeof aborted !== "boolean") return false;
+  let ael: unknown;
+  try {
+    ael = (signal as { addEventListener?: unknown }).addEventListener;
+  } catch {
+    return false;
+  }
+  if (typeof ael !== "function") return false;
+  return true;
+}
+
+function snapshotEnv(envRaw: unknown): Record<string, string> {
+  if (envRaw === null) {
+    throw new TypeError("RunOptions.env must not be null");
+  }
+  if (Array.isArray(envRaw)) {
+    throw new TypeError("RunOptions.env must not be an array");
+  }
+  const t = typeof envRaw;
+  if (t === "function") {
+    throw new TypeError("RunOptions.env must not be a function");
+  }
+  if (t !== "object") {
+    throw new TypeError(`RunOptions.env must be an object, got ${t}`);
+  }
+
+  const out: Record<string, string> = {};
+  // Object.keys() returns own enumerable string-keyed properties; for Proxy
+  // it invokes the ownKeys + getOwnPropertyDescriptor traps, which may throw
+  // and propagate naturally to the caller (captured into snap.error).
+  const keys = Object.keys(envRaw as object);
+  for (const key of keys) {
+    // [[Get]] — invokes any accessor getter or proxy get trap (may throw).
+    const value = (envRaw as Record<string, unknown>)[key];
+    if (typeof value !== "string") {
+      throw new TypeError(
+        `RunOptions.env[${JSON.stringify(key)}] must be a string, got ${typeof value}`
+      );
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+function snapshotOptions(options: unknown): OptionSnapshot {
+  const snap: OptionSnapshot = {};
+
+  if (options === undefined) return snap;
+  if (options === null) {
+    snap.error = new TypeError("RunOptions must not be null");
+    return snap;
+  }
+  if (Array.isArray(options)) {
+    snap.error = new TypeError("RunOptions must not be an array");
+    return snap;
+  }
+  const ot = typeof options;
+  if (ot === "function") {
+    snap.error = new TypeError("RunOptions must not be a function");
+    return snap;
+  }
+  if (ot !== "object") {
+    snap.error = new TypeError(`RunOptions must be an object, got ${ot}`);
+    return snap;
+  }
+
+  const opts = options as Record<string, unknown>;
+
+  // SPEC §9.1: signal is read FIRST before any other field, so an
+  // already-aborted signal is captured before any other option-field read
+  // can produce a snapshot exception.
+  let signalRaw: unknown;
+  try {
+    signalRaw = opts.signal;
+  } catch (e) {
+    snap.error = e;
+    return snap;
+  }
+  if (signalRaw !== undefined) {
+    if (!isAbortSignalCompatible(signalRaw)) {
+      snap.error = new TypeError(
+        "RunOptions.signal must be an AbortSignal-compatible object"
+      );
+      return snap;
+    }
+    snap.signal = signalRaw as AbortSignal;
+  }
+
+  // Order among remaining fields is implementation-defined per SPEC §9.1.
+  // We do cwd before envFile so envFile can be resolved against the snapshot
+  // cwd at call time per SPEC §9.5.
+  let cwdRaw: unknown;
+  try {
+    cwdRaw = opts.cwd;
+  } catch (e) {
+    snap.error = e;
+    return snap;
+  }
+  if (cwdRaw !== undefined) {
+    if (typeof cwdRaw !== "string") {
+      snap.error = new TypeError(
+        `RunOptions.cwd must be a string, got ${typeof cwdRaw}`
+      );
+      return snap;
+    }
+    try {
+      snap.cwd = isAbsolute(cwdRaw)
+        ? cwdRaw
+        : resolve(process.cwd(), cwdRaw);
+    } catch (e) {
+      snap.error = e;
+      return snap;
+    }
+  }
+
+  let envFileRaw: unknown;
+  try {
+    envFileRaw = opts.envFile;
+  } catch (e) {
+    snap.error = e;
+    return snap;
+  }
+  if (envFileRaw !== undefined) {
+    if (typeof envFileRaw !== "string") {
+      snap.error = new TypeError(
+        `RunOptions.envFile must be a string, got ${typeof envFileRaw}`
+      );
+      return snap;
+    }
+    snap.envFile = envFileRaw;
+  }
+
+  let envRaw: unknown;
+  try {
+    envRaw = opts.env;
+  } catch (e) {
+    snap.error = e;
+    return snap;
+  }
+  if (envRaw !== undefined) {
+    try {
+      snap.env = snapshotEnv(envRaw);
+    } catch (e) {
+      snap.error = e;
+      return snap;
+    }
+  }
+
+  let maxIterRaw: unknown;
+  try {
+    maxIterRaw = opts.maxIterations;
+  } catch (e) {
+    snap.error = e;
+    return snap;
+  }
+  if (maxIterRaw !== undefined) {
+    if (
+      typeof maxIterRaw !== "number" ||
+      !Number.isInteger(maxIterRaw) ||
+      maxIterRaw < 0 ||
+      Number.isNaN(maxIterRaw)
+    ) {
+      snap.error = new Error(
+        `Invalid maxIterations: must be a non-negative integer, got ${String(maxIterRaw)}`
+      );
+      return snap;
+    }
+    snap.maxIterations = maxIterRaw as number;
+  }
+
+  return snap;
 }
 
 function getRunningVersion(): string {
@@ -38,10 +223,9 @@ function getRunningVersion(): string {
  * Run a loopx target and yield Output for each iteration.
  *
  * Per SPEC §9.1/9.5:
- *   - RunOptions.cwd is snapshotted at call time; it specifies the project
- *     root (for `.loopx/` resolution and LOOPX_PROJECT_ROOT), NOT the script
- *     execution cwd. Scripts always execute with their workflow directory
- *     as cwd (§6.1).
+ *   - Options are snapshotted at call time. Throwing getters / proxy traps
+ *     are captured rather than escaping at the call site, and surface via
+ *     the standard pre-iteration error path on first next().
  *   - target is a required string of shape `workflow[:script]`.
  *   - Errors are surfaced lazily on first iteration.
  */
@@ -53,26 +237,58 @@ export function run(
 }
 
 function runWithInternal(
-  target: string,
+  target: unknown,
   options: RunOptions | undefined,
   internal: InternalRunOptions | undefined
 ): AsyncGenerator<Output> {
-  const cwd = options?.cwd ?? process.cwd();
-  const maxIterations = options?.maxIterations;
-  const envFile = options?.envFile;
-  const externalSignal = options?.signal;
+  const snap = snapshotOptions(options);
+
+  // Default cwd to process.cwd() at call time per SPEC §9.5.
+  if (snap.error === undefined && snap.cwd === undefined) {
+    try {
+      snap.cwd = process.cwd();
+    } catch (e) {
+      snap.error = e;
+    }
+  }
+
   const loopxBin = getLoopxBin();
 
   const internalAc = new AbortController();
-  const effectiveSignal: AbortSignal = externalSignal
-    ? AbortSignal.any([externalSignal, internalAc.signal])
-    : internalAc.signal;
+
+  // Wire user signal → internal abort propagation. SPEC §9.5: addEventListener
+  // must return without throwing; if it throws, capture as a snapshot error.
+  if (snap.error === undefined && snap.signal) {
+    if (snap.signal.aborted) {
+      try {
+        internalAc.abort(snap.signal.reason);
+      } catch {
+        /* ignore */
+      }
+    } else {
+      try {
+        snap.signal.addEventListener(
+          "abort",
+          () => {
+            try {
+              internalAc.abort(snap.signal!.reason);
+            } catch {
+              /* ignore */
+            }
+          },
+          { once: true }
+        );
+      } catch (e) {
+        snap.error = e;
+      }
+    }
+  }
+
+  const effectiveSignal: AbortSignal = internalAc.signal;
 
   const gen = runInternal(
     target,
-    cwd,
-    maxIterations,
-    envFile,
+    snap,
     effectiveSignal,
     loopxBin,
     internal?.tmpdirParent
@@ -118,31 +334,28 @@ function runWithInternal(
 }
 
 async function* runInternal(
-  target: string | undefined,
-  cwd: string,
-  maxIterations: number | undefined,
-  envFile: string | undefined,
+  target: unknown,
+  snap: OptionSnapshot,
   signal: AbortSignal,
   loopxBin: string,
   tmpdirParent: string | undefined
 ): AsyncGenerator<Output> {
-  if (maxIterations !== undefined) {
-    if (
-      typeof maxIterations !== "number" ||
-      !Number.isInteger(maxIterations) ||
-      maxIterations < 0 ||
-      Number.isNaN(maxIterations)
-    ) {
-      throw new Error(
-        `Invalid maxIterations: must be a non-negative integer, got ${maxIterations}`
-      );
-    }
+  // SPEC §9.3 abort precedence: if a usable signal was captured and is
+  // aborted (or aborts later), it displaces all other pre-iteration failures.
+  if (snap.signal?.aborted) {
+    throw makeAbortError(snap.signal);
+  }
+
+  // Surface any captured option-snapshot error.
+  if (snap.error !== undefined) {
+    throw snap.error;
   }
 
   if (signal.aborted) {
     throw makeAbortError(signal);
   }
 
+  const cwd = snap.cwd!;
   const loopxDir = join(cwd, ".loopx");
 
   // Discovery (global validation per SPEC §5.4)
@@ -162,8 +375,10 @@ async function* runInternal(
   }
 
   let localEnv: Record<string, string> = {};
-  if (envFile) {
-    const envFilePath = resolve(cwd, envFile);
+  if (snap.envFile !== undefined) {
+    const envFilePath = isAbsolute(snap.envFile)
+      ? snap.envFile
+      : resolve(cwd, snap.envFile);
     const localResult = loadLocalEnv(envFilePath);
     localEnv = localResult.vars;
     for (const w of localResult.warnings) {
@@ -171,7 +386,19 @@ async function* runInternal(
     }
   }
 
-  const mergedEnv = mergeEnv(globalEnv, localEnv);
+  // SPEC §8.3 precedence (highest wins):
+  //   1. protocol vars (LOOPX_*) — applied in execution.ts
+  //   2. RunOptions.env
+  //   3. local env file (-e / RunOptions.envFile)
+  //   4. global loopx env
+  //   5. inherited process.env
+  //
+  // mergeEnv yields tiers 5→4→3 (process.env, global, local). RunOptions.env
+  // overlays tier 2 here. Protocol vars overlay tier 1 in executeScript.
+  const mergedEnv: Record<string, string> = {
+    ...mergeEnv(globalEnv, localEnv),
+    ...(snap.env ?? {}),
+  };
 
   ensureLoopxPackageJson(loopxDir);
 
@@ -217,14 +444,14 @@ async function* runInternal(
 
   // -n 0 / maxIterations: 0 — validates but does not enter the loop
   // (workflow-level version checking is skipped per SPEC §3.2).
-  if (maxIterations === 0) {
+  if (snap.maxIterations === 0) {
     return;
   }
 
   const starting: LoopStartingTarget = { workflow, script: scriptFile };
 
   yield* runLoop(starting, discovery.workflows, {
-    maxIterations,
+    maxIterations: snap.maxIterations,
     env: mergedEnv,
     projectRoot: cwd,
     loopxBin,
@@ -242,11 +469,6 @@ export async function runPromise(
   target: string,
   options?: RunOptions
 ): Promise<Output[]> {
-  const signal = options?.signal;
-  if (signal?.aborted) {
-    throw makeAbortError(signal);
-  }
-
   // SPEC §9.2: tmpdir-parent snapshot is EAGER under runPromise — captured
   // synchronously at the call site. Mutations to process.env.TMPDIR after
   // runPromise() returns must not affect the tmpdir parent for this run.
@@ -256,33 +478,6 @@ export async function runPromise(
     tmpdirParent: eagerTmpdirParent,
   });
   const outputs: Output[] = [];
-
-  if (signal) {
-    const abortPromise = new Promise<IteratorResult<Output>>((_, reject) => {
-      if (signal.aborted) {
-        reject(makeAbortError(signal));
-        return;
-      }
-      signal.addEventListener(
-        "abort",
-        () => reject(makeAbortError(signal)),
-        { once: true }
-      );
-    });
-    abortPromise.catch(() => {});
-
-    try {
-      while (true) {
-        const iterResult = await Promise.race([gen.next(), abortPromise]);
-        if (iterResult.done) break;
-        outputs.push(iterResult.value);
-      }
-      return outputs;
-    } catch (err) {
-      await gen.return(undefined as unknown as Output).catch(() => {});
-      throw err;
-    }
-  }
 
   for await (const output of gen) {
     outputs.push(output);
