@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { chmod, mkdir, writeFile, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createTempProject,
@@ -162,6 +163,93 @@ printf '{"stop":true}'
       // points at the project root (invocation cwd), not the target workflow dir.
       expect(recordedRoot).toBe(project.dir);
       expect(recordedRoot).not.toBe(join(project.loopxDir, "other"));
+    });
+
+    it("T-EXEC-03b: child cd does not leak across spawns (intra-workflow goto)", async () => {
+      project = await createTempProject();
+      const cwdMarker = join(project.dir, "check-cwd.txt");
+
+      // ralph:index cd's to /tmp then transitions intra-workflow to ralph:check.
+      // Per SPEC 6.1, cd is scoped to that child — the next spawn must reset to
+      // project-root cwd. /bin/pwd -P returns the kernel-canonical form (which
+      // matches realpathSync(project.dir) on POSIX).
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+cd /tmp
+printf '{"goto":"check"}'
+`,
+      );
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "check",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$(/bin/pwd -P)" > "${cwdMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "2", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(cwdMarker)).toBe(true);
+      const recordedCwd = readFileSync(cwdMarker, "utf-8");
+      // Kernel-canonical project root — NOT /tmp where the prior child cd'd.
+      const expectedRoot = realpathSync(project.dir);
+      expect(recordedCwd).toBe(expectedRoot);
+      expect(recordedCwd).not.toBe("/tmp");
+    });
+
+    it("T-EXEC-03c: bash cd does not leak across loop reset (no-goto path)", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "iter-count");
+      const cwdMarker = join(project.dir, "iter2-cwd.txt");
+
+      // ralph:index increments a counter; iteration 1 cd's to /tmp and emits
+      // empty output (loop reset back to ralph:index); iteration 2 records its
+      // own cwd into a marker and emits stop:true. The next-spawn cwd reset is
+      // independent of how the next spawn was reached (goto vs. no-goto reset).
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+if [ -f "${counterFile}" ]; then
+  COUNT=$(cat "${counterFile}")
+else
+  COUNT=0
+fi
+COUNT=$((COUNT + 1))
+printf '%s' "$COUNT" > "${counterFile}"
+if [ "$COUNT" = "1" ]; then
+  cd /tmp
+  exit 0
+fi
+printf '%s' "$(/bin/pwd -P)" > "${cwdMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "2", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(cwdMarker)).toBe(true);
+      const recordedCwd = readFileSync(cwdMarker, "utf-8");
+      const expectedRoot = realpathSync(project.dir);
+      expect(recordedCwd).toBe(expectedRoot);
+      expect(recordedCwd).not.toBe("/tmp");
     });
 
     it("T-EXEC-04: $LOOPX_WORKFLOW is injected and equals the workflow name", async () => {
@@ -372,6 +460,83 @@ process.stdout.write(JSON.stringify(outputs));
       expect(existsSync(markerPath)).toBe(true);
       expect(readFileSync(markerPath, "utf-8")).toBe("no-shebang-ran");
     });
+
+    it("T-EXEC-07a: a .sh script without the executable bit still runs", async () => {
+      project = await createTempProject();
+      const markerPath = join(project.dir, "no-exec-bit-marker.txt");
+
+      // SPEC 6.2: loopx invokes Bash scripts as `/bin/bash <script>`. Read
+      // permission is sufficient — the executable bit is not required.
+      const scriptPath = await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash\nprintf '%s' 'no-exec-bit-ran' > "${markerPath}"\nprintf '{"stop":true}'\n`,
+      );
+      // Override the helper's default 0o755. mode 0o644 = readable but not
+      // executable.
+      await chmod(scriptPath, 0o644);
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(markerPath)).toBe(true);
+      expect(readFileSync(markerPath, "utf-8")).toBe("no-exec-bit-ran");
+      // loopx did not silently chmod the script.
+      const mode = statSync(scriptPath).mode & 0o777;
+      expect(mode).toBe(0o644);
+    });
+
+    it("T-EXEC-07b: bash scripts are invoked via the absolute path /bin/bash (not PATH-resolved)", async () => {
+      project = await createTempProject();
+      const realBashMarker = join(project.dir, "real-bash-marker.txt");
+      const fakeBashMarker = join(project.dir, "fake-bash-marker.txt");
+
+      // Create a throwaway dir containing a fake `bash` shim that writes a
+      // sentinel and exits non-zero. If loopx resolves `bash` from PATH, the
+      // fake will be invoked and the script never runs.
+      const shimDir = await mkdtemp(join(tmpdir(), "loopx-fake-bash-"));
+      const fakeBashPath = join(shimDir, "bash");
+      await writeFile(
+        fakeBashPath,
+        `#!/bin/bash\nprintf 'FAKE-BASH-INVOKED' > "${fakeBashMarker}"\nexit 99\n`,
+        "utf-8",
+      );
+      await chmod(fakeBashPath, 0o755);
+
+      try {
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash\nprintf '%s' 'real-bash-ran' > "${realBashMarker}"\nprintf '{"stop":true}'\n`,
+        );
+
+        // Prepend the shim dir to PATH. If loopx invokes `bash` via PATH
+        // resolution, the fake shim wins. The absolute path /bin/bash is
+        // unaffected and still resolves to the real bash.
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: {
+            PATH: `${shimDir}:${process.env.PATH ?? ""}`,
+          },
+        });
+
+        // Real bash ran (script exited 0); fake shim was never invoked.
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(realBashMarker)).toBe(true);
+        expect(readFileSync(realBashMarker, "utf-8")).toBe("real-bash-ran");
+        expect(existsSync(fakeBashMarker)).toBe(false);
+      } finally {
+        await rm(shimDir, { recursive: true, force: true }).catch(() => {});
+      }
+    });
   });
 });
 
@@ -517,6 +682,189 @@ process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
       });
 
       // CJS is not supported. loopx must exit non-zero.
+      expect(result.exitCode).not.toBe(0);
+    });
+
+    // SPEC 6.3 CJS-rejection matrix: 3 forms × 4 extensions.
+    // T-EXEC-13a covers (.js, require). The remaining 11 combinations follow.
+    // The fixture pattern across all of them: an ESM-allowed shape (an `import`
+    // from "node:fs") plus the CJS form. Under proper ESM module evaluation,
+    // the CJS binding (`require`, `module`, or `exports`) is not in scope and
+    // the reference fails at execution time.
+
+    // For .tsx/.jsx fixtures, include a tiny `React.createElement` shim so the
+    // file is syntactically a JSX-using module (matching SPEC 6.3 semantics);
+    // the JSX literal itself is not load-bearing for the CJS-rejection test.
+
+    // ----- module.exports rejection -----
+
+    it("T-EXEC-13c: a .js script that uses module.exports (CJS) fails", async () => {
+      project = await createTempProject();
+      const content = `import "node:fs";
+module.exports = { value: "x" };
+process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
+`;
+      await createWorkflowScript(project, "ralph", "index", ".js", content);
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+      expect(result.exitCode).not.toBe(0);
+    });
+
+    it("T-EXEC-13h: a .ts script that uses module.exports (CJS) fails", async () => {
+      project = await createTempProject();
+      const content = `import "node:fs";
+module.exports = { value: "x" };
+process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
+`;
+      await createWorkflowScript(project, "ralph", "index", ".ts", content);
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+      expect(result.exitCode).not.toBe(0);
+    });
+
+    it("T-EXEC-13i: a .jsx script that uses module.exports (CJS) fails", async () => {
+      project = await createTempProject();
+      const content = `import "node:fs";
+const React = { createElement: (tag) => tag };
+const _el = <div/>;
+module.exports = { value: "x" };
+process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
+`;
+      await createWorkflowScript(project, "ralph", "index", ".jsx", content);
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+      expect(result.exitCode).not.toBe(0);
+    });
+
+    it("T-EXEC-13j: a .tsx script that uses module.exports (CJS) fails", async () => {
+      project = await createTempProject();
+      const content = `import "node:fs";
+const React = { createElement: (tag: string) => tag };
+const _el = <div/>;
+module.exports = { value: "x" };
+process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
+`;
+      await createWorkflowScript(project, "ralph", "index", ".tsx", content);
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+      expect(result.exitCode).not.toBe(0);
+    });
+
+    // ----- exports.foo rejection -----
+
+    it("T-EXEC-13d: a .js script that uses exports.foo = ... (CJS) fails", async () => {
+      project = await createTempProject();
+      const content = `import "node:fs";
+exports.value = "x";
+process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
+`;
+      await createWorkflowScript(project, "ralph", "index", ".js", content);
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+      expect(result.exitCode).not.toBe(0);
+    });
+
+    it("T-EXEC-13k: a .ts script that uses exports.foo = ... (CJS) fails", async () => {
+      project = await createTempProject();
+      const content = `import "node:fs";
+exports.value = "x";
+process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
+`;
+      await createWorkflowScript(project, "ralph", "index", ".ts", content);
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+      expect(result.exitCode).not.toBe(0);
+    });
+
+    it("T-EXEC-13l: a .jsx script that uses exports.foo = ... (CJS) fails", async () => {
+      project = await createTempProject();
+      const content = `import "node:fs";
+const React = { createElement: (tag) => tag };
+const _el = <div/>;
+exports.value = "x";
+process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
+`;
+      await createWorkflowScript(project, "ralph", "index", ".jsx", content);
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+      expect(result.exitCode).not.toBe(0);
+    });
+
+    it("T-EXEC-13m: a .tsx script that uses exports.foo = ... (CJS) fails", async () => {
+      project = await createTempProject();
+      const content = `import "node:fs";
+const React = { createElement: (tag: string) => tag };
+const _el = <div/>;
+exports.value = "x";
+process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
+`;
+      await createWorkflowScript(project, "ralph", "index", ".tsx", content);
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+      expect(result.exitCode).not.toBe(0);
+    });
+
+    // ----- require() rejection across .ts/.jsx/.tsx (.js is T-EXEC-13a) -----
+
+    it("T-EXEC-13e: a .ts script that uses require() (CJS) fails", async () => {
+      project = await createTempProject();
+      const content = `import "node:fs";
+const _x = require("node:os");
+process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
+`;
+      await createWorkflowScript(project, "ralph", "index", ".ts", content);
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+      expect(result.exitCode).not.toBe(0);
+    });
+
+    it("T-EXEC-13f: a .jsx script that uses require() (CJS) fails", async () => {
+      project = await createTempProject();
+      const content = `import "node:fs";
+const React = { createElement: (tag) => tag };
+const _el = <div/>;
+const _x = require("node:os");
+process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
+`;
+      await createWorkflowScript(project, "ralph", "index", ".jsx", content);
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+      expect(result.exitCode).not.toBe(0);
+    });
+
+    it("T-EXEC-13g: a .tsx script that uses require() (CJS) fails", async () => {
+      project = await createTempProject();
+      const content = `import "node:fs";
+const React = { createElement: (tag: string) => tag };
+const _el = <div/>;
+const _x = require("node:os");
+process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
+`;
+      await createWorkflowScript(project, "ralph", "index", ".tsx", content);
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
       expect(result.exitCode).not.toBe(0);
     });
   });
@@ -793,6 +1141,96 @@ printf '{"stop":true}'
       // LOOPX_WORKFLOW_DIR are independent surfaces.
       expect(existsSync(wfdirMarkerPath)).toBe(true);
       expect(readFileSync(wfdirMarkerPath, "utf-8")).toBe(otherDir);
+    });
+
+    it("T-EXEC-16c: JS/TS process.chdir() does not leak across spawns (intra-workflow goto)", async () => {
+      project = await createTempProject();
+      const cwdMarker = join(project.dir, "ts-check-cwd.txt");
+
+      // ralph:index calls process.chdir("/tmp") then transitions intra-workflow
+      // to ralph:check. Per SPEC 6.1, process.chdir() is scoped to that child;
+      // the next spawn must reset to project-root cwd.
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".ts",
+        `process.chdir("/tmp");
+process.stdout.write(JSON.stringify({ goto: "check" }));
+`,
+      );
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "check",
+        ".ts",
+        `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(cwdMarker)}, process.cwd());
+process.stdout.write(JSON.stringify({ stop: true }));
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "2", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(cwdMarker)).toBe(true);
+      const recordedCwd = readFileSync(cwdMarker, "utf-8");
+      // Directory identity matches project root (compared via realpath; the
+      // exact string spelling may be the runtime-canonicalized form).
+      const expectedRoot = realpathSync(project.dir);
+      expect(recordedCwd).toBe(expectedRoot);
+      // /tmp could canonicalize to /private/tmp on macOS, so guard against
+      // string equality only in the projectRoot direction. The directory
+      // identity assertion is the load-bearing check above.
+      expect(recordedCwd).not.toBe("/tmp");
+    });
+
+    it("T-EXEC-16d: JS/TS process.chdir() does not leak across loop reset (no-goto path)", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "iter-count");
+      const cwdMarker = join(project.dir, "iter2-ts-cwd.txt");
+
+      // ralph:index increments a counter; iteration 1 chdir's to /tmp and
+      // exits without writing to stdout (empty output ⇒ result:"" ⇒ no goto,
+      // no stop ⇒ loop reset back to ralph:index for iteration 2).
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".ts",
+        `import { existsSync, readFileSync, writeFileSync } from "node:fs";
+const counterPath = ${JSON.stringify(counterFile)};
+const markerPath = ${JSON.stringify(cwdMarker)};
+let count = 0;
+if (existsSync(counterPath)) {
+  count = Number(readFileSync(counterPath, "utf-8")) || 0;
+}
+count += 1;
+writeFileSync(counterPath, String(count));
+if (count === 1) {
+  process.chdir("/tmp");
+  // Empty stdout: result:"" ⇒ no goto, no stop ⇒ loop reset.
+  process.exit(0);
+}
+writeFileSync(markerPath, process.cwd());
+process.stdout.write(JSON.stringify({ stop: true }));
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "2", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(cwdMarker)).toBe(true);
+      const recordedCwd = readFileSync(cwdMarker, "utf-8");
+      const expectedRoot = realpathSync(project.dir);
+      expect(recordedCwd).toBe(expectedRoot);
+      expect(recordedCwd).not.toBe("/tmp");
     });
   });
 });
