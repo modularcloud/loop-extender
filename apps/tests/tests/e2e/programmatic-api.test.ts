@@ -4553,3 +4553,338 @@ console.log(JSON.stringify({
     });
   });
 });
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — RunOptions.env Basic Injection (SPEC §9.5 / §8.3)
+// ═════════════════════════════════════════════════════════════
+//
+// Per SPEC §9.5: RunOptions.env entries are injected into every spawned
+// script's environment. Entries merge into the child environment after global
+// and local env-file loading and before loopx-injected protocol variables (see
+// §8.3 precedence list). The entries apply to every script in the run —
+// starting target, intra- and cross-workflow goto destinations, and loop
+// resets all receive the same env additions.
+
+describe("SPEC: RunOptions.env Basic Injection", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-50: RunOptions.env injects a variable into the spawned script.
+    // SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-50: runPromise() RunOptions.env injects MYVAR into the spawned script", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `if [ -n "\${MYVAR+x}" ]; then
+  printf 'present\\t%s' "$MYVAR" > "${marker}"
+else
+  printf 'absent' > "${marker}"
+fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { MYVAR: "hello" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("present\thello");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50a: RunOptions.env applies across iterations (every iteration's
+    // spawned child observes MYVAR). SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-50a: RunOptions.env applies across multiple iterations", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const results = [];
+for await (const o of run("ralph", { cwd: ${JSON.stringify(project.dir)}, env: { MYVAR: "shared" }, maxIterations: 3 })) {
+  results.push(o);
+}
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(2);
+      expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("shared");
+      expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("shared");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50b: RunOptions.env applies across intra-workflow goto.
+    // ralph:index → ralph:check; both observe MYVAR. SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-50b: RunOptions.env applies across intra-workflow goto", async () => {
+      project = await createTempProject();
+      const markerDir = project.dir;
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/index.txt"
+printf '{"goto":"ralph:check"}'`,
+      );
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "check",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/check.txt"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const results = [];
+for await (const o of run("ralph", { cwd: ${JSON.stringify(project.dir)}, env: { MYVAR: "intra" } })) {
+  results.push(o);
+}
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(2);
+      expect(readFileSync(join(markerDir, "index.txt"), "utf-8")).toBe("intra");
+      expect(readFileSync(join(markerDir, "check.txt"), "utf-8")).toBe("intra");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50c: RunOptions.env applies across cross-workflow goto.
+    // alpha:index → beta:step; both observe MYVAR. SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-50c: RunOptions.env applies across cross-workflow goto", async () => {
+      project = await createTempProject();
+      const markerDir = project.dir;
+      await createBashWorkflowScript(
+        project,
+        "alpha",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/alpha.txt"
+printf '{"goto":"beta:step"}'`,
+      );
+      await createBashWorkflowScript(
+        project,
+        "beta",
+        "step",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/beta.txt"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const results = [];
+for await (const o of run("alpha", { cwd: ${JSON.stringify(project.dir)}, env: { MYVAR: "cross" } })) {
+  results.push(o);
+}
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(2);
+      expect(readFileSync(join(markerDir, "alpha.txt"), "utf-8")).toBe("cross");
+      expect(readFileSync(join(markerDir, "beta.txt"), "utf-8")).toBe("cross");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50d: RunOptions.env applies on loop reset. ralph:index returns to
+    // ralph:index after a chain completes without stop:true. Both runs of
+    // ralph:index observe MYVAR. SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-50d: RunOptions.env applies on loop reset", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/run\${N}.txt"
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+fi`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const results = [];
+for await (const o of run("ralph", { cwd: ${JSON.stringify(project.dir)}, env: { MYVAR: "reset" } })) {
+  results.push(o);
+}
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(2);
+      expect(readFileSync(join(markerDir, "run1.txt"), "utf-8")).toBe("reset");
+      expect(readFileSync(join(markerDir, "run2.txt"), "utf-8")).toBe("reset");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50e: Empty-string entry value reaches the spawned script as the
+    // empty string (distinguishable from `undefined`). SPEC §8.3 / §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-50e: empty-string entry value reaches script as empty string (present, not unset)", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `if [ -n "\${MYVAR+x}" ]; then
+  printf 'present\\t%s' "$MYVAR" > "${marker}"
+else
+  printf 'absent' > "${marker}"
+fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { MYVAR: "" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // present\t<empty> — the variable IS set in the env (distinguishable
+      // from "absent", which would mean MYVAR was not set at all).
+      expect(readFileSync(marker, "utf-8")).toBe("present\t");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50h: Tricky non-NUL string values (whitespace, embedded `=`, `#`,
+    // quotes, backslash, UTF-8, `\n`, `\r\n`, `\t`, whitespace-only) reach the
+    // spawned script byte-for-byte unchanged across both API surfaces.
+    // SPEC §9.5 / §8.3 — RunOptions.env is NOT subject to env-file parser
+    // normalization.
+    // ------------------------------------------------------------------------
+    it("T-API-50h: tricky non-NUL string values reach script byte-for-byte unchanged (runPromise + run)", async () => {
+      project = await createTempProject();
+      const markerDir = project.dir;
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `# Dump every observed entry verbatim into per-key marker files.
+# Use bash indirect expansion (\${!key}) — eval "val=\\"\\$\\$key\\"" would
+# expand \\$\\$ as the shell PID rather than escaped-dollar then key-expansion.
+for key in V_SPACES V_EQ V_HASH V_DQ V_SQ V_BS V_UTF V_LF V_CRLF V_TAB V_WSONLY; do
+  printf '%s' "\${!key}" > "${markerDir}/\${key}.txt"
+done
+printf '{"stop":true}'`,
+      );
+
+      // Construct a payload of tricky values (NO embedded NUL — those would
+      // surface as runtime spawn failures per T-API-57).
+      const payload = {
+        V_SPACES: "  leading and trailing  ",
+        V_EQ: "a=b=c",
+        V_HASH: "value # not a comment",
+        V_DQ: 'has "double" quotes',
+        V_SQ: "has 'single' quotes",
+        V_BS: "back\\slash\\path",
+        V_UTF: "UTF-8 ✅ é 日本語",
+        V_LF: "line1\nline2",
+        V_CRLF: "win1\r\nwin2",
+        V_TAB: "col1\tcol2",
+        V_WSONLY: "   ",
+      };
+
+      // Surface 1: runPromise().
+      const driverCode1 = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: ${JSON.stringify(payload)},
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result1 = await runAPIDriver(runtime, driverCode1);
+      expect(result1.exitCode).toBe(0);
+      expect(JSON.parse(result1.stdout).count).toBe(1);
+      for (const [key, expected] of Object.entries(payload)) {
+        expect(readFileSync(join(markerDir, `${key}.txt`), "utf-8")).toBe(expected);
+      }
+
+      // Reset markers between surfaces (each surface writes the same files).
+      for (const key of Object.keys(payload)) {
+        await rm(join(markerDir, `${key}.txt`), { force: true });
+      }
+
+      // Surface 2: run().
+      const driverCode2 = `
+import { run } from "loopx";
+let count = 0;
+for await (const _ of run("ralph", { cwd: ${JSON.stringify(project.dir)}, env: ${JSON.stringify(payload)}, maxIterations: 1 })) {
+  count++;
+}
+console.log(JSON.stringify({ count }));
+`;
+      const result2 = await runAPIDriver(runtime, driverCode2);
+      expect(result2.exitCode).toBe(0);
+      expect(JSON.parse(result2.stdout).count).toBe(1);
+      for (const [key, expected] of Object.entries(payload)) {
+        expect(readFileSync(join(markerDir, `${key}.txt`), "utf-8")).toBe(expected);
+      }
+    });
+  });
+});
