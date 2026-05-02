@@ -8148,6 +8148,472 @@ console.log(JSON.stringify({
     }
 
     // ------------------------------------------------------------------------
+    // T-TMP-35f / 35g / 35h: Cleanup warning does not mask a signal/abort
+    // terminal across all three execution surfaces (CLI / runPromise() /
+    // run()) × both warning-emitting cleanup-safety branches (regular-file
+    // replacement → SPEC §7.4 rule 3; mismatched-directory replacement →
+    // SPEC §7.4 rule 5). SPEC §7.4: "cleanup warnings do not affect the CLI
+    // exit code, the generator outcome, or the promise rejection reason."
+    //
+    // T-TMP-35 / 35a / 35b (rule-3 success terminal), T-TMP-36 / 36a / 36b
+    // (rule-5 success terminal), and T-TMP-35c / 35d / 35e (rule 3+5
+    // script-error terminal) pin the cleanup-warning-cardinality contract
+    // against script-completion outcomes. These three new tests pin the
+    // same contract against the signal terminal (SIGINT/SIGTERM, CLI) and
+    // the programmatic abort terminal (run() / runPromise() with
+    // RunOptions.signal): a cleanup warning from the §7.4 cleanup-safety
+    // dispatch must not promote a signal-driven CLI exit into a
+    // cleanup-failure exit code, mask the abort rejection reason on
+    // runPromise(), nor mask the abort throw on run(). The CLI surface
+    // additionally pins child-PG termination implicitly via the signal
+    // exit code (130/143 means the child was terminated and loopx
+    // forwarded the signal). The programmatic surfaces explicitly probe
+    // child-PG termination per SPEC §9.5 / §9.1: when an abort fires
+    // while a child is in flight, loopx must terminate the child PG
+    // (SIGTERM, then SIGKILL after 5s) before the surface settles.
+    //
+    // The shared fixture tampers with $LOOPX_TMPDIR (variant-specific
+    // rule 3 or rule 5), then writes the tmpdir-observation marker
+    // AFTER tampering completes (so the marker's existence implies
+    // tampering finished — important for the API drivers that poll for
+    // marker existence to know when to abort), writes the script's pid
+    // to a separate marker (for child-termination probing), prints
+    // "ready" to stderr (CLI signal coordinator via waitForStderr),
+    // then blocks forever. The signal/abort delivered while the script
+    // blocks triggers loopx's terminal handling: child PG killed,
+    // cleanup runs, cleanup hits the tampered tmpdir, cleanup warning
+    // is emitted, and the surface settles with the signal/abort
+    // terminal — not a cleanup-failure terminal.
+    //
+    // Path persistence per cleanup-safety branch is preserved across
+    // the signal/abort terminal because cleanup makes no further
+    // changes after detecting rule 3 (regular file: leave with warning)
+    // or rule 5 (mismatched directory: leave with warning).
+    //
+    // For variant b (mismatched-directory), the rename-aside pattern
+    // from T-TMP-36 guarantees inode-distinctness so the cleanup
+    // dispatch reaches rule 5 deterministically rather than rule 4 by
+    // accident of inode reuse.
+    // ------------------------------------------------------------------------
+
+    /** Variant labels used in the parameterized signal/abort tests. */
+    const SIGNAL_ABORT_CLEANUP_VARIANTS = [
+      "regular-file-replacement",
+      "mismatched-directory-replacement",
+    ] as const;
+    type SignalAbortCleanupVariant =
+      (typeof SIGNAL_ABORT_CLEANUP_VARIANTS)[number];
+
+    /**
+     * Build the shared bash fixture body for the signal/abort terminal
+     * variants of T-TMP-35f / 35g / 35h. Returns the bash content that:
+     *   1. Tampers with $LOOPX_TMPDIR (variant-specific rule 3 or rule 5).
+     *   2. Writes the original LOOPX_TMPDIR path to `tmpdirObservation`
+     *      AFTER tampering completes (existence of the marker implies
+     *      tampering finished — the API drivers poll for this to know
+     *      when to abort).
+     *   3. Writes the script's own pid to `pidMarker` for child-PG
+     *      termination probing under the API surfaces.
+     *   4. Prints "ready" to stderr (CLI surface signal coordinator
+     *      via runCLIWithSignal's waitForStderr).
+     *   5. Blocks forever (until killed by signal or abort).
+     */
+    function buildSignalAbortCleanupFixture(args: {
+      tmpdirObservation: string;
+      pidMarker: string;
+      variant: SignalAbortCleanupVariant;
+    }): string {
+      const tampering =
+        args.variant === "regular-file-replacement"
+          ? `rm -rf "$LOOPX_TMPDIR"
+printf '%s' "regular-file-replacement" > "$LOOPX_TMPDIR"`
+          : `mv "$LOOPX_TMPDIR" "$LOOPX_TMPDIR-original-aside"
+mkdir "$LOOPX_TMPDIR"
+touch "$LOOPX_TMPDIR/mismatched-marker"`;
+      return `#!/bin/bash
+set -e
+ORIG_TMPDIR="$LOOPX_TMPDIR"
+${tampering}
+printf '%s' "$ORIG_TMPDIR" > "${args.tmpdirObservation}"
+printf '%s' "$$" > "${args.pidMarker}"
+echo "ready" >&2
+while true; do sleep 1; done
+`;
+    }
+
+    /** Signal labels for the T-TMP-35f parameterization. */
+    const SIGNAL_VARIANTS = ["SIGINT", "SIGTERM"] as const;
+
+    for (const variant of SIGNAL_ABORT_CLEANUP_VARIANTS) {
+      for (const signalName of SIGNAL_VARIANTS) {
+        it(`T-TMP-35f (${variant} × ${signalName}): CLI cleanup warning does not mask signal exit code`, async () => {
+          const { project, tmpdirParent } = await setupTmpdirTest();
+          const tmpdirObservation = join(project.dir, "tmpdir.txt");
+          const pidMarker = join(project.dir, "pid.txt");
+
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            buildSignalAbortCleanupFixture({
+              tmpdirObservation,
+              pidMarker,
+              variant,
+            }),
+          );
+
+          const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+            ["run", "-n", "1", "ralph"],
+            {
+              cwd: project.dir,
+              runtime,
+              env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+              timeout: 30_000,
+            },
+          );
+
+          await waitForStderr("ready");
+
+          sendSignal(signalName);
+          const outcome = await result;
+
+          // (a) Exit code matches the signal terminal (130 for SIGINT,
+          // 143 for SIGTERM). The cleanup warning does not promote the
+          // signal terminal into a cleanup-failure exit code per
+          // SPEC §7.4.
+          const expectedCode = signalName === "SIGINT" ? 130 : 143;
+          expect(outcome.exitCode).toBe(expectedCode);
+
+          const observedLoopxTmpdir = readFileSync(
+            tmpdirObservation,
+            "utf-8",
+          );
+          expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+
+          // (b) Exactly one cleanup-related warning on stderr — per-run
+          // cleanup-warning cardinality holds under the signal terminal.
+          const cleanupWarnings = outcome.stderr
+            .split("\n")
+            .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+          expect(cleanupWarnings.length).toBe(1);
+
+          // (c) Path persistence per cleanup-safety branch — cleanup
+          // emitted a warning and made no further changes per SPEC §7.4.
+          if (variant === "regular-file-replacement") {
+            expect(existsSync(observedLoopxTmpdir)).toBe(true);
+            const st = statSync(observedLoopxTmpdir);
+            expect(st.isFile()).toBe(true);
+            expect(readFileSync(observedLoopxTmpdir, "utf-8")).toBe(
+              "regular-file-replacement",
+            );
+            await rm(observedLoopxTmpdir, { force: true }).catch(() => {});
+          } else {
+            expect(existsSync(observedLoopxTmpdir)).toBe(true);
+            expect(statSync(observedLoopxTmpdir).isDirectory()).toBe(true);
+            const mismatchedMarker = join(
+              observedLoopxTmpdir,
+              "mismatched-marker",
+            );
+            expect(existsSync(mismatchedMarker)).toBe(true);
+            const renamedAside = `${observedLoopxTmpdir}-original-aside`;
+            expect(existsSync(renamedAside)).toBe(true);
+            await rm(observedLoopxTmpdir, {
+              recursive: true,
+              force: true,
+            }).catch(() => {});
+            await rm(renamedAside, { recursive: true, force: true }).catch(
+              () => {},
+            );
+          }
+        });
+      }
+    }
+
+    for (const variant of SIGNAL_ABORT_CLEANUP_VARIANTS) {
+      it(`T-TMP-35g (${variant}): runPromise() cleanup warning does not mask abort rejection reason`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const tmpdirObservation = join(project.dir, "tmpdir.txt");
+        const pidMarker = join(project.dir, "pid.txt");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          buildSignalAbortCleanupFixture({
+            tmpdirObservation,
+            pidMarker,
+            variant,
+          }),
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+const pidMarker = ${JSON.stringify(pidMarker)};
+async function waitForObservation() {
+  for (let i = 0; i < 600; i++) {
+    if (existsSync(tmpdirObservation) && existsSync(pidMarker)) {
+      const t = readFileSync(tmpdirObservation, "utf-8");
+      const p = readFileSync(pidMarker, "utf-8").trim();
+      if (t.length > 0 && p.length > 0) return { tmpdir: t, pid: parseInt(p, 10) };
+    }
+    await new Promise(r => setTimeout(r, 50));
+  }
+  throw new Error("markers never appeared");
+}
+function isAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+async function waitDead(pid, timeout) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return true;
+    await new Promise(r => setTimeout(r, 50));
+  }
+  return !isAlive(pid);
+}
+const c = new AbortController();
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, signal: c.signal });
+const { tmpdir: observed, pid } = await waitForObservation();
+c.abort();
+let rejected = false;
+let errMsg = "";
+let errName = "";
+try {
+  await p;
+} catch (e) {
+  rejected = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? (e.name || "") : "";
+}
+const childDead = await waitDead(pid, 10_000);
+const observedExists = existsSync(observed);
+let observedIsFile = false;
+let observedContent = "";
+let observedIsDir = false;
+let mismatchedMarkerExists = false;
+let renamedAsideExists = false;
+if (observedExists) {
+  const st = statSync(observed);
+  observedIsFile = st.isFile();
+  observedIsDir = st.isDirectory();
+  if (observedIsFile) observedContent = readFileSync(observed, "utf-8");
+  if (observedIsDir) {
+    mismatchedMarkerExists = existsSync(join(observed, "mismatched-marker"));
+  }
+}
+const renamedAside = observed + "-original-aside";
+renamedAsideExists = existsSync(renamedAside);
+console.log(JSON.stringify({
+  rejected,
+  errMsg,
+  errName,
+  observed,
+  pid,
+  childDead,
+  observedExists,
+  observedIsFile,
+  observedContent,
+  observedIsDir,
+  mismatchedMarkerExists,
+  renamedAside,
+  renamedAsideExists,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+          timeout: 30_000,
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+
+        // (a) Promise rejected with abort error. Cleanup warning does
+        // not mask the abort rejection reason per SPEC §7.4. Abort
+        // error class — DOMException("AbortError") or signal.reason.
+        expect(data.rejected).toBe(true);
+        expect(
+          data.errName === "AbortError" || /abort/i.test(data.errMsg),
+        ).toBe(true);
+        expect(data.errMsg.toLowerCase()).not.toContain("cleanup");
+
+        // (b) Exactly one cleanup-related warning on driver-process
+        // stderr.
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(1);
+
+        // (c) Active child PG terminated per SPEC §9.1 / §9.5.
+        expect(data.childDead).toBe(true);
+
+        // (d) Path persistence per cleanup-safety branch.
+        expect(data.observed.length).toBeGreaterThan(0);
+        expect(data.observedExists).toBe(true);
+        if (variant === "regular-file-replacement") {
+          expect(data.observedIsFile).toBe(true);
+          expect(data.observedContent).toBe("regular-file-replacement");
+          await rm(data.observed, { force: true }).catch(() => {});
+        } else {
+          expect(data.observedIsDir).toBe(true);
+          expect(data.mismatchedMarkerExists).toBe(true);
+          expect(data.renamedAsideExists).toBe(true);
+          await rm(data.observed, {
+            recursive: true,
+            force: true,
+          }).catch(() => {});
+          await rm(data.renamedAside, {
+            recursive: true,
+            force: true,
+          }).catch(() => {});
+        }
+      });
+    }
+
+    for (const variant of SIGNAL_ABORT_CLEANUP_VARIANTS) {
+      it(`T-TMP-35h (${variant}): run() generator cleanup warning does not mask abort throw`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const tmpdirObservation = join(project.dir, "tmpdir.txt");
+        const pidMarker = join(project.dir, "pid.txt");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          buildSignalAbortCleanupFixture({
+            tmpdirObservation,
+            pidMarker,
+            variant,
+          }),
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+const pidMarker = ${JSON.stringify(pidMarker)};
+async function waitForObservation() {
+  for (let i = 0; i < 600; i++) {
+    if (existsSync(tmpdirObservation) && existsSync(pidMarker)) {
+      const t = readFileSync(tmpdirObservation, "utf-8");
+      const p = readFileSync(pidMarker, "utf-8").trim();
+      if (t.length > 0 && p.length > 0) return { tmpdir: t, pid: parseInt(p, 10) };
+    }
+    await new Promise(r => setTimeout(r, 50));
+  }
+  throw new Error("markers never appeared");
+}
+function isAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+async function waitDead(pid, timeout) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return true;
+    await new Promise(r => setTimeout(r, 50));
+  }
+  return !isAlive(pid);
+}
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, signal: c.signal });
+const nextP = gen.next();
+nextP.catch(() => {});
+const { tmpdir: observed, pid } = await waitForObservation();
+c.abort();
+let thrown = false;
+let errMsg = "";
+let errName = "";
+try {
+  await nextP;
+} catch (e) {
+  thrown = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? (e.name || "") : "";
+}
+const childDead = await waitDead(pid, 10_000);
+const observedExists = existsSync(observed);
+let observedIsFile = false;
+let observedContent = "";
+let observedIsDir = false;
+let mismatchedMarkerExists = false;
+let renamedAsideExists = false;
+if (observedExists) {
+  const st = statSync(observed);
+  observedIsFile = st.isFile();
+  observedIsDir = st.isDirectory();
+  if (observedIsFile) observedContent = readFileSync(observed, "utf-8");
+  if (observedIsDir) {
+    mismatchedMarkerExists = existsSync(join(observed, "mismatched-marker"));
+  }
+}
+const renamedAside = observed + "-original-aside";
+renamedAsideExists = existsSync(renamedAside);
+console.log(JSON.stringify({
+  thrown,
+  errMsg,
+  errName,
+  observed,
+  pid,
+  childDead,
+  observedExists,
+  observedIsFile,
+  observedContent,
+  observedIsDir,
+  mismatchedMarkerExists,
+  renamedAside,
+  renamedAsideExists,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+          timeout: 30_000,
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+
+        // (a) Generator threw abort error. Cleanup warning does not
+        // mask the generator outcome per SPEC §7.4.
+        expect(data.thrown).toBe(true);
+        expect(
+          data.errName === "AbortError" || /abort/i.test(data.errMsg),
+        ).toBe(true);
+        expect(data.errMsg.toLowerCase()).not.toContain("cleanup");
+
+        // (b) Exactly one cleanup-related warning on driver-process
+        // stderr.
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(1);
+
+        // (c) Active child PG terminated per SPEC §9.1 / §9.5.
+        expect(data.childDead).toBe(true);
+
+        // (d) Path persistence per cleanup-safety branch.
+        expect(data.observed.length).toBeGreaterThan(0);
+        expect(data.observedExists).toBe(true);
+        if (variant === "regular-file-replacement") {
+          expect(data.observedIsFile).toBe(true);
+          expect(data.observedContent).toBe("regular-file-replacement");
+          await rm(data.observed, { force: true }).catch(() => {});
+        } else {
+          expect(data.observedIsDir).toBe(true);
+          expect(data.mismatchedMarkerExists).toBe(true);
+          expect(data.renamedAsideExists).toBe(true);
+          await rm(data.observed, {
+            recursive: true,
+            force: true,
+          }).catch(() => {});
+          await rm(data.renamedAside, {
+            recursive: true,
+            force: true,
+          }).catch(() => {});
+        }
+      });
+    }
+
+    // ------------------------------------------------------------------------
     // T-TMP-37 / 37d / 37e: Recursive cleanup of an identity-matched directory
     // unlinks nested symlink entries WITHOUT traversing their targets — SPEC
     // §7.4 cleanup-safety rule 4. Surface-parity matrix across CLI /
