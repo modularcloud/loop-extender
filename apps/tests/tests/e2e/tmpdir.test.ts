@@ -7201,5 +7201,256 @@ console.log(JSON.stringify({
         .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
       expect(cleanupWarnings.length).toBe(0);
     });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-35 / 35a / 35b: Regular-file-replacement cleanup follows SPEC §7.4
+    // cleanup-safety rule 3 — leave the non-directory non-symlink in place
+    // and emit exactly one stderr warning. Surface-parity matrix across CLI
+    // / runPromise() / run().
+    //
+    // SPEC §7.4 dispatch case 3: "Path is a regular file, FIFO, socket, or
+    // other non-directory non-symlink: leave in place with a stderr warning.
+    // Unlinking would risk mutating unrelated data (hard-link nlink decrement,
+    // or data renamed into the path with nlink == 1)." Per-run cleanup-warning
+    // cardinality (SPEC §7.2) is exactly one across the surface; the warning
+    // does not promote the terminal outcome (CLI stays exit 0 / promise still
+    // resolves / generator still settles cleanly) per SPEC §7.4.
+    //
+    // The fixture (shared across all three surfaces): observe LOOPX_TMPDIR,
+    // remove the directory loopx created at the path, and replace it with a
+    // regular file containing fixed content `regular-file-replacement`, then
+    // emit `{"stop":true}`.
+    //
+    // Post-conditions per surface: (a) success outcome surfaces (CLI exit 0
+    // / promise resolves / generator settles cleanly), (b) the LOOPX_TMPDIR
+    // path still exists and is a regular file with content `regular-file-
+    // replacement` (rule-3 leave-in-place), (c) exactly one
+    // LOOPX_TEST_CLEANUP_WARNING\t… line on stderr.
+    // ------------------------------------------------------------------------
+
+    /**
+     * Build the shared bash fixture body for T-TMP-35/35a/35b. The script
+     * writes the observed LOOPX_TMPDIR path to `tmpdirObservation`, removes
+     * the directory loopx created at the path, replaces it with a regular
+     * file of fixed content, then emits stop:true.
+     */
+    function buildRegularFileReplacementFixture(args: {
+      tmpdirObservation: string;
+    }): string {
+      return `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${args.tmpdirObservation}"
+rm -rf "$LOOPX_TMPDIR"
+printf '%s' "regular-file-replacement" > "$LOOPX_TMPDIR"
+printf '{"stop":true}'
+`;
+    }
+
+    it("T-TMP-35: CLI regular-file replacement leaves file in place with exactly one cleanup warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildRegularFileReplacementFixture({ tmpdirObservation }),
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+      });
+
+      // (c) CLI exit 0 — the cleanup warning does not affect the exit code.
+      expect(result.exitCode).toBe(0);
+
+      const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+      expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+
+      // (a) Path still exists and is a regular file with the script-written
+      // content — SPEC §7.4 rule 3 "leave in place with a stderr warning"
+      // means the regular file was NOT unlinked.
+      expect(existsSync(observedLoopxTmpdir)).toBe(true);
+      const st = statSync(observedLoopxTmpdir);
+      expect(st.isFile()).toBe(true);
+      expect(readFileSync(observedLoopxTmpdir, "utf-8")).toBe(
+        "regular-file-replacement",
+      );
+
+      // (b) Exactly one cleanup-related warning on stderr (per-run cleanup-
+      // warning cardinality from SPEC §7.4; structured marker line count
+      // is the implementation-neutral predicate per TEST-SPEC §1.4).
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // Harness clean-up: remove the leftover regular file at the recorded
+      // path so the test-isolated tmpdir parent can be removed cleanly.
+      await rm(observedLoopxTmpdir, { force: true }).catch(() => {});
+    });
+
+    it("T-TMP-35a: runPromise() regular-file replacement resolves with exactly one cleanup warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildRegularFileReplacementFixture({ tmpdirObservation }),
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, readFileSync, statSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+let rejected = false;
+let errMsg = "";
+let outputs = [];
+try {
+  outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) {
+  rejected = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+const observedExists = existsSync(observed);
+let observedIsFile = false;
+let observedContent = "";
+if (observedExists) {
+  observedIsFile = statSync(observed).isFile();
+  observedContent = readFileSync(observed, "utf-8");
+}
+const stop = outputs.length === 1 ? !!outputs[0].stop : false;
+console.log(JSON.stringify({
+  rejected,
+  errMsg,
+  outputsLen: outputs.length,
+  stop,
+  observed,
+  observedExists,
+  observedIsFile,
+  observedContent,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+
+      // (a) Promise resolved (no rejection). Single Output with stop:true —
+      // the terminal outcome is what the script produced, not a cleanup-
+      // failure-class rejection. SPEC §7.4: cleanup warnings do not affect
+      // the promise rejection reason.
+      expect(data.rejected).toBe(false);
+      expect(data.errMsg).toBe("");
+      expect(data.outputsLen).toBe(1);
+      expect(data.stop).toBe(true);
+
+      // (b) LOOPX_TMPDIR path still exists as a regular file with the
+      // expected content — SPEC §7.4 rule 3 leave-in-place held.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.observedExists).toBe(true);
+      expect(data.observedIsFile).toBe(true);
+      expect(data.observedContent).toBe("regular-file-replacement");
+
+      // (c) Exactly one cleanup-related warning on driver-process stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // Harness clean-up: remove the leftover regular file at the recorded
+      // path so the test-isolated tmpdir parent can be removed cleanly.
+      await rm(data.observed, { force: true }).catch(() => {});
+    });
+
+    it("T-TMP-35b: run() regular-file replacement settles with exactly one cleanup warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildRegularFileReplacementFixture({ tmpdirObservation }),
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync, statSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+let thrown = false;
+let errMsg = "";
+let yieldCount = 0;
+let lastStop = false;
+try {
+  const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  for await (const out of gen) {
+    yieldCount++;
+    lastStop = !!out.stop;
+  }
+} catch (e) {
+  thrown = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+const observedExists = existsSync(observed);
+let observedIsFile = false;
+let observedContent = "";
+if (observedExists) {
+  observedIsFile = statSync(observed).isFile();
+  observedContent = readFileSync(observed, "utf-8");
+}
+console.log(JSON.stringify({
+  thrown,
+  errMsg,
+  yieldCount,
+  lastStop,
+  observed,
+  observedExists,
+  observedIsFile,
+  observedContent,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+
+      // (a) Generator settled cleanly (no throw). Single yield with stop:true
+      // — the terminal outcome is what the script produced, not a cleanup-
+      // failure-class throw. SPEC §7.4: cleanup warnings do not affect the
+      // generator outcome.
+      expect(data.thrown).toBe(false);
+      expect(data.errMsg).toBe("");
+      expect(data.yieldCount).toBe(1);
+      expect(data.lastStop).toBe(true);
+
+      // (b) LOOPX_TMPDIR path still exists as a regular file with the
+      // expected content — SPEC §7.4 rule 3 leave-in-place held.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.observedExists).toBe(true);
+      expect(data.observedIsFile).toBe(true);
+      expect(data.observedContent).toBe("regular-file-replacement");
+
+      // (c) Exactly one cleanup-related warning on driver-process stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // Harness clean-up: remove the leftover regular file at the recorded
+      // path so the test-isolated tmpdir parent can be removed cleanly.
+      await rm(data.observed, { force: true }).catch(() => {});
+    });
   });
 });
