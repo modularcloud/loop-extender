@@ -316,7 +316,22 @@ function runWithInternal(
         return { done: true, value: undefined } as IteratorResult<Output>;
       }
     },
-    throw: (err: unknown) => gen.throw(err),
+    // SPEC §9.1 consumer-driven cancellation: `.throw()` after first `next()`
+    // terminates the active child process group (via abort) and ensures no
+    // further iterations start. When no child is active (between iterations,
+    // after final yield, post-yield), this produces silent clean completion
+    // — the consumer-supplied error is not surfaced. For the active-child
+    // case the settlement form is implementation-defined; we choose silent
+    // completion for symmetry with `.return()`.
+    throw: async (_err: unknown) => {
+      returnCalled = true;
+      internalAc.abort();
+      try {
+        return await gen.return(undefined as unknown as Output);
+      } catch {
+        return { done: true, value: undefined } as IteratorResult<Output>;
+      }
+    },
     [Symbol.asyncIterator]() {
       return this;
     },

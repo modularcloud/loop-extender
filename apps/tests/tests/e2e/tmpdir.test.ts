@@ -21,7 +21,7 @@ import {
   createBashWorkflowScript,
   type TempProject,
 } from "../helpers/fixtures.js";
-import { runCLI } from "../helpers/cli.js";
+import { runCLI, runCLIWithSignal } from "../helpers/cli.js";
 import { runAPIDriver } from "../helpers/api-driver.js";
 import { forEachRuntime } from "../helpers/runtime.js";
 
@@ -3905,6 +3905,771 @@ console.log(JSON.stringify({ thrown, errMsg, observed, exist: existsSync(observe
       expect(data.errMsg).not.toMatch(
         /multiple colons|only one .* delimiter/i,
       );
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ========================================================================
+    // Cleanup Triggers (T-TMP-17..22f) — signal / abort / consumer cancellation
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // T-TMP-17: Cleanup on SIGINT (CLI). SPEC §7.4 / §7.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-17: cleanup on SIGINT (CLI)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+echo "ready" >&2
+sleep 999999
+`,
+      );
+
+      const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+        ["run", "-n", "1", "ralph"],
+        { cwd: project.dir, runtime, env: { TMPDIR: tmpdirParent }, timeout: 30_000 },
+      );
+
+      await waitForStderr("ready");
+      const observed = readFileSync(marker, "utf-8");
+      expect(observed.length).toBeGreaterThan(0);
+
+      sendSignal("SIGINT");
+      const outcome = await result;
+      expect(outcome.exitCode).toBe(130);
+      expect(existsSync(observed)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-18: Cleanup on SIGTERM (CLI). SPEC §7.4 / §7.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-18: cleanup on SIGTERM (CLI)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+echo "ready" >&2
+sleep 999999
+`,
+      );
+
+      const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+        ["run", "-n", "1", "ralph"],
+        { cwd: project.dir, runtime, env: { TMPDIR: tmpdirParent }, timeout: 30_000 },
+      );
+
+      await waitForStderr("ready");
+      const observed = readFileSync(marker, "utf-8");
+      expect(observed.length).toBeGreaterThan(0);
+
+      sendSignal("SIGTERM");
+      const outcome = await result;
+      expect(outcome.exitCode).toBe(143);
+      expect(existsSync(observed)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-18a: Signal escalation + cleanup (SIGTERM trapped by child).
+    // SPEC §7.3 grace period + SIGKILL escalation × SPEC §7.4 cleanup-after-
+    // escalation. Loopx exits with the originally-forwarded signal (143),
+    // not the escalation signal it sent to the child (137).
+    // ------------------------------------------------------------------------
+    it(
+      "T-TMP-18a: SIGTERM grace-period escalation followed by tmpdir cleanup",
+      async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const tmpdirMarker = join(project.dir, "tmpdir.txt");
+        const pidMarker = join(project.dir, "pid.txt");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$$" > "${pidMarker}"
+trap '' TERM
+echo "ready" >&2
+while true; do sleep 1; done
+`,
+        );
+
+        const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+          ["run", "-n", "1", "ralph"],
+          { cwd: project.dir, runtime, env: { TMPDIR: tmpdirParent }, timeout: 30_000 },
+        );
+
+        await waitForStderr("ready");
+        const observed = readFileSync(tmpdirMarker, "utf-8");
+        const childPid = parseInt(readFileSync(pidMarker, "utf-8").trim(), 10);
+        expect(observed.length).toBeGreaterThan(0);
+        expect(Number.isFinite(childPid)).toBe(true);
+
+        const start = Date.now();
+        sendSignal("SIGTERM");
+        const outcome = await result;
+        const elapsed = Date.now() - start;
+
+        // (a) Grace period (~5s) before SIGKILL escalation.
+        expect(elapsed).toBeGreaterThanOrEqual(4_000);
+        expect(elapsed).toBeLessThanOrEqual(15_000);
+        // (b) Loopx exits with 143 (the originally-forwarded SIGTERM), not 137.
+        expect(outcome.exitCode).toBe(143);
+        // (c) Active child process group has been terminated.
+        let childAlive = true;
+        try {
+          process.kill(childPid, 0);
+        } catch {
+          childAlive = false;
+        }
+        expect(childAlive).toBe(false);
+        // (d) Tmpdir was removed after escalation completed.
+        expect(existsSync(observed)).toBe(false);
+      },
+      { timeout: 30_000, retry: 3 },
+    );
+
+    // ------------------------------------------------------------------------
+    // T-TMP-18b: Signal escalation + cleanup (SIGINT trapped by child).
+    // SIGINT parity for T-TMP-18a. SPEC §7.3 / §7.4 escalation × cleanup ×
+    // signal-symmetry combined contract.
+    // ------------------------------------------------------------------------
+    it(
+      "T-TMP-18b: SIGINT grace-period escalation followed by tmpdir cleanup",
+      async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const tmpdirMarker = join(project.dir, "tmpdir.txt");
+        const pidMarker = join(project.dir, "pid.txt");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$$" > "${pidMarker}"
+trap '' INT
+echo "ready" >&2
+while true; do sleep 1; done
+`,
+        );
+
+        const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+          ["run", "-n", "1", "ralph"],
+          { cwd: project.dir, runtime, env: { TMPDIR: tmpdirParent }, timeout: 30_000 },
+        );
+
+        await waitForStderr("ready");
+        const observed = readFileSync(tmpdirMarker, "utf-8");
+        const childPid = parseInt(readFileSync(pidMarker, "utf-8").trim(), 10);
+        expect(observed.length).toBeGreaterThan(0);
+        expect(Number.isFinite(childPid)).toBe(true);
+
+        const start = Date.now();
+        sendSignal("SIGINT");
+        const outcome = await result;
+        const elapsed = Date.now() - start;
+
+        // (a) Grace period (~5s) before SIGKILL escalation.
+        expect(elapsed).toBeGreaterThanOrEqual(4_000);
+        expect(elapsed).toBeLessThanOrEqual(15_000);
+        // (b) Loopx exits with 130 (the originally-forwarded SIGINT), not 137.
+        expect(outcome.exitCode).toBe(130);
+        // (c) Active child process group has been terminated.
+        let childAlive = true;
+        try {
+          process.kill(childPid, 0);
+        } catch {
+          childAlive = false;
+        }
+        expect(childAlive).toBe(false);
+        // (d) Tmpdir was removed after escalation completed.
+        expect(existsSync(observed)).toBe(false);
+      },
+      { timeout: 30_000, retry: 3 },
+    );
+
+    // ------------------------------------------------------------------------
+    // T-TMP-19: Cleanup on programmatic AbortSignal abort. SPEC §7.4 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-19: cleanup on programmatic AbortSignal abort", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"result":"r"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let thrown = false;
+let errMsg = "";
+let errName = "";
+try { await gen.next(); } catch (e) {
+  thrown = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? (e.name || "") : "";
+}
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({
+  firstOk: !first.done,
+  thrown,
+  errMsg,
+  errName,
+  observed,
+  exist: existsSync(observed),
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.firstOk).toBe(true);
+      expect(data.thrown).toBe(true);
+      // Abort error: AbortError name OR message containing "abort".
+      expect(
+        data.errName === "AbortError" || /abort/i.test(data.errMsg),
+      ).toBe(true);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-20: Cleanup on `.return()` while first `next()` is pending.
+    // The script blocks forever after writing markers; `.return()` aborts
+    // the active child PG and settles silently. SPEC §7.4 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-20: cleanup on .return() while first next() pending", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirMarker = join(project.dir, "tmpdir.txt");
+      const pidMarker = join(project.dir, "pid.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$$" > "${pidMarker}"
+while true; do sleep 1; done
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const tmpdirMarker = ${JSON.stringify(tmpdirMarker)};
+const pidMarker = ${JSON.stringify(pidMarker)};
+async function waitForMarkers() {
+  for (let i = 0; i < 200; i++) {
+    if (existsSync(tmpdirMarker) && existsSync(pidMarker)) {
+      const t = readFileSync(tmpdirMarker, "utf-8");
+      const p = readFileSync(pidMarker, "utf-8").trim();
+      if (t.length > 0 && p.length > 0) return { tmpdir: t, pid: parseInt(p, 10) };
+    }
+    await new Promise(r => setTimeout(r, 50));
+  }
+  throw new Error("markers never appeared");
+}
+function isAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+async function waitDead(pid, timeout) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return true;
+    await new Promise(r => setTimeout(r, 50));
+  }
+  return !isAlive(pid);
+}
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+const nextP = gen.next().then(
+  (r) => ({ kind: "resolved", done: r.done }),
+  (e) => ({ kind: "rejected", msg: e instanceof Error ? e.message : String(e) }),
+);
+const { tmpdir, pid } = await waitForMarkers();
+const settled = await gen.return(undefined);
+const nextResult = await nextP;
+const childDead = await waitDead(pid, 10_000);
+console.log(JSON.stringify({
+  tmpdir,
+  pid,
+  childDead,
+  exist: existsSync(tmpdir),
+  settledDone: settled.done,
+  nextResult,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+        timeout: 30_000,
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      // (a) Active child process group terminated.
+      expect(data.childDead).toBe(true);
+      // (b) Tmpdir cleanup ran before generator settled.
+      expect(data.exist).toBe(false);
+      // (c) Generator settles cleanly (silent completion per SPEC §9.1).
+      expect(data.settledDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-21: Cleanup on `.throw()` while first `next()` is pending.
+    // Same fixture as T-TMP-20. SPEC §9.1 requires active child PG
+    // termination and no further iterations; the consumer-error settlement
+    // form is unspecified — assert only PG-termination + tmpdir-cleanup +
+    // settlement (resolved or rejected). SPEC §7.4 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-21: cleanup on .throw() while first next() pending", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirMarker = join(project.dir, "tmpdir.txt");
+      const pidMarker = join(project.dir, "pid.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$$" > "${pidMarker}"
+while true; do sleep 1; done
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const tmpdirMarker = ${JSON.stringify(tmpdirMarker)};
+const pidMarker = ${JSON.stringify(pidMarker)};
+async function waitForMarkers() {
+  for (let i = 0; i < 200; i++) {
+    if (existsSync(tmpdirMarker) && existsSync(pidMarker)) {
+      const t = readFileSync(tmpdirMarker, "utf-8");
+      const p = readFileSync(pidMarker, "utf-8").trim();
+      if (t.length > 0 && p.length > 0) return { tmpdir: t, pid: parseInt(p, 10) };
+    }
+    await new Promise(r => setTimeout(r, 50));
+  }
+  throw new Error("markers never appeared");
+}
+function isAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+async function waitDead(pid, timeout) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return true;
+    await new Promise(r => setTimeout(r, 50));
+  }
+  return !isAlive(pid);
+}
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+const nextP = gen.next().then(
+  (r) => ({ kind: "resolved", done: r.done }),
+  (e) => ({ kind: "rejected", msg: e instanceof Error ? e.message : String(e) }),
+);
+const { tmpdir, pid } = await waitForMarkers();
+let throwResult;
+try {
+  const r = await gen.throw(new Error("consumer-err"));
+  throwResult = { kind: "resolved", done: r.done };
+} catch (e) {
+  throwResult = { kind: "rejected", msg: e instanceof Error ? e.message : String(e) };
+}
+const nextResult = await nextP;
+const childDead = await waitDead(pid, 10_000);
+console.log(JSON.stringify({
+  tmpdir,
+  pid,
+  childDead,
+  exist: existsSync(tmpdir),
+  throwResult,
+  nextResult,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+        timeout: 30_000,
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      // (a) Active child process group terminated.
+      expect(data.childDead).toBe(true);
+      // (b) Tmpdir cleanup ran before generator settled.
+      expect(data.exist).toBe(false);
+      // (c) Generator reaches a settled state (resolved or rejected, both OK).
+      expect(["resolved", "rejected"]).toContain(data.throwResult.kind);
+      // (d) Pending nextP also settles (does not block).
+      expect(["resolved", "rejected"]).toContain(data.nextResult.kind);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-22: Cleanup on `break` after yield. SPEC §7.4 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-22: cleanup on break after yield", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"result":"r"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+for await (const _ of gen) { break; }
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({ observed, exist: existsSync(observed) }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-22a: Cleanup on `.return()` after yield (no active child).
+    // Script yields {result:"ok"}, exits, then driver calls .return().
+    // SPEC §7.4 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-22a: cleanup on .return() after yield (no active child)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+const first = await gen.next();
+const settled = await gen.return(undefined);
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({
+  firstDone: first.done,
+  firstHasValue: first.value !== undefined,
+  settledDone: settled.done,
+  observed,
+  exist: existsSync(observed),
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.firstHasValue).toBe(true);
+      expect(data.settledDone).toBe(true);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-22b: Cleanup on `.throw()` after yield (no active child).
+    // Per SPEC §9.1, .throw() on no-active-child path produces silent
+    // completion — consumer-supplied error is swallowed. SPEC §7.4 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-22b: cleanup on .throw() after yield (no active child)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+const first = await gen.next();
+let throwResult;
+try {
+  const r = await gen.throw(new Error("consumer-err"));
+  throwResult = { kind: "resolved", done: r.done };
+} catch (e) {
+  throwResult = { kind: "rejected", msg: e instanceof Error ? e.message : String(e) };
+}
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({
+  firstDone: first.done,
+  throwResult,
+  observed,
+  exist: existsSync(observed),
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.firstDone).toBe(false);
+      // SPEC §9.1: silent completion — done:true, error not surfaced.
+      expect(data.throwResult.kind).toBe("resolved");
+      expect(data.throwResult.done).toBe(true);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-22c: Cleanup on `.return()` after final yield (maxIterations:1).
+    // Settlement triggers cleanup on the post-final-yield boundary.
+    // SPEC §7.4 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-22c: cleanup on .return() after final yield (maxIterations:1)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+const first = await gen.next();
+const settled = await gen.return(undefined);
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({
+  firstDone: first.done,
+  firstHasValue: first.value !== undefined,
+  settledDone: settled.done,
+  observed,
+  exist: existsSync(observed),
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.firstHasValue).toBe(true);
+      expect(data.settledDone).toBe(true);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-22d: Cleanup on `.throw()` after final yield (maxIterations:1).
+    // Counterpart to T-TMP-22c. Silent completion per SPEC §9.1 since the
+    // script exited before .throw() arrived. SPEC §7.4 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-22d: cleanup on .throw() after final yield (maxIterations:1)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+const first = await gen.next();
+let throwResult;
+try {
+  const r = await gen.throw(new Error("consumer-err"));
+  throwResult = { kind: "resolved", done: r.done };
+} catch (e) {
+  throwResult = { kind: "rejected", msg: e instanceof Error ? e.message : String(e) };
+}
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({
+  firstDone: first.done,
+  firstHasValue: first.value !== undefined,
+  throwResult,
+  observed,
+  exist: existsSync(observed),
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.firstHasValue).toBe(true);
+      expect(data.throwResult.kind).toBe("resolved");
+      expect(data.throwResult.done).toBe(true);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-22e: Cleanup on `.return()` after stop:true-driven final yield.
+    // Mirrors T-TMP-22c on the stop:true trigger. SPEC §7.4 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-22e: cleanup on .return() after stop:true-driven final yield", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5 });
+const first = await gen.next();
+const settled = await gen.return(undefined);
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({
+  firstDone: first.done,
+  firstStop: first.value && first.value.stop === true,
+  settledDone: settled.done,
+  observed,
+  exist: existsSync(observed),
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.firstStop).toBe(true);
+      expect(data.settledDone).toBe(true);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-22f: Cleanup on `.throw()` after stop:true-driven final yield.
+    // Mirrors T-TMP-22d on the stop:true trigger. Silent completion per
+    // SPEC §9.1 since the script exited. SPEC §7.4 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-22f: cleanup on .throw() after stop:true-driven final yield", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5 });
+const first = await gen.next();
+let throwResult;
+try {
+  const r = await gen.throw(new Error("consumer-err"));
+  throwResult = { kind: "resolved", done: r.done };
+} catch (e) {
+  throwResult = { kind: "rejected", msg: e instanceof Error ? e.message : String(e) };
+}
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({
+  firstDone: first.done,
+  firstStop: first.value && first.value.stop === true,
+  throwResult,
+  observed,
+  exist: existsSync(observed),
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.firstStop).toBe(true);
+      expect(data.throwResult.kind).toBe("resolved");
+      expect(data.throwResult.done).toBe(true);
       expect(data.observed.length).toBeGreaterThan(0);
       expect(data.exist).toBe(false);
     });
