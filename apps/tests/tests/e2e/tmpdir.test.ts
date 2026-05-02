@@ -7764,5 +7764,266 @@ console.log(JSON.stringify({
         force: true,
       }).catch(() => {});
     });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-37 / 37d / 37e: Recursive cleanup of an identity-matched directory
+    // unlinks nested symlink entries WITHOUT traversing their targets — SPEC
+    // §7.4 cleanup-safety rule 4. Surface-parity matrix across CLI /
+    // runPromise() / run().
+    //
+    // SPEC §7.4 dispatch case 4: "Path is a directory whose identity matches
+    // the recorded identity: recursively remove. Symlink entries encountered
+    // during the walk are unlinked but not traversed, so symlinks pointing
+    // outside the tmpdir do not collateral-delete their targets." Rule-4
+    // success path emits NO cleanup warning (warnings only fire on cleanup
+    // failure or rules 3 / 5 — see T-TMP-35 / 36 for the warning-emitting
+    // branches and T-TMP-34 for the rule-2 no-warning branch).
+    //
+    // The fixture (shared across all three surfaces): observe LOOPX_TMPDIR,
+    // create an external `external-target-dir/` under PROJECT_ROOT containing
+    // an `external-file` with sentinel content, then create a NESTED symlink
+    // INSIDE LOOPX_TMPDIR pointing at the external directory
+    // (`$LOOPX_TMPDIR/nested-link -> $LOOPX_PROJECT_ROOT/external-target-dir`),
+    // then emit `{"stop":true}`. The top-level entry remains the
+    // identity-matched directory loopx created (rule 4 applies); only an
+    // entry INSIDE the tmpdir is a symlink, so the recursive walk's
+    // symlink-handling clause is what's under test.
+    //
+    // Post-conditions per surface: (a) success outcome surfaces (CLI exit 0
+    // / promise resolves / generator settles cleanly), (b) the LOOPX_TMPDIR
+    // path no longer exists (rule-4 recursive cleanup completed), (c) the
+    // external `external-target-dir/external-file` still exists with content
+    // intact (the recursive walk unlinked the nested symlink entry but did
+    // NOT follow the symlink target — collateral-deletion safety per SPEC
+    // §7.4 rule 4 "symlinks pointing outside the tmpdir do not collateral-
+    // delete their targets"), (d) zero LOOPX_TEST_CLEANUP_WARNING\t… lines
+    // on stderr (rule-4 success branch is silent). NODE_ENV=test is set so
+    // the structured marker is gated on; absence of the marker is then a
+    // load-bearing assertion, not a trivially-true non-emission.
+    //
+    // A buggy implementation that wired surface-specific recursive-walk
+    // dispatchers (e.g., a CLI-only `rmSync({recursive:true})` that conforms
+    // to rule 4 and a programmatic-driver path that traversed nested symlinks
+    // — silently deleting external target contents) would pass T-TMP-37 yet
+    // fail T-TMP-37d / 37e.
+    // ------------------------------------------------------------------------
+
+    /**
+     * Build the shared bash fixture body for T-TMP-37/37d/37e. The script
+     * writes the observed LOOPX_TMPDIR path to `tmpdirObservation`, sets up
+     * the external target directory with `external-file`, creates a nested
+     * symlink inside LOOPX_TMPDIR pointing at that external directory, then
+     * emits stop:true.
+     */
+    function buildNestedSymlinkFixture(args: {
+      tmpdirObservation: string;
+    }): string {
+      return `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${args.tmpdirObservation}"
+mkdir -p "$LOOPX_PROJECT_ROOT/external-target-dir"
+printf 'external-content' > "$LOOPX_PROJECT_ROOT/external-target-dir/external-file"
+ln -s "$LOOPX_PROJECT_ROOT/external-target-dir" "$LOOPX_TMPDIR/nested-link"
+printf '{"stop":true}'
+`;
+    }
+
+    it("T-TMP-37: CLI recursive cleanup unlinks nested symlink without traversing target, no warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildNestedSymlinkFixture({ tmpdirObservation }),
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+      });
+
+      // (a) CLI success outcome surfaces.
+      expect(result.exitCode).toBe(0);
+
+      const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+      expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+
+      // (b) The LOOPX_TMPDIR path no longer exists — rule-4 recursive
+      // cleanup ran on the identity-matched directory.
+      expect(existsSync(observedLoopxTmpdir)).toBe(false);
+
+      // (c) The external target directory and `external-file` still exist
+      // with content intact — the recursive walk unlinked the nested
+      // symlink entry but did NOT follow the symlink target (collateral-
+      // deletion safety per SPEC §7.4 rule 4).
+      const externalTargetDir = join(project.dir, "external-target-dir");
+      expect(existsSync(externalTargetDir)).toBe(true);
+      const externalFile = join(externalTargetDir, "external-file");
+      expect(existsSync(externalFile)).toBe(true);
+      expect(readFileSync(externalFile, "utf-8")).toBe("external-content");
+
+      // (d) Zero cleanup warnings on stderr — rule-4 success branch is
+      // silent. NODE_ENV=test is set above, so the structured marker would
+      // be emitted if any warning happened — making this a load-bearing
+      // negative assertion, not a trivially-true non-emission.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(0);
+    });
+
+    it("T-TMP-37d: runPromise() recursive cleanup unlinks nested symlink without traversing target, no warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildNestedSymlinkFixture({ tmpdirObservation }),
+      );
+
+      const externalTargetDir = join(project.dir, "external-target-dir");
+      const externalFile = join(externalTargetDir, "external-file");
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+const externalTargetDir = ${JSON.stringify(externalTargetDir)};
+const externalFile = ${JSON.stringify(externalFile)};
+let rejected = false;
+let errMsg = "";
+let outputs = [];
+try {
+  outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) {
+  rejected = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+const externalDirExists = existsSync(externalTargetDir);
+const externalFileExists = existsSync(externalFile);
+const externalFileContent = externalFileExists ? readFileSync(externalFile, "utf-8") : "";
+console.log(JSON.stringify({
+  rejected,
+  errMsg,
+  outputsLen: outputs.length,
+  observed,
+  observedExists: existsSync(observed),
+  externalDirExists,
+  externalFileExists,
+  externalFileContent,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+
+      // (a) Promise resolved (no rejection). One Output yielded.
+      expect(data.rejected).toBe(false);
+      expect(data.errMsg).toBe("");
+      expect(data.outputsLen).toBe(1);
+
+      // (b) LOOPX_TMPDIR removed — rule-4 recursive cleanup ran.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.observedExists).toBe(false);
+
+      // (c) External target directory and `external-file` survive intact —
+      // recursive walk did NOT traverse the nested symlink.
+      expect(data.externalDirExists).toBe(true);
+      expect(data.externalFileExists).toBe(true);
+      expect(data.externalFileContent).toBe("external-content");
+
+      // (d) Zero cleanup warnings on driver-process stderr — rule-4 success
+      // branch is silent. NODE_ENV=test is set so the structured marker
+      // would be emitted if any warning happened — load-bearing negative.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(0);
+    });
+
+    it("T-TMP-37e: run() recursive cleanup unlinks nested symlink without traversing target, no warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildNestedSymlinkFixture({ tmpdirObservation }),
+      );
+
+      const externalTargetDir = join(project.dir, "external-target-dir");
+      const externalFile = join(externalTargetDir, "external-file");
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+const externalTargetDir = ${JSON.stringify(externalTargetDir)};
+const externalFile = ${JSON.stringify(externalFile)};
+let thrown = false;
+let errMsg = "";
+let yieldCount = 0;
+try {
+  const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  for await (const _ of gen) { yieldCount++; }
+} catch (e) {
+  thrown = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+const externalDirExists = existsSync(externalTargetDir);
+const externalFileExists = existsSync(externalFile);
+const externalFileContent = externalFileExists ? readFileSync(externalFile, "utf-8") : "";
+console.log(JSON.stringify({
+  thrown,
+  errMsg,
+  yieldCount,
+  observed,
+  observedExists: existsSync(observed),
+  externalDirExists,
+  externalFileExists,
+  externalFileContent,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+
+      // (a) Generator settled cleanly (no throw). One yield.
+      expect(data.thrown).toBe(false);
+      expect(data.errMsg).toBe("");
+      expect(data.yieldCount).toBe(1);
+
+      // (b) LOOPX_TMPDIR removed — rule-4 recursive cleanup ran.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.observedExists).toBe(false);
+
+      // (c) External target directory and `external-file` survive intact —
+      // recursive walk did NOT traverse the nested symlink.
+      expect(data.externalDirExists).toBe(true);
+      expect(data.externalFileExists).toBe(true);
+      expect(data.externalFileContent).toBe("external-content");
+
+      // (d) Zero cleanup warnings on driver-process stderr — rule-4 success
+      // branch is silent.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(0);
+    });
   });
 });
