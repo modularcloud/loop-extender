@@ -7916,20 +7916,25 @@ console.log(JSON.stringify({ threw, message, name }));
 });
 
 // ---------------------------------------------------------------------------
-// SPEC: RunOptions.env — LOOPX_* Silent-Override Contract (T-API-58 series)
+// SPEC: RunOptions.env / envFile — LOOPX_* Silent-Override Contract
+//   (T-API-58 series)
 //
 // SPEC §8.3 / §9.5 / §13: The five script-protocol-protected names
 // (LOOPX_BIN, LOOPX_PROJECT_ROOT, LOOPX_WORKFLOW, LOOPX_WORKFLOW_DIR,
 // LOOPX_TMPDIR) are silently overridden by protocol injection when supplied
 // via RunOptions.env. Non-protocol LOOPX_* names (e.g., LOOPX_DELEGATED) are
-// NOT script-protocol-protected and reach the spawned child unchanged.
+// NOT script-protocol-protected and reach the spawned child unchanged from
+// every env-supply tier (inherited env, global env file, CLI `-e`,
+// programmatic `RunOptions.envFile`, and `RunOptions.env`).
 //
 // T-API-51a/51a2 cover all five protocol names with arbitrary fake values
 // silently overridden, but they don't isolate the per-name override behavior
 // against a non-protocol same-prefix name. T-API-58 series adds:
 //   T-API-58    runPromise + LOOPX_WORKFLOW (fake) + CUSTOM (user-val)
-//   T-API-58a   runPromise + LOOPX_DELEGATED (user-supplied) reaches script
-//   T-API-58a2  run        + LOOPX_DELEGATED (user-supplied) reaches script
+//   T-API-58a   runPromise + RunOptions.env LOOPX_DELEGATED reaches script
+//   T-API-58a2  run        + RunOptions.env LOOPX_DELEGATED reaches script
+//   T-API-58a3  runPromise + RunOptions.envFile LOOPX_DELEGATED reaches script
+//   T-API-58a4  run        + RunOptions.envFile LOOPX_DELEGATED reaches script
 // ---------------------------------------------------------------------------
 
 describe("SPEC: RunOptions.env LOOPX_* Silent Override", () => {
@@ -8051,6 +8056,91 @@ console.log(JSON.stringify({ count }));
       expect(result.exitCode).toBe(0);
       expect(JSON.parse(result.stdout).count).toBe(1);
       expect(readFileSync(marker, "utf-8")).toBe("user-supplied");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58a3: runPromise() — RunOptions.envFile (programmatic local
+    //   env-file) supplying LOOPX_DELEGATED reaches the spawned script
+    //   unchanged. Closes the per-tier supply matrix for LOOPX_DELEGATED on
+    //   the programmatic surface alongside T-API-58a (RunOptions.env tier),
+    //   T-ENV-24a (inherited env), T-ENV-24a2 (global env file), and
+    //   T-ENV-24a3 (CLI -e). Confirms that the no-protection contract for
+    //   LOOPX_DELEGATED holds on the §8.3 tier-3 RunOptions.envFile path,
+    //   not just on tier-2 RunOptions.env.
+    // ------------------------------------------------------------------------
+    it("T-API-58a3: runPromise() — RunOptions.envFile LOOPX_DELEGATED reaches child unchanged", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "delegated.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await createEnvFile(envFilePath, { LOOPX_DELEGATED: "from-envfile" });
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${LOOPX_DELEGATED:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      // Per TEST-SPEC §1.4: harness must scrub LOOPX_DELEGATED from inherited
+      // env so the only tier supplying the value is RunOptions.envFile,
+      // mirroring T-ENV-24a3's discipline for the CLI local env-file tier.
+      const driverCode = `
+import { runPromise } from "loopx";
+delete process.env.LOOPX_DELEGATED;
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(envFilePath)},
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // LOOPX_DELEGATED from the programmatic-envFile tier reached the child
+      // unchanged. Distinguishes LOOPX_DELEGATED from script-protocol-protected
+      // LOOPX_* names whose lower-tier values are silently overridden by
+      // protocol injection.
+      expect(readFileSync(marker, "utf-8")).toBe("from-envfile");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58a4: run() — generator-surface counterpart to T-API-58a3.
+    //   Surface-parity for LOOPX_DELEGATED's startup-reserved-only contract on
+    //   the §8.3 tier-3 RunOptions.envFile path, mirroring the runPromise/run
+    //   surface-parity already pinned for the RunOptions.env tier by
+    //   T-API-58a / T-API-58a2.
+    // ------------------------------------------------------------------------
+    it("T-API-58a4: run() — RunOptions.envFile LOOPX_DELEGATED reaches child unchanged on generator surface", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "delegated.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await createEnvFile(envFilePath, { LOOPX_DELEGATED: "from-envfile" });
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${LOOPX_DELEGATED:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+delete process.env.LOOPX_DELEGATED;
+let count = 0;
+for await (const _ of run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(envFilePath)},
+  maxIterations: 1,
+})) {
+  count++;
+}
+console.log(JSON.stringify({ count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("from-envfile");
     });
   });
 });
