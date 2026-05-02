@@ -1,6 +1,6 @@
 # Implementation Plan for loopx Test Harness
 
-**Status: ADR-0004 §6.1 (project-root cwd + LOOPX_WORKFLOW_DIR injection), §7.4 (LOOPX_TMPDIR creation/injection/cleanup + parent-snapshot timing across all four injection tiers), §9.5 (RunOptions.env tier-2 env merging), §9.3 (abort-after-final-yield carve-out), §9.2 (LOOPX_TMPDIR async creation under runPromise()), AND §9.2 (process.env eager snapshot under runPromise()) are now IMPLEMENTED. Recent (this iteration): `runPromise()` now eagerly captures `process.env` and the global env-file path (`getGlobalEnvPath` resolved against the snapshot) before the `await Promise.resolve()` microtask boundary, threaded through `runWithInternal` → `runInternal` as `inheritedEnv` / `globalEnvPath`. `mergeEnv` now spreads the inherited snapshot when provided instead of reading live `process.env`. `run()` retains lazy semantics (no snapshot threaded → reads live `process.env` inside `runLoop`). tmpdir.test.ts 389/389 still passes; programmatic-api: 370 (was 358, +12 new env-snapshot-timing tests T-API-71/71a/71b/72/72a/72b × 2 runtimes); env-vars 96; wfdir 40. Full e2e suite: 2249/2250 passing; the single remaining failure is T-INST-GLOBAL-01a [Bun] (pre-existing, unrelated to this work).**
+**Status: ADR-0004 §6.1 (project-root cwd + LOOPX_WORKFLOW_DIR injection), §7.4 (LOOPX_TMPDIR creation/injection/cleanup + parent-snapshot timing across all four injection tiers + run-setup non-reaping + renamed-away ENOENT silence), §9.5 (RunOptions.env tier-2 env merging), §9.3 (abort-after-final-yield carve-out), §9.2 (LOOPX_TMPDIR async creation under runPromise()), AND §9.2 (process.env eager snapshot under runPromise()) are now IMPLEMENTED. Recent (this iteration): authored T-TMP-32/32a/32b/32c (stale-tmpdir non-reaping across CLI `loopx run`, `runPromise()`, `run()`, and four non-`run` CLI startup surfaces — `loopx -h`, `loopx version`, `loopx`, `loopx --unknown`) and T-TMP-33 (renamed-away tmpdir is not chased and emits no cleanup warning per SPEC §7.4 cleanup-rule-1 ENOENT-silence). 16 new tests (7 sub-tests × 2 runtimes for T-TMP-32 series; 1 × 2 for T-TMP-33). The implementation already conformed to spec — `createTmpdir` only does `mkdtemp(parent, "loopx-")` with no parent-scan, and `cleanupTmpdir` rule 1 is silent on ENOENT — so this iteration is purely test-authoring. tmpdir.test.ts: 405/405 (was 389, +16). Full e2e suite expected: 2265/2266 passing; the single remaining failure is T-INST-GLOBAL-01a [Bun] (pre-existing, unrelated).**
 
 ## P0/P1 — RESOLVED
 
@@ -136,12 +136,29 @@ Now-passing tests (this iteration):
 - **programmatic-api: 370 PASS** (was 358; +12 new tests under "SPEC: Inherited Env Snapshot Timing" — T-API-71/71a/71b/72/72a/72b × 2 runtimes). T-API-71/71a/71b verify `run()` lazy semantics (mutation between call and first `next()` observed; mid-run mutation frozen at first `next()`; XDG_CONFIG_HOME mutation redirects global env file lookup). T-API-72/72a/72b verify `runPromise()` eager semantics (mutation after return not observed; mid-run mutation not observed across iterations; XDG_CONFIG_HOME mutation does not redirect global env file lookup).
 - Adjacent suites: zero regressions (tmpdir 389, env-vars 96, wfdir 40).
 
+### ADR-0004 §7.4 (stale-tmpdir non-reaping + renamed-away ENOENT silence) — RESOLVED
+
+SPEC §7.4 specifies that loopx does not reap stale `loopx-*` entries during CLI startup, CLI `loopx run` setup, or any per-run setup performed for `run()` / `runPromise()`. SPEC §7.4 also specifies that a script that renames its tmpdir defeats automatic cleanup (loopx does not chase renamed tmpdirs) and that the resulting ENOENT at cleanup time is a silent no-op (cleanup-safety rule 1).
+
+The existing implementation already conformed:
+- `createTmpdir` (`packages/loop-extender/src/tmpdir.ts`) only invokes `mkdtempSync(join(parent, "loopx-"))` — no parent-scan, no validation, no removal of pre-existing entries.
+- `cleanupTmpdir` rule 1 (lines 196-199) returns silently on ENOENT without emitting any warning.
+- `bin.ts` dispatches to help / version / unknown-command paths via `process.exit()` before any tmpdir-related code runs, so non-`run` CLI startup never creates or scans tmpdir.
+
+Now-passing tests (this iteration):
+- **tmpdir.test.ts: 405/405 PASS** — added 16 tests (7 sub-tests × 2 runtimes for T-TMP-32 series + 1 × 2 for T-TMP-33):
+  - **T-TMP-32**: CLI `loopx run` setup leaves pre-existing `loopx-stale-xyz/` intact + cleans up its own tmpdir after run (only stale entry remains under parent).
+  - **T-TMP-32a**: Same contract on `runPromise()` (eager-snapshot path per SPEC §9.2).
+  - **T-TMP-32b**: Same contract on `run()` (lazy-snapshot path per SPEC §9.1).
+  - **T-TMP-32c**: 4 sub-cases over non-`run` CLI startup — `loopx -h` (exit 0), `loopx version` (exit 0), `loopx` (no args, exit 0), `loopx --unknown` (parser error, exit 1). All assert: stale entry survives, no new `loopx-*` materialized under parent, expected exit code.
+  - **T-TMP-33**: Fixture renames `$LOOPX_TMPDIR` to `$LOOPX_TMPDIR-renamed` mid-run. Asserts: original path absent, renamed path present with marker intact, **zero** `LOOPX_TEST_CLEANUP_WARNING\t…` lines on stderr (ENOENT-at-cleanup is silent per SPEC §7.4 cleanup-rule-1, completing the warning-cardinality characterization across the cleanup-dispatch tree alongside T-TMP-35/T-TMP-36 which assert exactly one warning for non-ENOENT mismatched-identity / regular-file replacements).
+- Adjacent suites: zero regressions. Full tmpdir.test.ts run: 405/405 in ~61s.
+
 ## P1 — REMAINING T-TMP-* subsections
 
 These T-TMP IDs are not yet implemented as test cases or are blocked by missing infrastructure:
 
-- **Renamed-Away and Mount-Point** — T-TMP-32, T-TMP-32a..32c, T-TMP-33.
-- **Cleanup-Safety dispatch matrix** — T-TMP-34/34a/34b (renamed-away), T-TMP-35..35h (script-failure terminal cleanup-warning cardinality), T-TMP-36/36a/36b (mismatched-identity), T-TMP-37/37a..37e (recursive-removal walk semantics), T-TMP-38/39/38a/38a2/38b/38b-run/38b2/38b2-run/38c/38c2 (cleanup idempotence and at-most-one-warning under racing terminals), T-TMP-40 (lstat-fail), T-TMP-41 (symlink-unlink-fail), T-TMP-42/42a/42b/42c (recursive-remove-fail).
+- **Cleanup-Safety dispatch matrix** — T-TMP-34/34a/34b (symlink-replacement cleanup-rule-2), T-TMP-35..35h (script-failure terminal cleanup-warning cardinality), T-TMP-36/36a/36b (mismatched-identity), T-TMP-37/37a..37e (recursive-removal walk semantics), T-TMP-38/39/38a/38a2/38b/38b-run/38b2/38b2-run/38c/38c2 (cleanup idempotence and at-most-one-warning under racing terminals), T-TMP-40 (lstat-fail), T-TMP-41 (symlink-unlink-fail), T-TMP-42/42a/42b/42c (recursive-remove-fail).
 
 ## P1 — Discovered open issues
 

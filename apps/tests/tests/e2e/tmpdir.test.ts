@@ -6692,5 +6692,279 @@ console.log(JSON.stringify({ loopx, observed }));
       expect(dirname(data.loopx)).toBe(expectedParent);
       expect(data.observed).toBe(wrongParent);
     });
+
+    // ========================================================================
+    // T-TMP-32 / T-TMP-32a / T-TMP-32b / T-TMP-32c — Stale-tmpdir non-reaping.
+    // T-TMP-33 — Renamed-away tmpdir cleanup is silent (no warning).
+    //
+    // SPEC §7.4: "loopx does not reap stale tmpdirs during CLI startup, CLI
+    // `loopx run` setup, or any per-run setup performed for `run()` /
+    // `runPromise()`. A run setup creates only its own `mkdtemp` directory
+    // under the selected parent and does not scan for, validate, or remove
+    // pre-existing `loopx-*` entries under that parent."
+    //
+    // SPEC §7.4: "A script that removes or renames its tmpdir during the run
+    // defeats automatic cleanup of the moved directory; loopx does not chase
+    // renamed tmpdirs." Plus cleanup-safety rule 1: "Path no longer exists
+    // (ENOENT): no-op." T-TMP-33 pins down that the ENOENT no-op is silent
+    // (no cleanup warning), so warning cardinality across the cleanup-
+    // dispatch tree is fully characterized.
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // T-TMP-32: No stale-tmpdir reaping during CLI `loopx run` setup.
+    // ------------------------------------------------------------------------
+    it("T-TMP-32: CLI run setup does not reap pre-existing loopx-* entries", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const stalePath = join(tmpdirParent, "loopx-stale-xyz");
+      const staleMarker = join(stalePath, "marker.txt");
+      await mkdir(stalePath, { recursive: true });
+      await writeFile(staleMarker, "preexisting", "utf-8");
+
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+printf '{"stop":true}'
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+
+      // (a) Stale entry survives intact — loopx did not reap it.
+      expect(existsSync(stalePath)).toBe(true);
+      expect(existsSync(staleMarker)).toBe(true);
+      expect(readFileSync(staleMarker, "utf-8")).toBe("preexisting");
+
+      // (b) loopx's own freshly-created tmpdir was cleaned up after the run.
+      const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+      expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+      expect(dirname(observedLoopxTmpdir)).toBe(tmpdirParent);
+      expect(observedLoopxTmpdir).not.toBe(stalePath);
+      expect(existsSync(observedLoopxTmpdir)).toBe(false);
+
+      // (c) Only the stale entry remains under the parent — no new loopx-*
+      // entries leaked, and loopx did not delete the stale entry.
+      expect(listLoopxEntries(tmpdirParent)).toEqual(["loopx-stale-xyz"]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-32a: No stale-tmpdir reaping during runPromise() setup.
+    // ------------------------------------------------------------------------
+    it("T-TMP-32a: runPromise() setup does not reap pre-existing loopx-* entries", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const stalePath = join(tmpdirParent, "loopx-stale-xyz");
+      const staleMarker = join(stalePath, "marker.txt");
+      await mkdir(stalePath, { recursive: true });
+      await writeFile(staleMarker, "preexisting", "utf-8");
+
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { readFileSync } from "node:fs";
+await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+const observed = readFileSync(${JSON.stringify(tmpdirObservation)}, "utf-8");
+console.log(JSON.stringify({ observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+
+      // (a) Stale entry survives.
+      expect(existsSync(stalePath)).toBe(true);
+      expect(existsSync(staleMarker)).toBe(true);
+      expect(readFileSync(staleMarker, "utf-8")).toBe("preexisting");
+
+      // (b) loopx's tmpdir lived under the parent and is now cleaned up.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(dirname(data.observed)).toBe(tmpdirParent);
+      expect(data.observed).not.toBe(stalePath);
+      expect(existsSync(data.observed)).toBe(false);
+
+      // (c) Only the stale entry remains.
+      expect(listLoopxEntries(tmpdirParent)).toEqual(["loopx-stale-xyz"]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-32b: No stale-tmpdir reaping during run() setup.
+    // ------------------------------------------------------------------------
+    it("T-TMP-32b: run() setup does not reap pre-existing loopx-* entries", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const stalePath = join(tmpdirParent, "loopx-stale-xyz");
+      const staleMarker = join(stalePath, "marker.txt");
+      await mkdir(stalePath, { recursive: true });
+      await writeFile(staleMarker, "preexisting", "utf-8");
+
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { readFileSync } from "node:fs";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+for await (const _ of gen) { /* drain */ }
+const observed = readFileSync(${JSON.stringify(tmpdirObservation)}, "utf-8");
+console.log(JSON.stringify({ observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+
+      // (a) Stale entry survives.
+      expect(existsSync(stalePath)).toBe(true);
+      expect(existsSync(staleMarker)).toBe(true);
+      expect(readFileSync(staleMarker, "utf-8")).toBe("preexisting");
+
+      // (b) loopx's tmpdir lived under the parent and is now cleaned up.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(dirname(data.observed)).toBe(tmpdirParent);
+      expect(data.observed).not.toBe(stalePath);
+      expect(existsSync(data.observed)).toBe(false);
+
+      // (c) Only the stale entry remains.
+      expect(listLoopxEntries(tmpdirParent)).toEqual(["loopx-stale-xyz"]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-32c: No stale-tmpdir reaping during non-`run` CLI startup.
+    //
+    // Four sub-cases exercise SPEC §7.4's literal "CLI startup" enumeration
+    // through CLI invocations that do NOT reach `loopx run` setup:
+    //   - c-help:         `loopx -h`         (top-level help short-circuit, exit 0)
+    //   - c-version:      `loopx version`    (version subcommand, exit 0)
+    //   - c-no-args:      `loopx`            (no subcommand, prints help, exit 0)
+    //   - c-parser-error: `loopx --unknown`  (top-level usage error, exit 1)
+    //
+    // For each sub-case, assert: (a) the pre-created `loopx-stale-xyz/`
+    // entry survives, (b) NO new `loopx-*` entry was materialized under the
+    // parent (no startup-side scratch-dir creation), and (c) the variant-
+    // specific exit code.
+    // ------------------------------------------------------------------------
+    const NON_RUN_CLI_CASES = [
+      { id: "c-help", args: ["-h"], expectedExit: 0 },
+      { id: "c-version", args: ["version"], expectedExit: 0 },
+      { id: "c-no-args", args: [], expectedExit: 0 },
+      { id: "c-parser-error", args: ["--unknown"], expectedExit: 1 },
+    ] as const;
+
+    for (const { id, args, expectedExit } of NON_RUN_CLI_CASES) {
+      it(`T-TMP-32c (${id}): non-run CLI startup does not reap or create loopx-* entries`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const stalePath = join(tmpdirParent, "loopx-stale-xyz");
+        const staleMarker = join(stalePath, "marker.txt");
+        await mkdir(stalePath, { recursive: true });
+        await writeFile(staleMarker, "preexisting", "utf-8");
+
+        const result = await runCLI([...args], {
+          cwd: project.dir,
+          runtime,
+          env: { TMPDIR: tmpdirParent },
+        });
+
+        // (a) Variant-specific exit code.
+        expect(result.exitCode).toBe(expectedExit);
+
+        // (b) Stale entry survives — no startup-side reaping.
+        expect(existsSync(stalePath)).toBe(true);
+        expect(existsSync(staleMarker)).toBe(true);
+        expect(readFileSync(staleMarker, "utf-8")).toBe("preexisting");
+
+        // (c) Only the pre-created stale entry exists under the parent —
+        // no new `loopx-*` directory was materialized by the CLI startup
+        // (no startup-side scratch-dir creation).
+        expect(listLoopxEntries(tmpdirParent)).toEqual(["loopx-stale-xyz"]);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-TMP-33: Renamed-away tmpdir is not chased; ENOENT cleanup is silent.
+    //
+    // SPEC §7.4: "A script that removes or renames its tmpdir during the
+    // run defeats automatic cleanup of the moved directory; loopx does not
+    // chase renamed tmpdirs." + cleanup-safety rule 1 (ENOENT no-op, no
+    // warning).
+    // ------------------------------------------------------------------------
+    it("T-TMP-33: renamed-away tmpdir is not chased and emits no cleanup warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      // Fixture: observe LOOPX_TMPDIR, write a marker into the tmpdir,
+      // rename the tmpdir directory itself to a sibling path under the
+      // same parent, then emit stop:true.
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+printf 'initialized' > "$LOOPX_TMPDIR/marker.txt"
+mv "$LOOPX_TMPDIR" "$LOOPX_TMPDIR-renamed"
+printf '{"stop":true}'
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+
+      const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+      expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+      const renamedPath = `${observedLoopxTmpdir}-renamed`;
+
+      // (a) Original tmpdir path no longer exists (the rename moved it).
+      expect(existsSync(observedLoopxTmpdir)).toBe(false);
+
+      // (b) Renamed path still exists with the marker intact — loopx did
+      // NOT chase the renamed directory and did NOT remove it.
+      expect(existsSync(renamedPath)).toBe(true);
+      const renamedMarker = join(renamedPath, "marker.txt");
+      expect(existsSync(renamedMarker)).toBe(true);
+      expect(readFileSync(renamedMarker, "utf-8")).toBe("initialized");
+
+      // (c) No cleanup-related warning was emitted — ENOENT-at-cleanup is
+      // silent (the structured marker line count is the implementation-
+      // neutral predicate per TEST-SPEC §1.4).
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(0);
+    });
   });
 });
