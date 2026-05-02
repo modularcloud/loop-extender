@@ -5944,3 +5944,354 @@ console.log(JSON.stringify({ count: outputs.length }));
     });
   });
 });
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — RunOptions.env Invalid Shape (SPEC §9.5)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.5 specifies RunOptions.env must be a non-null, non-array,
+// non-function object whose own enumerable string-keyed entries all have
+// string values. Any of: invalid object types, non-string entry values,
+// snapshot-time throws — surface as option-snapshot errors via the standard
+// pre-iteration error path: throwing on the first generator next() under
+// run(), or rejecting the returned promise under runPromise().
+//
+// T-API-53 series — whole-`env` primitive variants (run() surface):
+//   - 53: env: null
+//   - 53a: env: [] (array)
+//   - 53b: env: () => {} (function)
+//   - 53c: env: "string"
+//   - 53d: env: 42 (number)
+//   - 53e: env: true (boolean)
+//   - 53f: env: Symbol("x")
+//   - 53g: env: 1n (bigint)
+//
+// T-API-54 series — entry-value variants (run() surface):
+//   - 54: { MYVAR: 42 } (number)
+//   - 54a: { MYVAR: undefined }
+//   - 54b: { MYVAR: null }
+//   - 54c: { MYVAR: { nested: "value" } } (object)
+//   - 54d: accessor returning non-string (Object.defineProperty)
+//   - 54e: 54d's runPromise() counterpart
+//   - 54f: { MYVAR: true } (boolean)
+//   - 54g: { MYVAR: Symbol("x") }
+//   - 54h: { MYVAR: 1n } (bigint)
+//
+// T-API-55 — runPromise() equivalents — parameterized across all
+// whole-`env` and entry-value invalid shapes; each variant rejects the
+// promise with an option-snapshot error.
+
+describe("SPEC: RunOptions.env Invalid Shape", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-53 series — whole-`env` primitive variants on run() surface.
+    // SPEC §9.5: invalid `env` shape surfaces as a generator throw on
+    // first next().
+    // ------------------------------------------------------------------------
+    interface WholeEnvVariant {
+      id: string;
+      label: string;
+      // Inline literal (since values like Symbol(...) and BigInt cannot be
+      // serialized through JSON.stringify); spliced into the driver code.
+      envExpr: string;
+    }
+
+    const wholeEnvVariants: WholeEnvVariant[] = [
+      { id: "T-API-53", label: "null", envExpr: "null" },
+      { id: "T-API-53a", label: "array", envExpr: "[]" },
+      { id: "T-API-53b", label: "function", envExpr: "(() => {})" },
+      { id: "T-API-53c", label: "string", envExpr: '"string"' },
+      { id: "T-API-53d", label: "number", envExpr: "42" },
+      { id: "T-API-53e", label: "boolean", envExpr: "true" },
+      { id: "T-API-53f", label: "symbol", envExpr: 'Symbol("x")' },
+      { id: "T-API-53g", label: "bigint", envExpr: "1n" },
+    ];
+
+    for (const v of wholeEnvVariants) {
+      it(`${v.id}: run() with env: ${v.label} throws on first next()`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: ${v.envExpr},
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+  name = e.name || "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.threw).toBe(true);
+        // Error message must reference the env / RunOptions context
+        // (load-bearing — proves the failure surfaces from env-shape
+        // validation, not some unrelated downstream error).
+        expect(parsed.message).toMatch(/env|RunOptions/i);
+        // Script must NOT have been spawned (shape error fires
+        // pre-iteration, before any spawn).
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-54 series — entry-value variants on run() surface. SPEC §9.5:
+    // all entries must have string values; non-string values reject with
+    // an option-snapshot error.
+    // ------------------------------------------------------------------------
+    interface EntryValueVariant {
+      id: string;
+      label: string;
+      envExpr: string;
+    }
+
+    const entryValueVariants: EntryValueVariant[] = [
+      { id: "T-API-54", label: "number", envExpr: "{ MYVAR: 42 }" },
+      { id: "T-API-54a", label: "undefined", envExpr: "{ MYVAR: undefined }" },
+      { id: "T-API-54b", label: "null", envExpr: "{ MYVAR: null }" },
+      {
+        id: "T-API-54c",
+        label: "object",
+        envExpr: '{ MYVAR: { nested: "value" } }',
+      },
+      { id: "T-API-54f", label: "boolean", envExpr: "{ MYVAR: true }" },
+      { id: "T-API-54g", label: "symbol", envExpr: '{ MYVAR: Symbol("x") }' },
+      { id: "T-API-54h", label: "bigint", envExpr: "{ MYVAR: 1n }" },
+    ];
+
+    for (const v of entryValueVariants) {
+      it(`${v.id}: run() with env entry value ${v.label} throws on first next()`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: ${v.envExpr},
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+  name = e.name || "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.threw).toBe(true);
+        // Error message must reference env / MYVAR / string-shape context.
+        expect(parsed.message).toMatch(/env|MYVAR|string/i);
+        // No child was spawned.
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-54d: run() — accessor-returning-non-string entry value throws on
+    // first next(). SPEC §9.5: the [[Get]]-semantics value-read on each
+    // included key must yield a string; an accessor that returns a non-string
+    // value is invalid for the same reason as a data-property non-string
+    // value (T-API-54). Test-construction: build env directly via
+    // Object.defineProperty on the same object passed as options.env — NEVER
+    // via object spread (which would invoke the getter in the test harness
+    // before run() is called).
+    // ------------------------------------------------------------------------
+    it("T-API-54d: run() — accessor returning non-string value throws on first next()", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "spawn-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const env = {};
+Object.defineProperty(env, "KEY", {
+  enumerable: true,
+  configurable: true,
+  get() { return 42; },
+});
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+  name = e.name || "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(true);
+      // Error must reference the entry name KEY or string-shape context —
+      // a buggy implementation using descriptor-based extraction
+      // (descriptor.value === undefined on accessor properties) would
+      // surface a different error or skip validation.
+      expect(parsed.message).toMatch(/env|KEY|string/i);
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-54e: runPromise() — accessor-returning-non-string entry value
+    // rejects the promise. Companion to T-API-54d.
+    // ------------------------------------------------------------------------
+    it("T-API-54e: runPromise() — accessor returning non-string value rejects", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "spawn-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const env = {};
+Object.defineProperty(env, "KEY", {
+  enumerable: true,
+  configurable: true,
+  get() { return 42; },
+});
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+  name = e.name || "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(true);
+      expect(parsed.message).toMatch(/env|KEY|string/i);
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-55: runPromise() equivalents for all invalid env shapes.
+    // SPEC §9.5 / §9.2: all invalid RunOptions.env shapes reject the
+    // promise. Parameterized across the same whole-`env` primitive variants
+    // (T-API-53–53g) and entry-value variants (T-API-54–54c, 54f–54h) on
+    // the runPromise() surface.
+    // ------------------------------------------------------------------------
+    interface RunPromiseVariant {
+      label: string;
+      envExpr: string;
+    }
+
+    const runPromiseVariants: RunPromiseVariant[] = [
+      // Whole-env primitives (mirrors T-API-53–53g).
+      { label: "null", envExpr: "null" },
+      { label: "array", envExpr: "[]" },
+      { label: "function", envExpr: "(() => {})" },
+      { label: "string", envExpr: '"string"' },
+      { label: "number", envExpr: "42" },
+      { label: "boolean", envExpr: "true" },
+      { label: "symbol", envExpr: 'Symbol("x")' },
+      { label: "bigint", envExpr: "1n" },
+      // Entry-value primitives (mirrors T-API-54–54c, 54f–54h).
+      { label: "entry-number", envExpr: "{ MYVAR: 42 }" },
+      { label: "entry-undefined", envExpr: "{ MYVAR: undefined }" },
+      { label: "entry-null", envExpr: "{ MYVAR: null }" },
+      { label: "entry-object", envExpr: '{ MYVAR: { nested: "value" } }' },
+      { label: "entry-boolean", envExpr: "{ MYVAR: true }" },
+      { label: "entry-symbol", envExpr: '{ MYVAR: Symbol("x") }' },
+      { label: "entry-bigint", envExpr: "{ MYVAR: 1n }" },
+    ];
+
+    for (const v of runPromiseVariants) {
+      it(`T-API-55: runPromise() rejects on env: ${v.label}`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: ${v.envExpr},
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+  name = e.name || "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.message).toMatch(/env|MYVAR|RunOptions|string/i);
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+  });
+});
