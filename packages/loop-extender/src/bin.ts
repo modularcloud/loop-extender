@@ -644,8 +644,15 @@ async function main(): Promise<void> {
     process.exit(128 + sigNum);
   }
 
+  // SPEC §7.2 first-observed-wins: a second signal arriving after the first
+  // (e.g. SIGTERM during cleanup of a prior SIGINT) does not displace the
+  // first signal's exit code. The AbortController is already aborted on the
+  // second call (no-op), so we still propagate but leave `receivedSignal`
+  // anchored at the first observation.
   const signalHandler = (sig: NodeJS.Signals) => {
-    receivedSignal = sig;
+    if (receivedSignal === null) {
+      receivedSignal = sig;
+    }
     ac.abort(sig);
   };
   process.on("SIGINT", signalHandler);

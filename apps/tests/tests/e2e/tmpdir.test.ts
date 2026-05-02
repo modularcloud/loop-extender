@@ -10046,5 +10046,238 @@ console.log(JSON.stringify({
         }
       });
     }
+
+    // ------------------------------------------------------------------------
+    // T-TMP-38 / T-TMP-39: SPEC §7.2 / §7.4 cleanup-idempotence and
+    // warning-cardinality contracts under racing terminal triggers.
+    //
+    // SPEC §7.2: "The first terminal trigger observed by loopx determines the
+    // surfaced outcome among genuinely racing triggers" + "Racing terminal
+    // triggers ... do not start a second cleanup attempt and do not re-emit
+    // cleanup warnings." Both rules pin behavior at the sub-millisecond
+    // granularity that black-box tests cannot reach without a coordination
+    // seam.
+    //
+    // The TEST-SPEC §1.4 `LOOPX_TEST_TERMINAL_TRIGGER_PAUSE=cleanup-start`
+    // seam pauses loopx at the entry of the cleanup routine for a bounded
+    // interval, after writing a parent-observable marker, so the harness can
+    // race a second terminal trigger in deterministically. The companion
+    // `LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER` env var names the marker
+    // file path.
+    //
+    // T-TMP-38 covers the regular-file (SPEC §7.4 rule 3) cleanup-warning
+    // branch under SIGINT-then-SIGTERM-during-cleanup-pause race.
+    // T-TMP-39 covers the mismatched-directory (SPEC §7.4 rule 5) branch
+    // under the same race.
+    //
+    // For both tests the load-bearing assertions are:
+    //   (a) loopx exits with the SIGINT exit code 130 (the first-observed
+    //       signal — SPEC §7.2 first-trigger-wins; the post-cleanup-start
+    //       SIGTERM does not displace the first signal's exit code).
+    //   (b) Exactly one cleanup-related warning on stderr (per-run cleanup-
+    //       warning cardinality from SPEC §7.4: cleanup runs once and warns
+    //       once).
+    //   (c) Path persistence per cleanup-safety branch — cleanup completed
+    //       once, leaving the rule-3 / rule-5 path in place.
+    //
+    // A buggy implementation that started a second cleanup attempt on the
+    // racing SIGTERM would produce a second warning and fail (b).
+    // ------------------------------------------------------------------------
+
+    /**
+     * Build the bash fixture body for the racing-trigger tests. Tampers with
+     * $LOOPX_TMPDIR (rule-3 regular-file replacement, or rule-5 mismatched-
+     * directory rename-aside), writes "ready" to stderr (consumed by the CLI
+     * signal coordinator via `waitForStderr`), then blocks forever. The
+     * signal/cleanup race begins after "ready".
+     */
+    function buildRaceFixture(args: {
+      variant: "regular-file" | "mismatched-directory";
+    }): string {
+      const tampering =
+        args.variant === "regular-file"
+          ? `rm -rf "$LOOPX_TMPDIR"
+printf '%s' "regular-file-replacement" > "$LOOPX_TMPDIR"`
+          : `mv "$LOOPX_TMPDIR" "$LOOPX_TMPDIR-aside"
+mkdir "$LOOPX_TMPDIR"
+touch "$LOOPX_TMPDIR/mismatched-marker"`;
+      return `#!/bin/bash
+set -e
+${tampering}
+echo "ready" >&2
+while true; do sleep 1; done
+`;
+    }
+
+    /**
+     * Polls for the presence of `path` for up to `timeoutMs`, sleeping
+     * `intervalMs` between checks. Resolves true when the file exists,
+     * false on timeout. Used to coordinate the cleanup-start pause with
+     * the racing-second-signal harness step.
+     */
+    async function waitForFile(
+      path: string,
+      timeoutMs: number,
+      intervalMs: number = 50,
+    ): Promise<boolean> {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (existsSync(path)) return true;
+        await new Promise((r) => setTimeout(r, intervalMs));
+      }
+      return false;
+    }
+
+    it("T-TMP-38: cleanup idempotence under racing SIGINT → SIGTERM (rule-3 regular-file)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const pauseMarker = join(project.dir, "pause-marker.json");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildRaceFixture({ variant: "regular-file" }),
+      );
+
+      const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+        ["run", "-n", "1", "ralph"],
+        {
+          cwd: project.dir,
+          runtime,
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "cleanup-start",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          },
+          timeout: 30_000,
+        },
+      );
+
+      // Wait for the script to finish tampering and start blocking.
+      await waitForStderr("ready");
+
+      // First-observed signal: SIGINT. Triggers abort → cleanup → seam pause.
+      sendSignal("SIGINT");
+
+      // Poll for the parent-observable marker → cleanup is paused at entry.
+      const markerWritten = await waitForFile(pauseMarker, 10_000);
+      expect(markerWritten).toBe(true);
+
+      // Marker payload echoes the resolved window value (TEST-SPEC §1.4).
+      const marker = JSON.parse(readFileSync(pauseMarker, "utf-8"));
+      expect(marker.window).toBe("cleanup-start");
+
+      // Second-observed signal: SIGTERM. Delivered while loopx is paused at
+      // cleanup-start. SPEC §7.2 first-trigger-wins: must NOT displace the
+      // SIGINT exit code; SPEC §7.4 idempotence: must NOT start a second
+      // cleanup attempt or re-emit a cleanup warning.
+      sendSignal("SIGTERM");
+
+      const outcome = await result;
+
+      // (a) SIGINT exit code preserved across the SIGTERM-during-cleanup race.
+      expect(outcome.exitCode).toBe(130);
+
+      // (b) Exactly one cleanup-related warning — single cleanup attempt.
+      const cleanupWarnings = outcome.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // (c) Path persistence — rule-3 leave-with-warning preserved.
+      // Find the loopx tmpdir entry under the test-isolated parent.
+      const remaining = listLoopxEntries(tmpdirParent);
+      expect(remaining.length).toBe(1);
+      const tmpdirPath = join(tmpdirParent, remaining[0]);
+      expect(existsSync(tmpdirPath)).toBe(true);
+      const st = statSync(tmpdirPath);
+      expect(st.isFile()).toBe(true);
+      expect(readFileSync(tmpdirPath, "utf-8")).toBe(
+        "regular-file-replacement",
+      );
+
+      await rm(tmpdirPath, { force: true }).catch(() => {});
+    }, { timeout: 60_000, retry: 2 });
+
+    it("T-TMP-39: warning cardinality under racing SIGINT → SIGTERM (rule-5 mismatched-dir)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const pauseMarker = join(project.dir, "pause-marker.json");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildRaceFixture({ variant: "mismatched-directory" }),
+      );
+
+      const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+        ["run", "-n", "1", "ralph"],
+        {
+          cwd: project.dir,
+          runtime,
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "cleanup-start",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          },
+          timeout: 30_000,
+        },
+      );
+
+      await waitForStderr("ready");
+      sendSignal("SIGINT");
+
+      const markerWritten = await waitForFile(pauseMarker, 10_000);
+      expect(markerWritten).toBe(true);
+      const marker = JSON.parse(readFileSync(pauseMarker, "utf-8"));
+      expect(marker.window).toBe("cleanup-start");
+
+      sendSignal("SIGTERM");
+
+      const outcome = await result;
+
+      // (a) SIGINT exit code preserved.
+      expect(outcome.exitCode).toBe(130);
+
+      // (b) Exactly one cleanup-related warning across the racing triggers.
+      const cleanupWarnings = outcome.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // (c) rule-5 mismatched-dir replacement and the renamed-aside copy
+      // both survive the cleanup race.
+      // Find the loopx tmpdir replacement (the dir loopx would have removed
+      // had the identity matched) and the renamed-aside copy.
+      const remaining = listLoopxEntries(tmpdirParent);
+      // Both `loopx-XXXX` (the replacement) and `loopx-XXXX-aside` (the
+      // renamed copy of the original) should still be there.
+      expect(remaining.length).toBe(2);
+      const replacementName =
+        remaining.find((e) => !e.endsWith("-aside")) ?? "";
+      const asideName =
+        remaining.find((e) => e.endsWith("-aside")) ?? "";
+      expect(replacementName).not.toBe("");
+      expect(asideName).not.toBe("");
+      const replacementPath = join(tmpdirParent, replacementName);
+      const asidePath = join(tmpdirParent, asideName);
+
+      expect(existsSync(replacementPath)).toBe(true);
+      expect(statSync(replacementPath).isDirectory()).toBe(true);
+      const mismatchedMarker = join(replacementPath, "mismatched-marker");
+      expect(existsSync(mismatchedMarker)).toBe(true);
+
+      expect(existsSync(asidePath)).toBe(true);
+      expect(statSync(asidePath).isDirectory()).toBe(true);
+
+      await rm(replacementPath, { recursive: true, force: true }).catch(
+        () => {},
+      );
+      await rm(asidePath, { recursive: true, force: true }).catch(() => {});
+    }, { timeout: 60_000, retry: 2 });
   });
 });
