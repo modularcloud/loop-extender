@@ -383,7 +383,17 @@ function runWithInternal(
         returnCalled = true;
         await surfacePostFinalYieldAbort();
       }
-      returnCalled = true;
+      // SPEC §7.2 first-observed-wins: if an abort was observed before this
+      // .return() arrived (mid-loop), abort wins as the surfaced terminal
+      // outcome. Do NOT pin `returnCalled` — leave the in-flight wrapper.next()
+      // free to surface the abort error rather than being silenced via the
+      // consumer-cancellation contract. The inner gen.return() is still
+      // driven so the runLoop `finally` (cleanupTmpdir) runs once and the
+      // inner gen settles.
+      const abortObservedFirst = internalAc.signal.aborted;
+      if (!abortObservedFirst) {
+        returnCalled = true;
+      }
       internalAc.abort();
       try {
         const result = await gen.return(value as Output);
@@ -416,7 +426,17 @@ function runWithInternal(
         returnCalled = true;
         await surfacePostFinalYieldAbort();
       }
-      returnCalled = true;
+      // SPEC §7.2 first-observed-wins (mirror of .return()): if an abort was
+      // observed before this .throw() arrived, abort wins. Do NOT pin
+      // `returnCalled` — leave the in-flight wrapper.next() free to surface
+      // the abort error rather than being silenced. The consumer-supplied
+      // `_err` is intentionally not surfaced (consumer-cancellation contract);
+      // when abort is first-observed, the abort error displaces both the
+      // consumer error AND silent completion.
+      const abortObservedFirst = internalAc.signal.aborted;
+      if (!abortObservedFirst) {
+        returnCalled = true;
+      }
       internalAc.abort();
       try {
         const result = await gen.return(undefined as unknown as Output);
@@ -435,7 +455,12 @@ function runWithInternal(
         returnCalled = true;
         return;
       }
-      returnCalled = true;
+      // SPEC §7.2 first-observed-wins (mirror of .return()): if an abort was
+      // observed before dispose ran, abort wins; do not pin `returnCalled`.
+      const abortObservedFirst = internalAc.signal.aborted;
+      if (!abortObservedFirst) {
+        returnCalled = true;
+      }
       internalAc.abort();
       try {
         await gen.return(undefined as unknown as Output);

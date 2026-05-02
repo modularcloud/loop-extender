@@ -92,7 +92,7 @@ export async function* runLoop(
   // of any partial directory is handled inside createTmpdir without masking
   // the original creation error.
   const parent = tmpdirParent ?? osTmpdir();
-  const tmpdirResource = createTmpdir(parent);
+  const tmpdirResource = await createTmpdir(parent);
   const cleanupState = newCleanupState();
 
   try {
@@ -212,7 +212,10 @@ export async function* runLoop(
     // script-error, invalid goto, abort, consumer .return()/.throw()) reaches
     // this finally because the generator's machinery runs finally before the
     // throw / return propagates. Idempotent — newCleanupState() guarantees a
-    // single attempt and at most one warning.
-    cleanupTmpdir(tmpdirResource, cleanupState);
+    // single attempt and at most one warning. Awaited so the
+    // TEST-SPEC §1.4 cleanup-start seam pause (when configured) yields the
+    // event loop, allowing the same-process driver to coordinate racing
+    // terminal triggers via parent-observable markers.
+    await cleanupTmpdir(tmpdirResource, cleanupState);
   }
 }

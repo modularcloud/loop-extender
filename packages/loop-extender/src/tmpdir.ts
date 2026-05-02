@@ -78,17 +78,18 @@ function emitCleanupWarning(state: CleanupState, payload: string): void {
 }
 
 /**
- * Synchronous bounded sleep, blocking the JS thread for `ms` milliseconds.
- * Implemented via `Atomics.wait` on a SharedArrayBuffer the seam owns; nothing
- * else writes to that buffer, so the wait always times out at `ms`.
+ * Asynchronous bounded sleep — yields the event loop for `ms` milliseconds.
  *
  * Used by the `cleanup-start` seam to inject a deterministic pause window the
- * harness can race a second terminal trigger into.
+ * harness can race a second terminal trigger into. The pause is intentionally
+ * non-blocking so a same-process driver (programmatic API tests) can poll for
+ * the parent-observable marker and call `gen.return()` / `gen.throw()` /
+ * `ac.abort()` mid-pause. For the cross-process CLI tests the asynchronous
+ * pause is observably equivalent to a synchronous one — the OS-level signal
+ * handler still queues second-signal observation regardless.
  */
-function syncSleep(ms: number): void {
-  const sab = new SharedArrayBuffer(4);
-  const view = new Int32Array(sab);
-  Atomics.wait(view, 0, 0, ms);
+function asyncSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -102,7 +103,7 @@ function syncSleep(ms: number): void {
  * enough for the harness to race a second terminal trigger in, short enough to
  * bound test runtime if no trigger arrives.
  */
-function maybePauseAtCleanupStart(): void {
+async function maybePauseAtCleanupStart(): Promise<void> {
   if (!inTestMode()) return;
   const window = process.env.LOOPX_TEST_TERMINAL_TRIGGER_PAUSE;
   if (window !== "cleanup-start") return;
@@ -133,7 +134,7 @@ function maybePauseAtCleanupStart(): void {
   // Bounded delay: ≥ 2 seconds, ≤ 10 seconds (TEST-SPEC §1.4). Three seconds
   // is enough for parent polling + signal delivery on a busy CI host while
   // keeping suite runtime tight.
-  syncSleep(3000);
+  await asyncSleep(3000);
 }
 
 /**
@@ -141,7 +142,7 @@ function maybePauseAtCleanupStart(): void {
  * Throws on failure with the original error preserved (cleanup of any
  * partial directory does not mask the creation error).
  */
-export function createTmpdir(parent: string): TmpdirResource {
+export async function createTmpdir(parent: string): Promise<TmpdirResource> {
   const tmpdirFaults = readFaults("LOOPX_TEST_TMPDIR_FAULT");
 
   // Sub-step 1: mkdtemp. If this fails the path doesn't exist and no
@@ -213,7 +214,7 @@ export function createTmpdir(parent: string): TmpdirResource {
     // Per SPEC §7.4, run the FULL identity-fingerprint cleanup-safety
     // routine on the partial directory.
     const state = newCleanupState();
-    cleanupTmpdir(resource, state);
+    await cleanupTmpdir(resource, state);
     throw new Error(
       `LOOPX_TMPDIR creation failed: mode securing failed: EACCES`
     );
@@ -223,7 +224,7 @@ export function createTmpdir(parent: string): TmpdirResource {
     chmodSync(path, 0o700);
   } catch (err: unknown) {
     const state = newCleanupState();
-    cleanupTmpdir(resource, state);
+    await cleanupTmpdir(resource, state);
     throw new Error(
       `LOOPX_TMPDIR creation failed: mode securing failed: ${
         (err as Error).message
@@ -239,17 +240,17 @@ export function createTmpdir(parent: string): TmpdirResource {
  * calls with the same `state` are no-ops. Emits at most one stderr warning
  * per state over the lifetime of the cleanup.
  */
-export function cleanupTmpdir(
+export async function cleanupTmpdir(
   resource: TmpdirResource,
   state: CleanupState
-): void {
+): Promise<void> {
   if (state.attempted) return;
   state.attempted = true;
 
   // TEST-SPEC §1.4: pause at cleanup entry when the seam is configured. Done
   // BEFORE any cleanup work so the harness can race a second terminal trigger
   // in while loopx is paused; cleanup proceeds afterward.
-  maybePauseAtCleanupStart();
+  await maybePauseAtCleanupStart();
 
   const { path, identity } = resource;
   const cleanupFaults = readFaults("LOOPX_TEST_CLEANUP_FAULT");
