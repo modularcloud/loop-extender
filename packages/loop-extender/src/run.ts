@@ -570,11 +570,27 @@ export async function runPromise(
   // runPromise() returns must not affect the tmpdir parent for this run.
   const eagerTmpdirParent = osTmpdir();
 
+  // SPEC §9.5 / §9.2: option snapshot (incl. cwd, env, envFile, signal,
+  // maxIterations) is also eager at call site. runWithInternal() runs
+  // snapshotOptions() and captures the cwd default synchronously, so calling
+  // it here — before the microtask boundary below — pins those values to
+  // their call-site values (T-API-14c, T-API-14d).
   const gen = runWithInternal(target, options, {
     tmpdirParent: eagerTmpdirParent,
   });
-  const outputs: Output[] = [];
 
+  // SPEC §9.2: "LOOPX_TMPDIR itself is created asynchronously after return,
+  // during the same pre-iteration sequence used by the CLI and run()." The
+  // first await suspends runPromise and yields control back to the caller
+  // before any iteration work runs. Without this microtask boundary,
+  // evaluating `for await (const output of gen)` would synchronously call
+  // the wrapper's `next()`, which synchronously runs runInternal + runLoop
+  // bodies up to the first internal await — invoking createTmpdir before
+  // runPromise() has returned and violating the SPEC §9.2 contract
+  // (T-TMP-27a verifies this).
+  await Promise.resolve();
+
+  const outputs: Output[] = [];
   for await (const output of gen) {
     outputs.push(output);
   }

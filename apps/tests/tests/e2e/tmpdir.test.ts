@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
+import { spawnSync } from "node:child_process";
 import {
   existsSync,
   readFileSync,
@@ -24,6 +25,7 @@ import {
 import { runCLI, runCLIWithSignal } from "../helpers/cli.js";
 import { runAPIDriver } from "../helpers/api-driver.js";
 import { forEachRuntime } from "../helpers/runtime.js";
+import { createEnvFile, withGlobalEnv } from "../helpers/env.js";
 
 // ============================================================================
 // TEST-SPEC §4.7 — LOOPX_TMPDIR (run-scoped temporary directory)
@@ -380,6 +382,122 @@ function listLoopxEntries(parent: string): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Probes the active runtime's `os.tmpdir()` value when invoked in a child
+ * Node/Bun process configured with the given env. Used by T-TMP-25a / 25b /
+ * 26-temp / 26-tmp / 27-temp / 27-tmp / 28a / 28b / 28d / 28e / 28g / 28h /
+ * 29b / 29c / 29d / 29e / 29g / 29h / 29j / 29k to "anchor on `os.tmpdir()`
+ * evaluated in an identically-configured child process" — the runtime-aware
+ * expected-parent contract. SPEC §7.4 names `TMPDIR` / `TEMP` / `TMP`
+ * collectively as the variables `os.tmpdir()` reads, but on POSIX runtimes
+ * (Node, Bun) only `TMPDIR` is consulted, so the assertions for the `TEMP` /
+ * `TMP` variants must reduce to the runtime's actual `os.tmpdir()` reading.
+ *
+ * `env` accepts `undefined` values: a `key: undefined` entry deletes that
+ * variable from the child's effective environment (rather than passing the
+ * literal string "undefined"), letting tests express "TMPDIR unset" cleanly.
+ */
+function getRuntimeOsTmpdir(
+  runtime: "node" | "bun",
+  envOverrides: Record<string, string | undefined>,
+): string {
+  const effectiveEnv: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) effectiveEnv[key] = value;
+  }
+  for (const [key, value] of Object.entries(envOverrides)) {
+    if (value === undefined) {
+      delete effectiveEnv[key];
+    } else {
+      effectiveEnv[key] = value;
+    }
+  }
+  const command = runtime === "bun" ? "bun" : "node";
+  const result = spawnSync(
+    command,
+    ["-e", "process.stdout.write(require('os').tmpdir())"],
+    { env: effectiveEnv, encoding: "utf-8" },
+  );
+  if (result.status !== 0) {
+    throw new Error(
+      `getRuntimeOsTmpdir(${runtime}) probe failed: status=${result.status} stderr=${result.stderr}`,
+    );
+  }
+  return result.stdout.trim();
+}
+
+/**
+ * Snapshots-and-restores `process.env.TMPDIR` / `TEMP` / `TMP` around a
+ * test body. Per the snapshot-timing tests' contract, each test must leave
+ * the harness's inherited env exactly as it was — concurrent test files run
+ * in separate vitest worker forks, but tests within one file share
+ * `process.env`, so leaking a `TMPDIR` mutation would silently break
+ * subsequent tests in this file.
+ */
+async function withInheritedTmpdirEnv(
+  overrides: Record<"TMPDIR" | "TEMP" | "TMP", string | undefined>,
+  body: () => Promise<void>,
+): Promise<void> {
+  const originals: Record<string, string | undefined> = {
+    TMPDIR: process.env.TMPDIR,
+    TEMP: process.env.TEMP,
+    TMP: process.env.TMP,
+  };
+  for (const key of ["TMPDIR", "TEMP", "TMP"] as const) {
+    const v = overrides[key];
+    if (v === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = v;
+    }
+  }
+  try {
+    await body();
+  } finally {
+    for (const key of ["TMPDIR", "TEMP", "TMP"] as const) {
+      const orig = originals[key];
+      if (orig === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = orig;
+      }
+    }
+  }
+}
+
+/**
+ * Creates a writable test-isolated parent directory under the system tmpdir,
+ * registered for cleanup. Used by the snapshot-timing tests as the value to
+ * thread through `TMPDIR` / `TEMP` / `TMP` — concurrent test workers must not
+ * race on a fixed `/tmp/loopx-...` parent (per TEST-SPEC §4.7 preface).
+ */
+async function makeTestParent(label: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), `loopx-test-${label}-parent-`));
+  extraCleanups.push(async () => {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  });
+  return dir;
+}
+
+/**
+ * Builds a bash fixture body that observes `LOOPX_TMPDIR` plus optionally
+ * one or more of `TMPDIR` / `TEMP` / `TMP` into separate marker files. Each
+ * marker path is supplied via a uniquely-named env var (`OBS_<NAME>_PATH`)
+ * to avoid shadowing the variable being observed. Emits `{"stop":true}` to
+ * settle the loop after one iteration.
+ */
+function buildEnvObserveScript(observe: ("TMPDIR" | "TEMP" | "TMP")[]): string {
+  const lines = [
+    `#!/bin/bash`,
+    `printf '%s' "$LOOPX_TMPDIR" > "$OBS_LOOPX_TMPDIR_PATH"`,
+  ];
+  for (const v of observe) {
+    lines.push(`printf '%s' "$${v}" > "$OBS_${v}_PATH"`);
+  }
+  lines.push(`printf '{"stop":true}'`, ``);
+  return lines.join("\n");
 }
 
 /**
@@ -5177,5 +5295,1402 @@ while true; do sleep 1; done
         expect(cliResult.signal).toBe("SIGKILL");
       });
     }
+
+    // ========================================================================
+    // Tmpdir Parent Snapshot Timing (T-TMP-25..T-TMP-29k)
+    // SPEC §7.4 / §8.1 / §9.1 / §9.2 / §9.5: the tmpdir parent is
+    // `os.tmpdir()` evaluated in loopx's own process, captured on the
+    // inherited-env snapshot schedule (eager at runPromise() call site,
+    // lazy at first next() under run(), pre-iteration for the CLI).
+    // `TMPDIR` / `TEMP` / `TMP` entries in env files or RunOptions.env
+    // reach spawned scripts but do NOT mutate loopx's own process.env, so
+    // they do not redirect the tmpdir parent.
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // T-TMP-25 / 25a / 25b: CLI surface — tmpdir parent determined
+    // pre-iteration from loopx's inherited TMPDIR / TEMP / TMP. SPEC §7.4.
+    // ------------------------------------------------------------------------
+    it("T-TMP-25: CLI tmpdir parent determined from inherited TMPDIR pre-iteration", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const parent = await makeTestParent("tmpdir25");
+      const tmpdirMarker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: parent },
+      });
+      expect(result.exitCode).toBe(0);
+      const observed = readFileSync(tmpdirMarker, "utf-8");
+      expect(observed.length).toBeGreaterThan(0);
+      expect(isAbsolute(observed)).toBe(true);
+      expect(dirname(observed)).toBe(parent);
+    });
+
+    it("T-TMP-25a: CLI tmpdir parent via TEMP when TMPDIR unset", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const parent = await makeTestParent("temp25a");
+      const tmpdirMarker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TMP: undefined,
+        TEMP: parent,
+      });
+
+      await withInheritedTmpdirEnv(
+        { TMPDIR: undefined, TMP: undefined, TEMP: parent },
+        async () => {
+          const result = await runCLI(["run", "-n", "1", "ralph"], {
+            cwd: project.dir,
+            runtime,
+          });
+          expect(result.exitCode).toBe(0);
+          const observed = readFileSync(tmpdirMarker, "utf-8");
+          expect(observed.length).toBeGreaterThan(0);
+          expect(isAbsolute(observed)).toBe(true);
+          expect(dirname(observed)).toBe(expectedParent);
+        },
+      );
+    });
+
+    it("T-TMP-25b: CLI tmpdir parent via TMP when TMPDIR and TEMP unset", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const parent = await makeTestParent("tmp25b");
+      const tmpdirMarker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TEMP: undefined,
+        TMP: parent,
+      });
+
+      await withInheritedTmpdirEnv(
+        { TMPDIR: undefined, TEMP: undefined, TMP: parent },
+        async () => {
+          const result = await runCLI(["run", "-n", "1", "ralph"], {
+            cwd: project.dir,
+            runtime,
+          });
+          expect(result.exitCode).toBe(0);
+          const observed = readFileSync(tmpdirMarker, "utf-8");
+          expect(observed.length).toBeGreaterThan(0);
+          expect(isAbsolute(observed)).toBe(true);
+          expect(dirname(observed)).toBe(expectedParent);
+        },
+      );
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-26 / 26-temp / 26-tmp: run() generator — tmpdir parent captured
+    // lazily on first next(). SPEC §7.4 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-26: run() captures tmpdir parent lazily — TMPDIR mutation between run() and first next() redirects parent", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const parentA = await makeTestParent("p26-A");
+      const parentB = await makeTestParent("p26-B");
+      const tmpdirMarker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { readFileSync } from "node:fs";
+process.env.TMPDIR = ${JSON.stringify(parentA)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+process.env.TMPDIR = ${JSON.stringify(parentB)};
+for await (const _ of gen) { /* drain */ }
+const observed = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+console.log(JSON.stringify({ observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: parentA },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(dirname(data.observed)).toBe(parentB);
+    });
+
+    it("T-TMP-26-temp: run() captures tmpdir parent lazily — TEMP mutation between run() and first next() redirects parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const parentA = await makeTestParent("p26temp-A");
+      const parentB = await makeTestParent("p26temp-B");
+      const tmpdirMarker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      // Probe what os.tmpdir() returns in an identically-configured child
+      // process (TMPDIR / TMP unset, TEMP=parentB) to anchor the assertion
+      // on the runtime's actual `os.tmpdir()` behavior.
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TMP: undefined,
+        TEMP: parentB,
+      });
+
+      const driverCode = `
+import { run } from "loopx";
+import { readFileSync } from "node:fs";
+delete process.env.TMPDIR;
+delete process.env.TMP;
+process.env.TEMP = ${JSON.stringify(parentA)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+process.env.TEMP = ${JSON.stringify(parentB)};
+for await (const _ of gen) { /* drain */ }
+const observed = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+console.log(JSON.stringify({ observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TEMP: parentA },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(dirname(data.observed)).toBe(expectedParent);
+    });
+
+    it("T-TMP-26-tmp: run() captures tmpdir parent lazily — TMP mutation between run() and first next() redirects parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const parentA = await makeTestParent("p26tmp-A");
+      const parentB = await makeTestParent("p26tmp-B");
+      const tmpdirMarker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TEMP: undefined,
+        TMP: parentB,
+      });
+
+      const driverCode = `
+import { run } from "loopx";
+import { readFileSync } from "node:fs";
+delete process.env.TMPDIR;
+delete process.env.TEMP;
+process.env.TMP = ${JSON.stringify(parentA)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+process.env.TMP = ${JSON.stringify(parentB)};
+for await (const _ of gen) { /* drain */ }
+const observed = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+console.log(JSON.stringify({ observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMP: parentA },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(dirname(data.observed)).toBe(expectedParent);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-27 / 27-temp / 27-tmp: runPromise() — tmpdir parent captured
+    // eagerly at call site. SPEC §7.4 / §9.2.
+    // ------------------------------------------------------------------------
+    it("T-TMP-27: runPromise() captures tmpdir parent eagerly — TMPDIR mutation after call site does NOT redirect parent", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const parentA = await makeTestParent("p27-A");
+      const parentB = await makeTestParent("p27-B");
+      const tmpdirMarker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { readFileSync } from "node:fs";
+process.env.TMPDIR = ${JSON.stringify(parentA)};
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+process.env.TMPDIR = ${JSON.stringify(parentB)};
+await p;
+const observed = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+console.log(JSON.stringify({ observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: parentA },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(dirname(data.observed)).toBe(parentA);
+    });
+
+    it("T-TMP-27-temp: runPromise() captures tmpdir parent eagerly — TEMP mutation after call site does NOT redirect parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const parentA = await makeTestParent("p27temp-A");
+      const parentB = await makeTestParent("p27temp-B");
+      const tmpdirMarker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      // Anchor on the pre-mutation TEMP value (parentA), since the eager
+      // snapshot fires at the call site before the mutation to parentB.
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TMP: undefined,
+        TEMP: parentA,
+      });
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { readFileSync } from "node:fs";
+delete process.env.TMPDIR;
+delete process.env.TMP;
+process.env.TEMP = ${JSON.stringify(parentA)};
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+process.env.TEMP = ${JSON.stringify(parentB)};
+await p;
+const observed = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+console.log(JSON.stringify({ observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TEMP: parentA },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(dirname(data.observed)).toBe(expectedParent);
+    });
+
+    it("T-TMP-27-tmp: runPromise() captures tmpdir parent eagerly — TMP mutation after call site does NOT redirect parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const parentA = await makeTestParent("p27tmp-A");
+      const parentB = await makeTestParent("p27tmp-B");
+      const tmpdirMarker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TEMP: undefined,
+        TMP: parentA,
+      });
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { readFileSync } from "node:fs";
+delete process.env.TMPDIR;
+delete process.env.TEMP;
+process.env.TMP = ${JSON.stringify(parentA)};
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+process.env.TMP = ${JSON.stringify(parentB)};
+await p;
+const observed = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+console.log(JSON.stringify({ observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMP: parentA },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(dirname(data.observed)).toBe(expectedParent);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-27a: runPromise() does NOT create LOOPX_TMPDIR synchronously
+    // before returning — creation happens asynchronously during the
+    // pre-iteration sequence after runPromise() returns. SPEC §9.2 / §7.4.
+    // ------------------------------------------------------------------------
+    it("T-TMP-27a: runPromise() does not create LOOPX_TMPDIR synchronously before returning", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const parent = await makeTestParent("p27a");
+      const tmpdirMarker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+const parent = ${JSON.stringify(parent)};
+function listLoopx(p) {
+  try {
+    return readdirSync(p)
+      .filter(e => e.startsWith("loopx-"))
+      .filter(e => !e.startsWith("loopx-nodepath-shim-") && !e.startsWith("loopx-bun-jsx-") && !e.startsWith("loopx-install-"));
+  } catch { return []; }
+}
+const before = listLoopx(parent);
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+// Synchronous snapshot — must run before any await / microtask interleaving.
+const betweenSync = listLoopx(parent);
+await p;
+const after = listLoopx(parent);
+const observed = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+console.log(JSON.stringify({
+  before, betweenSync, after, observed, observedExists: existsSync(observed),
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: parent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      // (a) betweenSync set-equals before — runPromise() did NOT create a
+      // tmpdir synchronously before returning.
+      expect([...data.betweenSync].sort()).toEqual([...data.before].sort());
+      // (b) the script observed a LOOPX_TMPDIR value during the run,
+      // and that path lives under the configured parent.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(dirname(data.observed)).toBe(parent);
+      // (c) after does not contain the just-created loopx-* entry —
+      // SPEC §7.4 cleanup ran before runPromise() resolved.
+      expect(data.observedExists).toBe(false);
+      expect([...data.after].sort()).toEqual([...data.before].sort());
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-28 / 28a / 28b / 28c-h: Global env file does NOT redirect
+    // loopx's own tmpdir parent, but DOES reach spawned scripts. SPEC §7.4
+    // / §8.1 / §8.3 / §9.1 / §9.2.
+    // ------------------------------------------------------------------------
+    it("T-TMP-28: CLI — TMPDIR from global env file does NOT redirect tmpdir parent", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p28-right");
+      const wrongParent = await makeTestParent("p28-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpdirMarker = join(project.dir, "tmpdir-env.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildEnvObserveScript(["TMPDIR"]).replace(
+          /\$OBS_LOOPX_TMPDIR_PATH/g,
+          tmpdirMarker,
+        ).replace(/\$OBS_TMPDIR_PATH/g, observedTmpdirMarker),
+      );
+
+      await withGlobalEnv({ TMPDIR: wrongParent }, async () => {
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: { TMPDIR: rightParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+        const observedTmpdir = readFileSync(observedTmpdirMarker, "utf-8");
+        expect(dirname(observedLoopxTmpdir)).toBe(rightParent);
+        expect(observedTmpdir).toBe(wrongParent);
+      });
+    });
+
+    it("T-TMP-28a: CLI — TEMP from global env file does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p28a-right");
+      const wrongParent = await makeTestParent("p28a-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTempMarker = join(project.dir, "temp-env.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildEnvObserveScript(["TEMP"]).replace(
+          /\$OBS_LOOPX_TMPDIR_PATH/g,
+          tmpdirMarker,
+        ).replace(/\$OBS_TEMP_PATH/g, observedTempMarker),
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TMP: undefined,
+        TEMP: rightParent,
+      });
+
+      await withGlobalEnv({ TEMP: wrongParent }, async () => {
+        await withInheritedTmpdirEnv(
+          { TMPDIR: undefined, TMP: undefined, TEMP: rightParent },
+          async () => {
+            const result = await runCLI(["run", "-n", "1", "ralph"], {
+              cwd: project.dir,
+              runtime,
+            });
+            expect(result.exitCode).toBe(0);
+            const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+            const observedTemp = readFileSync(observedTempMarker, "utf-8");
+            expect(dirname(observedLoopxTmpdir)).toBe(expectedParent);
+            expect(observedTemp).toBe(wrongParent);
+          },
+        );
+      });
+    });
+
+    it("T-TMP-28b: CLI — TMP from global env file does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p28b-right");
+      const wrongParent = await makeTestParent("p28b-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpMarker = join(project.dir, "tmp-env.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildEnvObserveScript(["TMP"]).replace(
+          /\$OBS_LOOPX_TMPDIR_PATH/g,
+          tmpdirMarker,
+        ).replace(/\$OBS_TMP_PATH/g, observedTmpMarker),
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TEMP: undefined,
+        TMP: rightParent,
+      });
+
+      await withGlobalEnv({ TMP: wrongParent }, async () => {
+        await withInheritedTmpdirEnv(
+          { TMPDIR: undefined, TEMP: undefined, TMP: rightParent },
+          async () => {
+            const result = await runCLI(["run", "-n", "1", "ralph"], {
+              cwd: project.dir,
+              runtime,
+            });
+            expect(result.exitCode).toBe(0);
+            const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+            const observedTmp = readFileSync(observedTmpMarker, "utf-8");
+            expect(dirname(observedLoopxTmpdir)).toBe(expectedParent);
+            expect(observedTmp).toBe(wrongParent);
+          },
+        );
+      });
+    });
+
+    it("T-TMP-28c: runPromise() — TMPDIR from global env file does NOT redirect tmpdir parent", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p28c-right");
+      const wrongParent = await makeTestParent("p28c-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpdirMarker = join(project.dir, "tmpdir-env.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildEnvObserveScript(["TMPDIR"]).replace(
+          /\$OBS_LOOPX_TMPDIR_PATH/g,
+          tmpdirMarker,
+        ).replace(/\$OBS_TMPDIR_PATH/g, observedTmpdirMarker),
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { readFileSync } from "node:fs";
+await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTmpdirMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      await withGlobalEnv({ TMPDIR: wrongParent }, async () => {
+        const apiResult = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: rightParent },
+        });
+        expect(apiResult.exitCode).toBe(0);
+        const data = JSON.parse(apiResult.stdout);
+        expect(dirname(data.loopx)).toBe(rightParent);
+        expect(data.observed).toBe(wrongParent);
+      });
+    });
+
+    it("T-TMP-28d: runPromise() — TEMP from global env file does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p28d-right");
+      const wrongParent = await makeTestParent("p28d-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTempMarker = join(project.dir, "temp-env.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildEnvObserveScript(["TEMP"]).replace(
+          /\$OBS_LOOPX_TMPDIR_PATH/g,
+          tmpdirMarker,
+        ).replace(/\$OBS_TEMP_PATH/g, observedTempMarker),
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TMP: undefined,
+        TEMP: rightParent,
+      });
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { readFileSync } from "node:fs";
+delete process.env.TMPDIR;
+delete process.env.TMP;
+process.env.TEMP = ${JSON.stringify(rightParent)};
+await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTempMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      await withGlobalEnv({ TEMP: wrongParent }, async () => {
+        const apiResult = await runAPIDriver(runtime, driverCode, {
+          env: { TEMP: rightParent },
+        });
+        expect(apiResult.exitCode).toBe(0);
+        const data = JSON.parse(apiResult.stdout);
+        expect(dirname(data.loopx)).toBe(expectedParent);
+        expect(data.observed).toBe(wrongParent);
+      });
+    });
+
+    it("T-TMP-28e: runPromise() — TMP from global env file does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p28e-right");
+      const wrongParent = await makeTestParent("p28e-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpMarker = join(project.dir, "tmp-env.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildEnvObserveScript(["TMP"]).replace(
+          /\$OBS_LOOPX_TMPDIR_PATH/g,
+          tmpdirMarker,
+        ).replace(/\$OBS_TMP_PATH/g, observedTmpMarker),
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TEMP: undefined,
+        TMP: rightParent,
+      });
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { readFileSync } from "node:fs";
+delete process.env.TMPDIR;
+delete process.env.TEMP;
+process.env.TMP = ${JSON.stringify(rightParent)};
+await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTmpMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      await withGlobalEnv({ TMP: wrongParent }, async () => {
+        const apiResult = await runAPIDriver(runtime, driverCode, {
+          env: { TMP: rightParent },
+        });
+        expect(apiResult.exitCode).toBe(0);
+        const data = JSON.parse(apiResult.stdout);
+        expect(dirname(data.loopx)).toBe(expectedParent);
+        expect(data.observed).toBe(wrongParent);
+      });
+    });
+
+    it("T-TMP-28f: run() generator — TMPDIR from global env file does NOT redirect tmpdir parent", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p28f-right");
+      const wrongParent = await makeTestParent("p28f-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpdirMarker = join(project.dir, "tmpdir-env.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildEnvObserveScript(["TMPDIR"]).replace(
+          /\$OBS_LOOPX_TMPDIR_PATH/g,
+          tmpdirMarker,
+        ).replace(/\$OBS_TMPDIR_PATH/g, observedTmpdirMarker),
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { readFileSync } from "node:fs";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+for await (const _ of gen) { /* drain */ }
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTmpdirMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      await withGlobalEnv({ TMPDIR: wrongParent }, async () => {
+        const apiResult = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: rightParent },
+        });
+        expect(apiResult.exitCode).toBe(0);
+        const data = JSON.parse(apiResult.stdout);
+        expect(dirname(data.loopx)).toBe(rightParent);
+        expect(data.observed).toBe(wrongParent);
+      });
+    });
+
+    it("T-TMP-28g: run() generator — TEMP from global env file does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p28g-right");
+      const wrongParent = await makeTestParent("p28g-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTempMarker = join(project.dir, "temp-env.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildEnvObserveScript(["TEMP"]).replace(
+          /\$OBS_LOOPX_TMPDIR_PATH/g,
+          tmpdirMarker,
+        ).replace(/\$OBS_TEMP_PATH/g, observedTempMarker),
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TMP: undefined,
+        TEMP: rightParent,
+      });
+
+      const driverCode = `
+import { run } from "loopx";
+import { readFileSync } from "node:fs";
+delete process.env.TMPDIR;
+delete process.env.TMP;
+process.env.TEMP = ${JSON.stringify(rightParent)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+for await (const _ of gen) { /* drain */ }
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTempMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      await withGlobalEnv({ TEMP: wrongParent }, async () => {
+        const apiResult = await runAPIDriver(runtime, driverCode, {
+          env: { TEMP: rightParent },
+        });
+        expect(apiResult.exitCode).toBe(0);
+        const data = JSON.parse(apiResult.stdout);
+        expect(dirname(data.loopx)).toBe(expectedParent);
+        expect(data.observed).toBe(wrongParent);
+      });
+    });
+
+    it("T-TMP-28h: run() generator — TMP from global env file does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p28h-right");
+      const wrongParent = await makeTestParent("p28h-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpMarker = join(project.dir, "tmp-env.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildEnvObserveScript(["TMP"]).replace(
+          /\$OBS_LOOPX_TMPDIR_PATH/g,
+          tmpdirMarker,
+        ).replace(/\$OBS_TMP_PATH/g, observedTmpMarker),
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TEMP: undefined,
+        TMP: rightParent,
+      });
+
+      const driverCode = `
+import { run } from "loopx";
+import { readFileSync } from "node:fs";
+delete process.env.TMPDIR;
+delete process.env.TEMP;
+process.env.TMP = ${JSON.stringify(rightParent)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+for await (const _ of gen) { /* drain */ }
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTmpMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      await withGlobalEnv({ TMP: wrongParent }, async () => {
+        const apiResult = await runAPIDriver(runtime, driverCode, {
+          env: { TMP: rightParent },
+        });
+        expect(apiResult.exitCode).toBe(0);
+        const data = JSON.parse(apiResult.stdout);
+        expect(dirname(data.loopx)).toBe(expectedParent);
+        expect(data.observed).toBe(wrongParent);
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-29 / 29b / 29c: RunOptions.env does NOT redirect loopx's own
+    // tmpdir parent. SPEC §7.4 / §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-29: RunOptions.env TMPDIR does NOT redirect tmpdir parent", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p29-right");
+      const wrongParent = "/tmp/loopx-p29-wrong-does-not-exist";
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpdirMarker = join(project.dir, "tmpdir-env.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildEnvObserveScript(["TMPDIR"]).replace(
+          /\$OBS_LOOPX_TMPDIR_PATH/g,
+          tmpdirMarker,
+        ).replace(/\$OBS_TMPDIR_PATH/g, observedTmpdirMarker),
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { readFileSync } from "node:fs";
+await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, env: { TMPDIR: ${JSON.stringify(wrongParent)} } });
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTmpdirMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: rightParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(dirname(data.loopx)).toBe(rightParent);
+      expect(data.observed).toBe(wrongParent);
+    });
+
+    it("T-TMP-29b: RunOptions.env TEMP does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p29b-right");
+      const wrongParent = "/tmp/loopx-p29b-wrong-does-not-exist";
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTempMarker = join(project.dir, "temp-env.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildEnvObserveScript(["TEMP"]).replace(
+          /\$OBS_LOOPX_TMPDIR_PATH/g,
+          tmpdirMarker,
+        ).replace(/\$OBS_TEMP_PATH/g, observedTempMarker),
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TMP: undefined,
+        TEMP: rightParent,
+      });
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { readFileSync } from "node:fs";
+delete process.env.TMPDIR;
+delete process.env.TMP;
+process.env.TEMP = ${JSON.stringify(rightParent)};
+await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, env: { TEMP: ${JSON.stringify(wrongParent)} } });
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTempMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TEMP: rightParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(dirname(data.loopx)).toBe(expectedParent);
+      expect(data.observed).toBe(wrongParent);
+    });
+
+    it("T-TMP-29c: RunOptions.env TMP does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p29c-right");
+      const wrongParent = "/tmp/loopx-p29c-wrong-does-not-exist";
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpMarker = join(project.dir, "tmp-env.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildEnvObserveScript(["TMP"]).replace(
+          /\$OBS_LOOPX_TMPDIR_PATH/g,
+          tmpdirMarker,
+        ).replace(/\$OBS_TMP_PATH/g, observedTmpMarker),
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TEMP: undefined,
+        TMP: rightParent,
+      });
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { readFileSync } from "node:fs";
+delete process.env.TMPDIR;
+delete process.env.TEMP;
+process.env.TMP = ${JSON.stringify(rightParent)};
+await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, env: { TMP: ${JSON.stringify(wrongParent)} } });
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTmpMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMP: rightParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(dirname(data.loopx)).toBe(expectedParent);
+      expect(data.observed).toBe(wrongParent);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-29a / 29d / 29e: CLI -e local env file does NOT redirect
+    // loopx's own tmpdir parent. SPEC §7.4 / §8.2 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-29a: CLI -e — TMPDIR from local env file does NOT redirect tmpdir parent", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p29a-right");
+      const wrongParent = await makeTestParent("p29a-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpdirMarker = join(project.dir, "tmpdir-env.txt");
+      const statMarker = join(project.dir, "stat.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await createEnvFile(envFilePath, { TMPDIR: wrongParent });
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TMPDIR" > "${observedTmpdirMarker}"
+if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'exists-as-dir' > "${statMarker}"
+else
+  printf 'missing' > "${statMarker}"
+fi
+printf '{"stop":true}'
+`,
+      );
+
+      const result = await runCLI(
+        ["run", "-e", envFilePath, "-n", "1", "ralph"],
+        {
+          cwd: project.dir,
+          runtime,
+          env: { TMPDIR: rightParent },
+        },
+      );
+      expect(result.exitCode).toBe(0);
+      const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      const observedTmpdir = readFileSync(observedTmpdirMarker, "utf-8");
+      const stat = readFileSync(statMarker, "utf-8");
+      expect(observedTmpdir).toBe(wrongParent);
+      expect(dirname(observedLoopxTmpdir)).toBe(rightParent);
+      expect(stat).toBe("exists-as-dir");
+    });
+
+    it("T-TMP-29d: CLI -e — TEMP from local env file does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p29d-right");
+      const wrongParent = await makeTestParent("p29d-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTempMarker = join(project.dir, "temp-env.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await createEnvFile(envFilePath, { TEMP: wrongParent });
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TEMP" > "${observedTempMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TMP: undefined,
+        TEMP: rightParent,
+      });
+
+      await withInheritedTmpdirEnv(
+        { TMPDIR: undefined, TMP: undefined, TEMP: rightParent },
+        async () => {
+          const result = await runCLI(
+            ["run", "-e", envFilePath, "-n", "1", "ralph"],
+            {
+              cwd: project.dir,
+              runtime,
+            },
+          );
+          expect(result.exitCode).toBe(0);
+          const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+          const observedTemp = readFileSync(observedTempMarker, "utf-8");
+          expect(dirname(observedLoopxTmpdir)).toBe(expectedParent);
+          expect(observedTemp).toBe(wrongParent);
+        },
+      );
+    });
+
+    it("T-TMP-29e: CLI -e — TMP from local env file does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p29e-right");
+      const wrongParent = await makeTestParent("p29e-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpMarker = join(project.dir, "tmp-env.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await createEnvFile(envFilePath, { TMP: wrongParent });
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TMP" > "${observedTmpMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TEMP: undefined,
+        TMP: rightParent,
+      });
+
+      await withInheritedTmpdirEnv(
+        { TMPDIR: undefined, TEMP: undefined, TMP: rightParent },
+        async () => {
+          const result = await runCLI(
+            ["run", "-e", envFilePath, "-n", "1", "ralph"],
+            {
+              cwd: project.dir,
+              runtime,
+            },
+          );
+          expect(result.exitCode).toBe(0);
+          const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+          const observedTmp = readFileSync(observedTmpMarker, "utf-8");
+          expect(dirname(observedLoopxTmpdir)).toBe(expectedParent);
+          expect(observedTmp).toBe(wrongParent);
+        },
+      );
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-29f / 29g / 29h: RunOptions.envFile under runPromise() does NOT
+    // redirect loopx's own tmpdir parent. SPEC §7.4 / §8.2 / §8.3 / §9.5.
+    // ------------------------------------------------------------------------
+    it("T-TMP-29f: runPromise({ envFile }) — TMPDIR from local env file does NOT redirect tmpdir parent", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p29f-right");
+      const wrongParent = await makeTestParent("p29f-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpdirMarker = join(project.dir, "tmpdir-env.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await createEnvFile(envFilePath, { TMPDIR: wrongParent });
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TMPDIR" > "${observedTmpdirMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { readFileSync } from "node:fs";
+await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, envFile: ${JSON.stringify(envFilePath)}, maxIterations: 1 });
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTmpdirMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: rightParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(dirname(data.loopx)).toBe(rightParent);
+      expect(data.observed).toBe(wrongParent);
+    });
+
+    it("T-TMP-29g: runPromise({ envFile }) — TEMP from local env file does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p29g-right");
+      const wrongParent = await makeTestParent("p29g-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTempMarker = join(project.dir, "temp-env.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await createEnvFile(envFilePath, { TEMP: wrongParent });
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TEMP" > "${observedTempMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TMP: undefined,
+        TEMP: rightParent,
+      });
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { readFileSync } from "node:fs";
+delete process.env.TMPDIR;
+delete process.env.TMP;
+process.env.TEMP = ${JSON.stringify(rightParent)};
+await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, envFile: ${JSON.stringify(envFilePath)}, maxIterations: 1 });
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTempMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TEMP: rightParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(dirname(data.loopx)).toBe(expectedParent);
+      expect(data.observed).toBe(wrongParent);
+    });
+
+    it("T-TMP-29h: runPromise({ envFile }) — TMP from local env file does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p29h-right");
+      const wrongParent = await makeTestParent("p29h-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpMarker = join(project.dir, "tmp-env.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await createEnvFile(envFilePath, { TMP: wrongParent });
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TMP" > "${observedTmpMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TEMP: undefined,
+        TMP: rightParent,
+      });
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { readFileSync } from "node:fs";
+delete process.env.TMPDIR;
+delete process.env.TEMP;
+process.env.TMP = ${JSON.stringify(rightParent)};
+await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, envFile: ${JSON.stringify(envFilePath)}, maxIterations: 1 });
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTmpMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMP: rightParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(dirname(data.loopx)).toBe(expectedParent);
+      expect(data.observed).toBe(wrongParent);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-29i / 29j / 29k: RunOptions.envFile under run() generator does
+    // NOT redirect loopx's own tmpdir parent. SPEC §7.4 / §8.2 / §8.3 /
+    // §9.1 / §9.5.
+    // ------------------------------------------------------------------------
+    it("T-TMP-29i: run({ envFile }) — TMPDIR from local env file does NOT redirect tmpdir parent", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p29i-right");
+      const wrongParent = await makeTestParent("p29i-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpdirMarker = join(project.dir, "tmpdir-env.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await createEnvFile(envFilePath, { TMPDIR: wrongParent });
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TMPDIR" > "${observedTmpdirMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { readFileSync } from "node:fs";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, envFile: ${JSON.stringify(envFilePath)}, maxIterations: 1 });
+for await (const _ of gen) { /* drain */ }
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTmpdirMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: rightParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(dirname(data.loopx)).toBe(rightParent);
+      expect(data.observed).toBe(wrongParent);
+    });
+
+    it("T-TMP-29j: run({ envFile }) — TEMP from local env file does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p29j-right");
+      const wrongParent = await makeTestParent("p29j-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTempMarker = join(project.dir, "temp-env.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await createEnvFile(envFilePath, { TEMP: wrongParent });
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TEMP" > "${observedTempMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TMP: undefined,
+        TEMP: rightParent,
+      });
+
+      const driverCode = `
+import { run } from "loopx";
+import { readFileSync } from "node:fs";
+delete process.env.TMPDIR;
+delete process.env.TMP;
+process.env.TEMP = ${JSON.stringify(rightParent)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, envFile: ${JSON.stringify(envFilePath)}, maxIterations: 1 });
+for await (const _ of gen) { /* drain */ }
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTempMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TEMP: rightParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(dirname(data.loopx)).toBe(expectedParent);
+      expect(data.observed).toBe(wrongParent);
+    });
+
+    it("T-TMP-29k: run({ envFile }) — TMP from local env file does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      const project = await createTempProject();
+      extraCleanups.push(() => project.cleanup());
+      const rightParent = await makeTestParent("p29k-right");
+      const wrongParent = await makeTestParent("p29k-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpMarker = join(project.dir, "tmp-env.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await createEnvFile(envFilePath, { TMP: wrongParent });
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TMP" > "${observedTmpMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TEMP: undefined,
+        TMP: rightParent,
+      });
+
+      const driverCode = `
+import { run } from "loopx";
+import { readFileSync } from "node:fs";
+delete process.env.TMPDIR;
+delete process.env.TEMP;
+process.env.TMP = ${JSON.stringify(rightParent)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, envFile: ${JSON.stringify(envFilePath)}, maxIterations: 1 });
+for await (const _ of gen) { /* drain */ }
+const loopx = readFileSync(${JSON.stringify(tmpdirMarker)}, "utf-8");
+const observed = readFileSync(${JSON.stringify(observedTmpMarker)}, "utf-8");
+console.log(JSON.stringify({ loopx, observed }));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMP: rightParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(dirname(data.loopx)).toBe(expectedParent);
+      expect(data.observed).toBe(wrongParent);
+    });
   });
 });
