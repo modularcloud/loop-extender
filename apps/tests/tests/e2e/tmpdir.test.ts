@@ -10048,6 +10048,318 @@ console.log(JSON.stringify({
     }
 
     // ------------------------------------------------------------------------
+    // T-TMP-42b: cleanup-fault warning does not mask the abort terminal
+    // across the two programmatic surfaces (run() / runPromise()). Companion
+    // to T-TMP-42a (cleanup-failure × script-error × all surfaces) and
+    // T-TMP-42c (cleanup-failure × CLI signal terminal). Together with
+    // T-TMP-35g / T-TMP-35h (cleanup-safety × abort × programmatic surfaces),
+    // this closes the cleanup-warning-does-not-affect-outcome coverage axis
+    // on the abort terminal × cleanup-failure-warning branch.
+    //
+    // SPEC §7.4: "cleanup warnings do not affect the CLI exit code, the
+    // generator outcome, or the promise rejection reason." A buggy
+    // implementation that promoted the cleanup-failure warning to a
+    // cleanup-failure-class rejection in place of the abort error would
+    // pass T-TMP-35g / T-TMP-35h (cleanup-safety branch on the same
+    // terminal) yet fail this test, distinguishing the cleanup-safety
+    // warning branch from the cleanup-failure warning branch on the abort
+    // terminal.
+    //
+    // Parameterized over the three cleanup-fault seam values (lstat-fail,
+    // symlink-unlink-fail, recursive-remove-fail) and over both programmatic
+    // surfaces (runPromise() / run()) — six sub-cases per runtime.
+    //
+    // Per-fault tampering required to make the seam fire under the abort
+    // terminal (same as T-TMP-42c's per-fault dispatch reasoning):
+    //   - lstat-fail: seam fires at the top-level lstat in cleanupTmpdir;
+    //     no path manipulation needed.
+    //   - symlink-unlink-fail: seam fires only when dispatch reaches
+    //     rule 2 (path is a symlink), so the script must replace the
+    //     tmpdir with a symlink before blocking.
+    //   - recursive-remove-fail: seam fires only when dispatch reaches
+    //     rule 4 (identity-matched directory). Populating the directory
+    //     pins that recursive removal would normally have visited inner
+    //     entries.
+    //
+    // The fixture writes its PID to a marker so the harness can verify
+    // active-child termination (SPEC §9.1) after the abort, and writes
+    // the original LOOPX_TMPDIR path to an external observation marker so
+    // post-run path-persistence assertions can run regardless of the per-
+    // fault tampering.
+    // ------------------------------------------------------------------------
+
+    /**
+     * Build the bash fixture body for the T-TMP-42b (abort × cleanup-fault)
+     * variants. Observes LOOPX_TMPDIR into an external marker, performs the
+     * fault-specific tampering required to drive the cleanup-safety dispatch
+     * into the seam-protected branch, writes its PID to a separate marker,
+     * then blocks indefinitely so the run can only terminate via the abort
+     * delivered by the harness once both markers are visible.
+     */
+    function buildAbortCleanupFaultFixture(args: {
+      tmpdirObservation: string;
+      pidMarker: string;
+      fault: CleanupFaultVariant;
+    }): string {
+      let tampering: string;
+      if (args.fault === "lstat-fail") {
+        tampering = "";
+      } else if (args.fault === "symlink-unlink-fail") {
+        tampering = `rm -rf "$LOOPX_TMPDIR"
+ln -s /tmp "$LOOPX_TMPDIR"`;
+      } else {
+        tampering = `echo content > "$LOOPX_TMPDIR/file-1"
+mkdir "$LOOPX_TMPDIR/sub"
+echo more > "$LOOPX_TMPDIR/sub/file-2"`;
+      }
+      return `#!/bin/bash
+set -e
+ORIG_TMPDIR="$LOOPX_TMPDIR"
+${tampering}
+printf '%s' "$ORIG_TMPDIR" > "${args.tmpdirObservation}"
+printf '%s' "$$" > "${args.pidMarker}"
+while true; do sleep 1; done
+`;
+    }
+
+    for (const fault of CLEANUP_FAULT_VARIANTS) {
+      it(`T-TMP-42b (${fault}): runPromise() cleanup-fault warning does not mask abort rejection reason`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const tmpdirObservation = join(project.dir, "tmpdir.txt");
+        const pidMarker = join(project.dir, "pid.txt");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          buildAbortCleanupFaultFixture({
+            tmpdirObservation,
+            pidMarker,
+            fault,
+          }),
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+const pidMarker = ${JSON.stringify(pidMarker)};
+async function waitForObservation() {
+  for (let i = 0; i < 600; i++) {
+    if (existsSync(tmpdirObservation) && existsSync(pidMarker)) {
+      const t = readFileSync(tmpdirObservation, "utf-8");
+      const p = readFileSync(pidMarker, "utf-8").trim();
+      if (t.length > 0 && p.length > 0) return { tmpdir: t, pid: parseInt(p, 10) };
+    }
+    await new Promise(r => setTimeout(r, 50));
+  }
+  throw new Error("markers never appeared");
+}
+function isAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+async function waitDead(pid, timeout) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return true;
+    await new Promise(r => setTimeout(r, 50));
+  }
+  return !isAlive(pid);
+}
+const c = new AbortController();
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, signal: c.signal });
+const { tmpdir: observed, pid } = await waitForObservation();
+c.abort();
+let rejected = false;
+let errMsg = "";
+let errName = "";
+try {
+  await p;
+} catch (e) {
+  rejected = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? (e.name || "") : "";
+}
+const childDead = await waitDead(pid, 10_000);
+const observedExists = existsSync(observed);
+let observedIsSymlink = false;
+try { observedIsSymlink = lstatSync(observed).isSymbolicLink(); } catch {}
+console.log(JSON.stringify({
+  rejected,
+  errMsg,
+  errName,
+  observed,
+  pid,
+  childDead,
+  observedExists,
+  observedIsSymlink,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_CLEANUP_FAULT: fault,
+          },
+          timeout: 30_000,
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+
+        // (a) Promise rejected with abort error. Cleanup-fault warning
+        // does not mask the abort rejection reason per SPEC §7.4.
+        // Load-bearing: a buggy implementation that promoted the cleanup-
+        // failure warning to a cleanup-failure-class rejection in place
+        // of the abort error would fail this assertion.
+        expect(data.rejected).toBe(true);
+        expect(
+          data.errName === "AbortError" || /abort/i.test(data.errMsg),
+        ).toBe(true);
+        expect(data.errMsg.toLowerCase()).not.toContain("cleanup");
+
+        // (b) Exactly one cleanup-related warning on driver-process
+        // stderr — per-run cleanup-warning cardinality from SPEC §7.4
+        // holds under the abort terminal × cleanup-failure branch.
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(1);
+
+        // (c) Active child PG terminated per SPEC §9.1 / §9.5 — abort-
+        // driven process-group termination still applies under the
+        // cleanup-failure branch.
+        expect(data.childDead).toBe(true);
+
+        // (d) Path persistence per cleanup-fault seam — cleanup made no
+        // further changes after the simulated failure per SPEC §7.4.
+        expect(data.observed.length).toBeGreaterThan(0);
+        if (fault === "symlink-unlink-fail") {
+          expect(data.observedIsSymlink).toBe(true);
+          await rm(data.observed, { force: true }).catch(() => {});
+        } else {
+          expect(data.observedExists).toBe(true);
+        }
+      });
+    }
+
+    for (const fault of CLEANUP_FAULT_VARIANTS) {
+      it(`T-TMP-42b (${fault}): run() generator cleanup-fault warning does not mask abort throw`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const tmpdirObservation = join(project.dir, "tmpdir.txt");
+        const pidMarker = join(project.dir, "pid.txt");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          buildAbortCleanupFaultFixture({
+            tmpdirObservation,
+            pidMarker,
+            fault,
+          }),
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+const pidMarker = ${JSON.stringify(pidMarker)};
+async function waitForObservation() {
+  for (let i = 0; i < 600; i++) {
+    if (existsSync(tmpdirObservation) && existsSync(pidMarker)) {
+      const t = readFileSync(tmpdirObservation, "utf-8");
+      const p = readFileSync(pidMarker, "utf-8").trim();
+      if (t.length > 0 && p.length > 0) return { tmpdir: t, pid: parseInt(p, 10) };
+    }
+    await new Promise(r => setTimeout(r, 50));
+  }
+  throw new Error("markers never appeared");
+}
+function isAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+async function waitDead(pid, timeout) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return true;
+    await new Promise(r => setTimeout(r, 50));
+  }
+  return !isAlive(pid);
+}
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, signal: c.signal });
+const nextP = gen.next();
+nextP.catch(() => {});
+const { tmpdir: observed, pid } = await waitForObservation();
+c.abort();
+let thrown = false;
+let errMsg = "";
+let errName = "";
+try {
+  await nextP;
+} catch (e) {
+  thrown = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? (e.name || "") : "";
+}
+const childDead = await waitDead(pid, 10_000);
+const observedExists = existsSync(observed);
+let observedIsSymlink = false;
+try { observedIsSymlink = lstatSync(observed).isSymbolicLink(); } catch {}
+console.log(JSON.stringify({
+  thrown,
+  errMsg,
+  errName,
+  observed,
+  pid,
+  childDead,
+  observedExists,
+  observedIsSymlink,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_CLEANUP_FAULT: fault,
+          },
+          timeout: 30_000,
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+
+        // (a) Generator threw abort error. Cleanup-fault warning does not
+        // mask the generator outcome per SPEC §7.4. Load-bearing: a
+        // buggy implementation that wrapped the abort error in a cleanup-
+        // failure error or routed run() settlement through a different
+        // dispatcher than runPromise() rejection would fail this counter-
+        // part to the runPromise variant above.
+        expect(data.thrown).toBe(true);
+        expect(
+          data.errName === "AbortError" || /abort/i.test(data.errMsg),
+        ).toBe(true);
+        expect(data.errMsg.toLowerCase()).not.toContain("cleanup");
+
+        // (b) Exactly one cleanup-related warning on driver-process
+        // stderr — per-run cleanup-warning cardinality from SPEC §7.4.
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(1);
+
+        // (c) Active child PG terminated per SPEC §9.1 / §9.5.
+        expect(data.childDead).toBe(true);
+
+        // (d) Path persistence per cleanup-fault seam.
+        expect(data.observed.length).toBeGreaterThan(0);
+        if (fault === "symlink-unlink-fail") {
+          expect(data.observedIsSymlink).toBe(true);
+          await rm(data.observed, { force: true }).catch(() => {});
+        } else {
+          expect(data.observedExists).toBe(true);
+        }
+      });
+    }
+
+    // ------------------------------------------------------------------------
     // T-TMP-42c: cleanup-fault warning does not mask CLI signal terminal.
     // SPEC §7.4 final paragraph: "warnings do not affect the CLI exit code,
     // the generator outcome, or the promise rejection reason." The
