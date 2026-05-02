@@ -10446,5 +10446,86 @@ while true; do sleep 1; done
       );
       await rm(asidePath, { recursive: true, force: true }).catch(() => {});
     }, { timeout: 60_000, retry: 2 });
+
+    it("T-TMP-38f: cleanup idempotence under racing SIGTERM → SIGINT (inverted-order parity)", async () => {
+      // SPEC §7.2 first-trigger-wins applies symmetrically across SIGINT and
+      // SIGTERM — neither signal is privileged. T-TMP-38 covers SIGINT-first ×
+      // SIGTERM-second-during-cleanup; this test inverts the order so a buggy
+      // implementation that special-cased SIGINT-first cleanup-race handling
+      // would pass T-TMP-38 yet fail here. Same fixture and seam configuration
+      // as T-TMP-38 (rule-3 regular-file-replacement cleanup-warning branch).
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const pauseMarker = join(project.dir, "pause-marker.json");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildRaceFixture({ variant: "regular-file" }),
+      );
+
+      const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+        ["run", "-n", "1", "ralph"],
+        {
+          cwd: project.dir,
+          runtime,
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "cleanup-start",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          },
+          timeout: 30_000,
+        },
+      );
+
+      // Wait for the script to finish tampering and start blocking.
+      await waitForStderr("ready");
+
+      // First-observed signal: SIGTERM. Triggers abort → cleanup → seam pause.
+      sendSignal("SIGTERM");
+
+      // Poll for the parent-observable marker → cleanup is paused at entry.
+      const markerWritten = await waitForFile(pauseMarker, 10_000);
+      expect(markerWritten).toBe(true);
+
+      // Marker payload echoes the resolved window value (TEST-SPEC §1.4).
+      const marker = JSON.parse(readFileSync(pauseMarker, "utf-8"));
+      expect(marker.window).toBe("cleanup-start");
+
+      // Second-observed signal: SIGINT. Delivered while loopx is paused at
+      // cleanup-start. SPEC §7.2 first-trigger-wins (symmetric across signals):
+      // must NOT displace the SIGTERM exit code (143) with the SIGINT code
+      // (130); SPEC §7.4 idempotence: must NOT start a second cleanup attempt
+      // or re-emit a cleanup warning.
+      sendSignal("SIGINT");
+
+      const outcome = await result;
+
+      // (a) SIGTERM exit code preserved across the SIGINT-during-cleanup race
+      // — first-observed-wins applies symmetrically; the post-pause SIGINT
+      // does NOT shift the exit code from 143 down to 130.
+      expect(outcome.exitCode).toBe(143);
+
+      // (b) Exactly one cleanup-related warning — single cleanup attempt.
+      const cleanupWarnings = outcome.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // (c) Path persistence — rule-3 leave-with-warning preserved.
+      const remaining = listLoopxEntries(tmpdirParent);
+      expect(remaining.length).toBe(1);
+      const tmpdirPath = join(tmpdirParent, remaining[0]);
+      expect(existsSync(tmpdirPath)).toBe(true);
+      const st = statSync(tmpdirPath);
+      expect(st.isFile()).toBe(true);
+      expect(readFileSync(tmpdirPath, "utf-8")).toBe(
+        "regular-file-replacement",
+      );
+
+      await rm(tmpdirPath, { force: true }).catch(() => {});
+    }, { timeout: 60_000, retry: 2 });
   });
 });
