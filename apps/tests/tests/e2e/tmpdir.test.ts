@@ -12824,5 +12824,269 @@ console.log(JSON.stringify({ errName, errMessage, returnDone, returnValue, first
         await rm(tmpdirPath, { force: true }).catch(() => {});
       }, { timeout: 60_000, retry: 2 });
     }
+
+    // ------------------------------------------------------------------------
+    // T-TMP-38e / T-TMP-38e-run: SPEC §7.2 / §7.4 cleanup-idempotence under
+    // racing child spawn-failure × abort on the programmatic surfaces.
+    //
+    // Both variants use a NUL-in-RunOptions.env value (`MYVAR: "bad\0val"`),
+    // which causes the runtime to reject the spawn synchronously at child-
+    // launch time. The two seam windows wired in execution.ts gate the race:
+    //
+    //   variant a: `child-spawn-failure` — spawn-failure observed FIRST, the
+    //     seam pauses AFTER pinning iteration as first-observed; the harness
+    //     races c.abort() during the pause. Per SPEC §7.2 first-observed-wins,
+    //     the surfaced error must be the spawn-failure (post-pause abort
+    //     does NOT displace it). Per SPEC §7.4, exactly one cleanup attempt
+    //     and exactly one cleanup warning across both triggers.
+    //
+    //   variant b: `child-spawn-attempt` — seam fires BEFORE spawn() is
+    //     called; the harness races c.abort() during the pause so the abort
+    //     listener pins first-observed BEFORE loopx observes the spawn
+    //     outcome. Per SPEC §7.2, the surfaced error must be the abort
+    //     (post-pause spawn-failure does NOT displace it). Per SPEC §7.4,
+    //     same single-cleanup-attempt and single-warning contract.
+    //
+    // The cleanup-warning is induced by `LOOPX_TEST_CLEANUP_FAULT=
+    // recursive-remove-fail`, so the rule-4 identity-matched-directory cleanup
+    // emits a single SPEC §7.4 warning. Without this fault, the empty
+    // tmpdir would be removed warning-free and the assertion "exactly one
+    // cleanup warning" would not distinguish single-attempt from double-
+    // attempt code paths (T-TERM-04 covers the outcome axis on its own; this
+    // test covers the cardinality axis).
+    //
+    // Tmpdir-path observation: the embedded-NUL fixture causes spawn
+    // rejection before any child runs, so no script can write LOOPX_TMPDIR
+    // to a marker. Each test runs under a fresh test-isolated TMPDIR parent,
+    // so the loopx-created tmpdir is the single `loopx-*` entry remaining
+    // under that parent after rule-4 cleanup leaves the directory in place.
+    //
+    // T-TMP-38e covers the runPromise() surface; T-TMP-38e-run covers run().
+    // ------------------------------------------------------------------------
+    const SPAWN_FAILURE_ABORT_VARIANTS = [
+      { variant: "a", window: "child-spawn-failure", expectAbort: false },
+      { variant: "b", window: "child-spawn-attempt", expectAbort: true },
+    ] as const;
+
+    for (const { variant, window, expectAbort } of SPAWN_FAILURE_ABORT_VARIANTS) {
+      it(`T-TMP-38e (variant ${variant}): cleanup idempotence under racing spawn-failure × abort during ${window} (runPromise() rule-4)`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const pauseMarker = join(project.dir, "pause-marker.json");
+
+        // Minimal workflow: discovery requires at least one script; the
+        // script never runs because the spawn is rejected before child
+        // launch.
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash\nexit 0\n`,
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync } from "node:fs";
+
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const c = new AbortController();
+
+let errName = "";
+let errMessage = "";
+
+const promise = runPromise("ralph", {
+  signal: c.signal,
+  env: { MYVAR: "bad\\u0000val" },
+  maxIterations: 1,
+});
+
+const pauseSeen = await waitForFile(pauseMarker, 15_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared" }));
+  process.exit(1);
+}
+
+c.abort();
+
+try {
+  await promise;
+} catch (e) {
+  const ex = e as { name?: string; message?: string };
+  errName = ex?.name ?? "";
+  errMessage = ex?.message ?? String(e);
+}
+
+console.log(JSON.stringify({ errName, errMessage }));
+`;
+
+        const result = await runAPIDriver(runtime, driverCode, {
+          cwd: project.dir,
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: window,
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+            LOOPX_TEST_CLEANUP_FAULT: "recursive-remove-fail",
+          },
+          timeout: 60_000,
+        });
+
+        expect(result.exitCode).toBe(0);
+        const envelope = JSON.parse(result.stdout.trim());
+
+        // (a) Surfaced error is correct per first-observed-wins. T-TERM-04
+        // pins the outcome axis on its own; this assertion is a sanity check
+        // (the load-bearing assertion is (b) below). For variant a, the
+        // spawn-failure error wins (post-pause abort does NOT displace).
+        // For variant b, the abort error wins (post-pause spawn-failure does
+        // NOT displace).
+        if (expectAbort) {
+          expect(
+            envelope.errName === "AbortError" ||
+              /abort/i.test(envelope.errMessage),
+          ).toBe(true);
+        } else {
+          expect(envelope.errName).not.toBe("AbortError");
+          expect(envelope.errMessage).not.toMatch(/^AbortError/);
+        }
+
+        // (b) Exactly one cleanup-related warning across the racing triggers
+        // (SPEC §7.4 idempotence / at-most-one-warning). Load-bearing: a
+        // buggy implementation that wired separate cleanup-dispatchers into
+        // the spawn-failure callback and the abort listener could plausibly
+        // start two cleanup attempts and emit two warnings without violating
+        // any outcome-axis assertion in T-TERM-04.
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(1);
+
+        // (c) Recorded tmpdir path persists on disk per SPEC §7.4 "no
+        // further changes" after the rule-4 recursive-remove-fail warning.
+        const remaining = listLoopxEntries(tmpdirParent);
+        expect(remaining.length).toBe(1);
+        const tmpdirPath = join(tmpdirParent, remaining[0]);
+        expect(existsSync(tmpdirPath)).toBe(true);
+        const st = statSync(tmpdirPath);
+        expect(st.isDirectory()).toBe(true);
+
+        await rm(tmpdirPath, { recursive: true, force: true }).catch(() => {});
+      }, { timeout: 60_000, retry: 2 });
+
+      it(`T-TMP-38e-run (variant ${variant}): cleanup idempotence under racing spawn-failure × abort during ${window} (run() rule-4)`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const pauseMarker = join(project.dir, "pause-marker.json");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash\nexit 0\n`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync } from "node:fs";
+
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const c = new AbortController();
+const gen = run("ralph", {
+  signal: c.signal,
+  env: { MYVAR: "bad\\u0000val" },
+  maxIterations: 1,
+});
+
+let errName = "";
+let errMessage = "";
+
+const iterPromise = (async () => {
+  try {
+    for await (const _ of gen) { /* drain */ }
+  } catch (e) {
+    const ex = e as { name?: string; message?: string };
+    errName = ex?.name ?? "";
+    errMessage = ex?.message ?? String(e);
+  }
+})();
+
+const pauseSeen = await waitForFile(pauseMarker, 15_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared" }));
+  process.exit(1);
+}
+
+c.abort();
+
+await iterPromise;
+
+console.log(JSON.stringify({ errName, errMessage }));
+`;
+
+        const result = await runAPIDriver(runtime, driverCode, {
+          cwd: project.dir,
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: window,
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+            LOOPX_TEST_CLEANUP_FAULT: "recursive-remove-fail",
+          },
+          timeout: 60_000,
+        });
+
+        expect(result.exitCode).toBe(0);
+        const envelope = JSON.parse(result.stdout.trim());
+
+        // (a) Surfaced error per first-observed-wins (sanity; T-TERM-04-run
+        // is the dedicated outcome-axis test).
+        if (expectAbort) {
+          expect(
+            envelope.errName === "AbortError" ||
+              /abort/i.test(envelope.errMessage),
+          ).toBe(true);
+        } else {
+          expect(envelope.errName).not.toBe("AbortError");
+          expect(envelope.errMessage).not.toMatch(/^AbortError/);
+        }
+
+        // (b) Exactly one cleanup warning. A buggy run()-surface dispatcher
+        // that re-entered cleanup on the racing trigger would emit two.
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(1);
+
+        // (c) Recorded tmpdir path persists per rule-4 leave-with-warning.
+        const remaining = listLoopxEntries(tmpdirParent);
+        expect(remaining.length).toBe(1);
+        const tmpdirPath = join(tmpdirParent, remaining[0]);
+        expect(existsSync(tmpdirPath)).toBe(true);
+        const st = statSync(tmpdirPath);
+        expect(st.isDirectory()).toBe(true);
+
+        await rm(tmpdirPath, { recursive: true, force: true }).catch(() => {});
+      }, { timeout: 60_000, retry: 2 });
+    }
   });
 });

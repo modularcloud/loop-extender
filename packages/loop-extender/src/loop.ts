@@ -100,16 +100,39 @@ export async function* runLoop(
     if (warning) process.stderr.write(warning + "\n");
   };
 
+  // SPEC §7.2 first-observed-wins. The abortPromise causes runLoop's
+  // Promise.race to surface the abort error fast (without waiting for the
+  // active child to die), but we MUST NOT let it preempt an iteration-level
+  // trigger that was already observed first. Without this gate, e.g.,
+  // T-TMP-38e variant a (spawn-failure seam paused, racing abort delivered
+  // during pause) would short-circuit Promise.race with the abort error
+  // even though `firstObservedRef.trigger === "iteration"` was pinned in
+  // executeScript before the seam's pause. The gate keeps abortPromise
+  // pending in that case, letting execPromise's eventual rejection (the
+  // spawn-failure error) drive Promise.race instead.
   let abortPromise: Promise<never> | undefined;
   if (signal) {
     abortPromise = new Promise<never>((_, reject) => {
       if (signal.aborted) {
-        reject(makeAbortError(signal));
+        if (
+          !firstObservedRef ||
+          firstObservedRef.trigger !== "iteration"
+        ) {
+          reject(makeAbortError(signal));
+        }
         return;
       }
       signal.addEventListener(
         "abort",
-        () => reject(makeAbortError(signal)),
+        () => {
+          if (
+            firstObservedRef &&
+            firstObservedRef.trigger === "iteration"
+          ) {
+            return;
+          }
+          reject(makeAbortError(signal));
+        },
         { once: true }
       );
     });
@@ -150,6 +173,7 @@ export async function* runLoop(
         env,
         input: currentInput,
         signal,
+        firstObservedRef,
       });
 
       if (abortPromise) {
