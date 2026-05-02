@@ -7452,5 +7452,317 @@ console.log(JSON.stringify({
       // path so the test-isolated tmpdir parent can be removed cleanly.
       await rm(data.observed, { force: true }).catch(() => {});
     });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-36 / 36a / 36b: Mismatched-directory replacement cleanup follows
+    // SPEC §7.4 cleanup-safety rule 5 — leave the directory in place and
+    // emit exactly one stderr warning. Surface-parity matrix across CLI /
+    // runPromise() / run().
+    //
+    // SPEC §7.4 dispatch case 5: "Path is a directory whose identity does
+    // not match: leave in place with a stderr warning. loopx does not
+    // recursively remove a directory it did not create." Per-run cleanup-
+    // warning cardinality (SPEC §7.2) is exactly one across the surface;
+    // the warning does not promote the terminal outcome (CLI stays exit 0
+    // / promise still resolves / generator still settles cleanly) per
+    // SPEC §7.4.
+    //
+    // The fixture (shared across all three surfaces): observe LOOPX_TMPDIR,
+    // **rename** the original tmpdir aside (`mv tmpdir tmpdir-original-aside`)
+    // and create a different directory at the original path with a
+    // `mismatched-marker` file inside, then emit `{"stop":true}`. The
+    // rename-aside step is essential for inode-distinctness (per the
+    // T-TMP-36 TEST-SPEC text): a naive `rm -rf … && mkdir …` could let
+    // the kernel reuse the original directory's inode and the test would
+    // observe a successful (rather than mismatched) cleanup. By keeping
+    // the original alive at a different path, its inode remains occupied
+    // and the freshly-created directory at $LOOPX_TMPDIR is allocated a
+    // distinct inode (which differs from the identity fingerprint loopx
+    // captured at creation). The harness post-test removes the
+    // `-original-aside` copy.
+    //
+    // Post-conditions per surface: (a) success outcome surfaces (CLI exit 0
+    // / promise resolves / generator settles cleanly), (b) the LOOPX_TMPDIR
+    // path still exists as a directory with the `mismatched-marker` file
+    // inside (rule-5 leave-in-place), (c) exactly one
+    // LOOPX_TEST_CLEANUP_WARNING\t… line on stderr, (d) the `-original-aside`
+    // copy survives loopx (loopx does not chase renamed-away tmpdirs;
+    // incidental defense-in-depth for SPEC §7.4 already covered by
+    // T-TMP-33).
+    // ------------------------------------------------------------------------
+
+    /**
+     * Build the shared bash fixture body for T-TMP-36/36a/36b. The script
+     * writes the observed LOOPX_TMPDIR path to `tmpdirObservation`, renames
+     * the original tmpdir aside, creates a distinct-inode replacement
+     * directory at the original path with a marker file inside, then emits
+     * stop:true.
+     */
+    function buildMismatchedDirectoryFixture(args: {
+      tmpdirObservation: string;
+    }): string {
+      return `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${args.tmpdirObservation}"
+mv "$LOOPX_TMPDIR" "$LOOPX_TMPDIR-original-aside"
+mkdir "$LOOPX_TMPDIR"
+touch "$LOOPX_TMPDIR/mismatched-marker"
+printf '{"stop":true}'
+`;
+    }
+
+    it("T-TMP-36: CLI mismatched-directory replacement leaves directory in place with exactly one cleanup warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildMismatchedDirectoryFixture({ tmpdirObservation }),
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+      });
+
+      // (d) CLI exit 0 — the cleanup warning does not affect the exit code
+      // (SPEC §7.4: "cleanup warnings do not affect the CLI exit code").
+      expect(result.exitCode).toBe(0);
+
+      const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+      expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+
+      // (a) The LOOPX_TMPDIR path still exists and is a directory — SPEC
+      // §7.4 rule 5 "leave in place with a stderr warning" means loopx did
+      // NOT recursively remove the mismatched-identity directory.
+      expect(existsSync(observedLoopxTmpdir)).toBe(true);
+      const st = statSync(observedLoopxTmpdir);
+      expect(st.isDirectory()).toBe(true);
+
+      // (b) The `mismatched-marker` file inside still exists — loopx did
+      // not recursively remove the directory's contents (the filesystem-
+      // safety outcome per SPEC §7.4 rule 5).
+      const mismatchedMarker = join(observedLoopxTmpdir, "mismatched-marker");
+      expect(existsSync(mismatchedMarker)).toBe(true);
+
+      // (c) Exactly one cleanup-related warning on stderr (per-run cleanup-
+      // warning cardinality from SPEC §7.4; structured marker line count
+      // is the implementation-neutral predicate per TEST-SPEC §1.4).
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // (e) The renamed-aside copy survives — loopx does not chase
+      // renamed-away tmpdirs (SPEC §7.4 "no chasing renamed tmpdirs",
+      // already covered by T-TMP-33; this assertion provides incidental
+      // defense-in-depth via the rename-aside fixture pattern).
+      const renamedAside = `${observedLoopxTmpdir}-original-aside`;
+      expect(existsSync(renamedAside)).toBe(true);
+      expect(statSync(renamedAside).isDirectory()).toBe(true);
+
+      // Harness clean-up: remove both the leftover mismatched directory and
+      // the renamed-aside copy so the test-isolated tmpdir parent can be
+      // removed cleanly.
+      await rm(observedLoopxTmpdir, {
+        recursive: true,
+        force: true,
+      }).catch(() => {});
+      await rm(renamedAside, { recursive: true, force: true }).catch(() => {});
+    });
+
+    it("T-TMP-36a: runPromise() mismatched-directory replacement resolves with exactly one cleanup warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildMismatchedDirectoryFixture({ tmpdirObservation }),
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+let rejected = false;
+let errMsg = "";
+let outputs = [];
+try {
+  outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) {
+  rejected = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+const observedExists = existsSync(observed);
+let observedIsDir = false;
+let mismatchedMarkerExists = false;
+if (observedExists) {
+  observedIsDir = statSync(observed).isDirectory();
+  mismatchedMarkerExists = existsSync(join(observed, "mismatched-marker"));
+}
+const renamedAside = observed + "-original-aside";
+const renamedAsideExists = existsSync(renamedAside);
+const stop = outputs.length === 1 ? !!outputs[0].stop : false;
+console.log(JSON.stringify({
+  rejected,
+  errMsg,
+  outputsLen: outputs.length,
+  stop,
+  observed,
+  observedExists,
+  observedIsDir,
+  mismatchedMarkerExists,
+  renamedAside,
+  renamedAsideExists,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+
+      // (a) Promise resolved (no rejection). Single Output with stop:true —
+      // the terminal outcome is what the script produced, not a cleanup-
+      // failure-class rejection. SPEC §7.4: cleanup warnings do not affect
+      // the promise rejection reason.
+      expect(data.rejected).toBe(false);
+      expect(data.errMsg).toBe("");
+      expect(data.outputsLen).toBe(1);
+      expect(data.stop).toBe(true);
+
+      // (b) LOOPX_TMPDIR path still exists as a directory with the marker
+      // file inside — SPEC §7.4 rule 5 leave-in-place held.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.observedExists).toBe(true);
+      expect(data.observedIsDir).toBe(true);
+      expect(data.mismatchedMarkerExists).toBe(true);
+
+      // (c) The renamed-aside copy survives — incidental defense-in-depth
+      // for the renamed-away-tmpdir contract.
+      expect(data.renamedAsideExists).toBe(true);
+
+      // (d) Exactly one cleanup-related warning on driver-process stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // Harness clean-up.
+      await rm(data.observed, {
+        recursive: true,
+        force: true,
+      }).catch(() => {});
+      await rm(data.renamedAside, {
+        recursive: true,
+        force: true,
+      }).catch(() => {});
+    });
+
+    it("T-TMP-36b: run() mismatched-directory replacement settles with exactly one cleanup warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildMismatchedDirectoryFixture({ tmpdirObservation }),
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+let thrown = false;
+let errMsg = "";
+let yieldCount = 0;
+let lastStop = false;
+try {
+  const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  for await (const out of gen) {
+    yieldCount++;
+    lastStop = !!out.stop;
+  }
+} catch (e) {
+  thrown = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+const observedExists = existsSync(observed);
+let observedIsDir = false;
+let mismatchedMarkerExists = false;
+if (observedExists) {
+  observedIsDir = statSync(observed).isDirectory();
+  mismatchedMarkerExists = existsSync(join(observed, "mismatched-marker"));
+}
+const renamedAside = observed + "-original-aside";
+const renamedAsideExists = existsSync(renamedAside);
+console.log(JSON.stringify({
+  thrown,
+  errMsg,
+  yieldCount,
+  lastStop,
+  observed,
+  observedExists,
+  observedIsDir,
+  mismatchedMarkerExists,
+  renamedAside,
+  renamedAsideExists,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+
+      // (a) Generator settled cleanly (no throw). Single yield with
+      // stop:true — the terminal outcome is what the script produced, not
+      // a cleanup-failure-class throw. SPEC §7.4: cleanup warnings do not
+      // affect the generator outcome.
+      expect(data.thrown).toBe(false);
+      expect(data.errMsg).toBe("");
+      expect(data.yieldCount).toBe(1);
+      expect(data.lastStop).toBe(true);
+
+      // (b) LOOPX_TMPDIR path still exists as a directory with the marker
+      // file inside — SPEC §7.4 rule 5 leave-in-place held.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.observedExists).toBe(true);
+      expect(data.observedIsDir).toBe(true);
+      expect(data.mismatchedMarkerExists).toBe(true);
+
+      // (c) The renamed-aside copy survives — incidental defense-in-depth
+      // for the renamed-away-tmpdir contract.
+      expect(data.renamedAsideExists).toBe(true);
+
+      // (d) Exactly one cleanup-related warning on driver-process stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // Harness clean-up.
+      await rm(data.observed, {
+        recursive: true,
+        force: true,
+      }).catch(() => {});
+      await rm(data.renamedAside, {
+        recursive: true,
+        force: true,
+      }).catch(() => {});
+    });
   });
 });
