@@ -4259,3 +4259,297 @@ console.log(JSON.stringify({ count: results.length }));
     });
   });
 });
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — Abort After Final Yield (SPEC §9.3 / §9.1)
+// ═════════════════════════════════════════════════════════════
+//
+// Per SPEC §9.3: "Abort observed after the final yield but before the
+// generator settles produces the abort error on the next generator
+// interaction — `g.next()`, `.return()`, or `.throw()`."
+//
+// The "final yield" can be triggered by either `maxIterations`-reached or by
+// a script-emitted `stop: true`. The abort-after-final-yield rule applies
+// symmetrically across both triggers and across all three settle-triggering
+// interactions.
+//
+// For `.throw()`, the abort error displaces the consumer-supplied error per
+// SPEC §9.3 (signal wins).
+//
+// These tests pin the OUTCOME axis of the contract (error identity and
+// rejection rather than silent settlement). The CLEANUP-ORDERING axis (tmpdir
+// removed before the abort error surfaces) is pinned by the T-TMP-23/24a/24c/
+// 24d/24e/24f/24g family in tmpdir.test.ts.
+
+describe("SPEC: Abort After Final Yield", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-66: Abort after maxIterations-driven final yield + .next() →
+    // abort error (not silent { done: true }). SPEC §9.3.
+    // ------------------------------------------------------------------------
+    it("T-API-66: abort after final yield (maxIter) + .next() → abort error", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.next();
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+console.log(JSON.stringify({
+  firstDone: first.done,
+  firstHasValue: first.value !== undefined,
+  result,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.firstHasValue).toBe(true);
+      expect(data.result.kind).toBe("rejected");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-66a: Abort after maxIterations-driven final yield + .return() →
+    // abort error (not silent settlement). SPEC §9.3 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-66a: abort after final yield (maxIter) + .return() → abort error", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.return(undefined);
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+console.log(JSON.stringify({
+  firstDone: first.done,
+  result,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.result.kind).toBe("rejected");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-66b: Abort after maxIterations-driven final yield + .throw() →
+    // abort error displaces consumer-supplied error. SPEC §9.3 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-66b: abort after final yield (maxIter) + .throw() → abort displaces consumer error", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.throw(new Error("consumer-err"));
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+console.log(JSON.stringify({
+  firstDone: first.done,
+  result,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.result.kind).toBe("rejected");
+      // Abort error displaces consumer-supplied "consumer-err".
+      expect(data.result.msg).not.toBe("consumer-err");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-66c: Abort after stop:true-driven final yield + .next() → abort
+    // error (not silent settlement). SPEC §9.3 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-66c: abort after stop:true final yield + .next() → abort error", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.next();
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+console.log(JSON.stringify({
+  firstDone: first.done,
+  firstStop: first.value && first.value.stop === true,
+  result,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.firstStop).toBe(true);
+      expect(data.result.kind).toBe("rejected");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-66d: Abort after stop:true-driven final yield + .return() →
+    // abort error (not silent settlement). SPEC §9.3 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-66d: abort after stop:true final yield + .return() → abort error", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.return(undefined);
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+console.log(JSON.stringify({
+  firstStop: first.value && first.value.stop === true,
+  result,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstStop).toBe(true);
+      expect(data.result.kind).toBe("rejected");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-66e: Abort after stop:true-driven final yield + .throw() →
+    // abort error displaces consumer-supplied error. SPEC §9.3 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-66e: abort after stop:true final yield + .throw() → abort displaces consumer error", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.throw(new Error("consumer-err"));
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+console.log(JSON.stringify({
+  firstStop: first.value && first.value.stop === true,
+  result,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstStop).toBe(true);
+      expect(data.result.kind).toBe("rejected");
+      // Abort error displaces consumer-supplied "consumer-err".
+      expect(data.result.msg).not.toBe("consumer-err");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+    });
+  });
+});
