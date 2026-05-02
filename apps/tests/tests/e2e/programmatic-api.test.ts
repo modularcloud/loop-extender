@@ -1,8 +1,9 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
-import { chmod } from "node:fs/promises";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { chmod, mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { execSync } from "node:child_process";
 import { join, resolve } from "node:path";
+import { tmpdir as osTmpdir } from "node:os";
 import {
   createTempProject,
   createWorkflowScript,
@@ -323,16 +324,19 @@ console.log(JSON.stringify(results));
       expect(readFileSync(markerPath, "utf-8")).toBe(project.dir);
     });
 
-    // T-API-07a: RunOptions.cwd does not control script execution cwd — scripts run with
-    //            the workflow directory as their cwd, not the provided RunOptions.cwd.
-    it("T-API-07a: RunOptions.cwd does not control script execution cwd", async () => {
+    // T-API-07a: RunOptions.cwd controls script execution cwd (project-root-unified per
+    //            ADR-0004 §3 / SPEC 9.5). Script execution cwd equals the project root,
+    //            and LOOPX_WORKFLOW_DIR exposes the workflow-relative path independently.
+    it("T-API-07a: RunOptions.cwd controls script execution cwd (project-root-unified)", async () => {
       project = await createTempProject();
-      const markerPath = join(project.dir, "cwd-marker.txt");
+      const cwdMarker = join(project.dir, "cwd-marker.txt");
+      const wfdirMarker = join(project.dir, "wfdir-marker.txt");
       await createBashWorkflowScript(
         project,
         "ralph",
         "index",
-        `printf '%s' "$PWD" > "${markerPath}"
+        `printf '%s' "$(/bin/pwd -P)" > "${cwdMarker}"
+printf '%s' "$LOOPX_WORKFLOW_DIR" > "${wfdirMarker}"
 printf '{"stop":true}'`,
       );
 
@@ -345,12 +349,19 @@ console.log("done");
 `;
       const result = await runAPIDriver(runtime, driverCode);
       expect(result.exitCode).toBe(0);
-      expect(existsSync(markerPath)).toBe(true);
-      // Script's cwd must be the workflow dir (.loopx/ralph), NOT projectA.
-      // Use realpath-tolerant comparison: resolve both sides.
-      const actualCwd = readFileSync(markerPath, "utf-8");
-      expect(resolve(actualCwd)).toBe(resolve(workflowDir));
-      expect(resolve(actualCwd)).not.toBe(resolve(project.dir));
+      expect(existsSync(cwdMarker)).toBe(true);
+      // Per SPEC 9.5 (rewritten by ADR-0004 §3): RunOptions.cwd specifies BOTH
+      // the project root and the script execution cwd. The previous "cwd does
+      // not control script execution cwd" disclaimer no longer applies.
+      // /bin/pwd -P returns the kernel-canonical form, so compare against
+      // realpath(project.dir).
+      const actualCwd = readFileSync(cwdMarker, "utf-8");
+      const expectedRoot = realpathSync(project.dir);
+      expect(actualCwd).toBe(expectedRoot);
+      expect(actualCwd).not.toBe(workflowDir);
+      // The workflow-relative path is exposed via LOOPX_WORKFLOW_DIR, not cwd.
+      expect(existsSync(wfdirMarker)).toBe(true);
+      expect(readFileSync(wfdirMarker, "utf-8")).toBe(workflowDir);
     });
 
     // T-API-08: maxIterations: 0 → completes immediately, no yields, no child spawn.
@@ -2111,15 +2122,17 @@ console.log(JSON.stringify(outputs));
       expect(outputs[0].result).toBe("no-index-ok");
     });
 
-    // T-API-47b: RunOptions.cwd sets LOOPX_PROJECT_ROOT; script still runs with workflow dir as cwd.
-    it("T-API-47b: runPromise — cwd sets LOOPX_PROJECT_ROOT, script cwd is workflow dir", async () => {
+    // T-API-47b: runPromise — RunOptions.cwd sets BOTH LOOPX_PROJECT_ROOT and the
+    //            script execution cwd. LOOPX_WORKFLOW_DIR independently exposes the
+    //            workflow-relative path.
+    it("T-API-47b: runPromise — cwd sets LOOPX_PROJECT_ROOT and script execution cwd", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cwd-marker.txt");
       await createBashWorkflowScript(
         project,
         "ralph",
         "index",
-        `printf '{"cwd":"%s","root":"%s"}' "$PWD" "$LOOPX_PROJECT_ROOT" > "${markerPath}"
+        `printf '{"cwd":"%s","root":"%s","wfdir":"%s"}' "$(/bin/pwd -P)" "$LOOPX_PROJECT_ROOT" "$LOOPX_WORKFLOW_DIR" > "${markerPath}"
 printf '{"stop":true}'`,
       );
       const workflowDir = join(project.loopxDir, "ralph");
@@ -2133,8 +2146,14 @@ console.log("done");
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
       const parsed = JSON.parse(readFileSync(markerPath, "utf-8"));
-      expect(resolve(parsed.cwd)).toBe(resolve(workflowDir));
-      expect(resolve(parsed.root)).toBe(resolve(project.dir));
+      // Per SPEC 9.5 (rewritten by ADR-0004 §3): RunOptions.cwd specifies BOTH
+      // the project root AND the script execution cwd. /bin/pwd -P yields the
+      // kernel-canonical form, so the cwd assertion uses realpath(project.dir).
+      const expectedRoot = realpathSync(project.dir);
+      expect(parsed.cwd).toBe(expectedRoot);
+      expect(parsed.root).toBe(project.dir);
+      // LOOPX_WORKFLOW_DIR exposes the workflow-relative path (independent of cwd).
+      expect(parsed.wfdir).toBe(workflowDir);
     });
   });
 });
@@ -3951,6 +3970,292 @@ console.log(JSON.stringify({ rejected }));
       const result = await runAPIDriver(runtime, driverCode);
       expect(result.exitCode).toBe(0);
       expect(JSON.parse(result.stdout).rejected).toBe(true);
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — Inherited Env Snapshot Timing (SPEC §9.1 / §9.2 / §8.1)
+// ═════════════════════════════════════════════════════════════
+//
+// Under run(), the inherited process.env snapshot is LAZY — captured on the
+// first next() call alongside the rest of the pre-iteration sequence.
+// Mutations between run() returning and first next() ARE observed; later
+// mutations between iterations are not (the snapshot is reused once taken).
+//
+// Under runPromise(), the inherited process.env snapshot is EAGER — captured
+// synchronously at the runPromise() call site. Mutations to process.env
+// after runPromise() returns are NOT observed. The same eager schedule
+// applies to global env file path resolution (XDG_CONFIG_HOME / HOME).
+
+describe("SPEC: Inherited Env Snapshot Timing", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // T-API-71: run() inherited-env snapshot is lazy (captured at first next()).
+    it("T-API-71: run() inherited-env snapshot is lazy — mutation between run() and first next() observed", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.env.MYVAR = "A";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+process.env.MYVAR = "B";
+const results = [];
+for await (const o of gen) { results.push(o); }
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // Lazy snapshot taken on first next() — the post-call mutation ("B") is
+      // observed because the snapshot had not yet been taken when the mutation
+      // happened.
+      expect(readFileSync(marker, "utf-8")).toBe("B");
+    });
+
+    // T-API-71a: run() inherited-env snapshot is frozen at first next().
+    it("T-API-71a: run() inherited-env snapshot is frozen at first next() — mutation between iterations not observed", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.env.MYVAR = "A";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+const r1 = await gen.next();
+// Mutation between gen.next() calls: must NOT propagate to iteration 2 because
+// the inherited-env snapshot is frozen at first next().
+process.env.MYVAR = "B";
+const r2 = await gen.next();
+const r3 = await gen.next();
+console.log(JSON.stringify({ done3: r3.done, count: [r1, r2].filter(x => !x.done).length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.done3).toBe(true);
+      expect(parsed.count).toBe(2);
+      // Both iterations observe the snapshot taken at first next() — "A".
+      expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("A");
+      expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("A");
+    });
+
+    // T-API-72: runPromise() inherited-env snapshot is eager (captured at call site).
+    it("T-API-72: runPromise() inherited-env snapshot is eager — mutation after return not observed", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.env.MYVAR = "A";
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+// Eager snapshot taken at runPromise() call site — this mutation is too late.
+process.env.MYVAR = "B";
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("A");
+    });
+
+    // T-API-72a: runPromise() inherited-env snapshot is reused across iterations.
+    // Uses a release-sentinel barrier to synchronize a mid-run mutation between
+    // iter 1 and iter 2 — the eager snapshot taken at call time must be reused
+    // for every iteration of the run.
+    it("T-API-72a: runPromise() inherited-env snapshot reused across iterations — mid-run mutation not observed", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const releasePath = join(project.dir, "release.sentinel");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+RELEASE="${releasePath}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -eq 1 ]; then
+  # Iter 1 waits for release before exiting so the driver can mutate MYVAR
+  # between iter-1 capture and iter-2 spawn.
+  while [ ! -f "$RELEASE" ]; do sleep 0.02; done
+fi
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, writeFileSync } from "node:fs";
+process.env.MYVAR = "A";
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+// Wait for iter-1 marker to confirm iter 1 has captured MYVAR before mutating.
+const deadline = Date.now() + 15_000;
+while (Date.now() < deadline) {
+  if (existsSync(${JSON.stringify(join(markerDir, "iter1.txt"))})) break;
+  await new Promise(r => setTimeout(r, 25));
+}
+// Mutate MYVAR mid-run, then release iter 1 so iter 2 can spawn.
+process.env.MYVAR = "B";
+writeFileSync(${JSON.stringify(releasePath)}, "");
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, { timeout: 30_000 });
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(2);
+      // Both iterations observe the eager snapshot ("A") — the mid-run
+      // mutation to "B" must not propagate to iter 2 because the inherited
+      // env snapshot is reused for the entire run.
+      expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("A");
+      expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("A");
+    });
+
+    // T-API-72b: runPromise() global env file path resolution is eager.
+    // SPEC §9.2: "Global env file path resolution (XDG_CONFIG_HOME / HOME)
+    // also uses this schedule."
+    it("T-API-72b: runPromise() XDG_CONFIG_HOME mutation after return does not redirect global env file lookup", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myglobal.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MY_GLOBAL:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      // Two XDG_CONFIG_HOME directories with different env file contents.
+      const xdgA = await mkdtemp(join(osTmpdir(), "loopx-xdg-a-"));
+      await mkdir(join(xdgA, "loopx"), { recursive: true });
+      await writeFile(join(xdgA, "loopx", "env"), "MY_GLOBAL=valueA\n", "utf-8");
+
+      const xdgB = await mkdtemp(join(osTmpdir(), "loopx-xdg-b-"));
+      await mkdir(join(xdgB, "loopx"), { recursive: true });
+      await writeFile(join(xdgB, "loopx", "env"), "MY_GLOBAL=valueB\n", "utf-8");
+
+      try {
+        const driverCode = `
+import { runPromise } from "loopx";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgA)};
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+// Eager path resolution at call site pinned the global env file to xdgA.
+// A post-return mutation must not redirect the lookup to xdgB.
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgB)};
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(readFileSync(marker, "utf-8")).toBe("valueA");
+      } finally {
+        await Promise.all([
+          rm(xdgA, { recursive: true, force: true }),
+          rm(xdgB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+
+    // T-API-71b: run() global env file path resolution is lazy (counterpart to 72b).
+    it("T-API-71b: run() XDG_CONFIG_HOME mutation between run() and first next() redirects global env file lookup", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myglobal.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MY_GLOBAL:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const xdgA = await mkdtemp(join(osTmpdir(), "loopx-xdg-a-"));
+      await mkdir(join(xdgA, "loopx"), { recursive: true });
+      await writeFile(join(xdgA, "loopx", "env"), "MY_GLOBAL=valueA\n", "utf-8");
+
+      const xdgB = await mkdtemp(join(osTmpdir(), "loopx-xdg-b-"));
+      await mkdir(join(xdgB, "loopx"), { recursive: true });
+      await writeFile(join(xdgB, "loopx", "env"), "MY_GLOBAL=valueB\n", "utf-8");
+
+      try {
+        const driverCode = `
+import { run } from "loopx";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgA)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+// Lazy path resolution — mutation before first next() redirects the lookup.
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgB)};
+const results = [];
+for await (const o of gen) { results.push(o); }
+console.log(JSON.stringify({ count: results.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(readFileSync(marker, "utf-8")).toBe("valueB");
+      } finally {
+        await Promise.all([
+          rm(xdgA, { recursive: true, force: true }),
+          rm(xdgB, { recursive: true, force: true }),
+        ]);
+      }
     });
   });
 });

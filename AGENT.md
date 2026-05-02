@@ -2,7 +2,7 @@
 
 ## Build & Test Commands
 
-- Install dependencies: `npm install`
+- Install dependencies: `npm install` (can wipe out `node_modules/loopx` symlink; turbo's build cache may then report a hit without re-creating it. If `Cannot find module '.../node_modules/loopx/dist/bin.js'` appears, run `node packages/loop-extender/scripts/postbuild.mjs`.)
 - Run all tests: `npm run test`
 - Run harness tests only: `npm run test:harness`
 - Run unit tests only: `npm run test:unit`
@@ -21,6 +21,10 @@
 - Workflow fixtures: `createWorkflowScript(project, workflow, script, ext, content)`, `createBashWorkflowScript(project, workflow, script, body)`, `createWorkflowPackageJson(project, workflow, content)`. Legacy `createScript` / `createDirScript` / `createBashScript` were removed with ADR-0003 — do not reintroduce.
 - Version-check warning matchers in `apps/tests/tests/e2e/version-check.test.ts` are regex-based and overlap between categories. Keep runtime warning prose free of the mismatch trigger words (`version`, `mismatch`, `range`, `satisf`) for non-mismatch cases; include them only for the actual mismatch warning.
 - `apps/tests/tests/helpers/api-driver.ts` spawns `<repo>/node_modules/.bin/tsx` by absolute path (computed from an `import.meta.url`-derived `REPO_ROOT`, not `process.cwd()` — vitest now runs from `apps/tests/`), not via `npx`. When the consumer cwd has a `node_modules/` (even one containing only a symlinked package), `npm 11+` / `npx` skips auto-install and exits 127 with "tsx: command not found". Preserve the absolute-path spawn in that helper.
+- `apps/tests/tests/helpers/api-driver.ts` strips any caller-supplied `extraEnv.TMPDIR` from the spawned child's env and bakes a `process.env.TMPDIR = <orig>` prefix into the driver code. This decouples tsx's eager `${TMPDIR}/tsx-${UID}` IPC dir from the loopx-perceived TMPDIR — tests can pass an unwritable TMPDIR (T-TMP-12b/12c/12g/12h) without crashing tsx at module-load. loopx still observes the test's intended TMPDIR because every `os.tmpdir()` read in loopx is lazy (inside `runLoop`, `runPromise`'s eager-snapshot call, or pre-iteration in the CLI), all of which execute after the prefix.
+- `loopx-nodepath-shim-<pid>` is created in `os.tmpdir()` lazily on first `executeScript()` call (not at module load). Tests scanning a test-isolated `TMPDIR` parent for `loopx-*` entries (e.g., the LOOPX_TMPDIR snapshot-timing tests) must filter out implementation-internal helpers — `loopx-nodepath-shim-`, `loopx-bun-jsx-` (created on demand for .tsx/.jsx fixtures), and `loopx-install-` (install-time staging). See `tests/e2e/tmpdir.test.ts` `listLoopxEntries()` for the canonical filter.
+- Tests that use a release-sentinel barrier with a live CLI/run inspection (e.g., stat the LOOPX_TMPDIR while the script blocks on a release file) must wrap assertions in try/catch and always release + await the CLI in the failure path. Without this pattern, an assertion failure leaves the script blocked, the CLI helper times out, and the rejection becomes an unhandled rejection that pollutes other tests' diagnostics.
+- `runCLIWithSignal` waits for the spawn `'close'` event, which fires only after all stdio streams close. When a test SIGKILLs loopx (e.g., T-TMP-24b), the detached child shell holds an inherited copy of loopx's stderr fd, so `'close'` doesn't fire until the orphan child also dies. The test must read its assertion data from markers, then kill the orphan child by PID before awaiting `result`.
 
 ## Runtime Quirks
 

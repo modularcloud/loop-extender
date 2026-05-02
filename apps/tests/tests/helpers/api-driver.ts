@@ -79,9 +79,29 @@ export async function runAPIDriver(
       // which is the expected behavior for pre-implementation testing
     }
 
+    // Decouple the spawned tooling's TMPDIR from the loopx-perceived TMPDIR.
+    // tsx's IPC server / file cache does an eager `mkdirSync` against
+    // `${TMPDIR}/tsx-${UID}` at module-load time, so an unwritable TMPDIR
+    // (which several tmpdir tests rely on) crashes tsx before the driver
+    // body runs. Strip TMPDIR from the spawned child's env (tsx then
+    // inherits the harness's writable /tmp) and inject a prefix that resets
+    // `process.env.TMPDIR` to the test-intended value at the top of the
+    // driver body. loopx reads `os.tmpdir()` lazily at run() / runPromise()
+    // call sites and inside `runLoop`, all of which execute after the
+    // prefix, so loopx still observes the test's intended TMPDIR.
+    const cleanedExtraEnv: Record<string, string> = { ...extraEnv };
+    const intendedTmpdir = cleanedExtraEnv.TMPDIR;
+    if (intendedTmpdir !== undefined) {
+      delete cleanedExtraEnv.TMPDIR;
+    }
+    const tmpdirPrefix =
+      intendedTmpdir !== undefined
+        ? `process.env.TMPDIR = ${JSON.stringify(intendedTmpdir)};\n`
+        : "";
+
     // Write the driver script
     const driverPath = join(consumerDir, "driver.ts");
-    await writeFile(driverPath, code, "utf-8");
+    await writeFile(driverPath, tmpdirPrefix + code, "utf-8");
 
     // Spawn the driver. Under Node, invoke the repo's own `tsx` binary by
     // absolute path rather than via `npx tsx`: with npm 11+, `npx` refuses
@@ -97,7 +117,7 @@ export async function runAPIDriver(
 
     const mergedEnv = {
       ...process.env,
-      ...extraEnv,
+      ...cleanedExtraEnv,
     };
 
     return await new Promise<APIDriverResult>((resolve, reject) => {

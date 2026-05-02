@@ -84,6 +84,10 @@ const LOOPX_WORKSPACE_NODE_MODULES = resolve(
 // loop-extender package root (one level above __dirname, since __dirname is
 // the compiled dist/ dir and package.json with `exports` lives at the parent)
 // and prepend it to NODE_PATH.
+//
+// Lazy: created on first executeScript() call. Doing this at module-load time
+// would crash loopx whenever TMPDIR points at an unwritable parent — which
+// the SPEC §7.1 step-5-before-step-6 ordering tests deliberately exercise.
 let loopxShimDir: string | null = null;
 function getLoopxShimDir(): string {
   if (loopxShimDir && existsSync(join(loopxShimDir, "loopx"))) {
@@ -105,7 +109,9 @@ function getLoopxShimDir(): string {
   return dir;
 }
 
-const LOOPX_NODE_PATH = `${getLoopxShimDir()}:${LOOPX_NODE_MODULES}:${LOOPX_PACKAGE_PARENT}:${LOOPX_WORKSPACE_NODE_MODULES}`;
+function buildLoopxNodePath(): string {
+  return `${getLoopxShimDir()}:${LOOPX_NODE_MODULES}:${LOOPX_PACKAGE_PARENT}:${LOOPX_WORKSPACE_NODE_MODULES}`;
+}
 
 export interface ExecResult {
   stdout: string;
@@ -117,6 +123,7 @@ export interface ExecOptions {
   workflowDir: string;
   projectRoot: string;
   loopxBin: string;
+  tmpdir: string;
   env: Record<string, string>;
   input?: string;
   signal?: AbortSignal;
@@ -143,22 +150,27 @@ export function executeScript(
     workflowDir,
     projectRoot,
     loopxBin,
+    tmpdir: loopxTmpdir,
     env,
     input,
     signal,
   } = options;
 
-  // SPEC §6.1: scripts always run with the workflow directory as cwd.
-  const cwd = workflowDir;
+  // SPEC §6.1 (ADR-0004): scripts always run with the project root as cwd.
+  // The workflow directory is exposed via LOOPX_WORKFLOW_DIR.
+  const cwd = projectRoot;
 
   const currentPath = env.PATH ?? process.env.PATH ?? "";
   const currentNodePath = env.NODE_PATH ?? "";
+  const loopxNodePath = buildLoopxNodePath();
 
   const scriptEnv: Record<string, string> = {
     ...env,
     LOOPX_BIN: loopxBin,
     LOOPX_PROJECT_ROOT: projectRoot,
     LOOPX_WORKFLOW: workflowName,
+    LOOPX_WORKFLOW_DIR: workflowDir,
+    LOOPX_TMPDIR: loopxTmpdir,
     PATH: (() => {
       const pathEntries = currentPath.split(":");
       const prepend: string[] = [];
@@ -174,8 +186,8 @@ export function executeScript(
         : `${prepend.join(":")}:${currentPath}`;
     })(),
     NODE_PATH: currentNodePath
-      ? `${LOOPX_NODE_PATH}:${currentNodePath}`
-      : LOOPX_NODE_PATH,
+      ? `${loopxNodePath}:${currentNodePath}`
+      : loopxNodePath,
   };
 
   let command: string;
