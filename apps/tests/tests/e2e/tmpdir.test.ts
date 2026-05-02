@@ -10048,6 +10048,173 @@ console.log(JSON.stringify({
     }
 
     // ------------------------------------------------------------------------
+    // T-TMP-42c: cleanup-fault warning does not mask CLI signal terminal.
+    // SPEC §7.4 final paragraph: "warnings do not affect the CLI exit code,
+    // the generator outcome, or the promise rejection reason." The
+    // contract holds for both the cleanup-safety warning branch and the
+    // cleanup-failure warning branch.
+    //
+    // Coverage matrix entries already pinned:
+    //   T-TMP-35f (cleanup-safety × signal × CLI),
+    //   T-TMP-40 / T-TMP-41 / T-TMP-42 (cleanup-failure × success × all
+    //     three surfaces),
+    //   T-TMP-42a (cleanup-failure × script-error × all three surfaces),
+    //   T-TMP-42b (cleanup-failure × abort × programmatic surfaces — abort
+    //     is programmatic-only).
+    //
+    // T-TMP-42c closes the remaining diagonal: cleanup-failure warning ×
+    // CLI signal terminal. A buggy implementation that wired the signal-
+    // terminal `128 + signal-number` exit-code path correctly for rule-3 /
+    // rule-5 cleanup-safety warnings (passing T-TMP-35f) yet routed
+    // cleanup-failure warnings (lstat-fail / symlink-unlink-fail /
+    // recursive-remove-fail) through a separate stream that promoted the
+    // warning to a cleanup-failure-class exit code under signal — exit 1
+    // or some implementation-specific cleanup-failure code instead of the
+    // signal code — would pass T-TMP-35f / T-TMP-40 / T-TMP-41 / T-TMP-42 /
+    // T-TMP-42a / T-TMP-42b and fail this test.
+    //
+    // Parameterized over the three cleanup-fault seam values (lstat-fail,
+    // symlink-unlink-fail, recursive-remove-fail) and over both signals
+    // (SIGINT, SIGTERM) — six sub-cases per runtime.
+    //
+    // Per-fault tampering required to make the seam fire under the signal
+    // terminal:
+    //   - lstat-fail: seam fires at the top-level lstat in cleanupTmpdir;
+    //     no path manipulation needed.
+    //   - symlink-unlink-fail: seam fires only when dispatch reaches
+    //     rule 2 (path is a symlink), so the script must replace the
+    //     tmpdir with a symlink before blocking.
+    //   - recursive-remove-fail: seam fires only when dispatch reaches
+    //     rule 4 (identity-matched directory); the original loopx-created
+    //     directory satisfies that. Populating the directory with files
+    //     pins that recursive removal would normally have visited inner
+    //     entries.
+    //
+    // Per-fault path persistence (cleanup made no further changes after
+    // simulated failure per SPEC §7.4):
+    //   - lstat-fail: top-level lstat throws, dispatch never starts;
+    //     identity-matched directory at recorded path remains.
+    //   - symlink-unlink-fail: rule-2 unlink throws; the script-installed
+    //     symlink remains.
+    //   - recursive-remove-fail: rule-4 rmSync throws; the recorded path
+    //     itself remains visible (the partial walk's effect on inner
+    //     entries is implementation-defined per SPEC §7.4 "no further
+    //     changes" wording, but the recorded path remains).
+    //
+    // Together with T-TMP-35f (cleanup-safety × signal × CLI), T-TMP-40 /
+    // T-TMP-41 / T-TMP-42 (cleanup-failure × success × all surfaces),
+    // T-TMP-42a (cleanup-failure × script-error × all surfaces), and
+    // T-TMP-42b (cleanup-failure × abort × programmatic surfaces), this
+    // closes the cleanup-warning-does-not-affect-outcome coverage axis
+    // for the cleanup-failure branch across all four terminal types —
+    // success, script-error, signal, abort.
+    // ----------------------------------------------------------------------
+
+    /**
+     * Build the bash fixture body for the T-TMP-42c (signal × cleanup-
+     * fault) variants. Observes LOOPX_TMPDIR into an external marker so
+     * the harness can verify post-run path persistence, performs the
+     * fault-specific tampering required to drive the cleanup-safety
+     * dispatch into the seam-protected branch, prints "ready" to stderr
+     * (consumed by the CLI signal coordinator via runCLIWithSignal's
+     * waitForStderr), then blocks indefinitely so the run can only
+     * terminate via signal.
+     */
+    function buildSignalCleanupFaultFixture(args: {
+      tmpdirObservation: string;
+      fault: CleanupFaultVariant;
+    }): string {
+      let tampering: string;
+      if (args.fault === "lstat-fail") {
+        tampering = "";
+      } else if (args.fault === "symlink-unlink-fail") {
+        tampering = `rm -rf "$LOOPX_TMPDIR"
+ln -s /tmp "$LOOPX_TMPDIR"`;
+      } else {
+        tampering = `echo content > "$LOOPX_TMPDIR/file-1"
+mkdir "$LOOPX_TMPDIR/sub"
+echo more > "$LOOPX_TMPDIR/sub/file-2"`;
+      }
+      return `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${args.tmpdirObservation}"
+${tampering}
+echo "ready" >&2
+while true; do sleep 1; done
+`;
+    }
+
+    for (const fault of CLEANUP_FAULT_VARIANTS) {
+      for (const signalName of SIGNAL_VARIANTS) {
+        it(`T-TMP-42c (${fault} × ${signalName}): CLI cleanup-fault warning does not mask signal exit code`, async () => {
+          const { project, tmpdirParent } = await setupTmpdirTest();
+          const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            buildSignalCleanupFaultFixture({
+              tmpdirObservation,
+              fault,
+            }),
+          );
+
+          const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+            ["run", "-n", "1", "ralph"],
+            {
+              cwd: project.dir,
+              runtime,
+              env: {
+                TMPDIR: tmpdirParent,
+                NODE_ENV: "test",
+                LOOPX_TEST_CLEANUP_FAULT: fault,
+              },
+              timeout: 30_000,
+            },
+          );
+
+          await waitForStderr("ready");
+          sendSignal(signalName);
+          const outcome = await result;
+
+          // (a) CLI exit code matches the signal terminal (130 for
+          // SIGINT, 143 for SIGTERM). The cleanup-failure warning did
+          // not mask, replace, or override the signal exit code per
+          // SPEC §7.4 — load-bearing.
+          const expectedCode = signalName === "SIGINT" ? 130 : 143;
+          expect(outcome.exitCode).toBe(expectedCode);
+
+          const observedLoopxTmpdir = readFileSync(
+            tmpdirObservation,
+            "utf-8",
+          );
+          expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+
+          // (b) Exactly one cleanup-related warning on stderr — per-run
+          // cleanup-warning cardinality from SPEC §7.4 holds under the
+          // signal terminal; the signal does not double the warning
+          // emission.
+          const cleanupWarnings = outcome.stderr
+            .split("\n")
+            .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+          expect(cleanupWarnings.length).toBe(1);
+
+          // (c) Path persistence per fault seam — cleanup made no
+          // further changes after the simulated failure per SPEC §7.4.
+          if (fault === "symlink-unlink-fail") {
+            const lst = lstatSync(observedLoopxTmpdir);
+            expect(lst.isSymbolicLink()).toBe(true);
+            await rm(observedLoopxTmpdir, { force: true }).catch(() => {});
+          } else {
+            expect(existsSync(observedLoopxTmpdir)).toBe(true);
+          }
+        });
+      }
+    }
+
+    // ------------------------------------------------------------------------
     // T-TMP-38 / T-TMP-39: SPEC §7.2 / §7.4 cleanup-idempotence and
     // warning-cardinality contracts under racing terminal triggers.
     //
