@@ -5,7 +5,12 @@ import { fileURLToPath } from "node:url";
 import type { Output, RunOptions } from "./types.js";
 import { discoverScripts } from "./discovery.js";
 import { runLoop, type LoopStartingTarget } from "./loop.js";
-import { loadGlobalEnv, loadLocalEnv, mergeEnv } from "./env.js";
+import {
+  getGlobalEnvPath,
+  loadGlobalEnv,
+  loadLocalEnv,
+  mergeEnv,
+} from "./env.js";
 import { parseTarget } from "./target-validation.js";
 import { makeAbortError } from "./abort.js";
 import { getLoopxBin, ensureLoopxPackageJson } from "./bin-path.js";
@@ -14,6 +19,19 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 interface InternalRunOptions {
   tmpdirParent?: string;
+  /**
+   * Eagerly captured snapshot of `process.env` (SPEC §9.2). When set, the
+   * inherited environment used in `mergeEnv` is read from this snapshot
+   * rather than the live `process.env`, pinning observed values to the
+   * runPromise() call site.
+   */
+  inheritedEnv?: Record<string, string>;
+  /**
+   * Eagerly resolved global loopx env file path (SPEC §9.2). When set,
+   * `loadGlobalEnv` consults this path verbatim instead of re-resolving from
+   * `XDG_CONFIG_HOME` / `HOME` at iteration time.
+   */
+  globalEnvPath?: string;
 }
 
 interface OptionSnapshot {
@@ -291,7 +309,9 @@ function runWithInternal(
     snap,
     effectiveSignal,
     loopxBin,
-    internal?.tmpdirParent
+    internal?.tmpdirParent,
+    internal?.inheritedEnv,
+    internal?.globalEnvPath
   );
 
   let returnCalled = false;
@@ -434,7 +454,9 @@ async function* runInternal(
   snap: OptionSnapshot,
   signal: AbortSignal,
   loopxBin: string,
-  tmpdirParent: string | undefined
+  tmpdirParent: string | undefined,
+  inheritedEnv: Record<string, string> | undefined,
+  globalEnvPath: string | undefined
 ): AsyncGenerator<Output> {
   // SPEC §9.3 abort precedence: if a usable signal was captured and is
   // aborted (or aborts later), it displaces all other pre-iteration failures.
@@ -463,8 +485,11 @@ async function* runInternal(
     process.stderr.write(w + "\n");
   }
 
-  // Load env (SPEC §8)
-  const globalResult = loadGlobalEnv();
+  // Load env (SPEC §8). globalEnvPath / inheritedEnv (when supplied) are the
+  // eager snapshots threaded down from runPromise() per SPEC §9.2; for run()
+  // and the CLI they remain undefined and process.env is read lazily here on
+  // the first next() call (SPEC §9.1).
+  const globalResult = loadGlobalEnv(globalEnvPath);
   const globalEnv = globalResult.vars;
   for (const w of globalResult.warnings) {
     process.stderr.write(`Warning: ${w}\n`);
@@ -492,7 +517,7 @@ async function* runInternal(
   // mergeEnv yields tiers 5→4→3 (process.env, global, local). RunOptions.env
   // overlays tier 2 here. Protocol vars overlay tier 1 in executeScript.
   const mergedEnv: Record<string, string> = {
-    ...mergeEnv(globalEnv, localEnv),
+    ...mergeEnv(globalEnv, localEnv, inheritedEnv),
     ...(snap.env ?? {}),
   };
 
@@ -570,6 +595,21 @@ export async function runPromise(
   // runPromise() returns must not affect the tmpdir parent for this run.
   const eagerTmpdirParent = osTmpdir();
 
+  // SPEC §9.2: the inherited `process.env` snapshot is EAGER under
+  // runPromise — captured synchronously at the call site as a shallow copy.
+  // Mutations to process.env after runPromise() returns are not observed by
+  // the spawned scripts. The shallow copy is reused for every iteration of
+  // the run (T-API-72 / T-API-72a).
+  const eagerInheritedEnv: Record<string, string> = {
+    ...(process.env as Record<string, string>),
+  };
+
+  // SPEC §9.2: global env file path resolution (XDG_CONFIG_HOME / HOME) also
+  // uses the eager schedule. We resolve the path here against the just-taken
+  // process.env snapshot so that XDG_CONFIG_HOME / HOME mutations after
+  // runPromise() returns do not redirect the global env file lookup.
+  const eagerGlobalEnvPath = getGlobalEnvPath(eagerInheritedEnv);
+
   // SPEC §9.5 / §9.2: option snapshot (incl. cwd, env, envFile, signal,
   // maxIterations) is also eager at call site. runWithInternal() runs
   // snapshotOptions() and captures the cwd default synchronously, so calling
@@ -577,6 +617,8 @@ export async function runPromise(
   // their call-site values (T-API-14c, T-API-14d).
   const gen = runWithInternal(target, options, {
     tmpdirParent: eagerTmpdirParent,
+    inheritedEnv: eagerInheritedEnv,
+    globalEnvPath: eagerGlobalEnvPath,
   });
 
   // SPEC §9.2: "LOOPX_TMPDIR itself is created asynchronously after return,

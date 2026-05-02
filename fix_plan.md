@@ -1,6 +1,6 @@
 # Implementation Plan for loopx Test Harness
 
-**Status: ADR-0004 §6.1 (project-root cwd + LOOPX_WORKFLOW_DIR injection), §7.4 (LOOPX_TMPDIR creation/injection/cleanup + parent-snapshot timing across all four injection tiers), §9.5 (RunOptions.env tier-2 env merging), §9.3 (abort-after-final-yield carve-out), AND §9.2 (LOOPX_TMPDIR async creation under runPromise()) are now IMPLEMENTED. Recent (this iteration): `runPromise()` now defers iteration to a microtask via `await Promise.resolve()` between option/parent-snapshot capture and `for await`, satisfying SPEC §9.2 "LOOPX_TMPDIR itself is created asynchronously after return" (T-TMP-27a verifies this). The `runWithInternal()` call still runs synchronously at the call site so `snapshotOptions()` and the cwd default capture (T-API-14c, T-API-14d) remain eager. tmpdir.test.ts: 389/389 PASS (was 327/327; +62 new tests covering T-TMP-25/25a/25b/26/26-temp/26-tmp/27/27-temp/27-tmp/27a/28/28a/28b/28c/28d/28e/28f/28g/28h/29/29a/29b/29c/29d/29e/29f/29g/29h/29i/29j/29k × 2 runtimes). T-API-14c/14d ("runPromise cwd/options snapshotted at call time") still pass — the option-snapshot eager contract was preserved by keeping `runWithInternal()` outside the microtask boundary. Adjacent test suites (programmatic-api 346, env-vars 96, execution 85, loop-state 96, wfdir 40, unit 143, harness 15) confirm zero regressions. Full suite: 2449/2450 pass; the single remaining failure is T-INST-GLOBAL-01a [Bun] (pre-existing, unrelated to this work).**
+**Status: ADR-0004 §6.1 (project-root cwd + LOOPX_WORKFLOW_DIR injection), §7.4 (LOOPX_TMPDIR creation/injection/cleanup + parent-snapshot timing across all four injection tiers), §9.5 (RunOptions.env tier-2 env merging), §9.3 (abort-after-final-yield carve-out), §9.2 (LOOPX_TMPDIR async creation under runPromise()), AND §9.2 (process.env eager snapshot under runPromise()) are now IMPLEMENTED. Recent (this iteration): `runPromise()` now eagerly captures `process.env` and the global env-file path (`getGlobalEnvPath` resolved against the snapshot) before the `await Promise.resolve()` microtask boundary, threaded through `runWithInternal` → `runInternal` as `inheritedEnv` / `globalEnvPath`. `mergeEnv` now spreads the inherited snapshot when provided instead of reading live `process.env`. `run()` retains lazy semantics (no snapshot threaded → reads live `process.env` inside `runLoop`). tmpdir.test.ts 389/389 still passes; programmatic-api: 370 (was 358, +12 new env-snapshot-timing tests T-API-71/71a/71b/72/72a/72b × 2 runtimes); env-vars 96; wfdir 40. Full e2e suite: 2249/2250 passing; the single remaining failure is T-INST-GLOBAL-01a [Bun] (pre-existing, unrelated to this work).**
 
 ## P0/P1 — RESOLVED
 
@@ -121,6 +121,21 @@ Now-passing tests (this iteration):
   - `buildEnvObserveScript(observe[])` — bash fixture template that observes `LOOPX_TMPDIR` plus `TMPDIR`/`TEMP`/`TMP` into separate marker files via uniquely-named `OBS_*_PATH` env vars to avoid shadowing the variable being observed.
 - Adjacent suites: zero regressions across programmatic-api (346), env-vars (96), execution (85), loop-state (96), wfdir (40), signals (9), unit (143), harness (15).
 
+### ADR-0004 §9.2 (process.env eager snapshot under runPromise) — RESOLVED
+
+The `runPromise()` body at `packages/loop-extender/src/run.ts` previously snapshotted only the tmpdir parent eagerly; the inherited `process.env` and global env-file path (`XDG_CONFIG_HOME` / `HOME`-derived) were still read lazily inside `runInternal` after the microtask boundary, violating SPEC §9.2: "Under runPromise(), the inherited process.env snapshot is eager — captured synchronously at the runPromise() call site, before runPromise() returns. Mutations to process.env after runPromise() returns are not observed."
+
+Implementation:
+1. **`packages/loop-extender/src/env.ts`**:
+   - `getGlobalEnvPath(envSnapshot?)` accepts optional snapshot; when provided, reads `XDG_CONFIG_HOME` / `HOME` from snapshot rather than live `process.env`.
+   - `loadGlobalEnv(envPath?)` accepts optional pre-resolved path verbatim.
+   - `mergeEnv(globalEnv, localEnv, inheritedEnv?)` spreads the inherited snapshot when provided, falling back to `process.env` for backward compatibility (preserves `run()` lazy semantics).
+2. **`packages/loop-extender/src/run.ts`**: `InternalRunOptions` extended with `inheritedEnv?` and `globalEnvPath?`, threaded through `runWithInternal()` / `runInternal()`. `runPromise()` now captures three eager snapshots before the `await Promise.resolve()`: `eagerTmpdirParent` (existing), `eagerInheritedEnv = { ...process.env }` (new), `eagerGlobalEnvPath = getGlobalEnvPath(eagerInheritedEnv)` (new).
+
+Now-passing tests (this iteration):
+- **programmatic-api: 370 PASS** (was 358; +12 new tests under "SPEC: Inherited Env Snapshot Timing" — T-API-71/71a/71b/72/72a/72b × 2 runtimes). T-API-71/71a/71b verify `run()` lazy semantics (mutation between call and first `next()` observed; mid-run mutation frozen at first `next()`; XDG_CONFIG_HOME mutation redirects global env file lookup). T-API-72/72a/72b verify `runPromise()` eager semantics (mutation after return not observed; mid-run mutation not observed across iterations; XDG_CONFIG_HOME mutation does not redirect global env file lookup).
+- Adjacent suites: zero regressions (tmpdir 389, env-vars 96, wfdir 40).
+
 ## P1 — REMAINING T-TMP-* subsections
 
 These T-TMP IDs are not yet implemented as test cases or are blocked by missing infrastructure:
@@ -130,11 +145,11 @@ These T-TMP IDs are not yet implemented as test cases or are blocked by missing 
 
 ## P1 — Discovered open issues
 
-- **SPEC §9.2 process.env eager snapshot under runPromise() — partially implemented.** The tmpdir-parent eager snapshot (`eagerTmpdirParent = osTmpdir()`) and the option snapshot (`snapshotOptions(options)`) are eager at call site, but the inherited `process.env` snapshot is still lazy: `mergeEnv()` reads `process.env` inside `runInternal`, which runs after the `await Promise.resolve()` microtask boundary in `runPromise()`. Per SPEC §9.2: "Under runPromise(), the inherited process.env snapshot is eager — captured synchronously at the runPromise() call site, before runPromise() returns. Mutations to process.env after runPromise() returns are not observed." A custom env var mutated between `runPromise()` returning and the deferred iteration is currently observed (lazy), violating this contract. Same for global env-file path resolution (`XDG_CONFIG_HOME` / `HOME` read inside `getGlobalEnvPath()`). My T-TMP-25..29k tests do NOT catch this because: (a) tmpdir-parent uses `eagerTmpdirParent`, (b) env files don't mutate process.env, (c) `RunOptions.env` is captured by `snapshotOptions`. Needs a separate fix: snapshot `process.env` eagerly in `runPromise()`, thread the snapshot through `runWithInternal` → `runInternal`, and have `mergeEnv` use the snapshot instead of reading `process.env` directly. Test coverage needed: a test that mutates a non-TMPDIR env var (e.g., `process.env.MY_VAR = "before"; const p = runPromise(...); process.env.MY_VAR = "after"; await p;`) and asserts the spawned script observes "before".
+(none currently open)
 
 ## P1 — Other ADR-0004 test suites still missing
 
-- **T-API-50..59i** — `RunOptions.env` block (~80 IDs) including inherited-env snapshot timing (lazy under `run()`, eager under `runPromise()`): infrastructure now in place; needs test authoring.
+- **T-API-50..59i** — `RunOptions.env` block (~80 IDs); the inherited-env snapshot-timing subset (T-API-71/71a/71b/72/72a/72b — lazy under `run()`, eager under `runPromise()`) is now in place. Remaining `RunOptions.env` shape / merge / precedence tests still need authoring.
 - **T-API-60..62i4** — Pre-iteration ordering and options-snapshot tests (~60 tests).
 - **T-API-63..69u** — Abort precedence, generator lifecycle, promise rejection (~150 tests). Note: T-API-66/66a/66b/66c/66d/66e (the API-surface counterparts to T-TMP-23/24a/24c/24d/24e/24f/24g — abort-after-final-yield × `.next()`/`.return()`/`.throw()` × maxIterations / stop:true matrix) are covered by the SPEC §9.3 wrapper implementation already in place; needs test authoring.
 - **T-API-70..74c** — 15 remaining programmatic API tests.
@@ -160,6 +175,7 @@ These T-TMP IDs are not yet implemented as test cases or are blocked by missing 
 ## Pre-existing failures (not ADR-0004)
 
 - **T-INST-GLOBAL-01a** — `[Bun] full global install lifecycle with import 'loopx'` fails with "Module not found … /loop-extender/bin.js". Pre-existing issue with Bun's resolution at the global-install layout. Unrelated to ADR-0004; confirmed by reproducing the failure on baseline (pre-change) source. Should be triaged separately.
+- **Bun-under-full-parallelism failures** — Running the entire `npm run test` matrix in full parallelism surfaces ~32 additional `[Bun]`-runtime failures across module-resolution / wfdir / execution / install test files. Confirmed pre-existing via `git stash`: the same 32 failures reproduce with this iteration's changes stashed, and they do NOT reproduce when running the e2e suites alone (e2e-only run shows 1 failure: T-INST-GLOBAL-01a above). Likely a parallelism / isolation issue in the test harness or Bun's loader behavior under concurrent test workers; unrelated to ADR-0004 and out of scope for this work.
 
 ## Notes
 
