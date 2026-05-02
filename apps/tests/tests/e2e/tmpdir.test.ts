@@ -7767,6 +7767,387 @@ console.log(JSON.stringify({
     });
 
     // ------------------------------------------------------------------------
+    // T-TMP-35c / 35d / 35e: Cleanup warning does not mask a script-error
+    // terminal across all three execution surfaces (CLI / runPromise() /
+    // run()) × both warning-emitting cleanup-safety branches (regular-file
+    // replacement → SPEC §7.4 rule 3; mismatched-directory replacement →
+    // SPEC §7.4 rule 5). SPEC §7.4: "cleanup warnings do not affect the CLI
+    // exit code, the generator outcome, or the promise rejection reason."
+    //
+    // T-TMP-35 / 35a / 35b (rule-3 success terminal) and T-TMP-36 / 36a / 36b
+    // (rule-5 success terminal) pin the cleanup-warning-cardinality contract
+    // against a `stop: true` script termination. These three new tests pin
+    // the error-terminal variant: a cleanup warning must not promote a
+    // script-failure outcome into a cleanup-failure outcome, nor mask the
+    // script failure as success. The error output / rejection / throw must
+    // identify the script failure as the primary cause rather than
+    // conflating it with the cleanup-warning category.
+    //
+    // The CLI surface uses an additional defense — a distinctive
+    // SCRIPT-FAILURE-MARKER line printed to stderr before the script's
+    // path-tampering. Both the script-failure path and a hypothetical
+    // cleanup-promoted-to-failure path produce CLI exit 1, so exit-code
+    // alone cannot distinguish them; the marker proves the script's own
+    // pre-failure stderr reached the user observably disjoint from the
+    // cleanup warning. The programmatic surfaces additionally inspect the
+    // rejection / throw error message for the script-failure shape
+    // ("exited with code") — matching the loop.ts contract — and the
+    // absence of any "cleanup" classifier.
+    //
+    // Both fixture variants run the same shape:
+    //   1. Observe LOOPX_TMPDIR into the external `tmpdir.txt` marker.
+    //   2. Print SCRIPT-FAILURE-MARKER-T-TMP-35C line to stderr (CLI test
+    //      uses this for the disjoint-line assertion; the API tests have
+    //      a stronger error-shape probe and don't need it but produce
+    //      the same fixture for consistency).
+    //   3. Perform the variant-specific replacement (rule-3 or rule-5).
+    //   4. `exit 1` (script fails).
+    //
+    // For variant b (mismatched-directory), the rename-aside pattern from
+    // T-TMP-36 guarantees inode-distinctness so the cleanup dispatch
+    // reaches rule 5 deterministically.
+    // ------------------------------------------------------------------------
+
+    /** Variant labels used in the parameterized tests' sub-case naming. */
+    const SCRIPT_ERROR_CLEANUP_VARIANTS = [
+      "regular-file-replacement",
+      "mismatched-directory-replacement",
+    ] as const;
+    type ScriptErrorCleanupVariant =
+      (typeof SCRIPT_ERROR_CLEANUP_VARIANTS)[number];
+
+    /**
+     * Build the shared bash fixture body for the script-error-terminal
+     * variants of T-TMP-35c / 35d / 35e. Returns the bash content that
+     * observes `$LOOPX_TMPDIR` into `tmpdirObservation`, prints the
+     * distinctive script-failure marker to stderr, performs the variant-
+     * specific path manipulation, then `exit 1` (script fails).
+     */
+    function buildScriptErrorCleanupFixture(args: {
+      tmpdirObservation: string;
+      variant: ScriptErrorCleanupVariant;
+    }): string {
+      const replacement =
+        args.variant === "regular-file-replacement"
+          ? `rm -rf "$LOOPX_TMPDIR"
+printf '%s' "regular-file-replacement" > "$LOOPX_TMPDIR"`
+          : `mv "$LOOPX_TMPDIR" "$LOOPX_TMPDIR-original-aside"
+mkdir "$LOOPX_TMPDIR"
+touch "$LOOPX_TMPDIR/mismatched-marker"`;
+      return `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${args.tmpdirObservation}"
+printf 'SCRIPT-FAILURE-MARKER-T-TMP-35C: script about to fail with non-zero exit\\n' >&2
+${replacement}
+exit 1
+`;
+    }
+
+    for (const variant of SCRIPT_ERROR_CLEANUP_VARIANTS) {
+      it(`T-TMP-35c (${variant}): CLI cleanup warning does not mask script-error exit code`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          buildScriptErrorCleanupFixture({ tmpdirObservation, variant }),
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+        });
+
+        // (a) Exit 1 — from the SCRIPT failure, not a cleanup-failure
+        // promotion. Both paths produce exit 1, so exit-code alone cannot
+        // distinguish; (b) and (d) below carry the load-bearing
+        // distinguishing assertions.
+        expect(result.exitCode).toBe(1);
+
+        const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+        expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+
+        // (b) The script's distinctive pre-failure marker reached stderr.
+        // An implementation that masked the script's stderr behind a
+        // cleanup-failure error wrapper would lose this line.
+        const stderrLines = result.stderr.split("\n");
+        const markerLines = stderrLines.filter((l) =>
+          l.includes("SCRIPT-FAILURE-MARKER-T-TMP-35C"),
+        );
+        expect(markerLines.length).toBe(1);
+
+        // (c) Exactly one cleanup-related warning on stderr (per-run
+        // cleanup-warning cardinality from SPEC §7.4 still holds under
+        // the script-error terminal).
+        const cleanupWarnings = stderrLines.filter((l) =>
+          l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"),
+        );
+        expect(cleanupWarnings.length).toBe(1);
+
+        // (d) The cleanup warning and the script-failure marker are on
+        // distinct stderr lines. An implementation that wrapped or
+        // replaced the marker with a cleanup-classifier wrapper would
+        // make these overlap.
+        expect(markerLines[0]).not.toContain("LOOPX_TEST_CLEANUP_WARNING");
+        expect(cleanupWarnings[0]).not.toContain(
+          "SCRIPT-FAILURE-MARKER-T-TMP-35C",
+        );
+
+        // (e) The path persistence for each cleanup-safety branch.
+        // Variant a (rule 3): regular file with the script-written content.
+        // Variant b (rule 5): directory with the mismatched-marker inside.
+        if (variant === "regular-file-replacement") {
+          expect(existsSync(observedLoopxTmpdir)).toBe(true);
+          const st = statSync(observedLoopxTmpdir);
+          expect(st.isFile()).toBe(true);
+          expect(readFileSync(observedLoopxTmpdir, "utf-8")).toBe(
+            "regular-file-replacement",
+          );
+          await rm(observedLoopxTmpdir, { force: true }).catch(() => {});
+        } else {
+          expect(existsSync(observedLoopxTmpdir)).toBe(true);
+          expect(statSync(observedLoopxTmpdir).isDirectory()).toBe(true);
+          const mismatchedMarker = join(
+            observedLoopxTmpdir,
+            "mismatched-marker",
+          );
+          expect(existsSync(mismatchedMarker)).toBe(true);
+          const renamedAside = `${observedLoopxTmpdir}-original-aside`;
+          expect(existsSync(renamedAside)).toBe(true);
+          await rm(observedLoopxTmpdir, {
+            recursive: true,
+            force: true,
+          }).catch(() => {});
+          await rm(renamedAside, { recursive: true, force: true }).catch(
+            () => {},
+          );
+        }
+      });
+    }
+
+    for (const variant of SCRIPT_ERROR_CLEANUP_VARIANTS) {
+      it(`T-TMP-35d (${variant}): runPromise() cleanup warning does not mask script-error rejection reason`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          buildScriptErrorCleanupFixture({ tmpdirObservation, variant }),
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+let rejected = false;
+let errMsg = "";
+let outputs = [];
+try {
+  outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) {
+  rejected = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+const observedExists = existsSync(observed);
+let observedIsFile = false;
+let observedContent = "";
+let observedIsDir = false;
+let mismatchedMarkerExists = false;
+let renamedAsideExists = false;
+if (observedExists) {
+  const st = statSync(observed);
+  observedIsFile = st.isFile();
+  observedIsDir = st.isDirectory();
+  if (observedIsFile) observedContent = readFileSync(observed, "utf-8");
+  if (observedIsDir) {
+    mismatchedMarkerExists = existsSync(join(observed, "mismatched-marker"));
+  }
+}
+const renamedAside = observed + "-original-aside";
+renamedAsideExists = existsSync(renamedAside);
+console.log(JSON.stringify({
+  rejected,
+  errMsg,
+  outputsLen: outputs.length,
+  observed,
+  observedExists,
+  observedIsFile,
+  observedContent,
+  observedIsDir,
+  mismatchedMarkerExists,
+  renamedAside,
+  renamedAsideExists,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+
+        // (a) The promise rejected (it did not resolve to a partial-output
+        // array because cleanup produced "only a warning"). SPEC §7.4:
+        // cleanup warnings do not affect the promise rejection reason.
+        expect(data.rejected).toBe(true);
+
+        // (b) The rejection reason is a SCRIPT-failure error matching the
+        // loop.ts contract ("Script '<wf>:<scr>' exited with code <n>").
+        // It must NOT be a cleanup-failure-class wrapper. The "cleanup"
+        // word does not appear in the script-failure error message.
+        expect(data.errMsg).toMatch(/exited with code/);
+        expect(data.errMsg.toLowerCase()).not.toContain("cleanup");
+
+        // (c) Exactly one cleanup-related warning on stderr (per-run
+        // cleanup-warning cardinality still holds under the script-error
+        // terminal).
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(1);
+
+        // (d) Path persistence per cleanup-safety branch.
+        expect(data.observed.length).toBeGreaterThan(0);
+        expect(data.observedExists).toBe(true);
+        if (variant === "regular-file-replacement") {
+          expect(data.observedIsFile).toBe(true);
+          expect(data.observedContent).toBe("regular-file-replacement");
+          await rm(data.observed, { force: true }).catch(() => {});
+        } else {
+          expect(data.observedIsDir).toBe(true);
+          expect(data.mismatchedMarkerExists).toBe(true);
+          expect(data.renamedAsideExists).toBe(true);
+          await rm(data.observed, {
+            recursive: true,
+            force: true,
+          }).catch(() => {});
+          await rm(data.renamedAside, {
+            recursive: true,
+            force: true,
+          }).catch(() => {});
+        }
+      });
+    }
+
+    for (const variant of SCRIPT_ERROR_CLEANUP_VARIANTS) {
+      it(`T-TMP-35e (${variant}): run() generator cleanup warning does not mask script-error throw`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          buildScriptErrorCleanupFixture({ tmpdirObservation, variant }),
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+let thrown = false;
+let errMsg = "";
+let yieldCount = 0;
+try {
+  const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  for await (const _ of gen) {
+    yieldCount++;
+  }
+} catch (e) {
+  thrown = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+const observedExists = existsSync(observed);
+let observedIsFile = false;
+let observedContent = "";
+let observedIsDir = false;
+let mismatchedMarkerExists = false;
+let renamedAsideExists = false;
+if (observedExists) {
+  const st = statSync(observed);
+  observedIsFile = st.isFile();
+  observedIsDir = st.isDirectory();
+  if (observedIsFile) observedContent = readFileSync(observed, "utf-8");
+  if (observedIsDir) {
+    mismatchedMarkerExists = existsSync(join(observed, "mismatched-marker"));
+  }
+}
+const renamedAside = observed + "-original-aside";
+renamedAsideExists = existsSync(renamedAside);
+console.log(JSON.stringify({
+  thrown,
+  errMsg,
+  yieldCount,
+  observed,
+  observedExists,
+  observedIsFile,
+  observedContent,
+  observedIsDir,
+  mismatchedMarkerExists,
+  renamedAside,
+  renamedAsideExists,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+
+        // (a) The generator threw (the for-await exited via a rejection
+        // rather than completing cleanly). SPEC §7.4: cleanup warnings
+        // do not affect the generator outcome. yieldCount may be 0 (the
+        // script never produced parseable structured stdout before
+        // failing) — what matters is that the surface settled via throw.
+        expect(data.thrown).toBe(true);
+
+        // (b) The throw is a SCRIPT-failure error matching loop.ts's
+        // ("Script '<wf>:<scr>' exited with code <n>"), not a cleanup-
+        // failure-class wrapper.
+        expect(data.errMsg).toMatch(/exited with code/);
+        expect(data.errMsg.toLowerCase()).not.toContain("cleanup");
+
+        // (c) Exactly one cleanup-related warning on stderr.
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(1);
+
+        // (d) Path persistence per cleanup-safety branch.
+        expect(data.observed.length).toBeGreaterThan(0);
+        expect(data.observedExists).toBe(true);
+        if (variant === "regular-file-replacement") {
+          expect(data.observedIsFile).toBe(true);
+          expect(data.observedContent).toBe("regular-file-replacement");
+          await rm(data.observed, { force: true }).catch(() => {});
+        } else {
+          expect(data.observedIsDir).toBe(true);
+          expect(data.mismatchedMarkerExists).toBe(true);
+          expect(data.renamedAsideExists).toBe(true);
+          await rm(data.observed, {
+            recursive: true,
+            force: true,
+          }).catch(() => {});
+          await rm(data.renamedAside, {
+            recursive: true,
+            force: true,
+          }).catch(() => {});
+        }
+      });
+    }
+
+    // ------------------------------------------------------------------------
     // T-TMP-37 / 37d / 37e: Recursive cleanup of an identity-matched directory
     // unlinks nested symlink entries WITHOUT traversing their targets — SPEC
     // §7.4 cleanup-safety rule 4. Surface-parity matrix across CLI /
