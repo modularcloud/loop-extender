@@ -8279,5 +8279,621 @@ console.log(JSON.stringify({
         .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
       expect(cleanupWarnings.length).toBe(0);
     });
+
+    // ----------------------------------------------------------------------
+    // T-TMP-40 / T-TMP-41 / T-TMP-42: SPEC §7.4 cleanup-failure branches.
+    // SPEC §7.4 final paragraph: "If the top-level `lstat` fails for any
+    // reason other than ENOENT, the `unlink` in case 2 fails, or the
+    // recursive removal in case 4 fails, loopx emits a single stderr
+    // warning and makes no further changes." The three failure branches are
+    // specified normatively; black-box reproduction is unreliable on a
+    // same-user-owned directory, so coverage is via the TEST-SPEC §1.4
+    // `LOOPX_TEST_CLEANUP_FAULT` seam (gated on NODE_ENV=test). T-TMP-40
+    // covers `lstat-fail` (top-level lstat failure path), T-TMP-41 covers
+    // `symlink-unlink-fail` (rule-2 unlink failure), T-TMP-42 covers
+    // `recursive-remove-fail` (rule-4 recursive removal failure). Each is
+    // parameterized over the three execution surfaces (CLI / runPromise /
+    // run) — load-bearing because a buggy implementation that wired one
+    // stream of "warnings do not affect outcome" handling for the CLI exit-
+    // code path and a separate stream for the API rejection path could
+    // pass the CLI variant and fail the API variants. Together with
+    // T-TMP-35 (rule-3 cleanup-safety warning branch) and T-TMP-36 (rule-5
+    // cleanup-safety warning branch), this closes the cleanup-warning
+    // coverage axis on the success terminal across all five SPEC §7.4
+    // dispatch branches. Per-cleanup-attempt warning cardinality is
+    // exactly one per SPEC §7.4 "single stderr warning"; the surfaced
+    // outcome is unaffected per SPEC §7.4 "warnings do not affect the CLI
+    // exit code, the generator outcome, or the promise rejection reason".
+    // Implementation: the LOOPX_TEST_CLEANUP_FAULT seam is at three
+    // failure-injection points in packages/loop-extender/src/tmpdir.ts —
+    // the top of `cleanupTmpdir` for lstat-fail, the rule-2 unlink for
+    // symlink-unlink-fail, and the rule-4 rmSync for recursive-remove-fail.
+    // ----------------------------------------------------------------------
+
+    it("T-TMP-40: CLI lstat-fail seam emits exactly one cleanup warning, exit 0, path remains", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      // Fixture: observe LOOPX_TMPDIR into an external marker (under
+      // project.dir, not under the tmpdir, so the marker survives any
+      // hypothetical cleanup) and emit stop:true. No path manipulation is
+      // needed — the lstat-fail seam fires on the top-level `lstat` before
+      // any dispatch rule is reached.
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+printf '{"stop":true}'
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_CLEANUP_FAULT: "lstat-fail",
+        },
+      });
+
+      // (a) CLI exit 0 — cleanup-failure warning does not affect exit code
+      // per SPEC §7.4 "warnings do not affect the CLI exit code".
+      expect(result.exitCode).toBe(0);
+
+      const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+      expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+
+      // (b) Path observed in the marker still exists on disk — cleanup
+      // aborted at the top-level lstat seam before any file operations,
+      // per SPEC §7.4 "no further changes".
+      expect(existsSync(observedLoopxTmpdir)).toBe(true);
+
+      // (c) Exactly one cleanup-related warning on stderr (SPEC §7.4
+      // "single stderr warning"; structured marker line count is the
+      // implementation-neutral predicate per TEST-SPEC §1.4).
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+    });
+
+    it("T-TMP-40a: runPromise() lstat-fail seam emits exactly one cleanup warning, resolves, path remains", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+let rejected = false;
+let errMsg = "";
+let outputs = [];
+try {
+  outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) {
+  rejected = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+console.log(JSON.stringify({
+  rejected,
+  errMsg,
+  outputsLen: outputs.length,
+  observed,
+  observedExists: existsSync(observed),
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_CLEANUP_FAULT: "lstat-fail",
+        },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+
+      // (a) Promise resolved — cleanup warning does not affect the promise
+      // rejection reason per SPEC §7.4. One Output yielded.
+      expect(data.rejected).toBe(false);
+      expect(data.errMsg).toBe("");
+      expect(data.outputsLen).toBe(1);
+
+      // (b) Path observed still exists — cleanup aborted at the seam.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.observedExists).toBe(true);
+
+      // (c) Exactly one cleanup-related warning on driver-process stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+    });
+
+    it("T-TMP-40b: run() lstat-fail seam emits exactly one cleanup warning, settles cleanly, path remains", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+let thrown = false;
+let errMsg = "";
+let yieldCount = 0;
+try {
+  const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  for await (const _ of gen) { yieldCount++; }
+} catch (e) {
+  thrown = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+console.log(JSON.stringify({
+  thrown,
+  errMsg,
+  yieldCount,
+  observed,
+  observedExists: existsSync(observed),
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_CLEANUP_FAULT: "lstat-fail",
+        },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+
+      // (a) Generator settled cleanly — cleanup warning does not affect the
+      // generator outcome per SPEC §7.4. One yield.
+      expect(data.thrown).toBe(false);
+      expect(data.errMsg).toBe("");
+      expect(data.yieldCount).toBe(1);
+
+      // (b) Path observed still exists — cleanup aborted at the seam.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.observedExists).toBe(true);
+
+      // (c) Exactly one cleanup-related warning on driver-process stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+    });
+
+    it("T-TMP-41: CLI symlink-unlink-fail seam emits exactly one cleanup warning, exit 0, symlink remains", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      // Fixture: observe LOOPX_TMPDIR, replace it with a symlink so the
+      // cleanup dispatch reaches rule 2 (where the seam fires). The
+      // symlink target (`/tmp`) is intentionally outside the tmpdir parent
+      // so a buggy implementation that followed the symlink despite the
+      // SPEC §7.4 "do not follow the target" clause would be detectable
+      // (though here we additionally fault the rule-2 unlink itself).
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+rm -rf "$LOOPX_TMPDIR"
+ln -s /tmp "$LOOPX_TMPDIR"
+printf '{"stop":true}'
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_CLEANUP_FAULT: "symlink-unlink-fail",
+        },
+      });
+
+      // (a) CLI exit 0 per SPEC §7.4 "warnings do not affect the CLI exit
+      // code".
+      expect(result.exitCode).toBe(0);
+
+      const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+      expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+
+      // (b) Symlink at the recorded path still exists — rule-2 unlink was
+      // faulted, so loopx made no further changes per SPEC §7.4.
+      const lst = lstatSync(observedLoopxTmpdir);
+      expect(lst.isSymbolicLink()).toBe(true);
+
+      // (c) Exactly one cleanup-related warning on stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // Harness clean-up: remove the leftover symlink so the test-isolated
+      // tmpdir parent can be torn down without confusion. (`rm` on a
+      // symlink unlinks the symlink entry; it does not follow the target.)
+      await rm(observedLoopxTmpdir, { force: true }).catch(() => {});
+    });
+
+    it("T-TMP-41a: runPromise() symlink-unlink-fail seam emits exactly one cleanup warning, resolves, symlink remains", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+rm -rf "$LOOPX_TMPDIR"
+ln -s /tmp "$LOOPX_TMPDIR"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+let rejected = false;
+let errMsg = "";
+let outputs = [];
+try {
+  outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) {
+  rejected = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+let observedIsSymlink = false;
+try {
+  observedIsSymlink = lstatSync(observed).isSymbolicLink();
+} catch {}
+console.log(JSON.stringify({
+  rejected,
+  errMsg,
+  outputsLen: outputs.length,
+  observed,
+  observedIsSymlink,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_CLEANUP_FAULT: "symlink-unlink-fail",
+        },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+
+      // (a) Promise resolved — cleanup warning does not affect the promise
+      // rejection reason per SPEC §7.4. One Output yielded.
+      expect(data.rejected).toBe(false);
+      expect(data.errMsg).toBe("");
+      expect(data.outputsLen).toBe(1);
+
+      // (b) Symlink at the recorded path still exists.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.observedIsSymlink).toBe(true);
+
+      // (c) Exactly one cleanup-related warning on driver-process stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // Harness clean-up: remove the leftover symlink.
+      const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+      await rm(observedLoopxTmpdir, { force: true }).catch(() => {});
+    });
+
+    it("T-TMP-41b: run() symlink-unlink-fail seam emits exactly one cleanup warning, settles cleanly, symlink remains", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+rm -rf "$LOOPX_TMPDIR"
+ln -s /tmp "$LOOPX_TMPDIR"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+let thrown = false;
+let errMsg = "";
+let yieldCount = 0;
+try {
+  const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  for await (const _ of gen) { yieldCount++; }
+} catch (e) {
+  thrown = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+let observedIsSymlink = false;
+try {
+  observedIsSymlink = lstatSync(observed).isSymbolicLink();
+} catch {}
+console.log(JSON.stringify({
+  thrown,
+  errMsg,
+  yieldCount,
+  observed,
+  observedIsSymlink,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_CLEANUP_FAULT: "symlink-unlink-fail",
+        },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+
+      // (a) Generator settled cleanly — cleanup warning does not affect
+      // the generator outcome per SPEC §7.4. One yield.
+      expect(data.thrown).toBe(false);
+      expect(data.errMsg).toBe("");
+      expect(data.yieldCount).toBe(1);
+
+      // (b) Symlink at the recorded path still exists.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.observedIsSymlink).toBe(true);
+
+      // (c) Exactly one cleanup-related warning on driver-process stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // Harness clean-up: remove the leftover symlink.
+      const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+      await rm(observedLoopxTmpdir, { force: true }).catch(() => {});
+    });
+
+    it("T-TMP-42: CLI recursive-remove-fail seam emits exactly one cleanup warning, exit 0, path remains", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      // Fixture: observe LOOPX_TMPDIR, write a few files inside (so the
+      // path is a non-empty identity-matched directory) and emit stop:true.
+      // The seam fires when the dispatch reaches rule 4 (identity-matched
+      // directory recursive removal). The contents are not load-bearing —
+      // the seam fires before `rmSync` is invoked — but populating the
+      // directory matches the TEST-SPEC pattern and pins that recursive
+      // removal would normally have visited the inner files.
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+echo content > "$LOOPX_TMPDIR/file-1"
+mkdir "$LOOPX_TMPDIR/sub"
+echo more > "$LOOPX_TMPDIR/sub/file-2"
+printf '{"stop":true}'
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_CLEANUP_FAULT: "recursive-remove-fail",
+        },
+      });
+
+      // (a) CLI exit 0 per SPEC §7.4 "warnings do not affect the CLI exit
+      // code".
+      expect(result.exitCode).toBe(0);
+
+      const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+      expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+
+      // (b) Path observed in the marker still exists — cleanup made no
+      // further changes after the simulated rule-4 failure per SPEC §7.4.
+      // (The partial walk's effect on inner files is implementation-
+      // defined, but the path itself remains visible at the recorded
+      // location.)
+      expect(existsSync(observedLoopxTmpdir)).toBe(true);
+
+      // (c) Exactly one cleanup-related warning on stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+    });
+
+    it("T-TMP-42d: runPromise() recursive-remove-fail seam emits exactly one cleanup warning, resolves, path remains", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+echo content > "$LOOPX_TMPDIR/file-1"
+mkdir "$LOOPX_TMPDIR/sub"
+echo more > "$LOOPX_TMPDIR/sub/file-2"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+let rejected = false;
+let errMsg = "";
+let outputs = [];
+try {
+  outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) {
+  rejected = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+console.log(JSON.stringify({
+  rejected,
+  errMsg,
+  outputsLen: outputs.length,
+  observed,
+  observedExists: existsSync(observed),
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_CLEANUP_FAULT: "recursive-remove-fail",
+        },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+
+      // (a) Promise resolved — cleanup warning does not affect the promise
+      // rejection reason per SPEC §7.4. One Output yielded.
+      expect(data.rejected).toBe(false);
+      expect(data.errMsg).toBe("");
+      expect(data.outputsLen).toBe(1);
+
+      // (b) Path observed still exists.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.observedExists).toBe(true);
+
+      // (c) Exactly one cleanup-related warning on driver-process stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+    });
+
+    it("T-TMP-42e: run() recursive-remove-fail seam emits exactly one cleanup warning, settles cleanly, path remains", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+echo content > "$LOOPX_TMPDIR/file-1"
+mkdir "$LOOPX_TMPDIR/sub"
+echo more > "$LOOPX_TMPDIR/sub/file-2"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+let thrown = false;
+let errMsg = "";
+let yieldCount = 0;
+try {
+  const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  for await (const _ of gen) { yieldCount++; }
+} catch (e) {
+  thrown = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+console.log(JSON.stringify({
+  thrown,
+  errMsg,
+  yieldCount,
+  observed,
+  observedExists: existsSync(observed),
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_CLEANUP_FAULT: "recursive-remove-fail",
+        },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+
+      // (a) Generator settled cleanly — cleanup warning does not affect
+      // the generator outcome per SPEC §7.4. One yield.
+      expect(data.thrown).toBe(false);
+      expect(data.errMsg).toBe("");
+      expect(data.yieldCount).toBe(1);
+
+      // (b) Path observed still exists.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.observedExists).toBe(true);
+
+      // (c) Exactly one cleanup-related warning on driver-process stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+    });
   });
 });
