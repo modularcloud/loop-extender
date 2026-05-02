@@ -13,7 +13,7 @@ RALPH_OUTPUT=$(cat)
 
 REVIEW_PROMPT=$(printf 'The following is the stdout of one iteration of an agent development loop. Judge whether the output itself states or clearly indicates that the work is production ready / complete / done. Only answer READY if the output affirmatively claims production readiness. Reply with exactly one word: READY or NOT_READY.\n\n--- begin output ---\n%s\n--- end output ---' "$RALPH_OUTPUT")
 
-VERDICT=$(echo "$REVIEW_PROMPT" | claude -p --dangerously-skip-permissions 2>/dev/null)
+VERDICT=$(echo "$REVIEW_PROMPT" | claude --effort max -p --dangerously-skip-permissions 2>/dev/null)
 
 echo "=== Readiness verdict: ${VERDICT} ===" >&2
 

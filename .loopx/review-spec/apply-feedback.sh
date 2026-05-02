@@ -21,7 +21,7 @@ $FEEDBACK"
 SESSION_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
 echo "$SESSION_ID" > "$SESSION_FILE"
 
-CLAUDE_OUTPUT=$(echo "$PROMPT" | claude --dangerously-skip-permissions --session-id "$SESSION_ID" -p 2>/dev/null)
+CLAUDE_OUTPUT=$(echo "$PROMPT" | claude --effort max --dangerously-skip-permissions --session-id "$SESSION_ID" -p 2>/dev/null)
 
 rm -f "$FEEDBACK_FILE"
 echo "$CLAUDE_OUTPUT" > "$CLAUDE_OUTPUT_FILE"

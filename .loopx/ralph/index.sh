@@ -30,6 +30,6 @@ curl -s -X POST "${TELEGRAM_API}/sendMessage" \
 
 echo "=== Ralph iteration ${ITER} ===" >&2
 
-RALPH_OUTPUT=$(cat "$PROMPT_FILE" | claude -p --dangerously-skip-permissions 2>/dev/null)
+RALPH_OUTPUT=$(cat "$PROMPT_FILE" | claude --effort max -p --dangerously-skip-permissions 2>/dev/null)
 
 $LOOPX_BIN output --result "$RALPH_OUTPUT" --goto "check-ready"
