@@ -18,6 +18,25 @@ export interface LoopStartingTarget {
   script: ScriptFile; // resolved starting script (e.g., index or explicit)
 }
 
+/**
+ * SPEC §7.2 first-observed-trigger tracking. When loopx observes a terminal
+ * trigger (abort propagated from user signal, an iteration-level error such
+ * as non-zero script exit / invalid goto, or a consumer cancellation via
+ * `.return()` / `.throw()`), the FIRST observation pins this slot. Later
+ * observations do not displace the first. The `run()` wrapper at run.ts
+ * uses this to surface the right terminal outcome under racing triggers
+ * (e.g., abort-listener seam where the script's exit is observed AFTER
+ * loopx has already recorded abort as first-observed).
+ */
+export type FirstObservedTrigger =
+  | "abort"
+  | "iteration"
+  | "consumer"
+  | null;
+export interface FirstObservedRef {
+  trigger: FirstObservedTrigger;
+}
+
 export interface LoopOptions {
   maxIterations?: number;
   env: Record<string, string>;
@@ -33,6 +52,14 @@ export interface LoopOptions {
    * `os.tmpdir()` lazily here.
    */
   tmpdirParent?: string;
+  /**
+   * SPEC §7.2 first-observed-wins. Optional shared slot the wrapper reads
+   * to determine the surfaced terminal outcome under racing triggers. When
+   * provided, runLoop pins `trigger = "iteration"` (only if currently null)
+   * before throwing an iteration-level error so a racing abort observed
+   * later cannot reclassify the outcome as abort.
+   */
+  firstObservedRef?: FirstObservedRef;
 }
 
 export async function* runLoop(
@@ -48,7 +75,14 @@ export async function* runLoop(
     runningVersion,
     signal,
     tmpdirParent,
+    firstObservedRef,
   } = options;
+
+  const pinIterationFirstObserved = (): void => {
+    if (firstObservedRef && firstObservedRef.trigger === null) {
+      firstObservedRef.trigger = "iteration";
+    }
+  };
 
   // SPEC §7.1 step 4: -n 0 / maxIterations: 0 — exit before version check
   // and tmpdir creation.
@@ -130,6 +164,7 @@ export async function* runLoop(
       }
 
       if (result.exitCode !== 0) {
+        pinIterationFirstObserved();
         throw new Error(
           `Script '${currentWorkflow.name}:${currentScript.name}' exited with code ${result.exitCode}`
         );
@@ -162,6 +197,7 @@ export async function* runLoop(
       if (output.goto !== undefined) {
         const goto = parseGoto(output.goto);
         if (!goto.ok) {
+          pinIterationFirstObserved();
           throw new Error(goto.error);
         }
 
@@ -173,6 +209,7 @@ export async function* runLoop(
           nextWorkflow = currentWorkflow;
           nextScript = currentWorkflow.scripts.get(goto.script);
           if (!nextScript) {
+            pinIterationFirstObserved();
             throw new Error(
               `Invalid goto target: script '${goto.script}' not found in workflow '${currentWorkflow.name}'`
             );
@@ -180,6 +217,7 @@ export async function* runLoop(
         } else {
           const targetWf = workflows.get(goto.workflow);
           if (!targetWf) {
+            pinIterationFirstObserved();
             throw new Error(
               `Invalid goto target: workflow '${goto.workflow}' not found in .loopx/`
             );
@@ -187,6 +225,7 @@ export async function* runLoop(
           nextWorkflow = targetWf;
           nextScript = targetWf.scripts.get(goto.script);
           if (!nextScript) {
+            pinIterationFirstObserved();
             throw new Error(
               `Invalid goto target: script '${goto.script}' not found in workflow '${targetWf.name}'`
             );

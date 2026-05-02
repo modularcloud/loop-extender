@@ -11075,6 +11075,305 @@ console.log(JSON.stringify({ errName, errMessage }));
     }, { timeout: 60_000, retry: 2 });
 
     // ------------------------------------------------------------------------
+    // T-TMP-38b2 / T-TMP-38b2-run: SPEC §7.2 first-observed-wins inverted-order
+    // parity for T-TMP-38b / T-TMP-38b-run (which covered iteration-error first
+    // × abort second). Here abort is observed FIRST and a racing non-zero
+    // script exit arrives during the bounded TEST-SPEC §1.4 `abort-listener`
+    // pause — i.e., the user-signal listener has already pinned abort as
+    // first-observed AND the seam has paused the internalAc.abort() dispatch,
+    // keeping the active child alive (qualified form (a): mid-loop). The
+    // harness sends SIGUSR1 to the still-alive script's process group; the
+    // fixture's `trap 'exit 1' USR1` causes the child to exit non-zero, which
+    // runLoop observes as a script-failure. Per SPEC §7.2 first-observed-wins,
+    // the abort error must be the surfaced terminal outcome — the racing
+    // iteration-error must NOT displace it. Per SPEC §7.4 idempotence + at-
+    // most-one-warning, the racing iteration-error must NOT initiate a second
+    // cleanup attempt and must NOT emit a second warning.
+    //
+    // T-TMP-38b2 covers the runPromise() programmatic surface. T-TMP-38b2-run
+    // covers the run() generator surface (a buggy implementation that wired
+    // the abort-listener seam correctly on runPromise rejection but routed
+    // run() settlement through a different first-observed dispatcher would
+    // pass T-TMP-38b2 and fail T-TMP-38b2-run).
+    //
+    // The seam used here (`abort-listener`) differs from T-TMP-38b's seam
+    // (`cleanup-start`) because by `cleanup-start` time the child has already
+    // exited (per SPEC §9.1's terminate-child → wait-for-exit → cleanup →
+    // surface ordering), so a `cleanup-start` pause cannot stage the
+    // racing-non-zero-exit-against-abort-during-active-child scenario. The
+    // `abort-listener` seam fires AFTER abort is recorded as first-observed
+    // but BEFORE loopx terminates the active child, so the harness can race
+    // a child-driven non-zero exit into the still-alive process group.
+    // ------------------------------------------------------------------------
+    function buildAbortListenerRule3SignalTrapFixture(): string {
+      return `#!/bin/bash
+set -e
+rm -rf "$LOOPX_TMPDIR"
+printf '%s' "regular-file-replacement" > "$LOOPX_TMPDIR"
+printf '%s' "$$" > "$PID_MARKER_PATH"
+trap 'exit 1' USR1
+touch "$FIXTURE_READY_PATH"
+sleep 30 &
+wait
+`;
+    }
+
+    it("T-TMP-38b2: SPEC §7.2 first-observed-wins under racing abort → non-zero-exit during abort-listener (runPromise() rule-3)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const fixtureReady = join(project.dir, "fixture-ready.flag");
+      const pauseMarker = join(project.dir, "pause-marker.json");
+      const pidMarker = join(project.dir, "pid.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildAbortListenerRule3SignalTrapFixture(),
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+
+const fixtureReady = ${JSON.stringify(fixtureReady)};
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+const pidMarker = ${JSON.stringify(pidMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const ac = new AbortController();
+
+let errName = "";
+let errMessage = "";
+
+const promise = runPromise("ralph", { signal: ac.signal, maxIterations: 1 });
+
+const fxReady = await waitForFile(fixtureReady, 15_000);
+if (!fxReady) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "fixture-ready never appeared" }));
+  process.exit(1);
+}
+
+// Abort observed FIRST. The user-signal listener pins firstObservedRef
+// to "abort" and (because LOOPX_TEST_TERMINAL_TRIGGER_PAUSE=abort-listener)
+// schedules the bounded §1.4 pause before dispatching internalAc.abort().
+// During the pause the child is still alive — execution.ts's onAbort has
+// not fired — so SIGUSR1 sent to its process group will reach the script.
+ac.abort();
+
+const pauseSeen = await waitForFile(pauseMarker, 10_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared" }));
+  process.exit(1);
+}
+
+const pidStr = readFileSync(pidMarker, "utf-8").trim();
+const pid = parseInt(pidStr, 10);
+if (Number.isNaN(pid) || pid <= 0) {
+  console.log(JSON.stringify({ errName: "RangeError", errMessage: "invalid pid in marker: " + pidStr }));
+  process.exit(1);
+}
+
+// Racing non-zero exit. SIGUSR1 → bash trap → exit 1 → runLoop observes
+// the iteration-level error during the still-paused abort dispatch. Per
+// SPEC §7.2, the abort error must remain the surfaced terminal outcome
+// (firstObservedRef.trigger === "abort" already pinned).
+try {
+  process.kill(-pid, "SIGUSR1");
+} catch {
+  // ESRCH is acceptable — script may have already exited.
+}
+
+try {
+  await promise;
+} catch (e) {
+  const ex = e as { name?: string; message?: string };
+  errName = ex?.name ?? "";
+  errMessage = ex?.message ?? String(e);
+}
+
+console.log(JSON.stringify({ errName, errMessage }));
+`;
+
+      const result = await runAPIDriver(runtime, driverCode, {
+        cwd: project.dir,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "abort-listener",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          FIXTURE_READY_PATH: fixtureReady,
+          PID_MARKER_PATH: pidMarker,
+        },
+        timeout: 60_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const envelope = JSON.parse(result.stdout.trim());
+
+      // (a) Promise rejects with the abort error (first-observed wins; the
+      // racing non-zero exit during the abort-listener pause does NOT
+      // displace it). Load-bearing: a buggy wrapper.next() catch that
+      // surfaced the iteration error directly (without consulting
+      // firstObservedRef) would show /exited with code/ here.
+      expect(envelope.errName).toBe("AbortError");
+      expect(envelope.errMessage).not.toMatch(/exited with code/);
+
+      // (b) Exactly one cleanup-related warning across the racing triggers
+      // (SPEC §7.4 idempotence / at-most-one-warning). A buggy implementation
+      // that started a second cleanup attempt on the racing iteration error
+      // would emit a second warning here.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // (c) Path persistence — rule-3 leave-with-warning preserved. The
+      // single cleanup attempt completed and left the regular-file
+      // replacement in place; no second attempt mutated it.
+      const remaining = listLoopxEntries(tmpdirParent);
+      expect(remaining.length).toBe(1);
+      const tmpdirPath = join(tmpdirParent, remaining[0]);
+      expect(existsSync(tmpdirPath)).toBe(true);
+      const st = statSync(tmpdirPath);
+      expect(st.isFile()).toBe(true);
+      expect(readFileSync(tmpdirPath, "utf-8")).toBe(
+        "regular-file-replacement",
+      );
+
+      await rm(tmpdirPath, { force: true }).catch(() => {});
+    }, { timeout: 60_000, retry: 2 });
+
+    it("T-TMP-38b2-run: SPEC §7.2 first-observed-wins under racing abort → non-zero-exit during abort-listener (run() rule-3)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const fixtureReady = join(project.dir, "fixture-ready.flag");
+      const pauseMarker = join(project.dir, "pause-marker.json");
+      const pidMarker = join(project.dir, "pid.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildAbortListenerRule3SignalTrapFixture(),
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+
+const fixtureReady = ${JSON.stringify(fixtureReady)};
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+const pidMarker = ${JSON.stringify(pidMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const ac = new AbortController();
+const gen = run("ralph", { signal: ac.signal, maxIterations: 1 });
+
+let errName = "";
+let errMessage = "";
+
+const iterPromise = (async () => {
+  try {
+    for await (const _ of gen) { /* drain */ }
+  } catch (e) {
+    const ex = e as { name?: string; message?: string };
+    errName = ex?.name ?? "";
+    errMessage = ex?.message ?? String(e);
+  }
+})();
+
+const fxReady = await waitForFile(fixtureReady, 15_000);
+if (!fxReady) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "fixture-ready never appeared" }));
+  process.exit(1);
+}
+
+ac.abort();
+
+const pauseSeen = await waitForFile(pauseMarker, 10_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared" }));
+  process.exit(1);
+}
+
+const pidStr = readFileSync(pidMarker, "utf-8").trim();
+const pid = parseInt(pidStr, 10);
+if (Number.isNaN(pid) || pid <= 0) {
+  console.log(JSON.stringify({ errName: "RangeError", errMessage: "invalid pid in marker: " + pidStr }));
+  process.exit(1);
+}
+
+try {
+  process.kill(-pid, "SIGUSR1");
+} catch {
+  // ESRCH is acceptable.
+}
+
+await iterPromise;
+
+console.log(JSON.stringify({ errName, errMessage }));
+`;
+
+      const result = await runAPIDriver(runtime, driverCode, {
+        cwd: project.dir,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "abort-listener",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          FIXTURE_READY_PATH: fixtureReady,
+          PID_MARKER_PATH: pidMarker,
+        },
+        timeout: 60_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const envelope = JSON.parse(result.stdout.trim());
+
+      // (a) For-await loop threw the abort error (first-observed wins; the
+      // racing non-zero exit during the abort-listener pause does NOT
+      // displace it).
+      expect(envelope.errName).toBe("AbortError");
+      expect(envelope.errMessage).not.toMatch(/exited with code/);
+
+      // (b) Exactly one cleanup-related warning across the racing triggers.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // (c) Path persistence — rule-3 leave-with-warning preserved.
+      const remaining = listLoopxEntries(tmpdirParent);
+      expect(remaining.length).toBe(1);
+      const tmpdirPath = join(tmpdirParent, remaining[0]);
+      expect(existsSync(tmpdirPath)).toBe(true);
+      const st = statSync(tmpdirPath);
+      expect(st.isFile()).toBe(true);
+      expect(readFileSync(tmpdirPath, "utf-8")).toBe(
+        "regular-file-replacement",
+      );
+
+      await rm(tmpdirPath, { force: true }).catch(() => {});
+    }, { timeout: 60_000, retry: 2 });
+
+    // ------------------------------------------------------------------------
     // T-TMP-38c: SPEC §7.2 first-observed-wins applied to the abort-vs-
     // consumer-cancellation race on the run() programmatic surface for the
     // .throw() axis. Companion to T-TMP-38a (the .return() axis): both pin

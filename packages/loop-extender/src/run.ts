@@ -4,7 +4,11 @@ import { tmpdir as osTmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import type { Output, RunOptions } from "./types.js";
 import { discoverScripts } from "./discovery.js";
-import { runLoop, type LoopStartingTarget } from "./loop.js";
+import {
+  runLoop,
+  type LoopStartingTarget,
+  type FirstObservedRef,
+} from "./loop.js";
 import {
   getGlobalEnvPath,
   loadGlobalEnv,
@@ -275,10 +279,58 @@ function runWithInternal(
 
   const internalAc = new AbortController();
 
+  // SPEC §7.2 first-observed-trigger tracking — shared between this wrapper
+  // and `runLoop`. The abort listener pins `"abort"`; runLoop pins
+  // `"iteration"` before throwing iteration-level errors; the wrapper's
+  // consumer cancellation pins `"consumer"` when it acts as the first
+  // observed trigger. Each pin is only applied when currently null, so
+  // racing later observations do not displace the first.
+  const firstObservedRef: FirstObservedRef = { trigger: null };
+
+  // SPEC §7.2 abort propagation. Without the test seam, the listener fires
+  // synchronously and propagates the user signal into `internalAc` (which in
+  // turn fans out to `loop.ts` and `execution.ts`). With the
+  // TEST-SPEC §1.4 `abort-listener` seam active, the listener still records
+  // abort as first-observed AT ENTRY, but defers the `internalAc.abort()`
+  // dispatch onto a microtask and intentionally pauses for the bounded
+  // §1.4 interval first. This keeps the active child alive during the pause
+  // (qualified form (a): mid-loop / active-child) so a parent harness can
+  // race a second terminal trigger (e.g. SIGUSR1 → script `exit 1`) before
+  // loopx kills the child or rejects the abort promise.
+  const dispatchInternalAbort = (): void => {
+    try {
+      internalAc.abort(snap.signal?.reason);
+    } catch {
+      /* ignore */
+    }
+  };
+  const onUserSignalAbort = (): void => {
+    if (firstObservedRef.trigger === null) {
+      firstObservedRef.trigger = "abort";
+    }
+    const seamActive =
+      process.env.NODE_ENV === "test" &&
+      process.env.LOOPX_TEST_TERMINAL_TRIGGER_PAUSE === "abort-listener";
+    if (seamActive) {
+      void (async () => {
+        await maybePauseAtTerminalTriggerWindow("abort-listener");
+        dispatchInternalAbort();
+      })();
+    } else {
+      dispatchInternalAbort();
+    }
+  };
+
   // Wire user signal → internal abort propagation. SPEC §9.5: addEventListener
   // must return without throwing; if it throws, capture as a snapshot error.
   if (snap.error === undefined && snap.signal) {
     if (snap.signal.aborted) {
+      // Already aborted at call-time — record first-observed and propagate
+      // synchronously (no `abort-listener` seam pause: the seam fires from
+      // the listener path, not the eager-aborted path).
+      if (firstObservedRef.trigger === null) {
+        firstObservedRef.trigger = "abort";
+      }
       try {
         internalAc.abort(snap.signal.reason);
       } catch {
@@ -286,17 +338,9 @@ function runWithInternal(
       }
     } else {
       try {
-        snap.signal.addEventListener(
-          "abort",
-          () => {
-            try {
-              internalAc.abort(snap.signal!.reason);
-            } catch {
-              /* ignore */
-            }
-          },
-          { once: true }
-        );
+        snap.signal.addEventListener("abort", onUserSignalAbort, {
+          once: true,
+        });
       } catch (e) {
         snap.error = e;
       }
@@ -312,7 +356,8 @@ function runWithInternal(
     loopxBin,
     internal?.tmpdirParent,
     internal?.inheritedEnv,
-    internal?.globalEnvPath
+    internal?.globalEnvPath,
+    firstObservedRef
   );
 
   let returnCalled = false;
@@ -344,8 +389,16 @@ function runWithInternal(
       // the final Output but before settlement surfaces the abort error on
       // the next interaction. The first-observed-wins guard (!returnCalled)
       // ensures a prior consumer .return()/.throw() retains its silent
-      // completion outcome.
-      if (postFinalYield && internalAc.signal.aborted && !returnCalled) {
+      // completion outcome. We key on `firstObservedRef.trigger === "abort"`
+      // (set by the user-signal listener BEFORE the abort-listener seam
+      // pause) rather than `internalAc.signal.aborted` (which the seam
+      // delays) so the post-final-yield abort branch fires regardless of
+      // whether the seam is active.
+      if (
+        postFinalYield &&
+        firstObservedRef.trigger === "abort" &&
+        !returnCalled
+      ) {
         settled = true;
         await surfacePostFinalYieldAbort();
       }
@@ -368,6 +421,18 @@ function runWithInternal(
         if (returnCalled) {
           return { done: true, value: undefined } as IteratorResult<Output>;
         }
+        // SPEC §7.2 first-observed-wins. When abort was the first trigger
+        // observed by loopx (via the user-signal listener) but a racing
+        // iteration-level error reached the wrapper first (e.g. the
+        // abort-listener seam paused the abort dispatch while a SIGUSR1 →
+        // `exit 1` race played out — T-TMP-38b2 / T-TMP-38b2-run), the
+        // surfaced terminal outcome must be the abort error, not the
+        // iteration error. Conversely, when iteration-error or consumer
+        // cancellation pinned the slot first, we surface the original `err`
+        // unchanged (T-TMP-38b / T-TMP-38b-run).
+        if (firstObservedRef.trigger === "abort") {
+          throw makeAbortError(snap.signal ?? internalAc.signal);
+        }
         throw err;
       }
     },
@@ -378,8 +443,15 @@ function runWithInternal(
       }
       // SPEC §9.3 abort-after-final-yield: abort observed before this
       // .return() displaces silent completion; abort error surfaces (with
-      // cleanup first).
-      if (postFinalYield && internalAc.signal.aborted && !returnCalled) {
+      // cleanup first). We key on `firstObservedRef.trigger === "abort"`
+      // rather than `internalAc.signal.aborted` so the branch fires
+      // correctly even when the abort-listener seam is delaying the
+      // internalAc.abort() dispatch.
+      if (
+        postFinalYield &&
+        firstObservedRef.trigger === "abort" &&
+        !returnCalled
+      ) {
         settled = true;
         returnCalled = true;
         await surfacePostFinalYieldAbort();
@@ -391,8 +463,16 @@ function runWithInternal(
       // consumer-cancellation contract. The inner gen.return() is still
       // driven so the runLoop `finally` (cleanupTmpdir) runs once and the
       // inner gen settles.
-      const abortObservedFirst = internalAc.signal.aborted;
+      const abortObservedFirst = firstObservedRef.trigger === "abort";
       if (!abortObservedFirst) {
+        // SPEC §7.2: pin .return() as first-observed when no other trigger
+        // has done so yet. A subsequent abort-listener firing will then see
+        // the slot occupied and not displace the consumer-cancellation
+        // outcome (preserves the abort-second / consumer-first half of the
+        // T-TMP-38a2 contract).
+        if (firstObservedRef.trigger === null) {
+          firstObservedRef.trigger = "consumer";
+        }
         returnCalled = true;
         // TEST-SPEC §1.4 `consumer-return-observed` seam — fires only when
         // .return() is the first-observed terminal trigger (i.e., abort had
@@ -435,7 +515,11 @@ function runWithInternal(
         returnCalled = true;
         return { done: true, value: undefined } as IteratorResult<Output>;
       }
-      if (postFinalYield && internalAc.signal.aborted && !returnCalled) {
+      if (
+        postFinalYield &&
+        firstObservedRef.trigger === "abort" &&
+        !returnCalled
+      ) {
         settled = true;
         returnCalled = true;
         await surfacePostFinalYieldAbort();
@@ -447,8 +531,14 @@ function runWithInternal(
       // `_err` is intentionally not surfaced (consumer-cancellation contract);
       // when abort is first-observed, the abort error displaces both the
       // consumer error AND silent completion.
-      const abortObservedFirst = internalAc.signal.aborted;
+      const abortObservedFirst = firstObservedRef.trigger === "abort";
       if (!abortObservedFirst) {
+        // Pin .throw() as first-observed when nothing else has claimed the
+        // slot, so a subsequent abort-listener firing does not retroactively
+        // displace the silent-completion outcome (mirror of .return()).
+        if (firstObservedRef.trigger === null) {
+          firstObservedRef.trigger = "consumer";
+        }
         returnCalled = true;
         // TEST-SPEC §1.4 `consumer-throw-observed` seam — fires only when
         // .throw() is the first-observed terminal trigger (i.e., abort had
@@ -480,8 +570,11 @@ function runWithInternal(
       }
       // SPEC §7.2 first-observed-wins (mirror of .return()): if an abort was
       // observed before dispose ran, abort wins; do not pin `returnCalled`.
-      const abortObservedFirst = internalAc.signal.aborted;
+      const abortObservedFirst = firstObservedRef.trigger === "abort";
       if (!abortObservedFirst) {
+        if (firstObservedRef.trigger === null) {
+          firstObservedRef.trigger = "consumer";
+        }
         returnCalled = true;
       }
       internalAc.abort();
@@ -504,7 +597,8 @@ async function* runInternal(
   loopxBin: string,
   tmpdirParent: string | undefined,
   inheritedEnv: Record<string, string> | undefined,
-  globalEnvPath: string | undefined
+  globalEnvPath: string | undefined,
+  firstObservedRef: FirstObservedRef
 ): AsyncGenerator<Output> {
   // SPEC §9.3 abort precedence: if a usable signal was captured and is
   // aborted (or aborts later), it displaces all other pre-iteration failures.
@@ -627,6 +721,7 @@ async function* runInternal(
     runningVersion: getRunningVersion(),
     signal,
     tmpdirParent,
+    firstObservedRef,
   });
 }
 
