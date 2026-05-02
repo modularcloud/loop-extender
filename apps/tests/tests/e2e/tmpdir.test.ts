@@ -6966,5 +6966,240 @@ printf '{"stop":true}'
         .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
       expect(cleanupWarnings.length).toBe(0);
     });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-34 / 34a / 34b: Symlink-replacement cleanup follows SPEC §7.4
+    // cleanup-safety rule 2 — unlink the symlink entry, do NOT follow the
+    // target. Surface-parity matrix across CLI / runPromise() / run().
+    //
+    // SPEC §7.4 dispatch case 2: "Path is a symlink: unlink the symlink
+    // entry; do not follow the target." Successful rule-2 cleanup emits NO
+    // cleanup warning (warnings are only emitted on failure or rule-3 / 5
+    // — see T-TMP-35 / 36 for the warning-emitting branches and T-TMP-33
+    // for rule-1 ENOENT silence).
+    //
+    // The fixture (shared across all three surfaces): observe LOOPX_TMPDIR,
+    // create an external `target-survives/` directory under PROJECT_ROOT
+    // with a `target-marker` file, replace LOOPX_TMPDIR with a symlink
+    // pointing at that external directory, then emit `{"stop":true}`.
+    //
+    // Post-conditions per surface: (a) success outcome surfaces (CLI exit 0
+    // / promise resolves / generator settles cleanly), (b) the LOOPX_TMPDIR
+    // path no longer exists (loopx unlinked the symlink entry), (c) the
+    // external `target-survives/target-marker` still exists with content
+    // intact (loopx did NOT follow the symlink target — collateral-deletion
+    // safety), (d) zero LOOPX_TEST_CLEANUP_WARNING\t… lines on stderr
+    // (rule-2 success branch is silent).
+    // ------------------------------------------------------------------------
+
+    /**
+     * Build the shared bash fixture body for T-TMP-34/34a/34b. The script
+     * writes the observed LOOPX_TMPDIR path to `tmpdirObservation`, sets up
+     * the external target directory with marker, replaces LOOPX_TMPDIR with
+     * a symlink to that target, then emits stop:true.
+     */
+    function buildSymlinkReplacementFixture(args: {
+      tmpdirObservation: string;
+    }): string {
+      return `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${args.tmpdirObservation}"
+mkdir -p "$LOOPX_PROJECT_ROOT/target-survives"
+printf 'preserved' > "$LOOPX_PROJECT_ROOT/target-survives/target-marker"
+rm -rf "$LOOPX_TMPDIR"
+ln -s "$LOOPX_PROJECT_ROOT/target-survives" "$LOOPX_TMPDIR"
+printf '{"stop":true}'
+`;
+    }
+
+    it("T-TMP-34: CLI symlink-replacement cleanup unlinks symlink, leaves target intact, no warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildSymlinkReplacementFixture({ tmpdirObservation }),
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent },
+      });
+
+      // (a) CLI success outcome surfaces.
+      expect(result.exitCode).toBe(0);
+
+      const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+      expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+
+      // (b) The LOOPX_TMPDIR path no longer exists — loopx unlinked the
+      // symlink entry under cleanup-safety rule 2.
+      expect(existsSync(observedLoopxTmpdir)).toBe(false);
+
+      // (c) The external target directory still exists with marker intact —
+      // loopx did NOT follow the symlink target (collateral-deletion
+      // safety per SPEC §7.4 rule 2 "do not follow the target").
+      const externalTargetDir = join(project.dir, "target-survives");
+      expect(existsSync(externalTargetDir)).toBe(true);
+      const externalMarker = join(externalTargetDir, "target-marker");
+      expect(existsSync(externalMarker)).toBe(true);
+      expect(readFileSync(externalMarker, "utf-8")).toBe("preserved");
+
+      // (d) Zero cleanup warnings on stderr — rule-2 success branch is
+      // silent (warnings only emitted on cleanup failure or rule 3 / 5).
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(0);
+    });
+
+    it("T-TMP-34a: runPromise() symlink-replacement cleanup unlinks symlink, leaves target intact, no warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildSymlinkReplacementFixture({ tmpdirObservation }),
+      );
+
+      const externalTargetDir = join(project.dir, "target-survives");
+      const externalMarker = join(externalTargetDir, "target-marker");
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+const externalTargetDir = ${JSON.stringify(externalTargetDir)};
+const externalMarker = ${JSON.stringify(externalMarker)};
+let rejected = false;
+let errMsg = "";
+let outputs = [];
+try {
+  outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) {
+  rejected = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+const targetDirExists = existsSync(externalTargetDir);
+const markerExists = existsSync(externalMarker);
+const markerContent = markerExists ? readFileSync(externalMarker, "utf-8") : "";
+console.log(JSON.stringify({
+  rejected,
+  errMsg,
+  outputsLen: outputs.length,
+  observed,
+  observedExists: existsSync(observed),
+  targetDirExists,
+  markerExists,
+  markerContent,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+
+      // (a) Promise resolved (no rejection). One Output yielded.
+      expect(data.rejected).toBe(false);
+      expect(data.errMsg).toBe("");
+      expect(data.outputsLen).toBe(1);
+
+      // (b) LOOPX_TMPDIR symlink entry was unlinked.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.observedExists).toBe(false);
+
+      // (c) External target directory and marker survive intact.
+      expect(data.targetDirExists).toBe(true);
+      expect(data.markerExists).toBe(true);
+      expect(data.markerContent).toBe("preserved");
+
+      // (d) Zero cleanup warnings on driver-process stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(0);
+    });
+
+    it("T-TMP-34b: run() symlink-replacement cleanup unlinks symlink, leaves target intact, no warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildSymlinkReplacementFixture({ tmpdirObservation }),
+      );
+
+      const externalTargetDir = join(project.dir, "target-survives");
+      const externalMarker = join(externalTargetDir, "target-marker");
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+const externalTargetDir = ${JSON.stringify(externalTargetDir)};
+const externalMarker = ${JSON.stringify(externalMarker)};
+let thrown = false;
+let errMsg = "";
+let yieldCount = 0;
+try {
+  const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  for await (const _ of gen) { yieldCount++; }
+} catch (e) {
+  thrown = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+const targetDirExists = existsSync(externalTargetDir);
+const markerExists = existsSync(externalMarker);
+const markerContent = markerExists ? readFileSync(externalMarker, "utf-8") : "";
+console.log(JSON.stringify({
+  thrown,
+  errMsg,
+  yieldCount,
+  observed,
+  observedExists: existsSync(observed),
+  targetDirExists,
+  markerExists,
+  markerContent,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+
+      // (a) Generator settled cleanly (no throw). One yield.
+      expect(data.thrown).toBe(false);
+      expect(data.errMsg).toBe("");
+      expect(data.yieldCount).toBe(1);
+
+      // (b) LOOPX_TMPDIR symlink entry was unlinked.
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.observedExists).toBe(false);
+
+      // (c) External target directory and marker survive intact.
+      expect(data.targetDirExists).toBe(true);
+      expect(data.markerExists).toBe(true);
+      expect(data.markerContent).toBe("preserved");
+
+      // (d) Zero cleanup warnings on driver-process stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(0);
+    });
   });
 });
