@@ -5309,3 +5309,638 @@ console.log(JSON.stringify({ count }));
     });
   });
 });
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — RunOptions.env Snapshot Semantics (SPEC §9.5 / §9.1 / §9.2)
+// ═════════════════════════════════════════════════════════════
+//
+// Per SPEC §9.5: "Entries are captured synchronously at call time as a shallow
+// copy — loopx reads the supplied object's own enumerable string-keyed
+// properties once. The capture runs at the run() / runPromise() call site …".
+// These tests pin the eager-shallow-copy semantics across both API surfaces:
+//   - value mutation after call → not observed (T-API-52, T-API-52b)
+//   - key-set mutation after call → not observed (T-API-52a, T-API-52f)
+//   - per-entry accessor getter invoked exactly once at call site, not per
+//     spawn (T-API-52c, T-API-52d)
+//   - proxy `ownKeys` and `get` traps invoked exactly once per included key
+//     at call site, not per spawn (T-API-52e, T-API-52e2)
+
+describe("SPEC: RunOptions.env Snapshot Semantics", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-52: runPromise() — RunOptions.env is snapshotted at call time;
+    // mutating the original object's value after runPromise() returns has no
+    // effect on the running loop. SPEC §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-52: runPromise() — value mutation after call is not observed", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const e = { MYVAR: "initial" };
+const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+e.MYVAR = "mutated";
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("initial");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52a: run() — RunOptions.env snapshot is shallow on the key-set
+    // axis; a key added to the original object after run() is not observed
+    // by the spawned script. SPEC §9.5 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-52a: run() — added key after call is not observed (shallow snapshot)", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      const newvarMarker = join(project.dir, "newvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `if [ -n "\${MYVAR+x}" ]; then
+  printf 'present\\t%s' "$MYVAR" > "${myvarMarker}"
+else
+  printf 'absent' > "${myvarMarker}"
+fi
+if [ -n "\${NEWVAR+x}" ]; then
+  printf 'present\\t%s' "$NEWVAR" > "${newvarMarker}"
+else
+  printf 'absent' > "${newvarMarker}"
+fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const e = { MYVAR: "initial" };
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+e.NEWVAR = "added";
+const results = [];
+for await (const o of gen) {
+  results.push(o);
+}
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("present\tinitial");
+      expect(readFileSync(newvarMarker, "utf-8")).toBe("absent");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52b: run() — RunOptions.env snapshot is taken eagerly at call
+    // time, not lazily at first next(). SPEC §9.5 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-52b: run() — value mutation between call and first next() is not observed (eager snapshot)", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const e = { MYVAR: "A" };
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+e.MYVAR = "B";
+const results = [];
+for await (const o of gen) {
+  results.push(o);
+}
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("A");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52c: run() — RunOptions.env per-entry accessor getter is invoked
+    // exactly once at call time (eager-capture clause), not at first next()
+    // and not re-invoked per spawn. SPEC §9.5 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-52c: run() — accessor getter invoked exactly once at call time, not per spawn", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+let count = 0;
+let backing = "initial";
+const env = {};
+Object.defineProperty(env, "MYVAR", {
+  enumerable: true,
+  configurable: true,
+  get() { count += 1; return backing; },
+});
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 1,
+});
+const countAfterRun = count;
+backing = "mutated";
+const countAfterMutate = count;
+const results = [];
+for await (const o of gen) {
+  results.push(o);
+}
+const countAfterSettle = count;
+console.log(JSON.stringify({ countAfterRun, countAfterMutate, countAfterSettle, outputs: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.countAfterRun).toBe(1);
+      expect(parsed.countAfterMutate).toBe(1);
+      expect(parsed.countAfterSettle).toBe(1);
+      expect(parsed.outputs).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("initial");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52d: runPromise() — RunOptions.env per-entry accessor getter is
+    // invoked exactly once synchronously before runPromise() returns, and
+    // the captured value is observed by every script across multiple
+    // iterations even after the backing state mutates. SPEC §9.5 / §9.2.
+    // ------------------------------------------------------------------------
+    it("T-API-52d: runPromise() — accessor getter invoked exactly once at call time, snapshot reused across iterations", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -ge 3 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let count = 0;
+let backing = "initial";
+const env = {};
+Object.defineProperty(env, "MYVAR", {
+  enumerable: true,
+  configurable: true,
+  get() { count += 1; return backing; },
+});
+const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 3,
+});
+const countAfterCall = count;
+backing = "mutated";
+const countAfterMutate = count;
+const outputs = await p;
+const countAfterResolve = count;
+console.log(JSON.stringify({ countAfterCall, countAfterMutate, countAfterResolve, outputCount: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.countAfterCall).toBe(1);
+      expect(parsed.countAfterMutate).toBe(1);
+      expect(parsed.countAfterResolve).toBe(1);
+      expect(parsed.outputCount).toBe(3);
+      expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "iter3.txt"), "utf-8")).toBe("initial");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52e (variant a — run): proxy ownKeys + get traps. SPEC §9.5.
+    //   - ownKeys invoked exactly once at call time
+    //   - get invoked exactly once per included string key at call time
+    //   - neither re-invoked across iterations / spawns
+    // ------------------------------------------------------------------------
+    it("T-API-52e: run() — proxy ownKeys/get traps invoked exactly once at call time, not per spawn", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/myvar\${N}.txt"
+printf '%s' "\${OTHERVAR:-UNSET}" > "${markerDir}/othervar\${N}.txt"
+if [ "$N" -ge 3 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+let ownKeysCount = 0;
+let getCount = 0;
+const valueGetCounts = new Map();
+const target = { MYVAR: "initial", OTHERVAR: "second" };
+const env = new Proxy(target, {
+  ownKeys(t) { ownKeysCount += 1; return Reflect.ownKeys(t); },
+  getOwnPropertyDescriptor(t, key) { return Reflect.getOwnPropertyDescriptor(t, key); },
+  get(t, key) {
+    if (typeof key === "string") {
+      getCount += 1;
+      valueGetCounts.set(key, (valueGetCounts.get(key) ?? 0) + 1);
+    }
+    return Reflect.get(t, key);
+  },
+});
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 3,
+});
+const ownKeysAfterCall = ownKeysCount;
+const getAfterCall = getCount;
+const valueGetSnapshot = Object.fromEntries(valueGetCounts);
+const outputs = [];
+for await (const o of gen) {
+  outputs.push(o);
+}
+const ownKeysAfterDone = ownKeysCount;
+const getAfterDone = getCount;
+const valueGetAfterDone = Object.fromEntries(valueGetCounts);
+console.log(JSON.stringify({
+  ownKeysAfterCall, ownKeysAfterDone,
+  getAfterCall, getAfterDone,
+  valueGetSnapshot, valueGetAfterDone,
+  outputs: outputs.length,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.ownKeysAfterCall).toBe(1);
+      expect(parsed.ownKeysAfterDone).toBe(parsed.ownKeysAfterCall);
+      expect(parsed.getAfterCall).toBe(2);
+      expect(parsed.valueGetSnapshot.MYVAR).toBe(1);
+      expect(parsed.valueGetSnapshot.OTHERVAR).toBe(1);
+      expect(parsed.getAfterDone).toBe(parsed.getAfterCall);
+      expect(parsed.valueGetAfterDone.MYVAR).toBe(parsed.valueGetSnapshot.MYVAR);
+      expect(parsed.valueGetAfterDone.OTHERVAR).toBe(parsed.valueGetSnapshot.OTHERVAR);
+      expect(parsed.outputs).toBe(3);
+      expect(readFileSync(join(markerDir, "myvar1.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar2.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar3.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "othervar1.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar2.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar3.txt"), "utf-8")).toBe("second");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52e (variant b — runPromise): same trap-call invariants on the
+    // eager-snapshot surface. SPEC §9.5 / §9.2.
+    // ------------------------------------------------------------------------
+    it("T-API-52e: runPromise() — proxy ownKeys/get traps invoked exactly once at call time, not per spawn", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/myvar\${N}.txt"
+printf '%s' "\${OTHERVAR:-UNSET}" > "${markerDir}/othervar\${N}.txt"
+if [ "$N" -ge 3 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let ownKeysCount = 0;
+let getCount = 0;
+const valueGetCounts = new Map();
+const target = { MYVAR: "initial", OTHERVAR: "second" };
+const env = new Proxy(target, {
+  ownKeys(t) { ownKeysCount += 1; return Reflect.ownKeys(t); },
+  getOwnPropertyDescriptor(t, key) { return Reflect.getOwnPropertyDescriptor(t, key); },
+  get(t, key) {
+    if (typeof key === "string") {
+      getCount += 1;
+      valueGetCounts.set(key, (valueGetCounts.get(key) ?? 0) + 1);
+    }
+    return Reflect.get(t, key);
+  },
+});
+const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 3,
+});
+const ownKeysAfterCall = ownKeysCount;
+const getAfterCall = getCount;
+const valueGetSnapshot = Object.fromEntries(valueGetCounts);
+const outputs = await p;
+const ownKeysAfterDone = ownKeysCount;
+const getAfterDone = getCount;
+const valueGetAfterDone = Object.fromEntries(valueGetCounts);
+console.log(JSON.stringify({
+  ownKeysAfterCall, ownKeysAfterDone,
+  getAfterCall, getAfterDone,
+  valueGetSnapshot, valueGetAfterDone,
+  outputs: outputs.length,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.ownKeysAfterCall).toBe(1);
+      expect(parsed.ownKeysAfterDone).toBe(parsed.ownKeysAfterCall);
+      expect(parsed.getAfterCall).toBe(2);
+      expect(parsed.valueGetSnapshot.MYVAR).toBe(1);
+      expect(parsed.valueGetSnapshot.OTHERVAR).toBe(1);
+      expect(parsed.getAfterDone).toBe(parsed.getAfterCall);
+      expect(parsed.valueGetAfterDone.MYVAR).toBe(parsed.valueGetSnapshot.MYVAR);
+      expect(parsed.valueGetAfterDone.OTHERVAR).toBe(parsed.valueGetSnapshot.OTHERVAR);
+      expect(parsed.outputs).toBe(3);
+      expect(readFileSync(join(markerDir, "myvar1.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar2.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar3.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "othervar1.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar2.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar3.txt"), "utf-8")).toBe("second");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52e2 (variant a): only `getOwnPropertyDescriptor` is custom-
+    // trapped. SPEC §9.5 leaves the per-call descriptor count
+    // implementation-defined; we assert no per-spawn re-invocation. The
+    // snapshot values still reach every spawn. SPEC §9.5 / §9.1 / §9.2.
+    // ------------------------------------------------------------------------
+    it("T-API-52e2: runPromise() — descriptor-only proxy is not re-invoked per spawn", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/myvar\${N}.txt"
+printf '%s' "\${OTHERVAR:-UNSET}" > "${markerDir}/othervar\${N}.txt"
+if [ "$N" -ge 3 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let descCount = 0;
+const target = { MYVAR: "initial", OTHERVAR: "second" };
+const env = new Proxy(target, {
+  getOwnPropertyDescriptor(t, key) {
+    descCount += 1;
+    return Reflect.getOwnPropertyDescriptor(t, key);
+  },
+});
+const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 3,
+});
+const descAfterCall = descCount;
+const outputs = await p;
+const descAfterDone = descCount;
+console.log(JSON.stringify({ descAfterCall, descAfterDone, outputs: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // SPEC §9.5 leaves the per-call descriptor count implementation-defined,
+      // so only assert no per-spawn re-invocation across the multi-iteration run.
+      expect(parsed.descAfterDone).toBe(parsed.descAfterCall);
+      expect(parsed.outputs).toBe(3);
+      expect(readFileSync(join(markerDir, "myvar1.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar2.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar3.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "othervar1.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar2.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar3.txt"), "utf-8")).toBe("second");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52e2 (variant b): only `get` is custom-trapped. SPEC §9.5
+    // [[Get]]-semantics-exactly-once contract on the value-read axis. Per
+    // SPEC §9.5 / §9.2.
+    // ------------------------------------------------------------------------
+    it("T-API-52e2: runPromise() — get-only proxy fires exactly once per included key, not per spawn", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/myvar\${N}.txt"
+printf '%s' "\${OTHERVAR:-UNSET}" > "${markerDir}/othervar\${N}.txt"
+if [ "$N" -ge 3 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let getCount = 0;
+const valueGetCounts = new Map();
+const target = { MYVAR: "initial", OTHERVAR: "second" };
+const env = new Proxy(target, {
+  get(t, key) {
+    if (typeof key === "string") {
+      getCount += 1;
+      valueGetCounts.set(key, (valueGetCounts.get(key) ?? 0) + 1);
+    }
+    return Reflect.get(t, key);
+  },
+});
+const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 3,
+});
+const getAfterCall = getCount;
+const valueGetSnapshot = Object.fromEntries(valueGetCounts);
+const outputs = await p;
+const getAfterDone = getCount;
+const valueGetAfterDone = Object.fromEntries(valueGetCounts);
+console.log(JSON.stringify({
+  getAfterCall, getAfterDone,
+  valueGetSnapshot, valueGetAfterDone,
+  outputs: outputs.length,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.getAfterCall).toBe(2);
+      expect(parsed.valueGetSnapshot.MYVAR).toBe(1);
+      expect(parsed.valueGetSnapshot.OTHERVAR).toBe(1);
+      expect(parsed.getAfterDone).toBe(parsed.getAfterCall);
+      expect(parsed.valueGetAfterDone.MYVAR).toBe(parsed.valueGetSnapshot.MYVAR);
+      expect(parsed.valueGetAfterDone.OTHERVAR).toBe(parsed.valueGetSnapshot.OTHERVAR);
+      expect(parsed.outputs).toBe(3);
+      expect(readFileSync(join(markerDir, "myvar1.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar2.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar3.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "othervar1.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar2.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar3.txt"), "utf-8")).toBe("second");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52f: runPromise() — RunOptions.env snapshot is shallow on the
+    // key-set axis; a key added to the original object after runPromise()
+    // returns is not observed. SPEC §9.5 / §9.2.
+    // ------------------------------------------------------------------------
+    it("T-API-52f: runPromise() — added key after call is not observed (shallow snapshot)", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      const newvarMarker = join(project.dir, "newvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `if [ -n "\${MYVAR+x}" ]; then
+  printf 'present\\t%s' "$MYVAR" > "${myvarMarker}"
+else
+  printf 'absent' > "${myvarMarker}"
+fi
+if [ -n "\${NEWVAR+x}" ]; then
+  printf 'present\\t%s' "$NEWVAR" > "${newvarMarker}"
+else
+  printf 'absent' > "${newvarMarker}"
+fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const e = { MYVAR: "initial" };
+const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+e.NEWVAR = "added";
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("present\tinitial");
+      expect(readFileSync(newvarMarker, "utf-8")).toBe("absent");
+    });
+  });
+});
