@@ -4,6 +4,8 @@
 
 0c. study fix_plan.md
 
+0d. TDD GATE (MUST PASS BEFORE STEP 1): We are doing strict Test-Driven Development. Before implementing anything from @SPEC.md, verify that EVERY test described in @TEST-SPEC.md is implemented in the codebase. Use subagents to enumerate every test case in @TEST-SPEC.md and cross-check it against the actual test files. If ANY test from @TEST-SPEC.md is missing, your single most important task for this iteration is to implement those missing tests first (they are expected to fail against unimplemented SPEC.md behavior — that is correct TDD). Only once all TEST-SPEC.md tests exist may you proceed to step 1 to implement SPEC.md behavior to make them pass. Add any missing-test findings to @fix_plan.md before starting.
+
 1. Your task is to fully implement the specs. Follow the fix_plan.md and choose the most single (1) most important thing. Before making changes search codebase (don't assume not implemented) using subagents. You may use up to 500 parallel subagents for all operations but only 1 subagent for build/tests.
 
 2. When you discover an issue in the implementation. Immediately update @fix_plan.md with your findings using a subagent. When the issue is resolved, update @fix_plan.md and remove the item using a subagent.

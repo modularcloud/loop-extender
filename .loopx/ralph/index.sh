@@ -74,6 +74,6 @@ curl -s -X POST "${TELEGRAM_API}/sendMessage" \
 
 echo "=== Ralph iteration ${ITER} (stage=${STAGE}${ADR_NUM:+, ADR=${ADR_NUM}}) ===" >&2
 
-RALPH_OUTPUT=$(cd "$ROOT" && claude -p --dangerously-skip-permissions < "$TMP_DIR/PROMPT.md" 2>/dev/null)
+RALPH_OUTPUT=$(cd "$ROOT" && claude --effort max -p --dangerously-skip-permissions < "$TMP_DIR/PROMPT.md" 2>/dev/null)
 
 $LOOPX_BIN output --result "$RALPH_OUTPUT" --goto "check-ready"
