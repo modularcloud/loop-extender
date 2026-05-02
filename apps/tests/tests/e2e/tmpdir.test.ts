@@ -11215,5 +11215,186 @@ console.log(JSON.stringify({ errName, errMessage }));
 
       await rm(tmpdirPath, { force: true }).catch(() => {});
     }, { timeout: 60_000, retry: 2 });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-38c2: SPEC §7.2 first-observed-wins applied to the inverted
+    // observation order of T-TMP-38c — mid-loop `.throw()` observed FIRST
+    // (post first-next()), racing abort during the consumer-throw-observed
+    // pause window on the run() programmatic surface, rule-3 cleanup branch.
+    //
+    // T-TMP-38c covers abort-first × .throw()-second on the run() surface
+    // (where SPEC §7.2's first-observed-wins rule pins the surfaced outcome
+    // to the abort error). T-TMP-38c2 covers the inverted order: .throw()
+    // is observed first → loopx records it as the first-observed terminal
+    // trigger AND pauses at the new TEST-SPEC §1.4 `consumer-throw-observed`
+    // seam BEFORE dispatching the resulting silent settlement → driver polls
+    // the parent-observable pause marker, then calls `ac.abort()` during the
+    // bounded pause. Per SPEC §7.2 first-observed-wins, the .throw() observed
+    // earlier wins as the surfaced outcome — the racing abort must NOT
+    // displace the silent-clean-completion settlement (SPEC §9.1) and must
+    // NOT initiate a second cleanup attempt (SPEC §7.4 idempotence + at-most
+    // -one-warning).
+    //
+    // T-TERM-02d covers the surfaced-outcome axis on a non-warning-emitting
+    // fixture (cleanup runs warning-free), but its assertion that "the
+    // generator settles cleanly" cannot distinguish single-cleanup from
+    // double-cleanup paths — both single and double cleanup of an empty
+    // rule-4 directory are warning-free and outcome-equivalent. This test
+    // pins the warning-cardinality axis on the same race configuration by
+    // adding the rule-3 regular-file replacement that drives a warning-
+    // emitting branch.
+    //
+    // A buggy implementation that wired `.throw()` to start cleanup and then
+    // re-entered cleanup on a racing abort observation (e.g., one dispatcher
+    // pinned to consumer-cancellation and a separate one pinned to abort-
+    // listener, missing the shared CleanupState gate) would emit a second
+    // warning and fail (b). A buggy implementation that surfaced the
+    // consumer-thrown "test-throw" error or the abort error to the for-await
+    // loop instead of silent-clean-completion (per SPEC §9.1's consumer-
+    // cancellation contract) would shift envelope.errName / errMessage and
+    // fail (a).
+    // ------------------------------------------------------------------------
+    it("T-TMP-38c2: SPEC §7.2 first-observed-wins under racing .throw() → abort during consumer-throw-observed (run() rule-3, inverted order)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const fixtureReady = join(project.dir, "fixture-ready.flag");
+      const pauseMarker = join(project.dir, "pause-marker.json");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+set -e
+rm -rf "$LOOPX_TMPDIR"
+printf '%s' "regular-file-replacement" > "$LOOPX_TMPDIR"
+touch "$FIXTURE_READY_PATH"
+while true; do sleep 1; done
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync } from "node:fs";
+
+const fixtureReady = ${JSON.stringify(fixtureReady)};
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+
+const ac = new AbortController();
+const gen = run("ralph", { signal: ac.signal });
+
+let errName = "";
+let errMessage = "";
+
+const iterPromise = (async () => {
+  try {
+    for await (const _ of gen) { /* drain */ }
+  } catch (e) {
+    const ex = e as { name?: string; message?: string };
+    errName = ex?.name ?? "";
+    errMessage = ex?.message ?? String(e);
+  }
+})();
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const fxReady = await waitForFile(fixtureReady, 15_000);
+if (!fxReady) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "fixture-ready never appeared", throwDone: false, throwValue: null }));
+  process.exit(1);
+}
+
+// INVERTED order from T-TMP-38c: .throw() observed FIRST (mid-loop, post
+// first-next()) — this kicks off the wrapper.throw consumer-cancellation
+// path which pauses at the new consumer-throw-observed seam BEFORE
+// dispatching the silent settlement (terminate active child / cleanup /
+// surface). The racing ac.abort() arrives DURING that pause window.
+const throwPromise = gen.throw(new Error("test-throw"));
+
+const pauseSeen = await waitForFile(pauseMarker, 10_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared", throwDone: false, throwValue: null }));
+  process.exit(1);
+}
+
+// Racing abort: arrives during the consumer-throw-observed pause. Per SPEC
+// §7.2 first-observed-wins, the .throw() observed earlier wins as the
+// surfaced outcome — the abort here must NOT displace the silent-clean-
+// completion settlement (SPEC §9.1) and must NOT initiate a second cleanup
+// attempt (SPEC §7.4 idempotence + at-most-one-warning).
+ac.abort();
+
+const settled = await throwPromise;
+await iterPromise;
+
+console.log(JSON.stringify({
+  errName,
+  errMessage,
+  throwDone: settled.done === true,
+  throwValue: settled.value === undefined ? null : settled.value,
+}));
+`;
+
+      const result = await runAPIDriver(runtime, driverCode, {
+        cwd: project.dir,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "consumer-throw-observed",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          FIXTURE_READY_PATH: fixtureReady,
+        },
+        timeout: 60_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const envelope = JSON.parse(result.stdout.trim());
+
+      // (a) The generator settlement is NOT the abort error (the .throw()
+      // was observed first; per SPEC §7.2 first-observed-wins residual rule
+      // the post-pause abort does NOT displace the silent settlement). The
+      // for-await loop also exits cleanly — no error reaches the iter loop.
+      // The consumer-supplied "test-throw" error is silently absorbed per
+      // SPEC §9.1's consumer-cancellation contract (silent clean completion
+      // for .throw() with no further iterations). A buggy wrapper that
+      // surfaced the abort or the consumer-supplied error would shift these
+      // assertions.
+      expect(envelope.throwDone).toBe(true);
+      expect(envelope.throwValue).toBe(null);
+      expect(envelope.errName).toBe("");
+      expect(envelope.errMessage).not.toMatch(/abort/i);
+      expect(envelope.errMessage).not.toMatch(/test-throw/);
+
+      // (b) Exactly one cleanup-related warning across the racing triggers
+      // (SPEC §7.4 idempotence / at-most-one-warning). A buggy implementation
+      // that started a second cleanup attempt on the racing abort would
+      // emit a second warning here.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // (c) Path persistence — rule-3 leave-with-warning preserved. The
+      // single cleanup attempt completed and left the regular-file
+      // replacement in place; no second attempt mutated it.
+      const remaining = listLoopxEntries(tmpdirParent);
+      expect(remaining.length).toBe(1);
+      const tmpdirPath = join(tmpdirParent, remaining[0]);
+      expect(existsSync(tmpdirPath)).toBe(true);
+      const st = statSync(tmpdirPath);
+      expect(st.isFile()).toBe(true);
+      expect(readFileSync(tmpdirPath, "utf-8")).toBe(
+        "regular-file-replacement",
+      );
+
+      await rm(tmpdirPath, { force: true }).catch(() => {});
+    }, { timeout: 60_000, retry: 2 });
   });
 });

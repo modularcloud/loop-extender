@@ -14,6 +14,7 @@ import {
 import { parseTarget } from "./target-validation.js";
 import { makeAbortError } from "./abort.js";
 import { getLoopxBin, ensureLoopxPackageJson } from "./bin-path.js";
+import { maybePauseAtTerminalTriggerWindow } from "./test-seams.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -436,6 +437,15 @@ function runWithInternal(
       const abortObservedFirst = internalAc.signal.aborted;
       if (!abortObservedFirst) {
         returnCalled = true;
+        // TEST-SPEC §1.4 `consumer-throw-observed` seam — fires only when
+        // .throw() is the first-observed terminal trigger (i.e., abort had
+        // not been observed before this .throw() arrived). Pauses AFTER
+        // recording first-observed status (the `returnCalled` pin above)
+        // and BEFORE dispatch (internalAc.abort() / gen.return() below), so
+        // a parent harness can race a second terminal trigger into the
+        // window and assert SPEC §7.2 first-observed-wins + SPEC §7.4
+        // cleanup-idempotence + at-most-one-warning across racing triggers.
+        await maybePauseAtTerminalTriggerWindow("consumer-throw-observed");
       }
       internalAc.abort();
       try {

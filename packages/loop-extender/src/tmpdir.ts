@@ -5,12 +5,9 @@ import {
   rmSync,
   unlinkSync,
   chmodSync,
-  openSync,
-  writeSync,
-  fsyncSync,
-  closeSync,
 } from "node:fs";
 import { join } from "node:path";
+import { maybePauseAtTerminalTriggerWindow } from "./test-seams.js";
 
 // SPEC §7.4 — Run-scoped temporary directory (`LOOPX_TMPDIR`).
 //
@@ -31,7 +28,9 @@ import { join } from "node:path";
 //     Pauses cleanup at entry for a bounded interval after writing a
 //     parent-observable JSON marker, so the harness can deliver a racing
 //     terminal trigger and assert SPEC §7.2 first-observed-wins +
-//     cleanup-idempotence + at-most-one-warning.
+//     cleanup-idempotence + at-most-one-warning. Other window values are
+//     hosted on different callsites — `consumer-throw-observed` inside
+//     run.ts wrapper.throw, etc.
 
 export interface TmpdirIdentity {
   dev: bigint;
@@ -75,66 +74,6 @@ function emitCleanupWarning(state: CleanupState, payload: string): void {
   if (inTestMode()) {
     process.stderr.write(`LOOPX_TEST_CLEANUP_WARNING\t${payload}\n`);
   }
-}
-
-/**
- * Asynchronous bounded sleep — yields the event loop for `ms` milliseconds.
- *
- * Used by the `cleanup-start` seam to inject a deterministic pause window the
- * harness can race a second terminal trigger into. The pause is intentionally
- * non-blocking so a same-process driver (programmatic API tests) can poll for
- * the parent-observable marker and call `gen.return()` / `gen.throw()` /
- * `ac.abort()` mid-pause. For the cross-process CLI tests the asynchronous
- * pause is observably equivalent to a synchronous one — the OS-level signal
- * handler still queues second-signal observation regardless.
- */
-function asyncSleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * TEST-SPEC §1.4 `LOOPX_TEST_TERMINAL_TRIGGER_PAUSE=cleanup-start` seam.
- *
- * Fires at the entry of `cleanupTmpdir` (before any `lstat` / `unlink` /
- * `rmSync` call). When `NODE_ENV=test` and the env var equals `cleanup-start`,
- * writes a UTF-8 JSON marker file (when the companion
- * `LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER` env var names an absolute path),
- * `fsync`s and closes the file, then pauses for a bounded interval — long
- * enough for the harness to race a second terminal trigger in, short enough to
- * bound test runtime if no trigger arrives.
- */
-async function maybePauseAtCleanupStart(): Promise<void> {
-  if (!inTestMode()) return;
-  const window = process.env.LOOPX_TEST_TERMINAL_TRIGGER_PAUSE;
-  if (window !== "cleanup-start") return;
-
-  const markerPath = process.env.LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER;
-  if (markerPath) {
-    try {
-      const fd = openSync(markerPath, "w");
-      try {
-        const payload = JSON.stringify({ window: "cleanup-start" });
-        writeSync(fd, Buffer.from(payload + "\n", "utf-8"));
-        try {
-          fsyncSync(fd);
-        } catch {
-          // fsync may not be supported on every backing fs; the marker is
-          // already on the kernel's write buffer and the bounded delay
-          // gives the harness ample time to observe it.
-        }
-      } finally {
-        closeSync(fd);
-      }
-    } catch {
-      // Marker write is best-effort. If it fails (unwritable path, etc.),
-      // we still pause so the seam contract holds at the pause-only level.
-    }
-  }
-
-  // Bounded delay: ≥ 2 seconds, ≤ 10 seconds (TEST-SPEC §1.4). Three seconds
-  // is enough for parent polling + signal delivery on a busy CI host while
-  // keeping suite runtime tight.
-  await asyncSleep(3000);
 }
 
 /**
@@ -250,7 +189,7 @@ export async function cleanupTmpdir(
   // TEST-SPEC §1.4: pause at cleanup entry when the seam is configured. Done
   // BEFORE any cleanup work so the harness can race a second terminal trigger
   // in while loopx is paused; cleanup proceeds afterward.
-  await maybePauseAtCleanupStart();
+  await maybePauseAtTerminalTriggerWindow("cleanup-start");
 
   const { path, identity } = resource;
   const cleanupFaults = readFaults("LOOPX_TEST_CLEANUP_FAULT");
