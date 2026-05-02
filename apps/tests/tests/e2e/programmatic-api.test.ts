@@ -5946,6 +5946,925 @@ console.log(JSON.stringify({ count: outputs.length }));
 });
 
 // ═════════════════════════════════════════════════════════════
+// §4.9 — RunOptions.env Filtering (SPEC §9.5)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.5: loopx reads only the supplied object's own enumerable string-keyed
+// properties. The filtering is a hard predicate, applied BEFORE value-shape
+// validation:
+//   - inherited (prototype-chain) properties: filtered (T-API-56, 56f, 56j)
+//   - symbol-keyed properties: filtered (T-API-56a, 56d)
+//   - non-enumerable string-keyed properties: filtered (T-API-56b, 56e)
+//
+// The structural-not-nominal env-shape contract: SPEC §9.5 rejects only null,
+// arrays, and functions; any other non-null object qualifies as a valid env
+// shape, regardless of prototype:
+//   - null-prototype object: accepted, own entries reach child (T-API-56c)
+//   - class instance: accepted, class fields reach child (T-API-56g)
+//   - Map: accepted as a shape but contributes no entries (T-API-56h)
+//
+// T-API-56i is the run()-surface parity counterpart, parameterizing the
+// runPromise() matrix across the eight sub-rules to verify the generator
+// surface routes env through the same filtering predicate.
+
+describe("SPEC: RunOptions.env Filtering", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  // Bash fixture template that observes a list of environment variables into
+  // a marker file each. Each marker contains `present\t<value>` if the
+  // variable is set (including empty string), or `absent` if unset.
+  function makeObserveBashFixture(varToMarker: Record<string, string>): string {
+    const lines: string[] = [];
+    for (const [varname, marker] of Object.entries(varToMarker)) {
+      lines.push(
+        `if [ -n "\${${varname}+x}" ]; then\n  printf 'present\\t%s' "\${${varname}}" > "${marker}"\nelse\n  printf 'absent' > "${marker}"\nfi`
+      );
+    }
+    lines.push(`printf '{"stop":true}'`);
+    return lines.join("\n");
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-56: Inherited keys on options.env are ignored (runPromise).
+    // SPEC §9.5: own enumerable string-keyed properties only.
+    // ------------------------------------------------------------------------
+    it("T-API-56: runPromise() — inherited prototype keys are filtered out", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const inheritedMarker = join(project.dir, "inherited.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          OWN: ownMarker,
+          INHERITED: inheritedMarker,
+        })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const proto = { INHERITED: "proto-val" };
+const e = Object.create(proto);
+e.OWN = "own-val";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      // Inherited slot is filtered before value-read; absent in child env.
+      expect(readFileSync(inheritedMarker, "utf-8")).toBe("absent");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56a: Symbol-keyed entries are ignored (runPromise).
+    // SPEC §9.5: own enumerable STRING-keyed entries only — symbol keys are
+    // excluded by predicate. The Symbol value never appears in the child env
+    // under any stringification (Symbol(SYM), description "SYM", etc.).
+    // ------------------------------------------------------------------------
+    it("T-API-56a: runPromise() — symbol-keyed entries are filtered out", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const allEnvMarker = join(project.dir, "all-env.txt");
+      // Bash fixture: observe OWN normally, then dump every env var name (one
+      // per line) to a marker so the test can assert no symbol-derived stringification leaked.
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `if [ -n "\${OWN+x}" ]; then
+  printf 'present\\t%s' "$OWN" > "${ownMarker}"
+else
+  printf 'absent' > "${ownMarker}"
+fi
+# Dump all env var names (one per line) to a marker.
+env | cut -d= -f1 | sort > "${allEnvMarker}"
+printf '{"stop":true}'`
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const sym = Symbol("SYM");
+const e = { OWN: "own-val", [sym]: "sym-val" };
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      // Verify no symbol-derived stringified key leaked into the child env.
+      // Common buggy stringifications would produce keys like:
+      //   "Symbol(SYM)", "SYM", "@@SYM", or similar.
+      const envNames = readFileSync(allEnvMarker, "utf-8").split("\n");
+      for (const name of envNames) {
+        if (!name) continue;
+        // No env var name should contain the Symbol description "SYM" as a
+        // standalone token (excluding cases like "OWN" or system vars).
+        // The buggy stringification "Symbol(SYM)" would produce a name
+        // containing "Symbol(" — check for that.
+        expect(name).not.toMatch(/^Symbol\(/);
+        expect(name).not.toBe("SYM");
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56b: Non-enumerable string-keyed entries are ignored (runPromise).
+    // SPEC §9.5: own ENUMERABLE string-keyed entries only — non-enumerable
+    // are excluded by predicate.
+    // ------------------------------------------------------------------------
+    it("T-API-56b: runPromise() — non-enumerable string-keyed entries are filtered out", async () => {
+      project = await createTempProject();
+      const visibleMarker = join(project.dir, "visible.txt");
+      const hiddenMarker = join(project.dir, "hidden.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          VISIBLE: visibleMarker,
+          HIDDEN: hiddenMarker,
+        })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const e = {};
+Object.defineProperty(e, "HIDDEN", { value: "hidden-val", enumerable: false });
+e.VISIBLE = "visible-val";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(visibleMarker, "utf-8")).toBe("present\tvisible-val");
+      expect(readFileSync(hiddenMarker, "utf-8")).toBe("absent");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56c: Null-prototype options.env (Object.create(null)) is accepted.
+    // SPEC §9.5: env shape is structural-not-nominal; the absence of
+    // Object.prototype is fine. A buggy implementation that uses
+    // `instanceof Object` (false for null-prototype) or
+    // `env.hasOwnProperty(...)` (TypeError on null-prototype) would fail.
+    // ------------------------------------------------------------------------
+    it("T-API-56c: runPromise() — null-prototype env is accepted, own entries reach child", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      const othervarMarker = join(project.dir, "othervar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          MYVAR: myvarMarker,
+          OTHERVAR: othervarMarker,
+        })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const e = Object.create(null);
+e.MYVAR = "from-options";
+e.OTHERVAR = "second-value";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: e,
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected: false }));
+} catch (err) {
+  rejected = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("present\tfrom-options");
+      expect(readFileSync(othervarMarker, "utf-8")).toBe("present\tsecond-value");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56d: Symbol-keyed property with a THROWING getter does not fire.
+    // SPEC §9.5: symbol-keyed slots are filtered by predicate before any
+    // [[Get]] runs. The getter's throw must not surface as a snapshot error.
+    // ------------------------------------------------------------------------
+    it("T-API-56d: runPromise() — symbol-keyed throwing getter never fires", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ OWN: ownMarker })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const sym = Symbol("SYM-throw");
+const e = { OWN: "own-val" };
+Object.defineProperty(e, sym, {
+  enumerable: true,
+  get() { throw new Error("symbol-getter-should-never-fire"); },
+});
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: e,
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected: false }));
+} catch (err) {
+  rejected = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // Symbol getter never invoked → no rejection.
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      // The getter's distinctive throw message must NOT appear in stderr.
+      expect(result.stderr).not.toMatch(/symbol-getter-should-never-fire/);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56e: Non-enumerable string-keyed THROWING getter does not fire.
+    // Companion to T-API-56d for the non-enumerable-ignore axis.
+    // ------------------------------------------------------------------------
+    it("T-API-56e: runPromise() — non-enumerable throwing getter never fires", async () => {
+      project = await createTempProject();
+      const visibleMarker = join(project.dir, "visible.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ VISIBLE: visibleMarker })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const e = { VISIBLE: "visible-val" };
+Object.defineProperty(e, "HIDDEN", {
+  enumerable: false,
+  get() { throw new Error("non-enumerable-getter-should-never-fire"); },
+});
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: e,
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected: false }));
+} catch (err) {
+  rejected = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(visibleMarker, "utf-8")).toBe("present\tvisible-val");
+      expect(result.stderr).not.toMatch(/non-enumerable-getter-should-never-fire/);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56f: Inherited property with a NON-STRING value is ignored.
+    // SPEC §9.5: inherited slots are filtered BEFORE value-shape validation.
+    // A buggy implementation enumerating via `for ... in` would surface the
+    // inherited number as a value-shape error and reject.
+    // ------------------------------------------------------------------------
+    it("T-API-56f: runPromise() — inherited non-string-value property never reaches value validation", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const inheritedMarker = join(project.dir, "inherited-number.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          OWN: ownMarker,
+          INHERITED_NUMBER: inheritedMarker,
+        })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const proto = { INHERITED_NUMBER: 42 };
+const e = Object.create(proto);
+e.OWN = "own-val";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: e,
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected: false }));
+} catch (err) {
+  rejected = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      // Inherited slot filtered out — never reached value validation.
+      expect(readFileSync(inheritedMarker, "utf-8")).toBe("absent");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56g: Class-instance options.env is accepted. Class fields are
+    // own enumerable string-keyed properties on the instance (ES2022) and
+    // reach the spawned child. SPEC §9.5: structural-not-nominal contract.
+    // ------------------------------------------------------------------------
+    it("T-API-56g: runPromise() — class-instance env is accepted, class fields reach child", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ MYVAR: myvarMarker })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+class Env {
+  MYVAR = "from-class";
+}
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: new Env(),
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected: false }));
+} catch (err) {
+  rejected = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("present\tfrom-class");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56h: Map passed as options.env is accepted as a shape but
+    // contributes ZERO entries — Map data lives in [[MapData]], not as own
+    // enumerable string-keyed properties. SPEC §9.5: structural-not-nominal,
+    // strict own-enumerable-string-key predicate.
+    // ------------------------------------------------------------------------
+    it("T-API-56h: runPromise() — Map env accepted but contributes no entries", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ MYVAR: myvarMarker })
+      );
+
+      // Scrub MYVAR from inherited env so any observed value can only come
+      // from the env option (not from the surrounding test process).
+      const driverCode = `
+import { runPromise } from "loopx";
+delete process.env.MYVAR;
+const e = new Map([["MYVAR", "x"]]);
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: e,
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected: false }));
+} catch (err) {
+  rejected = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // Map is a non-null, non-array, non-function object — accepted as a shape.
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      // Map's "MYVAR" → "x" entry lives in [[MapData]], not as an own
+      // enumerable string-keyed property — filtered out by SPEC §9.5.
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("absent");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56j: Inherited THROWING getter never fires. SPEC §9.5: inherited
+    // slots are filtered by predicate. Parameterized over both runPromise
+    // and run() per TEST-SPEC.
+    // ------------------------------------------------------------------------
+    it("T-API-56j: runPromise() — inherited throwing getter never fires", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const inheritedMarker = join(project.dir, "inherited.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          OWN: ownMarker,
+          INHERITED_THROW: inheritedMarker,
+        })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const proto = {};
+Object.defineProperty(proto, "INHERITED_THROW", {
+  enumerable: true,
+  get() { throw new Error("inherited-getter-should-never-fire"); },
+});
+const e = Object.create(proto);
+e.OWN = "ok";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: e,
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected: false }));
+} catch (err) {
+  rejected = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\tok");
+      expect(readFileSync(inheritedMarker, "utf-8")).toBe("absent");
+      expect(result.stderr).not.toMatch(/inherited-getter-should-never-fire/);
+    });
+
+    it("T-API-56j: run() — inherited throwing getter never fires", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const inheritedMarker = join(project.dir, "inherited.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          OWN: ownMarker,
+          INHERITED_THROW: inheritedMarker,
+        })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const proto = {};
+Object.defineProperty(proto, "INHERITED_THROW", {
+  enumerable: true,
+  get() { throw new Error("inherited-getter-should-never-fire-run"); },
+});
+const e = Object.create(proto);
+e.OWN = "ok";
+let threw = false, message = "";
+try {
+  const gen = run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: e,
+    maxIterations: 1,
+  });
+  let count = 0;
+  for await (const _ of gen) {
+    count += 1;
+  }
+  console.log(JSON.stringify({ count, threw: false }));
+} catch (err) {
+  threw = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ threw, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\tok");
+      expect(readFileSync(inheritedMarker, "utf-8")).toBe("absent");
+      expect(result.stderr).not.toMatch(/inherited-getter-should-never-fire-run/);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56i: run()-surface parity for the SPEC §9.5 filtering matrix.
+    // Eight sub-variants matching the runPromise() coverage:
+    //   (a) inherited keys ignored
+    //   (b) symbol-keyed entries ignored
+    //   (c) non-enumerable string-keyed entries ignored
+    //   (d) null-prototype env accepted, own entries reach child
+    //   (e1) class-instance env accepted, fields reach child
+    //   (e2) Map env accepted, no entries reach child
+    //   (f) symbol-keyed throwing getter never fires
+    //   (g) non-enumerable throwing getter never fires
+    //   (h) inherited non-string-value never reaches value validation
+    // SPEC §9.5 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-56i (a): run() — inherited keys filtered out", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const inheritedMarker = join(project.dir, "inherited.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          OWN: ownMarker,
+          INHERITED: inheritedMarker,
+        })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const proto = { INHERITED: "proto-val" };
+const e = Object.create(proto);
+e.OWN = "own-val";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0;
+for await (const _ of gen) { count += 1; }
+console.log(JSON.stringify({ count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      expect(readFileSync(inheritedMarker, "utf-8")).toBe("absent");
+    });
+
+    it("T-API-56i (b): run() — symbol-keyed entries filtered out", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const allEnvMarker = join(project.dir, "all-env.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `if [ -n "\${OWN+x}" ]; then
+  printf 'present\\t%s' "$OWN" > "${ownMarker}"
+else
+  printf 'absent' > "${ownMarker}"
+fi
+env | cut -d= -f1 | sort > "${allEnvMarker}"
+printf '{"stop":true}'`
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const sym = Symbol("SYM");
+const e = { OWN: "own-val", [sym]: "sym-val" };
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0;
+for await (const _ of gen) { count += 1; }
+console.log(JSON.stringify({ count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      const envNames = readFileSync(allEnvMarker, "utf-8").split("\n");
+      for (const name of envNames) {
+        if (!name) continue;
+        expect(name).not.toMatch(/^Symbol\(/);
+        expect(name).not.toBe("SYM");
+      }
+    });
+
+    it("T-API-56i (c): run() — non-enumerable string-keyed entries filtered out", async () => {
+      project = await createTempProject();
+      const visibleMarker = join(project.dir, "visible.txt");
+      const hiddenMarker = join(project.dir, "hidden.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          VISIBLE: visibleMarker,
+          HIDDEN: hiddenMarker,
+        })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const e = {};
+Object.defineProperty(e, "HIDDEN", { value: "hidden-val", enumerable: false });
+e.VISIBLE = "visible-val";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0;
+for await (const _ of gen) { count += 1; }
+console.log(JSON.stringify({ count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(visibleMarker, "utf-8")).toBe("present\tvisible-val");
+      expect(readFileSync(hiddenMarker, "utf-8")).toBe("absent");
+    });
+
+    it("T-API-56i (d): run() — null-prototype env accepted, own entries reach child", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ MYVAR: myvarMarker })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const e = Object.create(null);
+e.MYVAR = "from-options";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of gen) { count += 1; }
+} catch (err) {
+  threw = true;
+  message = err && err.message ? err.message : String(err);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("present\tfrom-options");
+    });
+
+    it("T-API-56i (e1): run() — class-instance env accepted, fields reach child", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ MYVAR: myvarMarker })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+class Env { MYVAR = "from-class"; }
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: new Env(),
+  maxIterations: 1,
+});
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of gen) { count += 1; }
+} catch (err) {
+  threw = true;
+  message = err && err.message ? err.message : String(err);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("present\tfrom-class");
+    });
+
+    it("T-API-56i (e2): run() — Map env accepted but contributes no entries", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ MYVAR: myvarMarker })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+delete process.env.MYVAR;
+const e = new Map([["MYVAR", "x"]]);
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of gen) { count += 1; }
+} catch (err) {
+  threw = true;
+  message = err && err.message ? err.message : String(err);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("absent");
+    });
+
+    it("T-API-56i (f): run() — symbol-keyed throwing getter never fires", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ OWN: ownMarker })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const sym = Symbol("SYM-throw");
+const e = { OWN: "own-val" };
+Object.defineProperty(e, sym, {
+  enumerable: true,
+  get() { throw new Error("symbol-getter-should-never-fire-run"); },
+});
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of gen) { count += 1; }
+} catch (err) {
+  threw = true;
+  message = err && err.message ? err.message : String(err);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      expect(result.stderr).not.toMatch(/symbol-getter-should-never-fire-run/);
+    });
+
+    it("T-API-56i (g): run() — non-enumerable throwing getter never fires", async () => {
+      project = await createTempProject();
+      const visibleMarker = join(project.dir, "visible.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ VISIBLE: visibleMarker })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const e = { VISIBLE: "visible-val" };
+Object.defineProperty(e, "HIDDEN", {
+  enumerable: false,
+  get() { throw new Error("non-enumerable-getter-should-never-fire-run"); },
+});
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of gen) { count += 1; }
+} catch (err) {
+  threw = true;
+  message = err && err.message ? err.message : String(err);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(visibleMarker, "utf-8")).toBe("present\tvisible-val");
+      expect(result.stderr).not.toMatch(/non-enumerable-getter-should-never-fire-run/);
+    });
+
+    it("T-API-56i (h): run() — inherited non-string-value never reaches value validation", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const inheritedMarker = join(project.dir, "inherited-number.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          OWN: ownMarker,
+          INHERITED_NUMBER: inheritedMarker,
+        })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const proto = { INHERITED_NUMBER: 42 };
+const e = Object.create(proto);
+e.OWN = "own-val";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of gen) { count += 1; }
+} catch (err) {
+  threw = true;
+  message = err && err.message ? err.message : String(err);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      expect(readFileSync(inheritedMarker, "utf-8")).toBe("absent");
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
 // §4.9 — RunOptions.env Invalid Shape (SPEC §9.5)
 // ═════════════════════════════════════════════════════════════
 //
