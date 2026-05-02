@@ -10828,5 +10828,250 @@ console.log(JSON.stringify({
 
       await rm(tmpdirPath, { force: true }).catch(() => {});
     }, { timeout: 60_000, retry: 2 });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-38b / T-TMP-38b-run: SPEC §7.2 first-observed-wins applied to the
+    // non-zero-script-exit-vs-abort race during the cleanup-start pause window
+    // on the programmatic surfaces.
+    //
+    // Race configuration: the script exits non-zero (rule-3 regular-file
+    // replacement, then exit 1); loopx observes script-failure FIRST and
+    // throws Error('Script <wf>:<scr> exited with code 1') from runLoop; the
+    // throw propagates into the try/finally, which awaits cleanupTmpdir. The
+    // cleanup-start seam pauses cleanup for ≥2s; during the pause the harness
+    // calls ac.abort(). Per SPEC §7.2 first-observed-wins, the script-failure
+    // error must be the surfaced rejection / throw; the post-pause abort must
+    // NOT displace it. Per SPEC §7.4 idempotence + at-most-one-warning, the
+    // racing abort must NOT initiate a second cleanup attempt and must NOT
+    // emit a second warning.
+    //
+    // T-TMP-38b covers the runPromise() surface.
+    // T-TMP-38b-run covers the run() generator surface (a buggy implementation
+    // that wired idempotence correctly on runPromise rejection but routed
+    // run() settlement through a different cleanup-dispatcher could pass
+    // T-TMP-38b and fail T-TMP-38b-run).
+    // ------------------------------------------------------------------------
+    function buildScriptFailureRule3Fixture(): string {
+      return `#!/bin/bash
+set -e
+rm -rf "$LOOPX_TMPDIR"
+printf '%s' "regular-file-replacement" > "$LOOPX_TMPDIR"
+touch "$FIXTURE_READY_PATH"
+exit 1
+`;
+    }
+
+    it("T-TMP-38b: SPEC §7.2 first-observed-wins under racing non-zero-exit → abort during cleanup-start (runPromise() rule-3)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const fixtureReady = join(project.dir, "fixture-ready.flag");
+      const pauseMarker = join(project.dir, "pause-marker.json");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildScriptFailureRule3Fixture(),
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync } from "node:fs";
+
+const fixtureReady = ${JSON.stringify(fixtureReady)};
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const ac = new AbortController();
+
+let errName = "";
+let errMessage = "";
+
+const promise = runPromise("ralph", { signal: ac.signal, maxIterations: 1 });
+
+const fxReady = await waitForFile(fixtureReady, 15_000);
+if (!fxReady) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "fixture-ready never appeared" }));
+  process.exit(1);
+}
+
+const pauseSeen = await waitForFile(pauseMarker, 10_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared" }));
+  process.exit(1);
+}
+
+ac.abort();
+
+try {
+  await promise;
+} catch (e) {
+  const ex = e as { name?: string; message?: string };
+  errName = ex?.name ?? "";
+  errMessage = ex?.message ?? String(e);
+}
+
+console.log(JSON.stringify({ errName, errMessage }));
+`;
+
+      const result = await runAPIDriver(runtime, driverCode, {
+        cwd: project.dir,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "cleanup-start",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          FIXTURE_READY_PATH: fixtureReady,
+        },
+        timeout: 60_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const envelope = JSON.parse(result.stdout.trim());
+
+      // (a) Promise rejects with the script-failure error (first-observed
+      // wins; post-cleanup-start abort does NOT displace it). Error message
+      // matches /exited with code/ and does NOT contain abort-class hints.
+      expect(envelope.errMessage).toMatch(/exited with code/);
+      expect(envelope.errName).not.toBe("AbortError");
+      expect(envelope.errMessage).not.toMatch(/abort/i);
+
+      // (b) Exactly one cleanup-related warning across the racing triggers
+      // (SPEC §7.4 idempotence / at-most-one-warning). A buggy implementation
+      // that started a second cleanup attempt on the racing abort would emit
+      // a second warning here.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // (c) Path persistence — rule-3 leave-with-warning preserved. The
+      // single cleanup attempt completed and left the regular-file
+      // replacement in place; no second attempt mutated it.
+      const remaining = listLoopxEntries(tmpdirParent);
+      expect(remaining.length).toBe(1);
+      const tmpdirPath = join(tmpdirParent, remaining[0]);
+      expect(existsSync(tmpdirPath)).toBe(true);
+      const st = statSync(tmpdirPath);
+      expect(st.isFile()).toBe(true);
+      expect(readFileSync(tmpdirPath, "utf-8")).toBe(
+        "regular-file-replacement",
+      );
+
+      await rm(tmpdirPath, { force: true }).catch(() => {});
+    }, { timeout: 60_000, retry: 2 });
+
+    it("T-TMP-38b-run: SPEC §7.2 first-observed-wins under racing non-zero-exit → abort during cleanup-start (run() rule-3)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const fixtureReady = join(project.dir, "fixture-ready.flag");
+      const pauseMarker = join(project.dir, "pause-marker.json");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildScriptFailureRule3Fixture(),
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync } from "node:fs";
+
+const fixtureReady = ${JSON.stringify(fixtureReady)};
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const ac = new AbortController();
+const gen = run("ralph", { signal: ac.signal, maxIterations: 1 });
+
+let errName = "";
+let errMessage = "";
+
+const iterPromise = (async () => {
+  try {
+    for await (const _ of gen) { /* drain */ }
+  } catch (e) {
+    const ex = e as { name?: string; message?: string };
+    errName = ex?.name ?? "";
+    errMessage = ex?.message ?? String(e);
+  }
+})();
+
+const fxReady = await waitForFile(fixtureReady, 15_000);
+if (!fxReady) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "fixture-ready never appeared" }));
+  process.exit(1);
+}
+
+const pauseSeen = await waitForFile(pauseMarker, 10_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared" }));
+  process.exit(1);
+}
+
+ac.abort();
+
+await iterPromise;
+
+console.log(JSON.stringify({ errName, errMessage }));
+`;
+
+      const result = await runAPIDriver(runtime, driverCode, {
+        cwd: project.dir,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "cleanup-start",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          FIXTURE_READY_PATH: fixtureReady,
+        },
+        timeout: 60_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const envelope = JSON.parse(result.stdout.trim());
+
+      // (a) For-await loop threw the script-failure error (first-observed
+      // wins; post-cleanup-start abort does NOT displace it).
+      expect(envelope.errMessage).toMatch(/exited with code/);
+      expect(envelope.errName).not.toBe("AbortError");
+      expect(envelope.errMessage).not.toMatch(/abort/i);
+
+      // (b) Exactly one cleanup-related warning across the racing triggers.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // (c) Path persistence — rule-3 leave-with-warning preserved.
+      const remaining = listLoopxEntries(tmpdirParent);
+      expect(remaining.length).toBe(1);
+      const tmpdirPath = join(tmpdirParent, remaining[0]);
+      expect(existsSync(tmpdirPath)).toBe(true);
+      const st = statSync(tmpdirPath);
+      expect(st.isFile()).toBe(true);
+      expect(readFileSync(tmpdirPath, "utf-8")).toBe(
+        "regular-file-replacement",
+      );
+
+      await rm(tmpdirPath, { force: true }).catch(() => {});
+    }, { timeout: 60_000, retry: 2 });
   });
 });
