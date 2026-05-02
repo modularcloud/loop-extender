@@ -12422,5 +12422,407 @@ console.log(JSON.stringify({ errName, errMessage, throwDone, throwValue, firstSt
         await rm(tmpdirPath, { force: true }).catch(() => {});
       }, { timeout: 60_000, retry: 2 });
     }
+
+    // ------------------------------------------------------------------------
+    // T-TMP-38d: SPEC §7.2 / §7.4 / §9.3 — post-final-yield abort observed
+    // FIRST, racing `.throw()` during the `abort-listener` pause window on the
+    // run() programmatic surface, rule-3 cleanup branch.
+    //
+    // `.throw()`-axis abort-first counterpart on the post-final-yield × abort
+    // race. Together with T-TMP-38d2 (.throw()-first × abort-second post-
+    // final-yield), T-TMP-38d3 (.return()-first × abort-second), and T-TMP-38d4
+    // (abort-first × .return()-second), this closes the post-final-yield
+    // consumer-cancellation × abort race symmetrically across both observation
+    // orders × both consumer-cancellation axes (`.return()` and `.throw()`).
+    //
+    // Per SPEC §9.3's abort-after-final-yield rule, when abort is observed
+    // first after the final yield (before generator settlement), the abort
+    // outcome displaces normal completion — the consumer-thrown error is NOT
+    // surfaced to the consumer, and the racing `.throw()` does NOT produce a
+    // clean settlement. Equivalent contract to T-API-66b / T-API-66e but
+    // driven through the abort-listener pause race rather than direct
+    // interaction sequencing.
+    //
+    // **Seam choice rationale.** SPEC §7.4 guarantees cleanup on `run()`
+    // normal completion only once the generator is driven to settlement; it
+    // does NOT forbid an implementation from opportunistically running
+    // cleanup after the final yield but before settlement. A `cleanup-start`
+    // pause therefore cannot reliably coordinate this race: an opportunistic
+    // implementation may have already entered the cleanup routine (firing the
+    // seam) before the harness's `c.abort()` is observed. This test uses the
+    // `abort-listener` seam, which fires the moment the captured AbortSignal's
+    // abort listener observes the abort and pauses BEFORE loopx begins
+    // running cleanup or surfacing the abort error — so the seam fires
+    // deterministically when `c.abort()` is delivered.
+    //
+    // **Parameterized over the final-yield trigger** (per SPEC 9.3 "via
+    // `stop: true` or `maxIterations` reached"): variant **(stop)** the
+    // script-driven `stop: true` final-yield path; variant **(maxIterations)**
+    // the loopx-driven iteration-count-limit final-yield path. Both variants
+    // exercise the same SPEC 9.3 abort-after-final-yield clause but through
+    // structurally distinct loopx code paths.
+    //
+    // Buggy-implementation scenarios this test catches:
+    //   - Surfacing the consumer-thrown "test-throw" error (failing to apply
+    //     the SPEC §9.3 abort-after-final-yield carve-out): fails (a) on the
+    //     errMessage /test-throw/ probe.
+    //   - Surfacing a clean settlement (failing to displace the would-be
+    //     `.throw()` outcome): fails (a) on the errName === "AbortError"
+    //     probe.
+    //   - Starting a second cleanup attempt on the racing `.throw()`: emits
+    //     a second cleanup warning (fails b) and re-touches the rule-3 entry
+    //     (fails c).
+    // ------------------------------------------------------------------------
+    const POST_FINAL_YIELD_ABORT_FIRST_THROW_VARIANTS = [
+      "stop",
+      "maxIterations",
+    ] as const;
+
+    for (const variant of POST_FINAL_YIELD_ABORT_FIRST_THROW_VARIANTS) {
+      it(`T-TMP-38d (${variant}): SPEC §7.2 first-observed-wins under racing post-final-yield abort → .throw() during abort-listener (run() rule-3)`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const pauseMarker = join(project.dir, "pause-marker.json");
+
+        // Variant-specific final-yield trigger:
+        //   (stop) — script emits {"stop":true} so the first yield is final
+        //            even though maxIterations permits more iterations.
+        //   (maxIterations) — script emits raw `{}` (parses as
+        //            { result: "{}" } per SPEC §2.3 raw-fallback) so the
+        //            iteration is non-terminating; maxIterations: 1 makes it
+        //            final via the iteration-count limit.
+        const yieldEmit =
+          variant === "stop"
+            ? `printf '%s' '{"stop":true}'`
+            : `printf '%s' '{}'`;
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash
+set -e
+rm -rf "$LOOPX_TMPDIR"
+printf '%s' "regular-file-replacement" > "$LOOPX_TMPDIR"
+${yieldEmit}
+exit 0
+`,
+        );
+
+        const maxIters = variant === "stop" ? 5 : 1;
+
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync } from "node:fs";
+
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+
+const ac = new AbortController();
+const gen = run("ralph", { signal: ac.signal, maxIterations: ${maxIters} });
+
+let firstStop = false;
+let firstDone = true;
+let throwDone = false;
+let throwValue = null;
+let errName = "";
+let errMessage = "";
+
+async function waitForFile(path, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+try {
+  const first = await gen.next();
+  firstDone = first.done === true;
+  firstStop = !first.done && first.value && first.value.stop === true;
+
+  // Abort observed FIRST (post-final-yield, first-observed terminal trigger).
+  // The user-signal listener pins firstObservedRef.trigger="abort" and
+  // (because LOOPX_TEST_TERMINAL_TRIGGER_PAUSE=abort-listener) schedules a
+  // bounded async pause before dispatching internalAc.abort().
+  ac.abort();
+
+  const pauseSeen = await waitForFile(pauseMarker, 10_000);
+  if (!pauseSeen) {
+    console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared", throwDone: false, throwValue: null, firstStop, firstDone }));
+    process.exit(1);
+  }
+
+  // Racing post-final-yield .throw() during the abort-listener pause. Per
+  // SPEC §9.3 abort-after-final-yield rule, the abort outcome (first-observed)
+  // pins the surfaced terminal outcome — wrapper.throw enters the post-final-
+  // yield abort branch (firstObservedRef.trigger === "abort"), drives the
+  // inner gen's finally (cleanup runs once with rule-3 warning), and throws
+  // AbortError. The consumer-supplied "test-throw" error is NOT surfaced.
+  const throwPromise = gen.throw(new Error("test-throw"));
+
+  const settled = await throwPromise;
+  throwDone = settled.done === true;
+  throwValue = settled.value === undefined ? null : settled.value;
+} catch (e) {
+  const ex = e;
+  errName = ex && ex.name ? ex.name : "";
+  errMessage = ex && ex.message ? ex.message : String(e);
+}
+
+console.log(JSON.stringify({ errName, errMessage, throwDone, throwValue, firstStop, firstDone }));
+`;
+
+        const result = await runAPIDriver(runtime, driverCode, {
+          cwd: project.dir,
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "abort-listener",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          },
+          timeout: 60_000,
+        });
+
+        expect(result.exitCode).toBe(0);
+        const envelope = JSON.parse(result.stdout.trim());
+
+        // Variant-specific first-yield observation — confirms the harness
+        // entered the post-final-yield window before calling ac.abort().
+        if (variant === "stop") {
+          expect(envelope.firstStop).toBe(true);
+        } else {
+          expect(envelope.firstDone).toBe(false);
+        }
+
+        // (a) Generator throws AbortError — the first-observed abort wins per
+        // SPEC §9.3 abort-after-final-yield rule; the racing post-pause
+        // .throw() does NOT displace the abort outcome and the consumer-
+        // supplied "test-throw" error is NOT surfaced. Load-bearing: a buggy
+        // wrapper that surfaced the consumer-thrown error or a clean
+        // settlement would shift errName / errMessage.
+        expect(envelope.errName).toBe("AbortError");
+        expect(envelope.errMessage).not.toMatch(/test-throw/);
+        expect(envelope.throwDone).toBe(false);
+
+        // (b) Exactly one cleanup-related warning across the racing triggers
+        // (SPEC §7.4 idempotence / at-most-one-warning). A buggy
+        // implementation that started a second cleanup attempt on the racing
+        // .throw() would emit a second warning.
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(1);
+
+        // (c) Path persistence — rule-3 leave-with-warning preserved. The
+        // single cleanup attempt completed and left the regular-file
+        // replacement in place; no second attempt mutated it. A buggy
+        // implementation that re-touched the rule-3 entry on the second
+        // attempt would corrupt or remove the file.
+        const remaining = listLoopxEntries(tmpdirParent);
+        expect(remaining.length).toBe(1);
+        const tmpdirPath = join(tmpdirParent, remaining[0]);
+        expect(existsSync(tmpdirPath)).toBe(true);
+        const st = statSync(tmpdirPath);
+        expect(st.isFile()).toBe(true);
+        expect(readFileSync(tmpdirPath, "utf-8")).toBe(
+          "regular-file-replacement",
+        );
+
+        await rm(tmpdirPath, { force: true }).catch(() => {});
+      }, { timeout: 60_000, retry: 2 });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-TMP-38d4: SPEC §7.2 / §7.4 / §9.1 / §9.3 — post-final-yield abort
+    // observed FIRST, racing `.return()` during the `abort-listener` pause
+    // window on the run() programmatic surface, rule-3 cleanup branch.
+    //
+    // `.return()`-axis abort-first counterpart to T-TMP-38d (which covers the
+    // `.throw()` axis on the same observation order). Together with T-TMP-38d
+    // (abort-first × `.throw()`), T-TMP-38d2 (`.throw()`-first × abort), and
+    // T-TMP-38d3 (`.return()`-first × abort), this closes the post-final-yield
+    // consumer-cancellation × abort race symmetrically across the full
+    // {`.return()` / `.throw()`} × {abort-first / consumer-first} 2×2 matrix.
+    //
+    // Per SPEC §9.3's abort-after-final-yield rule, when abort is observed
+    // first after the final yield (before generator settlement), the abort
+    // outcome displaces normal completion regardless of which consumer
+    // cancellation later races against it. Equivalent contract to T-API-66b /
+    // T-API-66e (abort-first × `.return()` post-final-yield), but driven
+    // through the abort-listener pause race rather than direct interaction
+    // sequencing — pinning the warning-cardinality axis on the same race.
+    //
+    // **Seam choice rationale.** Same as T-TMP-38d (the `.throw()` companion):
+    // the `abort-listener` seam fires deterministically when `c.abort()` is
+    // delivered, regardless of whether the implementation had also
+    // opportunistically begun cleanup before the abort arrived.
+    //
+    // **Parameterized over the final-yield trigger** (per SPEC 9.3 "via
+    // `stop: true` or `maxIterations` reached"): variant **(stop)** the
+    // script-driven `stop: true` final-yield path; variant **(maxIterations)**
+    // the loopx-driven iteration-count-limit final-yield path.
+    //
+    // Buggy-implementation scenarios this test catches:
+    //   - Surfacing a clean `.return()` settlement (failing to displace the
+    //     would-be `.return()` outcome with the first-observed abort): fails
+    //     (a) on the errName === "AbortError" probe.
+    //   - Starting a second cleanup attempt on the racing `.return()` (e.g.,
+    //     handling the abort-first × `.throw()` race in T-TMP-38d via a "is
+    //     consumer interaction `.throw()`?" gate but missing the `.return()`
+    //     axis): emits a second cleanup warning (fails b) and re-touches the
+    //     rule-3 entry (fails c).
+    // ------------------------------------------------------------------------
+    const POST_FINAL_YIELD_ABORT_FIRST_RETURN_VARIANTS = [
+      "stop",
+      "maxIterations",
+    ] as const;
+
+    for (const variant of POST_FINAL_YIELD_ABORT_FIRST_RETURN_VARIANTS) {
+      it(`T-TMP-38d4 (${variant}): SPEC §7.2 first-observed-wins under racing post-final-yield abort → .return() during abort-listener (run() rule-3)`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const pauseMarker = join(project.dir, "pause-marker.json");
+
+        const yieldEmit =
+          variant === "stop"
+            ? `printf '%s' '{"stop":true}'`
+            : `printf '%s' '{}'`;
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash
+set -e
+rm -rf "$LOOPX_TMPDIR"
+printf '%s' "regular-file-replacement" > "$LOOPX_TMPDIR"
+${yieldEmit}
+exit 0
+`,
+        );
+
+        const maxIters = variant === "stop" ? 5 : 1;
+
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync } from "node:fs";
+
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+
+const ac = new AbortController();
+const gen = run("ralph", { signal: ac.signal, maxIterations: ${maxIters} });
+
+let firstStop = false;
+let firstDone = true;
+let returnDone = false;
+let returnValue = null;
+let errName = "";
+let errMessage = "";
+
+async function waitForFile(path, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+try {
+  const first = await gen.next();
+  firstDone = first.done === true;
+  firstStop = !first.done && first.value && first.value.stop === true;
+
+  // Abort observed FIRST (post-final-yield, first-observed terminal trigger).
+  // The user-signal listener pins firstObservedRef.trigger="abort" and
+  // (because LOOPX_TEST_TERMINAL_TRIGGER_PAUSE=abort-listener) schedules a
+  // bounded async pause before dispatching internalAc.abort().
+  ac.abort();
+
+  const pauseSeen = await waitForFile(pauseMarker, 10_000);
+  if (!pauseSeen) {
+    console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared", returnDone: false, returnValue: null, firstStop, firstDone }));
+    process.exit(1);
+  }
+
+  // Racing post-final-yield .return() during the abort-listener pause. Per
+  // SPEC §9.3 abort-after-final-yield rule, the abort outcome (first-observed)
+  // pins the surfaced terminal outcome — wrapper.return enters the post-final-
+  // yield abort branch (firstObservedRef.trigger === "abort"), drives the
+  // inner gen's finally (cleanup runs once with rule-3 warning), and throws
+  // AbortError. The .return() does NOT produce a clean { done: true }
+  // settlement.
+  const returnPromise = gen.return(undefined);
+
+  const settled = await returnPromise;
+  returnDone = settled.done === true;
+  returnValue = settled.value === undefined ? null : settled.value;
+} catch (e) {
+  const ex = e;
+  errName = ex && ex.name ? ex.name : "";
+  errMessage = ex && ex.message ? ex.message : String(e);
+}
+
+console.log(JSON.stringify({ errName, errMessage, returnDone, returnValue, firstStop, firstDone }));
+`;
+
+        const result = await runAPIDriver(runtime, driverCode, {
+          cwd: project.dir,
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "abort-listener",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          },
+          timeout: 60_000,
+        });
+
+        expect(result.exitCode).toBe(0);
+        const envelope = JSON.parse(result.stdout.trim());
+
+        // Variant-specific first-yield observation — confirms the harness
+        // entered the post-final-yield window before calling ac.abort().
+        if (variant === "stop") {
+          expect(envelope.firstStop).toBe(true);
+        } else {
+          expect(envelope.firstDone).toBe(false);
+        }
+
+        // (a) Generator throws AbortError — the first-observed abort wins per
+        // SPEC §9.3 abort-after-final-yield rule; the racing post-pause
+        // .return() does NOT produce a clean { done: true } settlement and
+        // does NOT displace the abort outcome. Load-bearing: a buggy wrapper
+        // that surfaced a clean settlement would shift errName / returnDone.
+        expect(envelope.errName).toBe("AbortError");
+        expect(envelope.returnDone).toBe(false);
+
+        // (b) Exactly one cleanup-related warning across the racing triggers
+        // (SPEC §7.4 idempotence / at-most-one-warning). A buggy
+        // implementation that started a second cleanup attempt on the racing
+        // .return() (e.g., one that handled abort-first × `.throw()` correctly
+        // via a "is consumer interaction `.throw()`?" gate but missed the
+        // `.return()` axis) would emit a second warning.
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(1);
+
+        // (c) Path persistence — rule-3 leave-with-warning preserved. The
+        // single cleanup attempt completed and left the regular-file
+        // replacement in place; no second attempt mutated it.
+        const remaining = listLoopxEntries(tmpdirParent);
+        expect(remaining.length).toBe(1);
+        const tmpdirPath = join(tmpdirParent, remaining[0]);
+        expect(existsSync(tmpdirPath)).toBe(true);
+        const st = statSync(tmpdirPath);
+        expect(st.isFile()).toBe(true);
+        expect(readFileSync(tmpdirPath, "utf-8")).toBe(
+          "regular-file-replacement",
+        );
+
+        await rm(tmpdirPath, { force: true }).catch(() => {});
+      }, { timeout: 60_000, retry: 2 });
+    }
   });
 });
