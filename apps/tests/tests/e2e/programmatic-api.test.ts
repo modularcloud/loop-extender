@@ -4888,3 +4888,424 @@ console.log(JSON.stringify({ count }));
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// TEST-SPEC §4.9 — Programmatic API › RunOptions.env › Precedence
+//
+// SPEC §8.3 / §9.5 precedence chain (highest wins):
+//   1. protocol vars (LOOPX_BIN / LOOPX_PROJECT_ROOT / LOOPX_WORKFLOW /
+//      LOOPX_WORKFLOW_DIR / LOOPX_TMPDIR) — applied in execution.ts
+//   2. RunOptions.env
+//   3. local env file (-e / RunOptions.envFile)
+//   4. global loopx env ($XDG_CONFIG_HOME/loopx/env)
+//   5. inherited process.env
+// ---------------------------------------------------------------------------
+
+describe("SPEC: RunOptions.env Precedence", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-51a: tier-1 protocol vars override tier-2 RunOptions.env for all
+    // five script-protocol-protected names. Override is silent (no stderr
+    // warning / notice). LOOPX_TMPDIR observation is during-run (via
+    // in-script stat) so a real loopx-created tmpdir can be distinguished
+    // from a string substitution; the cleanup at SPEC §7.4 would erase a
+    // post-run stat. SPEC §9.5 / §8.3 / §13 / §7.4.
+    // ------------------------------------------------------------------------
+    it("T-API-51a: runPromise() — protocol vars silently override RunOptions.env LOOPX_* keys", async () => {
+      project = await createTempProject();
+      const projectRoot = realpathSync(project.dir);
+      const markerDir = project.dir;
+      const binMarker = join(markerDir, "loopx_bin.txt");
+      const rootMarker = join(markerDir, "loopx_project_root.txt");
+      const wfMarker = join(markerDir, "loopx_workflow.txt");
+      const wfDirMarker = join(markerDir, "loopx_workflow_dir.txt");
+      const tmpdirMarker = join(markerDir, "loopx_tmpdir.txt");
+      const tmpdirStatMarker = join(markerDir, "loopx_tmpdir_stat.txt");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_BIN" > "${binMarker}"
+printf '%s' "$LOOPX_PROJECT_ROOT" > "${rootMarker}"
+printf '%s' "$LOOPX_WORKFLOW" > "${wfMarker}"
+printf '%s' "$LOOPX_WORKFLOW_DIR" > "${wfDirMarker}"
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${tmpdirStatMarker}"
+else
+  printf 'not-dir' > "${tmpdirStatMarker}"
+fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: {
+    LOOPX_WORKFLOW: "fake",
+    LOOPX_PROJECT_ROOT: "/tmp/fake",
+    LOOPX_WORKFLOW_DIR: "/tmp/fake-dir",
+    LOOPX_TMPDIR: "/tmp/fake-tmp",
+    LOOPX_BIN: "/tmp/fake-bin",
+  },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+
+      // (a) Each marker records the real tier-1 protocol value, not the
+      //     tier-2 RunOptions.env value.
+      const observedBin = readFileSync(binMarker, "utf-8");
+      expect(observedBin).not.toBe("/tmp/fake-bin");
+      expect(existsSync(observedBin)).toBe(true);
+
+      const observedRoot = readFileSync(rootMarker, "utf-8");
+      expect(observedRoot).not.toBe("/tmp/fake");
+      expect(observedRoot).toBe(projectRoot);
+
+      const observedWorkflow = readFileSync(wfMarker, "utf-8");
+      expect(observedWorkflow).not.toBe("fake");
+      expect(observedWorkflow).toBe("ralph");
+
+      const observedWorkflowDir = readFileSync(wfDirMarker, "utf-8");
+      expect(observedWorkflowDir).not.toBe("/tmp/fake-dir");
+      expect(observedWorkflowDir).toBe(join(projectRoot, ".loopx", "ralph"));
+
+      const observedTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(observedTmpdir).not.toBe("/tmp/fake-tmp");
+      // Real loopx-created tmpdir under the test runtime's os.tmpdir() (or
+      // the test-isolated parent), matching the `loopx-*` naming pattern.
+      expect(observedTmpdir).toMatch(/\/loopx-[^/]+$/);
+
+      // (b) During-run stat: the path that LOOPX_TMPDIR pointed to existed
+      //     as a directory while the script was running. Proves the value
+      //     is the real loopx-created tmpdir, not merely a substituted
+      //     string. SPEC §7.4 cleanup runs after the script, so a post-run
+      //     stat would observe absence — the in-script stat is what
+      //     distinguishes real from substituted.
+      expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+
+      // (c) Stderr contains no override warning / error / notice for any
+      //     of the five script-protocol-protected names (silent override
+      //     contract — SPEC §8.3 / §13).
+      const stderrLower = result.stderr.toLowerCase();
+      for (const name of [
+        "loopx_bin",
+        "loopx_project_root",
+        "loopx_workflow",
+        "loopx_workflow_dir",
+        "loopx_tmpdir",
+      ]) {
+        const re = new RegExp(
+          `${name}.*(override|overrid|ignored|warning|notice)`,
+          "i",
+        );
+        expect(stderrLower).not.toMatch(re);
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-51a2: generator-surface counterpart to T-API-51a — all five
+    // LOOPX_* keys silently overridden on the run() surface. SPEC §9.5 /
+    // §9.1 / §8.3 / §13 / §7.4.
+    // ------------------------------------------------------------------------
+    it("T-API-51a2: run() — protocol vars silently override RunOptions.env LOOPX_* keys", async () => {
+      project = await createTempProject();
+      const projectRoot = realpathSync(project.dir);
+      const markerDir = project.dir;
+      const binMarker = join(markerDir, "loopx_bin.txt");
+      const rootMarker = join(markerDir, "loopx_project_root.txt");
+      const wfMarker = join(markerDir, "loopx_workflow.txt");
+      const wfDirMarker = join(markerDir, "loopx_workflow_dir.txt");
+      const tmpdirMarker = join(markerDir, "loopx_tmpdir.txt");
+      const tmpdirStatMarker = join(markerDir, "loopx_tmpdir_stat.txt");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_BIN" > "${binMarker}"
+printf '%s' "$LOOPX_PROJECT_ROOT" > "${rootMarker}"
+printf '%s' "$LOOPX_WORKFLOW" > "${wfMarker}"
+printf '%s' "$LOOPX_WORKFLOW_DIR" > "${wfDirMarker}"
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${tmpdirStatMarker}"
+else
+  printf 'not-dir' > "${tmpdirStatMarker}"
+fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+let count = 0;
+for await (const _ of run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: {
+    LOOPX_WORKFLOW: "fake",
+    LOOPX_PROJECT_ROOT: "/tmp/fake",
+    LOOPX_WORKFLOW_DIR: "/tmp/fake-dir",
+    LOOPX_TMPDIR: "/tmp/fake-tmp",
+    LOOPX_BIN: "/tmp/fake-bin",
+  },
+  maxIterations: 1,
+})) {
+  count++;
+}
+console.log(JSON.stringify({ count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      // (g) generator settled cleanly with one yield.
+      expect(JSON.parse(result.stdout).count).toBe(1);
+
+      // (a) LOOPX_BIN overridden to real path.
+      const observedBin = readFileSync(binMarker, "utf-8");
+      expect(observedBin).not.toBe("/tmp/fake-bin");
+      expect(existsSync(observedBin)).toBe(true);
+      // (b) LOOPX_PROJECT_ROOT overridden.
+      const observedRoot = readFileSync(rootMarker, "utf-8");
+      expect(observedRoot).not.toBe("/tmp/fake");
+      expect(observedRoot).toBe(projectRoot);
+      // (c) LOOPX_WORKFLOW overridden.
+      const observedWorkflow = readFileSync(wfMarker, "utf-8");
+      expect(observedWorkflow).not.toBe("fake");
+      expect(observedWorkflow).toBe("ralph");
+      // (d) LOOPX_WORKFLOW_DIR overridden.
+      const observedWorkflowDir = readFileSync(wfDirMarker, "utf-8");
+      expect(observedWorkflowDir).not.toBe("/tmp/fake-dir");
+      expect(observedWorkflowDir).toBe(join(projectRoot, ".loopx", "ralph"));
+      // (e) LOOPX_TMPDIR overridden.
+      const observedTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(observedTmpdir).not.toBe("/tmp/fake-tmp");
+      expect(observedTmpdir).toMatch(/\/loopx-[^/]+$/);
+      // (f) During-run stat marker confirms real loopx-created tmpdir.
+      expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+      // (h) No override warning on stderr for any of the five names.
+      const stderrLower = result.stderr.toLowerCase();
+      for (const name of [
+        "loopx_bin",
+        "loopx_project_root",
+        "loopx_workflow",
+        "loopx_workflow_dir",
+        "loopx_tmpdir",
+      ]) {
+        const re = new RegExp(
+          `${name}.*(override|overrid|ignored|warning|notice)`,
+          "i",
+        );
+        expect(stderrLower).not.toMatch(re);
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-51b: RunOptions.env (tier 2) overrides local env-file values
+    // (tier 3). SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-51b: runPromise() — RunOptions.env overrides local env-file value", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      const localEnv = join(project.dir, ".env");
+      await createEnvFile(localEnv, { MYVAR: "from-file" });
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ".env",
+  env: { MYVAR: "from-options" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("from-options");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-51c: RunOptions.env (tier 2) overrides global env-file values
+    // (tier 4). SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-51c: runPromise() — RunOptions.env overrides global env-file value", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const xdg = await mkdtemp(join(osTmpdir(), "loopx-xdg-51c-"));
+      await mkdir(join(xdg, "loopx"), { recursive: true });
+      await writeFile(join(xdg, "loopx", "env"), "MYVAR=from-global\n", "utf-8");
+
+      try {
+        const driverCode = `
+import { runPromise } from "loopx";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdg)};
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { MYVAR: "from-options" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(readFileSync(marker, "utf-8")).toBe("from-options");
+      } finally {
+        await rm(xdg, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-51d: RunOptions.env (tier 2) overrides inherited process.env
+    // values (tier 5). SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-51d: runPromise() — RunOptions.env overrides inherited process.env value", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.env.MYVAR = "inherited";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { MYVAR: "from-options" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("from-options");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-51e: full precedence chain on the runPromise() surface.
+    // Inherited process.env MYVAR=1 (tier 5), global env file MYVAR=2
+    // (tier 4), local env file MYVAR=3 (tier 3), RunOptions.env MYVAR=4
+    // (tier 2). MYVAR is not a protocol name, so RunOptions.env is the
+    // effective winner. SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-51e: runPromise() — full precedence chain (RunOptions.env wins over local, global, inherited)", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      const localEnv = join(project.dir, ".env");
+      await createEnvFile(localEnv, { MYVAR: "3" });
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const xdg = await mkdtemp(join(osTmpdir(), "loopx-xdg-51e-"));
+      await mkdir(join(xdg, "loopx"), { recursive: true });
+      await writeFile(join(xdg, "loopx", "env"), "MYVAR=2\n", "utf-8");
+
+      try {
+        const driverCode = `
+import { runPromise } from "loopx";
+process.env.MYVAR = "1";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdg)};
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ".env",
+  env: { MYVAR: "4" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(readFileSync(marker, "utf-8")).toBe("4");
+      } finally {
+        await rm(xdg, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-51f: full precedence chain on the run() generator surface
+    // (counterpart to T-API-51e). SPEC §9.5 / §9.1 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-51f: run() — full precedence chain (RunOptions.env wins over local, global, inherited)", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      const localEnv = join(project.dir, ".env");
+      await createEnvFile(localEnv, { MYVAR: "3" });
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const xdg = await mkdtemp(join(osTmpdir(), "loopx-xdg-51f-"));
+      await mkdir(join(xdg, "loopx"), { recursive: true });
+      await writeFile(join(xdg, "loopx", "env"), "MYVAR=2\n", "utf-8");
+
+      try {
+        const driverCode = `
+import { run } from "loopx";
+process.env.MYVAR = "1";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdg)};
+let count = 0;
+for await (const _ of run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ".env",
+  env: { MYVAR: "4" },
+  maxIterations: 1,
+})) {
+  count++;
+}
+console.log(JSON.stringify({ count }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(readFileSync(marker, "utf-8")).toBe("4");
+      } finally {
+        await rm(xdg, { recursive: true, force: true });
+      }
+    });
+  });
+});
