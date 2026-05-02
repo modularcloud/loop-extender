@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { chmod, mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { execSync } from "node:child_process";
 import { join, resolve } from "node:path";
@@ -7212,5 +7212,845 @@ console.log(JSON.stringify({ rejected, message, name }));
         expect(existsSync(marker)).toBe(false);
       });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC: RunOptions.env — Runtime-Rejected Names/Values (T-API-57 series)
+//
+// SPEC §9.5 "No name validation beyond string-to-string": loopx accepts any
+// shape-conforming entries (own-enumerable string-keyed string-to-string
+// pairs) and does not pre-validate names beyond shape. Runtime-level
+// rejections — most reliably an embedded NUL byte in name or value — surface
+// as child launch / spawn failures at spawn time per SPEC §7.2 / §9.3.
+//
+// SPEC §7.4 cleanup trigger list ("Child launch / spawn failure after tmpdir
+// creation") + SPEC §9.3 ("Cleanup ordering is observable. When LOOPX_TMPDIR
+// cleanup runs as part of an error path … it runs before the generator
+// throws or the promise rejects") together require that no `loopx-*`
+// directory remains under the test-isolated TMPDIR parent after the spawn
+// failure surfaces.
+//
+// Coverage matrix (this block):
+//   T-API-57    runPromise + NUL in value, maxIterations: 1
+//   T-API-57a   runPromise + NUL in key,   maxIterations: 1
+//   T-API-57b   runPromise + "=" in key,   maxIterations: 1 (impl-defined)
+//   T-API-57c   runPromise + empty key,    maxIterations: 1 (impl-defined)
+//   T-API-57d   runPromise + NUL in value, maxIterations: 0 → resolves []
+//   T-API-57e   runPromise + NUL in key,   maxIterations: 0 → resolves []
+//   T-API-57f   run        + NUL in value, maxIterations: 0 → done immediately
+//   T-API-57f2  run        + NUL in key,   maxIterations: 0 → done immediately
+//   T-API-57g   runPromise + non-POSIX names → success, byte-exact propagation
+//   T-API-57g2  run        + non-POSIX names → success, byte-exact propagation
+//   T-API-57h   run        + NUL in value, maxIterations: 1 → throws + cleanup
+//   T-API-57i   run        + NUL in key,   maxIterations: 1 → throws + cleanup
+// ---------------------------------------------------------------------------
+
+describe("SPEC: RunOptions.env Runtime Rejection", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    for (const cleanup of cleanups.splice(0)) {
+      await cleanup().catch(() => {});
+    }
+  });
+
+  // Creates a writable test-isolated TMPDIR parent under the system tmpdir.
+  // Per TEST-SPEC §4.7 isolation guidance — concurrent test workers must not
+  // race on `/tmp` for `loopx-*` entries. Returns the parent path; cleanup
+  // is registered for afterEach.
+  async function makeIsolatedTmpdirParent(label: string): Promise<string> {
+    const dir = await mkdtemp(join(osTmpdir(), `loopx-test-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  // List `loopx-*` entries directly under `parent`, filtering implementation-
+  // internal helpers (per AGENT.md / SPEC §7.4: nodepath-shim, bun-jsx, and
+  // install staging are NOT LOOPX_TMPDIR).
+  function listLoopxEntries(parent: string): string[] {
+    try {
+      return readdirSync(parent)
+        .filter((e) => e.startsWith("loopx-"))
+        .filter(
+          (e) =>
+            !e.startsWith("loopx-nodepath-shim-") &&
+            !e.startsWith("loopx-bun-jsx-") &&
+            !e.startsWith("loopx-install-") &&
+            !e.startsWith("loopx-test-"),
+        );
+    } catch {
+      return [];
+    }
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-57: runPromise() + NUL byte in entry value at maxIterations: 1
+    //   surfaces as a spawn-failure rejection AND LOOPX_TMPDIR is cleaned up
+    //   before the rejection. Load-bearing: a buggy implementation that
+    //   surfaced spawn failure without running cleanup would leave a
+    //   `loopx-*` directory under the isolated parent and fail (c).
+    // SPEC §7.2 / §7.4 / §9.3 / §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-57: runPromise() — NUL byte in env value rejects with spawn failure and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57v");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { MYVAR: "bad\\u0000val" },
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with a spawn-failure error — NOT a shape-
+      //     validation error (the shape is valid: own-enumerable string key
+      //     mapped to a string value).
+      expect(parsed.rejected).toBe(true);
+      // The error message must NOT match the shape-validation surface
+      // (which would say `env|RunOptions|string`-shape). Spawn-failure
+      // messages mention argument validation, ENOENT-like, NUL, or
+      // similar runtime failures.
+      expect(parsed.message).not.toMatch(/RunOptions\.env\[.*\] must be a string/);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) Cleanup ran before rejection — no loopx-* residue under parent.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57a: NUL-in-key counterpart to T-API-57. Same cleanup contract.
+    // ------------------------------------------------------------------------
+    it("T-API-57a: runPromise() — NUL byte in env key rejects with spawn failure and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57a");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const env = {};
+env["BAD\\u0000KEY"] = "val";
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Spawn-failure rejection (not shape-validation).
+      expect(parsed.rejected).toBe(true);
+      expect(parsed.message).not.toMatch(/RunOptions\.env\[.*\] must be a string/);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) Cleanup ran before rejection.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57b: "=" in key — runtime behavior is impl-defined. Outcome must
+    //   be EITHER (a) spawn-failure rejection OR (b) clean resolution; loopx
+    //   must NEVER surface this as a shape/options-validation error.
+    // ------------------------------------------------------------------------
+    it("T-API-57b: runPromise() — '=' in env key surfaces per runtime behavior, never as shape error", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57b");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "", name = "";
+let resolved = false, count = 0;
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { "BAD=KEY": "val" },
+    maxIterations: 1,
+  });
+  resolved = true;
+  count = outputs.length;
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name, resolved, count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // Outcome is either rejection OR resolution — never a shape error.
+      expect(parsed.rejected || parsed.resolved).toBe(true);
+      if (parsed.rejected) {
+        // Failure surface must NOT be shape-validation.
+        expect(parsed.message).not.toMatch(/RunOptions\.env\[.*\] must be a string/);
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57c: Empty-string key — shape-valid (own-enumerable string-keyed
+    //   property with string value); runtime behavior impl-defined. Same
+    //   "never a shape error" assertion.
+    // ------------------------------------------------------------------------
+    it("T-API-57c: runPromise() — empty-string env key not rejected at shape level", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57c");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "", name = "";
+let resolved = false, count = 0;
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { "": "empty-key-value" },
+    maxIterations: 1,
+  });
+  resolved = true;
+  count = outputs.length;
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name, resolved, count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // Outcome is rejection OR resolution — never a shape error.
+      expect(parsed.rejected || parsed.resolved).toBe(true);
+      if (parsed.rejected) {
+        expect(parsed.message).not.toMatch(/RunOptions\.env\[.*\] must be a string/);
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57d: maxIterations: 0 + NUL in value — no spawn step runs, so
+    //   the runtime-rejection path cannot fire. SPEC §9.5 / §4.2 / §7.1:
+    //   "executes zero iterations". SPEC §7.4: tmpdir is not created under
+    //   maxIterations: 0. Promise resolves with [].
+    // ------------------------------------------------------------------------
+    it("T-API-57d: runPromise() — maxIterations:0 + NUL in value resolves [] (no spawn, no tmpdir)", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57d");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "", isArray = false, length = 0;
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { MYVAR: "bad\\u0000val" },
+    maxIterations: 0,
+  });
+  isArray = Array.isArray(outputs);
+  length = outputs.length;
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ rejected, message, isArray, length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise resolves.
+      expect(parsed.rejected).toBe(false);
+      // (b) Resolved value is [] (empty array).
+      expect(parsed.isArray).toBe(true);
+      expect(parsed.length).toBe(0);
+      // (c) No spawn-failure error on stderr.
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      // (d) No LOOPX_TMPDIR was created.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57e: maxIterations: 0 + NUL in key — same contract as 57d.
+    // ------------------------------------------------------------------------
+    it("T-API-57e: runPromise() — maxIterations:0 + NUL in key resolves [] (no spawn, no tmpdir)", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57e");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const env = {};
+env["BAD\\u0000KEY"] = "val";
+let rejected = false, message = "", isArray = false, length = 0;
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env,
+    maxIterations: 0,
+  });
+  isArray = Array.isArray(outputs);
+  length = outputs.length;
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ rejected, message, isArray, length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.isArray).toBe(true);
+      expect(parsed.length).toBe(0);
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57f: run() + maxIterations: 0 + NUL in value — first next()
+    //   returns { done: true, value: undefined }; no spawn, no tmpdir.
+    // ------------------------------------------------------------------------
+    it("T-API-57f: run() — maxIterations:0 + NUL in value completes immediately (no spawn, no tmpdir)", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57f");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { MYVAR: "bad\\u0000val" },
+  maxIterations: 0,
+});
+let threw = false, message = "", firstDone = null, firstValue = "<not-set>";
+try {
+  const first = await gen.next();
+  firstDone = first.done;
+  firstValue = first.value === undefined ? "undefined" : JSON.stringify(first.value);
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message, firstDone, firstValue }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() returned { done: true, value: undefined }.
+      expect(parsed.threw).toBe(false);
+      expect(parsed.firstDone).toBe(true);
+      expect(parsed.firstValue).toBe("undefined");
+      // (b) No spawn-failure error.
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      // (c) No LOOPX_TMPDIR was created.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57f2: run() + maxIterations: 0 + NUL in key — same as 57f.
+    // ------------------------------------------------------------------------
+    it("T-API-57f2: run() — maxIterations:0 + NUL in key completes immediately (no spawn, no tmpdir)", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57f2");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const env = {};
+env["BAD\\u0000KEY"] = "val";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 0,
+});
+let threw = false, message = "", firstDone = null, firstValue = "<not-set>";
+try {
+  const first = await gen.next();
+  firstDone = first.done;
+  firstValue = first.value === undefined ? "undefined" : JSON.stringify(first.value);
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message, firstDone, firstValue }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.firstDone).toBe(true);
+      expect(parsed.firstValue).toBe("undefined");
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57g: Positive coverage — non-POSIX names ("1BAD", "FOO-BAR")
+    //   reach the spawned script unchanged. SPEC §9.5: "loopx does not
+    //   enforce the POSIX [A-Za-z_][A-Za-z0-9_]* name pattern". Catches an
+    //   implementation that wrongly applied the SPEC §8.1 env-file POSIX
+    //   key validator to RunOptions.env.
+    // ------------------------------------------------------------------------
+    it("T-API-57g: runPromise() — non-POSIX names propagate unchanged to child env", async () => {
+      project = await createTempProject();
+      const digitMarker = join(project.dir, "digit.txt");
+      const dashMarker = join(project.dir, "dash.txt");
+      // TS fixture reads each name explicitly via process.env[<name>] (bash
+      // would mangle digit-prefix and dash-interior names through identifier
+      // parsing). Marker file holds JSON-encoded values for round-trip
+      // fidelity (distinguish empty string from undefined).
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".ts",
+        `import { writeFileSync } from "node:fs";
+const digit = process.env["1BAD"];
+const dash = process.env["FOO-BAR"];
+writeFileSync(${JSON.stringify(digitMarker)}, JSON.stringify({ present: digit !== undefined, value: digit }));
+writeFileSync(${JSON.stringify(dashMarker)}, JSON.stringify({ present: dash !== undefined, value: dash }));
+process.stdout.write('{"stop":true}');
+`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const env = {};
+env["1BAD"] = "ok-digit-prefix";
+env["FOO-BAR"] = "ok-dash-interior";
+let rejected = false, message = "", count = 0;
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env,
+    maxIterations: 1,
+  });
+  count = outputs.length;
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ rejected, message, count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise resolved (non-POSIX names are not validated by loopx).
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      // (b) Both names reached the child env unchanged.
+      const digitObserved = JSON.parse(readFileSync(digitMarker, "utf-8"));
+      expect(digitObserved.present).toBe(true);
+      expect(digitObserved.value).toBe("ok-digit-prefix");
+      const dashObserved = JSON.parse(readFileSync(dashMarker, "utf-8"));
+      expect(dashObserved.present).toBe(true);
+      expect(dashObserved.value).toBe("ok-dash-interior");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57g2: run() — non-POSIX names propagate. Surface-parity counter
+    //   to T-API-57g; catches implementations that drop non-POSIX names
+    //   on the lazy-snapshot generator path.
+    // ------------------------------------------------------------------------
+    it("T-API-57g2: run() — non-POSIX names propagate unchanged to child env", async () => {
+      project = await createTempProject();
+      const digitMarker = join(project.dir, "digit.txt");
+      const dashMarker = join(project.dir, "dash.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".ts",
+        `import { writeFileSync } from "node:fs";
+const digit = process.env["1BAD"];
+const dash = process.env["FOO-BAR"];
+writeFileSync(${JSON.stringify(digitMarker)}, JSON.stringify({ present: digit !== undefined, value: digit }));
+writeFileSync(${JSON.stringify(dashMarker)}, JSON.stringify({ present: dash !== undefined, value: dash }));
+process.stdout.write('{"stop":true}');
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const env = {};
+env["1BAD"] = "ok-digit-prefix";
+env["FOO-BAR"] = "ok-dash-interior";
+let threw = false, message = "", count = 0;
+try {
+  for await (const _ of run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env,
+    maxIterations: 1,
+  })) {
+    count++;
+  }
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message, count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      const digitObserved = JSON.parse(readFileSync(digitMarker, "utf-8"));
+      expect(digitObserved.present).toBe(true);
+      expect(digitObserved.value).toBe("ok-digit-prefix");
+      const dashObserved = JSON.parse(readFileSync(dashMarker, "utf-8"));
+      expect(dashObserved.present).toBe(true);
+      expect(dashObserved.value).toBe("ok-dash-interior");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57h: run() + NUL in value at maxIterations: 1 — first next()
+    //   throws spawn-failure AND tmpdir is cleaned up before the throw.
+    //   Generator-surface counterpart to T-API-57.
+    // ------------------------------------------------------------------------
+    it("T-API-57h: run() — NUL in env value throws spawn failure on first next() and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57h");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { MYVAR: "bad\\u0000val" },
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() rejected with spawn-failure (not shape-validation).
+      expect(parsed.threw).toBe(true);
+      expect(parsed.message).not.toMatch(/RunOptions\.env\[.*\] must be a string/);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) Cleanup ran before throw.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57i: run() + NUL in key at maxIterations: 1 — counterpart to
+    //   T-API-57h on the NUL-in-key axis.
+    // ------------------------------------------------------------------------
+    it("T-API-57i: run() — NUL in env key throws spawn failure on first next() and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57i");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const env = {};
+env["BAD\\u0000KEY"] = "val";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() rejected with spawn-failure (not shape-validation).
+      expect(parsed.threw).toBe(true);
+      expect(parsed.message).not.toMatch(/RunOptions\.env\[.*\] must be a string/);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) Cleanup ran before throw.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC: RunOptions.env — LOOPX_* Silent-Override Contract (T-API-58 series)
+//
+// SPEC §8.3 / §9.5 / §13: The five script-protocol-protected names
+// (LOOPX_BIN, LOOPX_PROJECT_ROOT, LOOPX_WORKFLOW, LOOPX_WORKFLOW_DIR,
+// LOOPX_TMPDIR) are silently overridden by protocol injection when supplied
+// via RunOptions.env. Non-protocol LOOPX_* names (e.g., LOOPX_DELEGATED) are
+// NOT script-protocol-protected and reach the spawned child unchanged.
+//
+// T-API-51a/51a2 cover all five protocol names with arbitrary fake values
+// silently overridden, but they don't isolate the per-name override behavior
+// against a non-protocol same-prefix name. T-API-58 series adds:
+//   T-API-58    runPromise + LOOPX_WORKFLOW (fake) + CUSTOM (user-val)
+//   T-API-58a   runPromise + LOOPX_DELEGATED (user-supplied) reaches script
+//   T-API-58a2  run        + LOOPX_DELEGATED (user-supplied) reaches script
+// ---------------------------------------------------------------------------
+
+describe("SPEC: RunOptions.env LOOPX_* Silent Override", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-58: runPromise() — supplying a LOOPX_* protocol name is silently
+    //   overridden by protocol injection while non-protocol entries reach
+    //   the child. Stderr contains no override warning. Mirrors T-API-51a's
+    //   silent-override but isolates one protocol name + one non-protocol
+    //   peer entry to confirm the override is per-name (not env-wide).
+    // ------------------------------------------------------------------------
+    it("T-API-58: runPromise() — LOOPX_* protocol name silently overridden, peer entry reaches child", async () => {
+      project = await createTempProject();
+      const wfMarker = join(project.dir, "workflow.txt");
+      const customMarker = join(project.dir, "custom.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_WORKFLOW" > "${wfMarker}"
+printf '%s' "\${CUSTOM:-UNSET}" > "${customMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { LOOPX_WORKFLOW: "user-fake", CUSTOM: "user-val" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) LOOPX_WORKFLOW silently overridden — script observes "ralph"
+      //     (real workflow name), NOT "user-fake".
+      expect(readFileSync(wfMarker, "utf-8")).toBe("ralph");
+      // (b) CUSTOM (non-protocol peer) reached the child unchanged —
+      //     confirms the override is per-name, not env-wide.
+      expect(readFileSync(customMarker, "utf-8")).toBe("user-val");
+      // (c) Stderr contains no warning/notice/error about LOOPX_WORKFLOW
+      //     being overridden — silent-override contract per SPEC §13 / §8.3.
+      const re = /loopx_workflow.*(override|overrid|ignored|warning|notice)/i;
+      expect(result.stderr).not.toMatch(re);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58a: runPromise() — LOOPX_DELEGATED is startup-reserved only,
+    //   NOT script-protocol-protected. RunOptions.env.LOOPX_DELEGATED reaches
+    //   the spawned script unchanged. Distinguishes the five script-protocol
+    //   names from the startup-only LOOPX_DELEGATED.
+    // ------------------------------------------------------------------------
+    it("T-API-58a: runPromise() — LOOPX_DELEGATED (non-script-protocol) reaches child unchanged", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "delegated.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${LOOPX_DELEGATED:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { LOOPX_DELEGATED: "user-supplied" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) LOOPX_DELEGATED reached the spawned script unchanged.
+      expect(readFileSync(marker, "utf-8")).toBe("user-supplied");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58a2: run() — generator-surface counterpart to T-API-58a.
+    //   Surface-parity for LOOPX_DELEGATED's startup-reserved-only contract.
+    // ------------------------------------------------------------------------
+    it("T-API-58a2: run() — LOOPX_DELEGATED reaches child unchanged on generator surface", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "delegated.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${LOOPX_DELEGATED:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+let count = 0;
+for await (const _ of run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { LOOPX_DELEGATED: "user-supplied" },
+  maxIterations: 1,
+})) {
+  count++;
+}
+console.log(JSON.stringify({ count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("user-supplied");
+    });
   });
 });
