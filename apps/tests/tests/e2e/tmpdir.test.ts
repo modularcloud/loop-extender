@@ -9276,5 +9276,309 @@ console.log(JSON.stringify({
         .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
       expect(cleanupWarnings.length).toBe(1);
     });
+
+    // ----------------------------------------------------------------------
+    // T-TMP-42a: cleanup-fault warning does not mask non-zero script exit.
+    // SPEC §7.4 final paragraph: "warnings do not affect the CLI exit code,
+    // the generator outcome, or the promise rejection reason." T-TMP-40/41/42
+    // pin this on the success terminal across the three fault seams ×
+    // three surfaces. T-TMP-42a closes the matrix on the script-failure
+    // terminal: the script exits non-zero AND a cleanup-fault seam fires
+    // during the §7.4 cleanup-safety dispatch (lstat-fail / symlink-unlink-
+    // fail / recursive-remove-fail), and the surfaced terminal must remain
+    // the SCRIPT failure (CLI exit 1 with the script's stderr passed
+    // through; runPromise rejects with the script-failure error; run()
+    // throws the script-failure error), not a cleanup-failure-class
+    // outcome. The implementation in `runLoop`
+    // (packages/loop-extender/src/loop.ts:120-217) wraps the iteration body
+    // in `try/finally` so `cleanupTmpdir` (which emits the warning) runs
+    // before the script-failure `throw new Error('Script <wf>:<scr>
+    // exited with code <n>')` propagates out of the generator. The CLI
+    // test carries an observably-disjoint-lines assertion (mirroring
+    // T-TMP-35c): a distinctive `SCRIPT-FAILURE-MARKER-T-TMP-42A` line
+    // printed to stderr by the script before its tampering must reach the
+    // user's stderr on a separate line from the
+    // `LOOPX_TEST_CLEANUP_WARNING\t…` marker. Since both the script-failure
+    // path and a hypothetical cleanup-promoted-to-failure path produce CLI
+    // exit 1, exit-code alone cannot distinguish — the disjoint-lines
+    // assertion is what catches a buggy implementation that wrapped or
+    // replaced the script's stderr with a cleanup-classifier wrapper.
+    // The API tests carry an error-message-shape probe: rejection reason
+    // (runPromise) / throw value (run) must match the loop.ts contract
+    // `Script '<wf>:<scr>' exited with code <n>` (regex `/exited with
+    // code/`) and must NOT contain "cleanup" anywhere in the message.
+    // Per fault-seam path persistence: lstat-fail leaves the original
+    // identity-matched directory; symlink-unlink-fail leaves the
+    // script-installed symlink; recursive-remove-fail leaves the original
+    // directory with files inside.
+    // ----------------------------------------------------------------------
+
+    const CLEANUP_FAULT_VARIANTS = [
+      "lstat-fail",
+      "symlink-unlink-fail",
+      "recursive-remove-fail",
+    ] as const;
+    type CleanupFaultVariant = (typeof CLEANUP_FAULT_VARIANTS)[number];
+
+    function buildScriptErrorCleanupFaultFixture(args: {
+      tmpdirObservation: string;
+      fault: CleanupFaultVariant;
+    }): string {
+      // Per-fault tampering required to make the seam fire on the failure
+      // path:
+      //   - lstat-fail: seam fires at the top-level lstat in
+      //     cleanupTmpdir; no path manipulation needed.
+      //   - symlink-unlink-fail: seam fires only when dispatch reaches
+      //     rule 2 (path is a symlink), so the script must replace the
+      //     tmpdir with a symlink.
+      //   - recursive-remove-fail: seam fires only when dispatch reaches
+      //     rule 4 (identity-matched directory); the original loopx-
+      //     created directory satisfies that. Populating the directory
+      //     with files matches the success-terminal T-TMP-42 fixture and
+      //     pins that recursive removal would normally have visited the
+      //     inner files.
+      let tampering: string;
+      if (args.fault === "lstat-fail") {
+        tampering = "";
+      } else if (args.fault === "symlink-unlink-fail") {
+        tampering = `rm -rf "$LOOPX_TMPDIR"
+ln -s /tmp "$LOOPX_TMPDIR"`;
+      } else {
+        tampering = `echo content > "$LOOPX_TMPDIR/file-1"
+mkdir "$LOOPX_TMPDIR/sub"
+echo more > "$LOOPX_TMPDIR/sub/file-2"`;
+      }
+      return `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${args.tmpdirObservation}"
+printf 'SCRIPT-FAILURE-MARKER-T-TMP-42A: script about to fail with non-zero exit\\n' >&2
+${tampering}
+exit 1
+`;
+    }
+
+    for (const fault of CLEANUP_FAULT_VARIANTS) {
+      it(`T-TMP-42a (${fault}): CLI cleanup-fault warning does not mask script-error exit code`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          buildScriptErrorCleanupFaultFixture({
+            tmpdirObservation,
+            fault,
+          }),
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_CLEANUP_FAULT: fault,
+          },
+        });
+
+        // (a) CLI exit 1 — cleanup-fault warning does not mask the
+        // script-failure exit code per SPEC §7.4.
+        expect(result.exitCode).toBe(1);
+
+        const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+        expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+
+        const stderrLines = result.stderr.split("\n");
+
+        // (b) Exactly one script-failure marker on stderr.
+        const markerLines = stderrLines.filter((l) =>
+          l.includes("SCRIPT-FAILURE-MARKER-T-TMP-42A"),
+        );
+        expect(markerLines.length).toBe(1);
+
+        // (c) Exactly one cleanup-related warning on stderr.
+        const cleanupWarnings = stderrLines.filter((l) =>
+          l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"),
+        );
+        expect(cleanupWarnings.length).toBe(1);
+
+        // (d) Marker line and warning line are observably disjoint —
+        // catches a buggy implementation that wrapped script stderr in a
+        // cleanup classifier or vice versa.
+        expect(markerLines[0]).not.toContain("LOOPX_TEST_CLEANUP_WARNING");
+        expect(cleanupWarnings[0]).not.toContain(
+          "SCRIPT-FAILURE-MARKER-T-TMP-42A",
+        );
+
+        // (e) Path persistence per cleanup-fault seam — cleanup made no
+        // further changes after the simulated failure per SPEC §7.4.
+        if (fault === "symlink-unlink-fail") {
+          const lst = lstatSync(observedLoopxTmpdir);
+          expect(lst.isSymbolicLink()).toBe(true);
+          await rm(observedLoopxTmpdir, { force: true }).catch(() => {});
+        } else {
+          expect(existsSync(observedLoopxTmpdir)).toBe(true);
+        }
+      });
+    }
+
+    for (const fault of CLEANUP_FAULT_VARIANTS) {
+      it(`T-TMP-42a (${fault}): runPromise() cleanup-fault warning does not mask script-error rejection reason`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          buildScriptErrorCleanupFaultFixture({
+            tmpdirObservation,
+            fault,
+          }),
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+let rejected = false;
+let errMsg = "";
+let outputs = [];
+try {
+  outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) {
+  rejected = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+const observedExists = existsSync(observed);
+let observedIsSymlink = false;
+try { observedIsSymlink = lstatSync(observed).isSymbolicLink(); } catch {}
+console.log(JSON.stringify({
+  rejected,
+  errMsg,
+  outputsLen: outputs.length,
+  observed,
+  observedExists,
+  observedIsSymlink,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_CLEANUP_FAULT: fault,
+          },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+
+        // (a) Promise rejected — cleanup-fault warning does not mask the
+        // script-failure rejection reason per SPEC §7.4.
+        expect(data.rejected).toBe(true);
+
+        // (b) Rejection reason matches the script-failure shape from
+        // loop.ts and does NOT mention "cleanup".
+        expect(data.errMsg).toMatch(/exited with code/);
+        expect(data.errMsg.toLowerCase()).not.toContain("cleanup");
+
+        // (c) Exactly one cleanup-related warning on driver-process stderr.
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(1);
+
+        // (d) Path persistence per cleanup-fault seam.
+        expect(data.observed.length).toBeGreaterThan(0);
+        if (fault === "symlink-unlink-fail") {
+          expect(data.observedIsSymlink).toBe(true);
+          await rm(data.observed, { force: true }).catch(() => {});
+        } else {
+          expect(data.observedExists).toBe(true);
+        }
+      });
+    }
+
+    for (const fault of CLEANUP_FAULT_VARIANTS) {
+      it(`T-TMP-42a (${fault}): run() generator cleanup-fault warning does not mask script-error throw`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          buildScriptErrorCleanupFaultFixture({
+            tmpdirObservation,
+            fault,
+          }),
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+let thrown = false;
+let errMsg = "";
+let yieldCount = 0;
+try {
+  const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  for await (const _ of gen) { yieldCount++; }
+} catch (e) {
+  thrown = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const observed = readFileSync(tmpdirObservation, "utf-8");
+const observedExists = existsSync(observed);
+let observedIsSymlink = false;
+try { observedIsSymlink = lstatSync(observed).isSymbolicLink(); } catch {}
+console.log(JSON.stringify({
+  thrown,
+  errMsg,
+  yieldCount,
+  observed,
+  observedExists,
+  observedIsSymlink,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_CLEANUP_FAULT: fault,
+          },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+
+        // (a) Generator threw — cleanup-fault warning does not mask the
+        // script-failure throw per SPEC §7.4.
+        expect(data.thrown).toBe(true);
+
+        // (b) Thrown error matches the script-failure shape from loop.ts
+        // and does NOT mention "cleanup".
+        expect(data.errMsg).toMatch(/exited with code/);
+        expect(data.errMsg.toLowerCase()).not.toContain("cleanup");
+
+        // (c) Exactly one cleanup-related warning on driver-process stderr.
+        const cleanupWarnings = result.stderr
+          .split("\n")
+          .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+        expect(cleanupWarnings.length).toBe(1);
+
+        // (d) Path persistence per cleanup-fault seam.
+        expect(data.observed.length).toBeGreaterThan(0);
+        if (fault === "symlink-unlink-fail") {
+          expect(data.observedIsSymlink).toBe(true);
+          await rm(data.observed, { force: true }).catch(() => {});
+        } else {
+          expect(data.observedExists).toBe(true);
+        }
+      });
+    }
   });
 });
