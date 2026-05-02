@@ -7939,13 +7939,28 @@ console.log(JSON.stringify({ threw, message, name }));
 
 describe("SPEC: RunOptions.env LOOPX_* Silent Override", () => {
   let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
 
   afterEach(async () => {
     if (project) {
       await project.cleanup().catch(() => {});
       project = null;
     }
+    for (const cleanup of cleanups.splice(0)) {
+      await cleanup().catch(() => {});
+    }
   });
+
+  // Test-isolated TMPDIR parent under the system tmpdir for the NUL × protocol
+  // merge-order tests below — concurrent test workers must not race on `/tmp`
+  // for `loopx-*` entries (TEST-SPEC §4.7). Cleanup registered for afterEach.
+  async function makeIsolatedTmpdirParent(label: string): Promise<string> {
+    const dir = await mkdtemp(join(osTmpdir(), `loopx-test-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
 
   forEachRuntime((runtime) => {
     // ------------------------------------------------------------------------
@@ -8142,5 +8157,443 @@ console.log(JSON.stringify({ count }));
       expect(JSON.parse(result.stdout).count).toBe(1);
       expect(readFileSync(marker, "utf-8")).toBe("from-envfile");
     });
+
+    // ------------------------------------------------------------------------
+    // T-API-58b: runPromise() — RunOptions.env supplying a NUL-containing value
+    //   for a protocol-variable name (LOOPX_WORKFLOW) is silently overridden by
+    //   protocol injection. The promise resolves; the script observes the real
+    //   workflow name; no spawn-failure error / override-warning surfaces.
+    //
+    //   Per SPEC §8.3 / §9.5 / §13: protocol-tier overlay (tier 1) replaces
+    //   user-supplied LOOPX_* values from RunOptions.env (tier 2) BEFORE the
+    //   merged env reaches child_process.spawn — so the runtime never observes
+    //   the NUL-containing value. A buggy implementation that merged
+    //   RunOptions.env into the child env BEFORE protocol injection would
+    //   surface a spawn-failure on the NUL byte and fail (a)/(c)/(e).
+    //   SPEC §7.2 / §8.3 / §9.2 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    it("T-API-58b: runPromise() — NUL in RunOptions.env LOOPX_WORKFLOW silently overridden by protocol injection", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api58b");
+      const wfMarker = join(project.dir, "workflow.txt");
+      const ranMarker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_WORKFLOW" > "${wfMarker}"
+printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { LOOPX_WORKFLOW: "bad\\u0000value" },
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected, message }));
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  console.log(JSON.stringify({ count: 0, rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise resolved (no rejection — protocol-tier overlay replaced
+      //     the NUL value before the runtime saw it).
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      // (b) Marker records the real workflow name from protocol injection,
+      //     NOT the user-supplied "bad value".
+      expect(readFileSync(wfMarker, "utf-8")).toBe("ralph");
+      // (c) No spawn-failure error on stderr.
+      expect(result.stderr).not.toMatch(/exited with code/);
+      expect(result.stderr).not.toMatch(/spawn/i);
+      // (d) No override-warning on stderr (silent-override per SPEC §13 / §8.3).
+      expect(result.stderr).not.toMatch(
+        /loopx_workflow.*(override|overrid|ignored|warning|notice)/i,
+      );
+      // (e) Workflow script ran exactly once (distinguishes from the spawn-
+      //     failure-no-script-ran outcome of T-API-57).
+      expect(existsSync(ranMarker)).toBe(true);
+      expect(readFileSync(ranMarker, "utf-8")).toBe("spawned");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58c: run() generator counterpart to T-API-58b. Same merge-order
+    //   contract on the lazy-snapshot run() surface (SPEC §9.1) — verifies
+    //   that both API surfaces share the protocol-tier overlay code path.
+    //   SPEC §7.2 / §8.3 / §9.1 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    it("T-API-58c: run() — NUL in RunOptions.env LOOPX_WORKFLOW silently overridden by protocol injection", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api58c");
+      const wfMarker = join(project.dir, "workflow.txt");
+      const ranMarker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_WORKFLOW" > "${wfMarker}"
+printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { LOOPX_WORKFLOW: "bad\\u0000value" },
+    maxIterations: 1,
+  })) {
+    count++;
+  }
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Generator settled cleanly (no throw — protocol-tier overlay
+      //     replaced the NUL value before the runtime saw it).
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      // (b) Marker records "ralph", NOT "bad value".
+      expect(readFileSync(wfMarker, "utf-8")).toBe("ralph");
+      // (c) No spawn-failure error on stderr.
+      expect(result.stderr).not.toMatch(/exited with code/);
+      expect(result.stderr).not.toMatch(/spawn/i);
+      // (d) No override-warning on stderr.
+      expect(result.stderr).not.toMatch(
+        /loopx_workflow.*(override|overrid|ignored|warning|notice)/i,
+      );
+      // (e) Workflow script ran exactly once.
+      expect(existsSync(ranMarker)).toBe(true);
+      expect(readFileSync(ranMarker, "utf-8")).toBe("spawned");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58d: runPromise() — same merge-order contract on LOOPX_TMPDIR (the
+    //   dynamically-computed protocol-injection axis per SPEC §7.4 — value is
+    //   computed during pre-iteration, not derived from a static call-time
+    //   identifier). T-API-58b/c cover LOOPX_WORKFLOW (call-time-identifier-
+    //   derived); a buggy implementation could plausibly route static-identifier
+    //   protocol injection through one merge code path and dynamic-tmpdir
+    //   injection through another — pinning both axes catches that.
+    //
+    //   The during-run stat (matching T-API-51a's rigor) is essential: cleanup
+    //   removes the tmpdir on run completion, so a post-run stat would observe
+    //   absence even if the value were a real path. The in-script stat proves
+    //   the value points to a real loopx-created directory.
+    //   SPEC §7.2 / §7.4 / §8.3 / §9.2 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    it("T-API-58d: runPromise() — NUL in RunOptions.env LOOPX_TMPDIR silently overridden by protocol injection", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api58d");
+      const tmpdirMarker = join(project.dir, "loopx_tmpdir.txt");
+      const tmpdirStatMarker = join(project.dir, "loopx_tmpdir_stat.txt");
+      const ranMarker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${tmpdirStatMarker}"
+else
+  printf 'not-dir' > "${tmpdirStatMarker}"
+fi
+printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { LOOPX_TMPDIR: "bad\\u0000value" },
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected, message }));
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  console.log(JSON.stringify({ count: 0, rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise resolved.
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      // (b) Marker records a real absolute path under the test-isolated parent
+      //     matching the loopx-* naming convention from SPEC §7.4 mkdtemp.
+      const observedTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(observedTmpdir).not.toBe("bad value");
+      expect(observedTmpdir).toMatch(/\/loopx-[^/]+$/);
+      const realTmpdirParent = realpathSync(tmpdirParent);
+      expect(observedTmpdir.startsWith(realTmpdirParent)).toBe(true);
+      // (c) During-run stat marker proves the path was a real directory while
+      //     the script ran (not a substituted string). SPEC §7.4 cleanup
+      //     removes the dir AFTER the script exits.
+      expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+      // (d) No spawn-failure error on stderr.
+      expect(result.stderr).not.toMatch(/exited with code/);
+      expect(result.stderr).not.toMatch(/spawn/i);
+      // (e) No override-warning on stderr.
+      expect(result.stderr).not.toMatch(
+        /loopx_tmpdir.*(override|overrid|ignored|warning|notice)/i,
+      );
+      // (f) Workflow script ran.
+      expect(existsSync(ranMarker)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58d2: run() generator counterpart to T-API-58d — NUL-merge-order on
+    //   the dynamically-computed LOOPX_TMPDIR protocol injection on the lazy-
+    //   snapshot run() surface. Distinct snapshot timing from runPromise() per
+    //   SPEC §9.1 vs §9.2 — a buggy implementation that wired the dynamically-
+    //   computed protocol injection correctly under the eager schedule but
+    //   incorrectly under the lazy schedule would pass T-API-58d and fail this.
+    //   SPEC §7.2 / §7.4 / §8.3 / §9.1 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    it("T-API-58d2: run() — NUL in RunOptions.env LOOPX_TMPDIR silently overridden by protocol injection", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api58d2");
+      const tmpdirMarker = join(project.dir, "loopx_tmpdir.txt");
+      const tmpdirStatMarker = join(project.dir, "loopx_tmpdir_stat.txt");
+      const ranMarker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${tmpdirStatMarker}"
+else
+  printf 'not-dir' > "${tmpdirStatMarker}"
+fi
+printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { LOOPX_TMPDIR: "bad\\u0000value" },
+    maxIterations: 1,
+  })) {
+    count++;
+  }
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Generator settled cleanly.
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      // (b) Marker records a real absolute path under the test-isolated parent.
+      const observedTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(observedTmpdir).not.toBe("bad value");
+      expect(observedTmpdir).toMatch(/\/loopx-[^/]+$/);
+      const realTmpdirParent = realpathSync(tmpdirParent);
+      expect(observedTmpdir.startsWith(realTmpdirParent)).toBe(true);
+      // (c) During-run stat proves the path was a real directory.
+      expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+      // (d) No spawn-failure error on stderr.
+      expect(result.stderr).not.toMatch(/exited with code/);
+      expect(result.stderr).not.toMatch(/spawn/i);
+      // (e) No override-warning on stderr.
+      expect(result.stderr).not.toMatch(
+        /loopx_tmpdir.*(override|overrid|ignored|warning|notice)/i,
+      );
+      // (f) Workflow script ran.
+      expect(existsSync(ranMarker)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58e (i)–(iii): runPromise() — parameterized hardening over the
+    //   remaining three script-protocol-protected names (LOOPX_BIN,
+    //   LOOPX_PROJECT_ROOT, LOOPX_WORKFLOW_DIR). T-API-58b/c/d cover the two
+    //   structurally distinct axes (call-time-derived LOOPX_WORKFLOW + pre-
+    //   iteration-computed LOOPX_TMPDIR). The remaining three are call-time-
+    //   derived but not workflow-identity-derived — this catches a buggy
+    //   implementation that special-cased the two pinned names into one merge-
+    //   order-correct path while routing the other three through a separate,
+    //   merge-order-broken path. SPEC §7.2 / §8.3 / §9.2 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      { name: "LOOPX_BIN", id: "i", marker: "loopx_bin" },
+      { name: "LOOPX_PROJECT_ROOT", id: "ii", marker: "loopx_project_root" },
+      { name: "LOOPX_WORKFLOW_DIR", id: "iii", marker: "loopx_workflow_dir" },
+    ]) {
+      it(`T-API-58e (${variant.id} ${variant.name}): runPromise() — NUL in RunOptions.env ${variant.name} silently overridden by protocol injection`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api58e-${variant.id}`);
+        const projectRoot = realpathSync(project.dir);
+        const obsMarker = join(project.dir, `${variant.marker}.txt`);
+        const ranMarker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '%s' "\$${variant.name}" > "${obsMarker}"
+printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { ${variant.name}: "bad\\u0000value" },
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected, message }));
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  console.log(JSON.stringify({ count: 0, rejected, message }));
+}
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise resolved.
+        expect(parsed.rejected).toBe(false);
+        expect(parsed.count).toBe(1);
+        // (b) Marker records the real protocol value, not the NUL string.
+        const observed = readFileSync(obsMarker, "utf-8");
+        expect(observed).not.toBe("bad value");
+        if (variant.name === "LOOPX_BIN") {
+          // LOOPX_BIN is the resolved realpath of the loopx binary — must
+          // exist on disk.
+          expect(existsSync(observed)).toBe(true);
+        } else if (variant.name === "LOOPX_PROJECT_ROOT") {
+          expect(observed).toBe(projectRoot);
+        } else if (variant.name === "LOOPX_WORKFLOW_DIR") {
+          expect(observed).toBe(join(projectRoot, ".loopx", "ralph"));
+        }
+        // (c) No spawn-failure error on stderr.
+        expect(result.stderr).not.toMatch(/exited with code/);
+        expect(result.stderr).not.toMatch(/spawn/i);
+        // (d) No override-warning on stderr.
+        const re = new RegExp(
+          `${variant.name.toLowerCase()}.*(override|overrid|ignored|warning|notice)`,
+          "i",
+        );
+        expect(result.stderr).not.toMatch(re);
+        // (e) Workflow script ran exactly once.
+        expect(existsSync(ranMarker)).toBe(true);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-58e2 (i)–(iii): run() generator counterpart to T-API-58e —
+    //   parameterized hardening over the remaining three names on the lazy-
+    //   snapshot surface. SPEC §7.2 / §8.3 / §9.1 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      { name: "LOOPX_BIN", id: "i", marker: "loopx_bin" },
+      { name: "LOOPX_PROJECT_ROOT", id: "ii", marker: "loopx_project_root" },
+      { name: "LOOPX_WORKFLOW_DIR", id: "iii", marker: "loopx_workflow_dir" },
+    ]) {
+      it(`T-API-58e2 (${variant.id} ${variant.name}): run() — NUL in RunOptions.env ${variant.name} silently overridden by protocol injection`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api58e2-${variant.id}`);
+        const projectRoot = realpathSync(project.dir);
+        const obsMarker = join(project.dir, `${variant.marker}.txt`);
+        const ranMarker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '%s' "\$${variant.name}" > "${obsMarker}"
+printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { ${variant.name}: "bad\\u0000value" },
+    maxIterations: 1,
+  })) {
+    count++;
+  }
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Generator settled cleanly.
+        expect(parsed.threw).toBe(false);
+        expect(parsed.count).toBe(1);
+        // (b) Marker records the real protocol value.
+        const observed = readFileSync(obsMarker, "utf-8");
+        expect(observed).not.toBe("bad value");
+        if (variant.name === "LOOPX_BIN") {
+          expect(existsSync(observed)).toBe(true);
+        } else if (variant.name === "LOOPX_PROJECT_ROOT") {
+          expect(observed).toBe(projectRoot);
+        } else if (variant.name === "LOOPX_WORKFLOW_DIR") {
+          expect(observed).toBe(join(projectRoot, ".loopx", "ralph"));
+        }
+        // (c) No spawn-failure error on stderr.
+        expect(result.stderr).not.toMatch(/exited with code/);
+        expect(result.stderr).not.toMatch(/spawn/i);
+        // (d) No override-warning on stderr.
+        const re = new RegExp(
+          `${variant.name.toLowerCase()}.*(override|overrid|ignored|warning|notice)`,
+          "i",
+        );
+        expect(result.stderr).not.toMatch(re);
+        // (e) Workflow script ran exactly once.
+        expect(existsSync(ranMarker)).toBe(true);
+      });
+    }
   });
 });
