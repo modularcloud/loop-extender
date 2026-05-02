@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
+  lstatSync,
   readFileSync,
   readdirSync,
   statSync,
@@ -7874,6 +7875,259 @@ printf '{"stop":true}'
         .split("\n")
         .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
       expect(cleanupWarnings.length).toBe(0);
+    });
+
+    // ----------------------------------------------------------------------
+    // T-TMP-37a / 37b / 37c: SPEC §7.4 cleanup-safety rule 3 — non-directory
+    // non-symlink replacement is left in place with exactly one warning.
+    // Rule 3 reads: "Path is a regular file, FIFO, socket, or other non-
+    // directory non-symlink: leave in place with a stderr warning. Unlinking
+    // would risk mutating unrelated data (hard-link `nlink` decrement, or
+    // data renamed into the path with `nlink == 1`)." T-TMP-35 covers the
+    // regular-file branch; T-TMP-37a/b/c cover the FIFO, socket, and hard-
+    // link branches respectively, proving the rule is typed generically
+    // (any non-directory non-symlink leaves-in-place + warns) rather than
+    // narrowly special-cased to regular files. Implementation note:
+    // `cleanupTmpdir` in packages/loop-extender/src/tmpdir.ts dispatches
+    // case 3 via `!stat.isDirectory()` (after the symlink early-return),
+    // which is the correct generic dispatch — the tests here pin the
+    // contract against any future narrowing of that branch.
+    // ----------------------------------------------------------------------
+
+    it("T-TMP-37a: CLI FIFO replacement leaves FIFO in place with exactly one cleanup warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+rm -rf "$LOOPX_TMPDIR"
+mkfifo "$LOOPX_TMPDIR"
+printf '{"stop":true}'
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+      });
+
+      // (c) CLI exit 0 — cleanup warning does not affect the exit code.
+      expect(result.exitCode).toBe(0);
+
+      const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+      expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+
+      // (a) Path still exists and is a FIFO — SPEC §7.4 rule 3 leaves
+      // non-directory non-symlink entries in place. `lstatSync().isFIFO()`
+      // is the implementation-neutral predicate for the FIFO branch.
+      expect(existsSync(observedLoopxTmpdir)).toBe(true);
+      const lst = lstatSync(observedLoopxTmpdir);
+      expect(lst.isFIFO()).toBe(true);
+      expect(lst.isDirectory()).toBe(false);
+      expect(lst.isSymbolicLink()).toBe(false);
+
+      // (b) Exactly one cleanup-related warning on stderr (per-run cleanup-
+      // warning cardinality from SPEC §7.4; structured marker line count is
+      // the implementation-neutral predicate per TEST-SPEC §1.4).
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // Harness clean-up: remove the leftover FIFO so the test-isolated
+      // tmpdir parent can be removed cleanly.
+      await rm(observedLoopxTmpdir, { force: true }).catch(() => {});
+    });
+
+    it("T-TMP-37b: CLI Unix-domain socket replacement leaves socket in place with exactly one cleanup warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      // .ts fixture — creating a SOCK_STREAM Unix-domain socket portably from
+      // bash is awkward, while Node's `net.createServer().listen(<path>)`
+      // reliably binds a socket inode at a path on every POSIX runtime
+      // targeted by this suite (works under tsx for Node and natively for
+      // Bun). The script binds the socket, then emits `output({ stop: true })`
+      // which calls `process.exit(0)` synchronously without invoking
+      // `server.close()` — Unix-domain socket files are NOT auto-unlinked by
+      // the kernel on process exit, so the socket inode persists on the
+      // filesystem at cleanup time when loopx's `lstat` runs.
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".ts",
+        `import { writeFileSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
+import { output } from "loopx";
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+const tmpdir = process.env.LOOPX_TMPDIR;
+if (!tmpdir) throw new Error("LOOPX_TMPDIR not set");
+writeFileSync(tmpdirObservation, tmpdir);
+rmSync(tmpdir, { recursive: true, force: true });
+const server = createServer();
+await new Promise<void>((resolve, reject) => {
+  server.once("listening", () => resolve());
+  server.once("error", reject);
+  server.listen(tmpdir);
+});
+output({ stop: true });
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+      });
+
+      // (c) CLI exit 0 — cleanup warning does not affect the exit code.
+      expect(result.exitCode).toBe(0);
+
+      const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+      expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+
+      // (a) Path still exists and is a Unix-domain socket — SPEC §7.4 rule 3
+      // leaves non-directory non-symlink entries in place.
+      expect(existsSync(observedLoopxTmpdir)).toBe(true);
+      const lst = lstatSync(observedLoopxTmpdir);
+      expect(lst.isSocket()).toBe(true);
+      expect(lst.isDirectory()).toBe(false);
+      expect(lst.isSymbolicLink()).toBe(false);
+
+      // (b) Exactly one cleanup-related warning on stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // Harness clean-up: remove the leftover socket entry.
+      await rm(observedLoopxTmpdir, { force: true }).catch(() => {});
+    });
+
+    it("T-TMP-37c: CLI hard-link replacement leaves entry in place with nlink unchanged and exactly one cleanup warning", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+
+      // Hard links require the source and destination to be on the same
+      // filesystem. Both `project.dir` (under os.tmpdir()) and `tmpdirParent`
+      // (also under os.tmpdir()) are typically same-device on POSIX, but
+      // assert this explicitly so a cross-device test environment fails fast
+      // with a clear message rather than producing a confusing `EXDEV` error
+      // when the script tries to `ln`. Per SPEC §7.4 rule-3 hard-link sub-
+      // clause coverage rationale.
+      const projectDev = lstatSync(project.dir).dev;
+      const parentDev = lstatSync(tmpdirParent).dev;
+      if (projectDev !== parentDev) {
+        // Skip if cross-device (unprivileged hard-link is not possible).
+        // No structured `it.skip` here because we discovered the device
+        // mismatch only after `setupTmpdirTest()`; emit a no-op assertion
+        // and return.
+        // eslint-disable-next-line no-console
+        console.warn(
+          `T-TMP-37c skipped: project.dir and tmpdirParent are on different devices (${projectDev} vs ${parentDev}); unprivileged hard-link is not possible.`,
+        );
+        return;
+      }
+
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+      const externalPathObservation = join(project.dir, "external-path.txt");
+      const preCleanupNlinkObservation = join(project.dir, "pre-nlink.txt");
+
+      // Bash fixture creates an external regular file (`external-content`),
+      // removes the directory loopx created at `$LOOPX_TMPDIR`, and replaces
+      // it with a HARD LINK to the external file — both paths now share the
+      // same inode with `nlink == 2`. The script captures the pre-cleanup
+      // `nlink` count of the external path into a marker (read after
+      // loopx exits, so the harness can assert post-cleanup `nlink` equals
+      // it). Use a portable `stat` invocation: GNU coreutils (`stat -c %h`)
+      // or BSD/macOS (`stat -f %l`).
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+mkdir -p "$LOOPX_PROJECT_ROOT/external"
+printf 'external-content' > "$LOOPX_PROJECT_ROOT/external/external-target-file"
+printf '%s' "$LOOPX_PROJECT_ROOT/external/external-target-file" > "${externalPathObservation}"
+rm -rf "$LOOPX_TMPDIR"
+ln "$LOOPX_PROJECT_ROOT/external/external-target-file" "$LOOPX_TMPDIR"
+{ stat -c '%h' "$LOOPX_PROJECT_ROOT/external/external-target-file" 2>/dev/null \\
+  || stat -f '%l' "$LOOPX_PROJECT_ROOT/external/external-target-file"; } \\
+  > "${preCleanupNlinkObservation}"
+printf '{"stop":true}'
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent, NODE_ENV: "test" },
+      });
+
+      // (g) CLI exit 0 — cleanup warning does not affect the exit code.
+      expect(result.exitCode).toBe(0);
+
+      const observedLoopxTmpdir = readFileSync(tmpdirObservation, "utf-8");
+      const externalPath = readFileSync(externalPathObservation, "utf-8");
+      const preCleanupNlinkRaw = readFileSync(
+        preCleanupNlinkObservation,
+        "utf-8",
+      ).trim();
+      const preCleanupNlink = Number.parseInt(preCleanupNlinkRaw, 10);
+      expect(observedLoopxTmpdir.length).toBeGreaterThan(0);
+      expect(externalPath.length).toBeGreaterThan(0);
+      expect(Number.isFinite(preCleanupNlink)).toBe(true);
+
+      // (a) The tmpdir-side path still exists — loopx did NOT unlink the
+      // hard-link entry under SPEC §7.4 rule 3.
+      expect(existsSync(observedLoopxTmpdir)).toBe(true);
+      const tmpdirLst = lstatSync(observedLoopxTmpdir);
+      expect(tmpdirLst.isFile()).toBe(true);
+      expect(readFileSync(observedLoopxTmpdir, "utf-8")).toBe(
+        "external-content",
+      );
+
+      // (b) The external path also still exists with original content.
+      expect(existsSync(externalPath)).toBe(true);
+      const externalLst = lstatSync(externalPath);
+      expect(externalLst.isFile()).toBe(true);
+      expect(readFileSync(externalPath, "utf-8")).toBe("external-content");
+
+      // (c) Pre-cleanup nlink == 2 (sanity: `ln A B` produces nlink=2
+      // sharing one inode); post-cleanup external-path nlink == pre-cleanup
+      // nlink — proving loopx did NOT decrement nlink by unlinking the
+      // tmpdir-side entry. SPEC §7.4 rule 3 names this exact scenario as
+      // the rationale for "leave in place".
+      expect(preCleanupNlink).toBe(2);
+      expect(externalLst.nlink).toBe(preCleanupNlink);
+
+      // (d) Tmpdir-side nlink also unchanged at 2 (both ends of the hard-
+      // link pair preserved).
+      expect(tmpdirLst.nlink).toBe(2);
+
+      // (e) Same inode on both ends — the hard-link relationship is intact.
+      expect(tmpdirLst.ino).toBe(externalLst.ino);
+
+      // (f) Exactly one cleanup-related warning on stderr.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // Harness clean-up: remove the leftover hard-link entry. The
+      // external file lives under `project.dir` and is removed by
+      // `setupTmpdirTest`'s registered cleanup.
+      await rm(observedLoopxTmpdir, { force: true }).catch(() => {});
     });
 
     it("T-TMP-37d: runPromise() recursive cleanup unlinks nested symlink without traversing target, no warning", async () => {
