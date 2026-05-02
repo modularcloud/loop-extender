@@ -394,6 +394,19 @@ function runWithInternal(
       const abortObservedFirst = internalAc.signal.aborted;
       if (!abortObservedFirst) {
         returnCalled = true;
+        // TEST-SPEC §1.4 `consumer-return-observed` seam — fires only when
+        // .return() is the first-observed terminal trigger (i.e., abort had
+        // not been observed before this .return() arrived). Pauses AFTER
+        // recording first-observed status (the `returnCalled` pin above) and
+        // BEFORE dispatch (internalAc.abort() / gen.return() below), so a
+        // parent harness can race a second terminal trigger into the window
+        // and assert SPEC §7.2 first-observed-wins + SPEC §7.4 cleanup-
+        // idempotence + at-most-one-warning across racing triggers. The seam
+        // fires on any post-first-`next()` `.return()` — both mid-loop and
+        // post-final-yield (the abort-already-observed post-final-yield case
+        // takes the `surfacePostFinalYieldAbort` branch above and never
+        // reaches this block).
+        await maybePauseAtTerminalTriggerWindow("consumer-return-observed");
       }
       internalAc.abort();
       try {
