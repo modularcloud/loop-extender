@@ -4673,5 +4673,509 @@ console.log(JSON.stringify({
       expect(data.observed.length).toBeGreaterThan(0);
       expect(data.exist).toBe(false);
     });
+
+    // ========================================================================
+    // Final-Yield-vs-Settlement Carve-out (T-TMP-23..24g)
+    // SPEC §7.4 / §9.1 / §9.3 — settlement triggers cleanup; abort-after-final-
+    // yield surfaces the abort error on the next interaction (with cleanup
+    // first); external SIGKILL to loopx itself runs no cleanup.
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // T-TMP-23: After the final yield, cleanup is guaranteed only once the
+    // generator settles. The post-final-yield / pre-settlement cleanup state
+    // is implementation-defined — only the post-settlement assertion is
+    // contractual. SPEC §7.4 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-23: cleanup runs after settlement (post-final-yield, no abort)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+const first = await gen.next();
+const observed = readFileSync(marker, "utf-8");
+// Intentionally no assertion here about tmpdir existence — SPEC §7.4 leaves
+// the post-final-yield / pre-settlement cleanup window implementation-defined.
+const settled = await gen.next();
+console.log(JSON.stringify({
+  firstDone: first.done,
+  firstHasValue: first.value !== undefined,
+  settledDone: settled.done,
+  settledValue: settled.value,
+  observed,
+  existAfterSettle: existsSync(observed),
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.firstHasValue).toBe(true);
+      expect(data.settledDone).toBe(true);
+      expect(data.settledValue).toBeUndefined();
+      expect(data.observed.length).toBeGreaterThan(0);
+      // Settlement triggers cleanup — definite post-condition per SPEC §7.4.
+      expect(data.existAfterSettle).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-24: Cleanup via full `for await` completion. `for await` drives
+    // settlement automatically; tmpdir is removed after the loop exits.
+    // SPEC §7.4 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-TMP-24: cleanup via full for-await completion", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+let count = 0;
+for await (const _ of gen) { count++; }
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({
+  count,
+  observed,
+  exist: existsSync(observed),
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.count).toBe(1);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-24a: Abort after final yield (maxIterations:1) + .next() →
+    // cleanup runs before the abort error surfaces. SPEC §7.4 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-24a: abort after final yield (maxIter) + .next() → cleanup before abort", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.next();
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({
+  firstDone: first.done,
+  firstHasValue: first.value !== undefined,
+  result,
+  observed,
+  exist: existsSync(observed),
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.firstHasValue).toBe(true);
+      expect(data.result.kind).toBe("rejected");
+      // Abort error class — DOMException("AbortError") or signal.reason.
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-24c: Abort after final yield (maxIter) + .return() → cleanup
+    // before abort error. SPEC §7.4 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-24c: abort after final yield (maxIter) + .return() → cleanup before abort", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.return(undefined);
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({
+  firstDone: first.done,
+  result,
+  observed,
+  exist: existsSync(observed),
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.result.kind).toBe("rejected");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-24d: Abort after final yield (maxIter) + .throw() → cleanup
+    // before abort error (which displaces the consumer-supplied error per
+    // SPEC §9.3). SPEC §7.4 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-24d: abort after final yield (maxIter) + .throw() → abort displaces consumer error", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.throw(new Error("consumer-err"));
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({
+  firstDone: first.done,
+  result,
+  observed,
+  exist: existsSync(observed),
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.result.kind).toBe("rejected");
+      // Abort error displaces consumer-supplied "consumer-err".
+      expect(data.result.msg).not.toBe("consumer-err");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-24e: Abort after stop:true-driven final yield + .next() →
+    // cleanup before abort error. SPEC §7.4 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-24e: abort after stop:true final yield + .next() → cleanup before abort", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.next();
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({
+  firstDone: first.done,
+  firstStop: first.value && first.value.stop === true,
+  result,
+  observed,
+  exist: existsSync(observed),
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.firstStop).toBe(true);
+      expect(data.result.kind).toBe("rejected");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-24f: Abort after stop:true-driven final yield + .return() →
+    // cleanup before abort error. SPEC §7.4 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-24f: abort after stop:true final yield + .return() → cleanup before abort", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.return(undefined);
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({
+  firstStop: first.value && first.value.stop === true,
+  result,
+  observed,
+  exist: existsSync(observed),
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstStop).toBe(true);
+      expect(data.result.kind).toBe("rejected");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-24g: Abort after stop:true-driven final yield + .throw() →
+    // cleanup before abort error (displaces consumer error). SPEC §7.4 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-TMP-24g: abort after stop:true final yield + .throw() → abort displaces consumer error", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const marker = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.throw(new Error("consumer-err"));
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+const observed = readFileSync(marker, "utf-8");
+console.log(JSON.stringify({
+  firstStop: first.value && first.value.stop === true,
+  result,
+  observed,
+  exist: existsSync(observed),
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstStop).toBe(true);
+      expect(data.result.kind).toBe("rejected");
+      expect(data.result.msg).not.toBe("consumer-err");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+      expect(data.observed.length).toBeGreaterThan(0);
+      expect(data.exist).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-24b: External SIGKILL to loopx itself does NOT run tmpdir
+    // cleanup. SIGKILL cannot be intercepted, so the tmpdir survives the
+    // loopx process death. SPEC §7.4. (CLI surface; not parameterized over
+    // runtimes — uses node CLI invocation directly.)
+    // ------------------------------------------------------------------------
+    if (runtime === "node") {
+      it("T-TMP-24b: external SIGKILL to loopx leaks tmpdir (no cleanup)", async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const tmpdirMarker = join(project.dir, "tmpdir.txt");
+        const pidMarker = join(project.dir, "pid.txt");
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$$" > "${pidMarker}"
+echo "ready" >&2
+while true; do sleep 1; done
+`,
+        );
+
+        const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+          ["run", "ralph"],
+          {
+            cwd: project.dir,
+            env: { TMPDIR: tmpdirParent },
+            timeout: 30_000,
+          },
+        );
+
+        await waitForStderr("ready");
+        // Read tmpdir + child pid from the markers before killing.
+        const observedTmpdir = readFileSync(tmpdirMarker, "utf-8");
+        const childPidStr = readFileSync(pidMarker, "utf-8").trim();
+        const childPid = parseInt(childPidStr, 10);
+        expect(observedTmpdir.length).toBeGreaterThan(0);
+        expect(Number.isFinite(childPid) && childPid > 0).toBe(true);
+
+        // SIGKILL the loopx process directly — cleanup cannot run.
+        sendSignal("SIGKILL");
+
+        // Brief delay so the SIGKILL takes effect on loopx before we read the
+        // tmpdir state. This pins down the "no cleanup runs" contract.
+        await new Promise((r) => setTimeout(r, 100));
+        // Tmpdir survives because loopx died without running its finally.
+        const tmpdirSurvived = existsSync(observedTmpdir);
+
+        // Kill the orphaned child (detached process group via execution.ts).
+        // Required so the inherited stderr fd closes and runCLIWithSignal's
+        // 'close' event fires; otherwise `await result` would block until
+        // the test's outer timeout. This is test plumbing, not the
+        // contract under test.
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {
+          // Child may already be reaped by the OS.
+        }
+
+        const cliResult = await result;
+        expect(tmpdirSurvived).toBe(true);
+        expect(cliResult.signal).toBe("SIGKILL");
+      });
+    }
   });
 });

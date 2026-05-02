@@ -295,12 +295,55 @@ function runWithInternal(
   );
 
   let returnCalled = false;
+  let settled = false;
+  let yieldCount = 0;
+  // SPEC §9.3 abort-after-final-yield: tracks whether the most recently
+  // yielded Output was final (stop:true or maxIterations reached). When set,
+  // an abort observed before the next consumer interaction surfaces the
+  // abort error (with cleanup first) rather than allowing silent completion.
+  let postFinalYield = false;
+
+  const surfacePostFinalYieldAbort = async (): Promise<never> => {
+    // Drive inner gen to settlement so its `finally` runs cleanupTmpdir
+    // before the abort error reaches the consumer (SPEC §9.3 / §7.4 ordering).
+    try {
+      await gen.return(undefined as unknown as Output);
+    } catch {
+      // Cleanup-time errors are swallowed; abort error takes precedence.
+    }
+    throw makeAbortError(snap.signal ?? internalAc.signal);
+  };
 
   const wrapper: AsyncGenerator<Output> = {
     next: async () => {
+      if (settled) {
+        return { done: true, value: undefined } as IteratorResult<Output>;
+      }
+      // SPEC §9.3 abort-after-final-yield: an AbortSignal that aborts after
+      // the final Output but before settlement surfaces the abort error on
+      // the next interaction. The first-observed-wins guard (!returnCalled)
+      // ensures a prior consumer .return()/.throw() retains its silent
+      // completion outcome.
+      if (postFinalYield && internalAc.signal.aborted && !returnCalled) {
+        settled = true;
+        await surfacePostFinalYieldAbort();
+      }
       try {
-        return await gen.next();
+        const result = await gen.next();
+        if (!result.done && result.value !== undefined) {
+          yieldCount++;
+          if (
+            result.value.stop === true ||
+            (snap.maxIterations !== undefined &&
+              yieldCount === snap.maxIterations)
+          ) {
+            postFinalYield = true;
+          }
+        }
+        if (result.done) settled = true;
+        return result;
       } catch (err) {
+        settled = true;
         if (returnCalled) {
           return { done: true, value: undefined } as IteratorResult<Output>;
         }
@@ -308,11 +351,26 @@ function runWithInternal(
       }
     },
     return: async (value?: Output) => {
+      if (settled) {
+        returnCalled = true;
+        return { done: true, value: undefined } as IteratorResult<Output>;
+      }
+      // SPEC §9.3 abort-after-final-yield: abort observed before this
+      // .return() displaces silent completion; abort error surfaces (with
+      // cleanup first).
+      if (postFinalYield && internalAc.signal.aborted && !returnCalled) {
+        settled = true;
+        returnCalled = true;
+        await surfacePostFinalYieldAbort();
+      }
       returnCalled = true;
       internalAc.abort();
       try {
-        return await gen.return(value as Output);
+        const result = await gen.return(value as Output);
+        settled = true;
+        return result;
       } catch {
+        settled = true;
         return { done: true, value: undefined } as IteratorResult<Output>;
       }
     },
@@ -323,12 +381,29 @@ function runWithInternal(
     // — the consumer-supplied error is not surfaced. For the active-child
     // case the settlement form is implementation-defined; we choose silent
     // completion for symmetry with `.return()`.
+    //
+    // SPEC §9.3 abort-after-final-yield carve-out: when an abort has already
+    // been observed in the post-final-yield window before this .throw()
+    // arrives, the abort error displaces both silent completion AND the
+    // consumer-supplied error.
     throw: async (_err: unknown) => {
+      if (settled) {
+        returnCalled = true;
+        return { done: true, value: undefined } as IteratorResult<Output>;
+      }
+      if (postFinalYield && internalAc.signal.aborted && !returnCalled) {
+        settled = true;
+        returnCalled = true;
+        await surfacePostFinalYieldAbort();
+      }
       returnCalled = true;
       internalAc.abort();
       try {
-        return await gen.return(undefined as unknown as Output);
+        const result = await gen.return(undefined as unknown as Output);
+        settled = true;
+        return result;
       } catch {
+        settled = true;
         return { done: true, value: undefined } as IteratorResult<Output>;
       }
     },
@@ -336,11 +411,17 @@ function runWithInternal(
       return this;
     },
     async [Symbol.asyncDispose](): Promise<void> {
+      if (settled) {
+        returnCalled = true;
+        return;
+      }
       returnCalled = true;
       internalAc.abort();
       try {
         await gen.return(undefined as unknown as Output);
+        settled = true;
       } catch {
+        settled = true;
         // Swallow errors during dispose
       }
     },
