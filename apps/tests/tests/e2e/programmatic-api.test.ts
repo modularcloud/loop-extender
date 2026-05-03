@@ -4170,10 +4170,11 @@ console.log(JSON.stringify({ count: outputs.length }));
       expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("A");
     });
 
-    // T-API-72b: runPromise() global env file path resolution is eager.
-    // SPEC §9.2: "Global env file path resolution (XDG_CONFIG_HOME / HOME)
-    // also uses this schedule."
-    it("T-API-72b: runPromise() XDG_CONFIG_HOME mutation after return does not redirect global env file lookup", async () => {
+    // T-API-73a: runPromise() global env file path resolution via XDG_CONFIG_HOME
+    // is eager (captured at call site).
+    // SPEC §9.2 / §8.1: "Global env file path resolution (XDG_CONFIG_HOME / HOME)
+    // reads the inherited env on the same schedule as the inherited-env snapshot."
+    it("T-API-73a: runPromise() XDG_CONFIG_HOME mutation after return does not redirect global env file lookup", async () => {
       project = await createTempProject();
       const marker = join(project.dir, "myglobal.txt");
       await createBashWorkflowScript(
@@ -4216,8 +4217,11 @@ console.log(JSON.stringify({ count: outputs.length }));
       }
     });
 
-    // T-API-71b: run() global env file path resolution is lazy (counterpart to 72b).
-    it("T-API-71b: run() XDG_CONFIG_HOME mutation between run() and first next() redirects global env file lookup", async () => {
+    // T-API-73: run() global env file path resolution via XDG_CONFIG_HOME is
+    // lazy (captured at first next()) — counterpart to T-API-73a.
+    // SPEC §9.1 / §8.1: a buggy implementation that read XDG_CONFIG_HOME eagerly
+    // would show "valueA"; the lazy snapshot picks up the post-call mutation.
+    it("T-API-73: run() XDG_CONFIG_HOME mutation between run() and first next() redirects global env file lookup", async () => {
       project = await createTempProject();
       const marker = join(project.dir, "myglobal.txt");
       await createBashWorkflowScript(
@@ -4255,6 +4259,471 @@ console.log(JSON.stringify({ count: results.length }));
         await Promise.all([
           rm(xdgA, { recursive: true, force: true }),
           rm(xdgB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+
+    // T-API-73b: run() global env file path resolution via the HOME fallback
+    // is lazy. With XDG_CONFIG_HOME unset, loopx falls back to
+    // $HOME/.config/loopx/env. A HOME mutation between run() and first next()
+    // must redirect the lookup, exactly mirroring the XDG_CONFIG_HOME case
+    // (T-API-73). SPEC §9.1 / §8.1.
+    it("T-API-73b: run() HOME mutation between run() and first next() redirects global env file lookup via the fallback path", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myglobal.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MY_GLOBAL:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const homeA = await mkdtemp(join(osTmpdir(), "loopx-home-a-"));
+      await mkdir(join(homeA, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeA, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueA\n",
+        "utf-8",
+      );
+
+      const homeB = await mkdtemp(join(osTmpdir(), "loopx-home-b-"));
+      await mkdir(join(homeB, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeB, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueB\n",
+        "utf-8",
+      );
+
+      try {
+        const driverCode = `
+import { run } from "loopx";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(homeA)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+// Lazy fallback resolution — HOME mutation before first next() redirects
+// the lookup to homeB's loopx env file.
+process.env.HOME = ${JSON.stringify(homeB)};
+const results = [];
+for await (const o of gen) { results.push(o); }
+console.log(JSON.stringify({ count: results.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(readFileSync(marker, "utf-8")).toBe("valueB");
+      } finally {
+        await Promise.all([
+          rm(homeA, { recursive: true, force: true }),
+          rm(homeB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+
+    // T-API-73c: runPromise() global env file path resolution via the HOME
+    // fallback is eager. With XDG_CONFIG_HOME unset, the eager call-site
+    // snapshot of HOME pins the fallback path; later HOME mutations do not
+    // redirect the lookup. SPEC §9.2 / §8.1.
+    it("T-API-73c: runPromise() HOME mutation after return does not redirect global env file lookup via the fallback path", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myglobal.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MY_GLOBAL:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const homeA = await mkdtemp(join(osTmpdir(), "loopx-home-a-"));
+      await mkdir(join(homeA, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeA, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueA\n",
+        "utf-8",
+      );
+
+      const homeB = await mkdtemp(join(osTmpdir(), "loopx-home-b-"));
+      await mkdir(join(homeB, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeB, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueB\n",
+        "utf-8",
+      );
+
+      try {
+        const driverCode = `
+import { runPromise } from "loopx";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(homeA)};
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+// Eager fallback resolution at call site pinned the global env file under
+// homeA. A post-return HOME mutation must not redirect the lookup.
+process.env.HOME = ${JSON.stringify(homeB)};
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(readFileSync(marker, "utf-8")).toBe("valueA");
+      } finally {
+        await Promise.all([
+          rm(homeA, { recursive: true, force: true }),
+          rm(homeB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — Cross-Iteration Global Env File Path Resolution Snapshot Reuse
+//        (SPEC §9.1 / §9.2 / §8.1)
+// ═════════════════════════════════════════════════════════════
+//
+// T-API-73 / 73a / 73b / 73c pin the FIRST-iteration timing for global env
+// file path resolution. T-API-71a / 72a pin the cross-iteration reuse
+// contract for the inherited-env snapshot. T-ENV-25 / 25a pin the env-file
+// CONTENT cache.
+//
+// These tests pin the cross-iteration reuse of the global env-file PATH
+// resolution itself: even if a buggy implementation re-resolved the path on
+// each iteration (re-reading XDG_CONFIG_HOME / HOME per spawn), the
+// already-cached file CONTENT would mask the bug. We probe by mutating the
+// resolution input mid-run and asserting the second iteration's spawned
+// script still observes the file loaded for the first iteration.
+
+describe("SPEC: Cross-Iteration Global Env File Path Resolution Snapshot Reuse", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // T-API-74: run() XDG_CONFIG_HOME path resolution is reused across
+    // iterations (frozen at the lazy first-next() snapshot). Mid-run mutation
+    // of process.env.XDG_CONFIG_HOME does not redirect the second iteration's
+    // global env file lookup. SPEC §9.1 / §8.1.
+    it("T-API-74: run() XDG_CONFIG_HOME path resolution is reused across iterations — mid-run mutation does not redirect", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const releasePath = join(project.dir, "release.sentinel");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+RELEASE="${releasePath}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MY_GLOBAL:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -eq 1 ]; then
+  while [ ! -f "$RELEASE" ]; do sleep 0.02; done
+fi
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const xdgA = await mkdtemp(join(osTmpdir(), "loopx-xdg-a-"));
+      await mkdir(join(xdgA, "loopx"), { recursive: true });
+      await writeFile(join(xdgA, "loopx", "env"), "MY_GLOBAL=valueA\n", "utf-8");
+
+      const xdgB = await mkdtemp(join(osTmpdir(), "loopx-xdg-b-"));
+      await mkdir(join(xdgB, "loopx"), { recursive: true });
+      await writeFile(join(xdgB, "loopx", "env"), "MY_GLOBAL=valueB\n", "utf-8");
+
+      try {
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync, writeFileSync } from "node:fs";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgA)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+// Start the first yield without awaiting — iter 1 will block on the release
+// sentinel after writing its observation, so awaiting here would deadlock.
+const firstNextP = gen.next();
+const deadline = Date.now() + 15_000;
+while (Date.now() < deadline) {
+  if (existsSync(${JSON.stringify(join(markerDir, "iter1.txt"))})) break;
+  await new Promise(r => setTimeout(r, 25));
+}
+// Mutate XDG_CONFIG_HOME between iter 1's lazy snapshot and iter 2's spawn.
+// Path resolution snapshot taken at first next() must be reused, so iter 2
+// must still observe valueA — not the mutated valueB path.
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgB)};
+writeFileSync(${JSON.stringify(releasePath)}, "");
+const r1 = await firstNextP;
+const results = [r1];
+for await (const o of gen) { results.push({ value: o, done: false }); }
+console.log(JSON.stringify({ count: results.filter(r => !r.done).length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, { timeout: 30_000 });
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(2);
+        expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("valueA");
+        expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("valueA");
+      } finally {
+        await Promise.all([
+          rm(xdgA, { recursive: true, force: true }),
+          rm(xdgB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+
+    // T-API-74a: runPromise() XDG_CONFIG_HOME path resolution is reused across
+    // iterations (frozen at the eager call-site snapshot). Mid-run mutation
+    // of process.env.XDG_CONFIG_HOME does not redirect the second iteration's
+    // global env file lookup. SPEC §9.2 / §8.1.
+    it("T-API-74a: runPromise() XDG_CONFIG_HOME path resolution is reused across iterations — mid-run mutation does not redirect", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const releasePath = join(project.dir, "release.sentinel");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+RELEASE="${releasePath}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MY_GLOBAL:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -eq 1 ]; then
+  while [ ! -f "$RELEASE" ]; do sleep 0.02; done
+fi
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const xdgA = await mkdtemp(join(osTmpdir(), "loopx-xdg-a-"));
+      await mkdir(join(xdgA, "loopx"), { recursive: true });
+      await writeFile(join(xdgA, "loopx", "env"), "MY_GLOBAL=valueA\n", "utf-8");
+
+      const xdgB = await mkdtemp(join(osTmpdir(), "loopx-xdg-b-"));
+      await mkdir(join(xdgB, "loopx"), { recursive: true });
+      await writeFile(join(xdgB, "loopx", "env"), "MY_GLOBAL=valueB\n", "utf-8");
+
+      try {
+        const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, writeFileSync } from "node:fs";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgA)};
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+const deadline = Date.now() + 15_000;
+while (Date.now() < deadline) {
+  if (existsSync(${JSON.stringify(join(markerDir, "iter1.txt"))})) break;
+  await new Promise(r => setTimeout(r, 25));
+}
+// Mutate XDG_CONFIG_HOME after iter 1's eager snapshot was already taken at
+// the runPromise() call site. The reused snapshot must keep iter 2 on xdgA.
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgB)};
+writeFileSync(${JSON.stringify(releasePath)}, "");
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, { timeout: 30_000 });
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(2);
+        expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("valueA");
+        expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("valueA");
+      } finally {
+        await Promise.all([
+          rm(xdgA, { recursive: true, force: true }),
+          rm(xdgB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+
+    // T-API-74b: run() HOME-fallback path resolution is reused across
+    // iterations (frozen at the lazy first-next() snapshot). Mid-run mutation
+    // of process.env.HOME (with XDG_CONFIG_HOME unset) does not redirect the
+    // second iteration's fallback global env file lookup. SPEC §9.1 / §8.1.
+    it("T-API-74b: run() HOME-fallback path resolution is reused across iterations — mid-run mutation does not redirect", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const releasePath = join(project.dir, "release.sentinel");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+RELEASE="${releasePath}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MY_GLOBAL:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -eq 1 ]; then
+  while [ ! -f "$RELEASE" ]; do sleep 0.02; done
+fi
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const homeA = await mkdtemp(join(osTmpdir(), "loopx-home-a-"));
+      await mkdir(join(homeA, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeA, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueA\n",
+        "utf-8",
+      );
+
+      const homeB = await mkdtemp(join(osTmpdir(), "loopx-home-b-"));
+      await mkdir(join(homeB, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeB, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueB\n",
+        "utf-8",
+      );
+
+      try {
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync, writeFileSync } from "node:fs";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(homeA)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+const firstNextP = gen.next();
+const deadline = Date.now() + 15_000;
+while (Date.now() < deadline) {
+  if (existsSync(${JSON.stringify(join(markerDir, "iter1.txt"))})) break;
+  await new Promise(r => setTimeout(r, 25));
+}
+// Mutate HOME between iter 1's lazy fallback snapshot and iter 2's spawn.
+// The frozen snapshot must keep iter 2 on homeA.
+process.env.HOME = ${JSON.stringify(homeB)};
+writeFileSync(${JSON.stringify(releasePath)}, "");
+const r1 = await firstNextP;
+const results = [r1];
+for await (const o of gen) { results.push({ value: o, done: false }); }
+console.log(JSON.stringify({ count: results.filter(r => !r.done).length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, { timeout: 30_000 });
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(2);
+        expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("valueA");
+        expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("valueA");
+      } finally {
+        await Promise.all([
+          rm(homeA, { recursive: true, force: true }),
+          rm(homeB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+
+    // T-API-74c: runPromise() HOME-fallback path resolution is reused across
+    // iterations (frozen at the eager call-site snapshot). Mid-run mutation
+    // of process.env.HOME (with XDG_CONFIG_HOME unset) does not redirect the
+    // second iteration's fallback global env file lookup. SPEC §9.2 / §8.1.
+    it("T-API-74c: runPromise() HOME-fallback path resolution is reused across iterations — mid-run mutation does not redirect", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const releasePath = join(project.dir, "release.sentinel");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+RELEASE="${releasePath}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MY_GLOBAL:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -eq 1 ]; then
+  while [ ! -f "$RELEASE" ]; do sleep 0.02; done
+fi
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const homeA = await mkdtemp(join(osTmpdir(), "loopx-home-a-"));
+      await mkdir(join(homeA, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeA, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueA\n",
+        "utf-8",
+      );
+
+      const homeB = await mkdtemp(join(osTmpdir(), "loopx-home-b-"));
+      await mkdir(join(homeB, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeB, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueB\n",
+        "utf-8",
+      );
+
+      try {
+        const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, writeFileSync } from "node:fs";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(homeA)};
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+const deadline = Date.now() + 15_000;
+while (Date.now() < deadline) {
+  if (existsSync(${JSON.stringify(join(markerDir, "iter1.txt"))})) break;
+  await new Promise(r => setTimeout(r, 25));
+}
+// Mutate HOME after iter 1's eager fallback snapshot was already taken at
+// the runPromise() call site. The reused snapshot must keep iter 2 on homeA.
+process.env.HOME = ${JSON.stringify(homeB)};
+writeFileSync(${JSON.stringify(releasePath)}, "");
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, { timeout: 30_000 });
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(2);
+        expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("valueA");
+        expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("valueA");
+      } finally {
+        await Promise.all([
+          rm(homeA, { recursive: true, force: true }),
+          rm(homeB, { recursive: true, force: true }),
         ]);
       }
     });
