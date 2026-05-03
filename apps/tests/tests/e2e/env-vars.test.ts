@@ -1,8 +1,9 @@
 import { describe, it, expect, afterEach } from "vitest";
+import { spawn } from "node:child_process";
 import { readFileSync, existsSync, unlinkSync, realpathSync } from "node:fs";
 import { mkdir, chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   createTempProject,
   createWorkflowScript,
@@ -1779,6 +1780,428 @@ printf '{"stop":true}'`,
       // (c) loopx loaded global env file using inherited HOME (real path)
       //     via the fallback — so MARKER=real.
       expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC: PWD Non-Protocol Behavior  (T-PWD-01 / 02 / 03 / 04a / 04b / 06 / 07
+// / 08; T-PWD-05 is non-normative per TEST-SPEC §4.7 and is intentionally
+// not implemented.)
+//
+// SPEC §6.1 / §8.3 / §13 explicitly declare PWD outside the
+// script-protocol-protected tier. These tests pin down that loopx neither
+// reserves nor synthesizes PWD and that user-supplied PWD reaches spawned
+// scripts unchanged through every supply tier (inherited env, RunOptions.env,
+// global env file, local -e env file).
+//
+// All exact-value PWD assertions use a TS fixture reading process.env.PWD
+// (via observeEnv) rather than Bash $PWD, because Bash performs shell-level
+// PWD rewriting at startup which is outside the loopx contract per the
+// TEST-SPEC §4.7 fixture note.
+// ---------------------------------------------------------------------------
+
+describe("SPEC: PWD Non-Protocol Behavior", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ----------------------------------------------------------------------
+    // T-PWD-01: loopx does not reserve/protect PWD; inherited PWD reaches
+    // the spawned script byte-for-byte unchanged. SPEC §6.1, §8.3, §13.
+    // ----------------------------------------------------------------------
+    it("T-PWD-01: inherited PWD reaches the spawned script unchanged (loopx does not reserve/protect PWD)", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "pwd-marker.json");
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          observeEnv("PWD", markerPath),
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: { PWD: "/some/inherited/value" },
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(markerPath)).toBe(true);
+        const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+        expect(observed).toEqual({
+          present: true,
+          value: "/some/inherited/value",
+        });
+      });
+    });
+
+    // ----------------------------------------------------------------------
+    // T-PWD-02: RunOptions.env.PWD reaches spawned scripts. SPEC §6.1, §8.3,
+    // §9.5. RunOptions.env is tier 2 — it overrides inherited env, global
+    // env file, and local env file, and is overridden only by protocol vars
+    // (which do not include PWD).
+    // ----------------------------------------------------------------------
+    it("T-PWD-02: RunOptions.env.PWD reaches spawned scripts via runPromise()", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "pwd-marker.json");
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          observeEnv("PWD", markerPath),
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { PWD: "/value-from-run-options" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(existsSync(markerPath)).toBe(true);
+        const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+        expect(observed).toEqual({
+          present: true,
+          value: "/value-from-run-options",
+        });
+      });
+    });
+
+    // ----------------------------------------------------------------------
+    // T-PWD-03: Inherited PWD propagates unchanged when neither env file
+    // nor RunOptions.env sets it. SPEC §6.1, §8.3.
+    // ----------------------------------------------------------------------
+    it("T-PWD-03: inherited PWD propagates unchanged when no env file or RunOptions.env sets PWD", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "pwd-marker.json");
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          observeEnv("PWD", markerPath),
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: { PWD: "/inherited" },
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(markerPath)).toBe(true);
+        const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+        expect(observed).toEqual({ present: true, value: "/inherited" });
+      });
+    });
+
+    // ----------------------------------------------------------------------
+    // T-PWD-04a: PWD propagates from inherited env AND all five LOOPX_*
+    // protocol variables are injected (SPEC §8.3 table). The TS fixture
+    // enumerates process.env's keys to assert membership of all protocol
+    // vars and reads the inherited PWD value to assert byte-for-byte
+    // passthrough. SPEC §6.1, §8.3, §13.
+    // ----------------------------------------------------------------------
+    it("T-PWD-04a: when loopx is spawned with PWD in its env, the script sees PWD passed through and all five LOOPX_* protocol vars injected", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "env-keys.json");
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          `import { writeFileSync } from "node:fs";
+const keys = Object.keys(process.env).sort();
+const data = {
+  keys,
+  pwd: process.env.PWD === undefined ? null : process.env.PWD,
+};
+writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify(data));
+`,
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: { PWD: "/inherited-pwd-value" },
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(markerPath)).toBe(true);
+        const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+        // (a) all five LOOPX_* protocol vars injected per SPEC §8.3 table.
+        expect(observed.keys).toContain("LOOPX_BIN");
+        expect(observed.keys).toContain("LOOPX_PROJECT_ROOT");
+        expect(observed.keys).toContain("LOOPX_WORKFLOW");
+        expect(observed.keys).toContain("LOOPX_WORKFLOW_DIR");
+        expect(observed.keys).toContain("LOOPX_TMPDIR");
+        // (b) PWD reached the child unchanged from the inherited tier (loopx
+        // did not synthesize, override, or rewrite it).
+        expect(observed.pwd).toBe("/inherited-pwd-value");
+      });
+    });
+
+    // ----------------------------------------------------------------------
+    // T-PWD-04b: When loopx is spawned without PWD in its environment
+    // (env -i style), the script's PWD must NOT be present — proving loopx
+    // does not synthesize a PWD value when none is inherited. The five
+    // LOOPX_* protocol vars must still be injected. SPEC §6.1, §8.3, §13.
+    //
+    // This test cannot use runCLI (which spreads process.env). Instead it
+    // performs an explicit child_process.spawn with a minimal env: PATH (to
+    // resolve tsx / bun) and an empty XDG_CONFIG_HOME (so loopx does not
+    // attempt to load a global env file that could supply PWD via tier 4).
+    // ----------------------------------------------------------------------
+    it("T-PWD-04b: when loopx is spawned without PWD in its environment, the child has no PWD (loopx does not synthesize PWD)", async () => {
+      project = await createTempProject();
+      const markerPath = join(project.dir, "env-keys.json");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".ts",
+        `import { writeFileSync } from "node:fs";
+const keys = Object.keys(process.env).sort();
+const data = {
+  keys,
+  pwdPresent: Object.prototype.hasOwnProperty.call(process.env, "PWD"),
+  pwdValue: process.env.PWD === undefined ? null : process.env.PWD,
+};
+writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify(data));
+`,
+      );
+
+      // Empty XDG_CONFIG_HOME so loopx finds no global env file (preventing
+      // a stray PWD entry from tier 4).
+      const emptyXdg = await mkdtemp(join(tmpdir(), "loopx-pwd04b-xdg-"));
+      try {
+        // Resolve loopx's actual bin path from its package.json (mirrors
+        // runCLI's getLoopxBinPath helper). The bin field points at
+        // dist/bin.js relative to the loopx package root, not bin.js at the
+        // package root.
+        const loopxPkgPath = resolve(
+          process.cwd(),
+          "node_modules/loopx/package.json",
+        );
+        const loopxPkg = JSON.parse(readFileSync(loopxPkgPath, "utf-8"));
+        const binRel =
+          typeof loopxPkg.bin === "string"
+            ? loopxPkg.bin
+            : loopxPkg.bin?.loopx;
+        const loopxBinPath = resolve(
+          process.cwd(),
+          "node_modules/loopx",
+          binRel,
+        );
+        const command = runtime === "bun" ? "bun" : "node";
+        const args = [loopxBinPath, "run", "-n", "1", "ralph"];
+        // Minimal env: PATH (for tsx / bun discovery) and XDG_CONFIG_HOME
+        // (set to empty dir to suppress global env loading). No PWD.
+        const minimalEnv: Record<string, string> = {
+          PATH: process.env.PATH ?? "",
+          XDG_CONFIG_HOME: emptyXdg,
+        };
+        const result = await new Promise<{
+          exitCode: number;
+          stdout: string;
+          stderr: string;
+        }>((resolvePromise, reject) => {
+          const child = spawn(command, args, {
+            cwd: project!.dir,
+            env: minimalEnv,
+            stdio: ["pipe", "pipe", "pipe"],
+          });
+          let stdout = "";
+          let stderr = "";
+          child.stdout.on("data", (chunk: Buffer) => {
+            stdout += chunk.toString();
+          });
+          child.stderr.on("data", (chunk: Buffer) => {
+            stderr += chunk.toString();
+          });
+          child.stdin.end();
+          const timer = setTimeout(() => {
+            child.kill("SIGKILL");
+            reject(new Error("T-PWD-04b CLI timed out after 30s"));
+          }, 30_000);
+          child.on("close", (code) => {
+            clearTimeout(timer);
+            resolvePromise({ exitCode: code ?? 1, stdout, stderr });
+          });
+          child.on("error", (err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(markerPath)).toBe(true);
+        const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+        // (a) all five LOOPX_* protocol vars still injected even with a
+        // minimal inherited env.
+        expect(observed.keys).toContain("LOOPX_BIN");
+        expect(observed.keys).toContain("LOOPX_PROJECT_ROOT");
+        expect(observed.keys).toContain("LOOPX_WORKFLOW");
+        expect(observed.keys).toContain("LOOPX_WORKFLOW_DIR");
+        expect(observed.keys).toContain("LOOPX_TMPDIR");
+        // (b) PWD is NOT present in the child env when not inherited — the
+        // load-bearing assertion of T-PWD-04: loopx does not synthesize PWD.
+        expect(observed.pwdPresent).toBe(false);
+        expect(observed.pwdValue).toBeNull();
+        // Defensive: PWD must not appear in the enumerated keys either.
+        expect(observed.keys).not.toContain("PWD");
+      } finally {
+        await rm(emptyXdg, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+
+    // ----------------------------------------------------------------------
+    // T-PWD-06: CLI project root derives from process.cwd() (loopx's own
+    // kernel cwd at invocation), NOT from the inherited PWD env var. SPEC
+    // §3.2 / §6.1 explicitly say "loopx does not consult $PWD" for
+    // project-root derivation. Inherited PWD still passes through unchanged
+    // to the child per T-PWD-01. SPEC §3.2, §6.1, §13.
+    // ----------------------------------------------------------------------
+    it("T-PWD-06: CLI project root derives from process.cwd(), not inherited PWD; PWD still passes through to the child", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "cwd-and-pwd.json");
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          `import { writeFileSync } from "node:fs";
+const data = {
+  loopxProjectRoot: process.env.LOOPX_PROJECT_ROOT ?? null,
+  cwd: process.cwd(),
+  pwd: process.env.PWD === undefined ? null : process.env.PWD,
+};
+writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify(data));
+`,
+        );
+
+        const bogusPwd = "/bogus-value-that-does-not-exist";
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: { PWD: bogusPwd },
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(markerPath)).toBe(true);
+        const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+
+        // (a) LOOPX_PROJECT_ROOT equals the kernel cwd (real project), NOT
+        // the bogus PWD value. POSIX getcwd(3) typically canonicalizes via
+        // the kernel, so the canonical project path equals
+        // realpathSync(project.dir). The load-bearing assertion is the
+        // negative form (not bogusPwd) — the realpath equality is the
+        // common-POSIX positive form.
+        expect(observed.loopxProjectRoot).not.toBe(bogusPwd);
+        expect(observed.loopxProjectRoot).toBe(realpathSync(project.dir));
+        // (b) process.cwd() likewise reports the real project (directory
+        // identity matches; the canonical spelling under getcwd(3)
+        // equals realpathSync(project.dir) on the common POSIX
+        // configuration).
+        expect(observed.cwd).not.toBe(bogusPwd);
+        expect(observed.cwd).toBe(realpathSync(project.dir));
+        // (c) Inherited PWD passes through to the child unchanged (per
+        // T-PWD-01) — loopx itself did not consume or rewrite it.
+        expect(observed.pwd).toBe(bogusPwd);
+      });
+    });
+
+    // ----------------------------------------------------------------------
+    // T-PWD-07: PWD supplied via the global env file reaches spawned
+    // scripts. SPEC §6.1, §8.1, §8.3, §13. PWD is not protocol-protected,
+    // so the global env-file value at tier 4 reaches the child unchanged
+    // (overriding the inherited PWD at tier 5).
+    // ----------------------------------------------------------------------
+    it("T-PWD-07: PWD supplied via global env file reaches the spawned script unchanged", async () => {
+      await withGlobalEnv(
+        { PWD: "/value-from-global-env-file" },
+        async () => {
+          project = await createTempProject();
+          const markerPath = join(project.dir, "pwd-marker.json");
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".ts",
+            observeEnv("PWD", markerPath),
+          );
+
+          const result = await runCLI(["run", "-n", "1", "ralph"], {
+            cwd: project.dir,
+            runtime,
+          });
+
+          expect(result.exitCode).toBe(0);
+          expect(existsSync(markerPath)).toBe(true);
+          const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+          expect(observed).toEqual({
+            present: true,
+            value: "/value-from-global-env-file",
+          });
+        },
+      );
+    });
+
+    // ----------------------------------------------------------------------
+    // T-PWD-08: PWD supplied via the local (-e) env file reaches spawned
+    // scripts. SPEC §6.1, §8.2, §8.3, §13. Local env file (tier 3) wins
+    // over global env file (tier 4) and inherited env (tier 5); only
+    // RunOptions.env (tier 2) and protocol vars (tier 1) outrank it, and
+    // PWD is at none of those higher tiers.
+    // ----------------------------------------------------------------------
+    it("T-PWD-08: PWD supplied via local (-e) env file reaches the spawned script unchanged", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        const localEnvFile = join(project.dir, "local.env");
+        await createEnvFile(localEnvFile, {
+          PWD: "/value-from-local-env-file",
+        });
+        const markerPath = join(project.dir, "pwd-marker.json");
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          observeEnv("PWD", markerPath),
+        );
+
+        const result = await runCLI(
+          ["run", "-e", localEnvFile, "-n", "1", "ralph"],
+          { cwd: project.dir, runtime },
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(markerPath)).toBe(true);
+        const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+        expect(observed).toEqual({
+          present: true,
+          value: "/value-from-local-env-file",
+        });
+      });
     });
   });
 });
