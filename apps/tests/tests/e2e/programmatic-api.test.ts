@@ -13483,3 +13483,565 @@ console.log(JSON.stringify({ synchronousThrew, callSiteMessage, scriptReachedRea
     }
   });
 });
+
+// ═════════════════════════════════════════════════════════════
+// §4.9.x — Abort Precedence over Pre-Iteration Failures
+// (T-API-65 series; SPEC §9.3 / §9.5 / §9.1 / §9.2)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.3 "Abort precedence over pre-iteration failures": Once a usable
+// AbortSignal has been captured (a real AbortSignal or a duck-typed signal
+// that satisfies the §9.5 contract), an already-aborted signal at call time
+// (or one that aborts during pre-iteration before the first child spawn)
+// displaces all other pre-iteration failure modes on the same call:
+// captured option-snapshot errors, target argument / target syntax
+// validation, .loopx/ discovery, env-file loading, target resolution, and
+// tmpdir creation.
+//
+// Carve-outs explicitly excluded by SPEC §9.3:
+//   - "An invalid options value or non-AbortSignal-compatible options.signal
+//     captures no signal and does not enter this pathway."
+//
+// Coverage in this block (foundational subset of T-API-65 series):
+//   T-API-65   runPromise + pre-aborted + missing envFile → abort error
+//   T-API-65a  runPromise + pre-aborted + invalid target  → abort error
+//   T-API-65b  runPromise + pre-aborted + missing .loopx/ → abort error
+//   T-API-65d  runPromise + pre-aborted + tmpdir creation fail → abort error
+//   T-API-65e  run        + invalid signal shape + missing envFile → NOT abort
+//   T-API-65k  run        + pre-aborted + missing envFile → abort error
+//   T-API-65l  run        + pre-aborted + invalid target  → abort error
+//   T-API-65m  run        + pre-aborted + missing .loopx/ → abort error
+//   T-API-65n  run        + pre-aborted + tmpdir creation fail → abort error
+//
+// All abort-path tests additionally verify (per SPEC §7.4):
+//   (b) no child was spawned (marker file absent)
+//   (c) no `loopx-*` tmpdir created under the test-isolated TMPDIR parent
+//
+// The cleanup-residue assertion is scoped to a per-test-isolated TMPDIR
+// parent (mkdtemp-based) per TEST-SPEC §4.7 isolation guidance — concurrent
+// test workers must not race on /tmp for `loopx-*` entries.
+
+describe("SPEC: Abort Precedence over Pre-Iteration Failures", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    for (const cleanup of cleanups.splice(0)) {
+      await cleanup().catch(() => {});
+    }
+  });
+
+  // Creates a writable test-isolated TMPDIR parent under the system tmpdir.
+  async function makeIsolatedTmpdirParent(label: string): Promise<string> {
+    const dir = await mkdtemp(join(osTmpdir(), `loopx-test-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  // List `loopx-*` entries directly under `parent`, filtering implementation-
+  // internal helpers (per AGENT.md / SPEC §7.4).
+  function listLoopxEntries(parent: string): string[] {
+    try {
+      return readdirSync(parent)
+        .filter((e) => e.startsWith("loopx-"))
+        .filter(
+          (e) =>
+            !e.startsWith("loopx-nodepath-shim-") &&
+            !e.startsWith("loopx-bun-jsx-") &&
+            !e.startsWith("loopx-install-") &&
+            !e.startsWith("loopx-test-"),
+        );
+    } catch {
+      return [];
+    }
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-65: runPromise() — pre-aborted signal beats missing env-file.
+    // SPEC §9.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-65: runPromise() pre-aborted signal beats missing env-file", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65v");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    envFile: "nonexistent.env",
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with the abort error, not the env-file error.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/nonexistent\.env|envFile|env file|ENOENT/i);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65a: runPromise() — pre-aborted signal beats invalid target.
+    // SPEC §9.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-65a: runPromise() pre-aborted signal beats invalid target", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65a");
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise(":bad", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with the abort error, not invalid-target.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/invalid.*target|target.*syntax|:bad/i);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65b: runPromise() — pre-aborted signal beats missing .loopx/
+    // discovery failure. SPEC §9.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-65b: runPromise() pre-aborted signal beats missing .loopx/ discovery", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65b");
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with the abort error, not the discovery error.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/\.loopx|discover|no.*such.*directory/i);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65d: runPromise() — pre-aborted signal beats tmpdir-creation
+    // failure. SPEC §9.3, §9.5, §7.4.
+    //
+    // Skipped under root: chmod 0500 does not block writes for uid 0.
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-API-65d: runPromise() pre-aborted signal beats tmpdir-creation failure",
+      async () => {
+        project = await createTempProject();
+        const unwritableParent = await mkdtemp(
+          join(osTmpdir(), "loopx-test-api65d-unwritable-"),
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        cleanups.push(async () => {
+          await chmod(unwritableParent, 0o700).catch(() => {});
+          await rm(unwritableParent, { recursive: true, force: true }).catch(
+            () => {},
+          );
+        });
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        await chmod(unwritableParent, 0o500);
+
+        const before = listLoopxEntries(unwritableParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: unwritableParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected with abort error, not tmpdir-creation error.
+        expect(parsed.rejected).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(/EACCES|mkdtemp|tmpdir.*creat/i);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the unwritable parent.
+        const after = listLoopxEntries(unwritableParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      },
+    );
+
+    // ------------------------------------------------------------------------
+    // T-API-65e: run() — invalid options.signal shape does NOT enter the
+    // abort pathway. The error must reference the invalid signal shape (or
+    // the missing env file — impl-defined ordering between those two), but
+    // NOT be an abort error. SPEC §9.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-65e: run() invalid signal shape does not enter abort pathway", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65e");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: "not-a-signal",
+  envFile: "nonexistent.env",
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "", looksLikeAbort = false;
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+  // Anchored "abort"/"aborted" word match avoids matching the SPEC-mandated
+  // shape error message "must be an AbortSignal-compatible object" (which
+  // naturally contains the substring "Abort"). The default abort error has
+  // name === "AbortError" and message "The operation was aborted." — both
+  // captured by this guard.
+  looksLikeAbort = (name === "AbortError") || /\\babort(ed)?\\b/i.test(message);
+}
+console.log(JSON.stringify({ threw, message, name, looksLikeAbort }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) The error surfaces (not the abort path).
+      expect(parsed.threw).toBe(true);
+      // (b) The surfaced error is NOT an abort error — SPEC §9.3 carve-out
+      //     rules out abort precedence for non-AbortSignal-compatible signal.
+      expect(parsed.looksLikeAbort).toBe(false);
+      // The error message should reference the invalid signal shape OR the
+      //   missing env-file path (impl-defined ordering between those two).
+      expect(parsed.message).toMatch(
+        /signal|RunOptions|nonexistent\.env|envFile|env file|ENOENT/i,
+      );
+      // (c) No child was spawned.
+      expect(existsSync(marker)).toBe(false);
+      // (d) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65k: run() — pre-aborted signal beats missing env-file.
+    // Generator-surface counterpart to T-API-65. SPEC §9.3, §9.5, §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-65k: run() pre-aborted signal beats missing env-file", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65k");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  envFile: "nonexistent.env",
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() throws abort error, not env-file error.
+      expect(parsed.threw).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/nonexistent\.env|envFile|env file|ENOENT/i);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65l: run() — pre-aborted signal beats invalid target.
+    // Generator-surface counterpart to T-API-65a. SPEC §9.3, §9.5, §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-65l: run() pre-aborted signal beats invalid target", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65l");
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run(":bad", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() throws abort error, not invalid-target error.
+      expect(parsed.threw).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/invalid.*target|target.*syntax|:bad/i);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65m: run() — pre-aborted signal beats missing .loopx/ discovery.
+    // Generator-surface counterpart to T-API-65b. SPEC §9.3, §9.5, §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-65m: run() pre-aborted signal beats missing .loopx/ discovery", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65m");
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() throws abort error, not discovery error.
+      expect(parsed.threw).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/\.loopx|discover|no.*such.*directory/i);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65n: run() — pre-aborted signal beats tmpdir-creation failure.
+    // Generator-surface counterpart to T-API-65d. SPEC §9.3, §9.5, §9.1, §7.4.
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-API-65n: run() pre-aborted signal beats tmpdir-creation failure",
+      async () => {
+        project = await createTempProject();
+        const unwritableParent = await mkdtemp(
+          join(osTmpdir(), "loopx-test-api65n-unwritable-"),
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        cleanups.push(async () => {
+          await chmod(unwritableParent, 0o700).catch(() => {});
+          await rm(unwritableParent, { recursive: true, force: true }).catch(
+            () => {},
+          );
+        });
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        await chmod(unwritableParent, 0o500);
+
+        const before = listLoopxEntries(unwritableParent);
+        const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: unwritableParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First next() throws abort error, not tmpdir-creation error.
+        expect(parsed.threw).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(/EACCES|mkdtemp|tmpdir.*creat/i);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the unwritable parent.
+        const after = listLoopxEntries(unwritableParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      },
+    );
+  });
+});
