@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import {
   existsSync,
   readFileSync,
+  readdirSync,
   symlinkSync,
   mkdirSync,
   writeFileSync,
@@ -20,6 +21,7 @@ import {
 } from "../helpers/fixtures.js";
 import { runCLI } from "../helpers/cli.js";
 import { runAPIDriver } from "../helpers/api-driver.js";
+import { forEachRuntime } from "../helpers/runtime.js";
 import { startLocalGitServer, type GitServer } from "../helpers/servers.js";
 import {
   writeValueToFile,
@@ -1844,6 +1846,291 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
       const result = await runCLI(["run", "-n", "3", "ralph"], { cwd: project.dir });
 
       expect(result.exitCode).toBe(1);
+    });
+
+    // ---------------------------------------------------------------------
+    // T-DISC-42d/e/f/g — programmatic-API counterparts to T-DISC-42a/b
+    //
+    // SPEC §5.1: discovery is cached at loop entry; mid-loop file-system
+    // changes to already-discovered scripts surface at spawn time.
+    // SPEC §7.2 + §9.3: spawn failure surfaces as iteration-level error and
+    // LOOPX_TMPDIR cleanup runs before the generator throws / promise
+    // rejects (Spec §7.4 cleanup-trigger: "Child launch / spawn failure
+    // after tmpdir creation").
+    //
+    // Each test sets `TMPDIR` to a freshly-mkdtemp'd parent so we can
+    // assert no `loopx-*` directories remain after the failure surfaces
+    // (cleanup ran before throw / rejection).
+    // ---------------------------------------------------------------------
+
+    function listLoopxResidue(parent: string): string[] {
+      try {
+        return readdirSync(parent)
+          .filter((e) => e.startsWith("loopx-"))
+          .filter(
+            (e) =>
+              !e.startsWith("loopx-nodepath-shim-") &&
+              !e.startsWith("loopx-bun-jsx-") &&
+              !e.startsWith("loopx-install-"),
+          );
+      } catch {
+        return [];
+      }
+    }
+
+    forEachRuntime((runtime) => {
+      it("T-DISC-42d: run() — discovered script removed mid-loop throws spawn-failure on next() and cleans tmpdir before throw", async () => {
+        project = await createTempProject();
+        const stepPath = join(project.loopxDir, "ralph", "check.sh");
+        await createBashWorkflowScript(project, "ralph", "index", `printf '{"goto":"check"}'`);
+        await createBashWorkflowScript(project, "ralph", "check", `printf '{"result":"check"}'`);
+
+        const tmpdirParent = await mkdtemp(join(tmpdir(), "loopx-test-disc42d-"));
+        extraCleanups.push(async () => {
+          await rm(tmpdirParent, { recursive: true, force: true }).catch(() => {});
+        });
+
+        const driverCode = `
+import { run } from "loopx";
+import { rmSync, readdirSync } from "node:fs";
+const tmpdirParent = ${JSON.stringify(tmpdirParent)};
+function listResidue() {
+  try {
+    return readdirSync(tmpdirParent)
+      .filter((e) => e.startsWith("loopx-"))
+      .filter((e) =>
+        !e.startsWith("loopx-nodepath-shim-") &&
+        !e.startsWith("loopx-bun-jsx-") &&
+        !e.startsWith("loopx-install-"));
+  } catch { return []; }
+}
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  maxIterations: 3,
+});
+const first = await gen.next();
+const firstHasGoto = first && first.value && first.value.goto === "check";
+// Mid-loop external removal between the first and second next() calls.
+rmSync(${JSON.stringify(stepPath)});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+const residue = listResidue();
+console.log(JSON.stringify({ firstDone: first.done, firstHasGoto, threw, message, name, residue }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First yield is from index.sh emitting goto:check
+        expect(parsed.firstDone).toBe(false);
+        expect(parsed.firstHasGoto).toBe(true);
+        // (b) Second next() throws — spawn-failure (cached check.sh path is gone).
+        expect(parsed.threw).toBe(true);
+        // (c) NOT a missing-target / discovery error (discovery cached check.sh).
+        expect(parsed.message).not.toMatch(/not.*found.*workflow|not.*found.*\.loopx|discover/i);
+        // (d) Cleanup ran before throw — no loopx-* residue under TMPDIR parent.
+        expect(parsed.residue).toEqual([]);
+      });
+
+      it("T-DISC-42e: runPromise() — in-loop self-delete of discovered script rejects with spawn-failure and cleans tmpdir before rejection", async () => {
+        project = await createTempProject();
+        const stepPath = join(project.loopxDir, "ralph", "check.sh");
+        const counter = join(project.dir, "counter-42e.txt");
+        // index.sh on first iteration: rm check.sh then emit goto:check.
+        // On any subsequent iteration (shouldn't reach here): emit stop.
+        const body = [
+          `COUNT_FILE=${JSON.stringify(counter)}`,
+          `printf '1' >> "$COUNT_FILE"`,
+          `COUNT=$(wc -c < "$COUNT_FILE" | tr -d ' ')`,
+          `if [ "$COUNT" = "1" ]; then`,
+          `  rm -f ${JSON.stringify(stepPath)}`,
+          `  printf '{"goto":"check"}'`,
+          `else`,
+          `  printf '{"stop":true}'`,
+          `fi`,
+        ].join("\n");
+        await createBashWorkflowScript(project, "ralph", "index", body);
+        await createBashWorkflowScript(project, "ralph", "check", `printf '{"result":"check"}'`);
+
+        const tmpdirParent = await mkdtemp(join(tmpdir(), "loopx-test-disc42e-"));
+        extraCleanups.push(async () => {
+          await rm(tmpdirParent, { recursive: true, force: true }).catch(() => {});
+        });
+
+        const driverCode = `
+import { runPromise } from "loopx";
+import { readdirSync } from "node:fs";
+const tmpdirParent = ${JSON.stringify(tmpdirParent)};
+function listResidue() {
+  try {
+    return readdirSync(tmpdirParent)
+      .filter((e) => e.startsWith("loopx-"))
+      .filter((e) =>
+        !e.startsWith("loopx-nodepath-shim-") &&
+        !e.startsWith("loopx-bun-jsx-") &&
+        !e.startsWith("loopx-install-"));
+  } catch { return []; }
+}
+let rejected = false, message = "", name = "", resolvedTo = null;
+try {
+  const out = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    maxIterations: 3,
+  });
+  resolvedTo = JSON.stringify(out);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+const residue = listResidue();
+console.log(JSON.stringify({ rejected, message, name, resolvedTo, residue }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected — runPromise() does not surface partial outputs.
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.resolvedTo).toBeNull();
+        // (b) Spawn-failure error — NOT a discovery error.
+        expect(parsed.message).not.toMatch(/not.*found.*workflow|not.*found.*\.loopx|discover/i);
+        // (c) Cleanup ran before rejection — no loopx-* residue under TMPDIR parent.
+        expect(parsed.residue).toEqual([]);
+      });
+
+      it("T-DISC-42f: run() — discovered script renamed mid-loop throws spawn-failure on next() and cleans tmpdir before throw", async () => {
+        project = await createTempProject();
+        const stepPath = join(project.loopxDir, "ralph", "check.sh");
+        const renamed = join(project.loopxDir, "ralph", "check-new.sh");
+        await createBashWorkflowScript(project, "ralph", "index", `printf '{"goto":"check"}'`);
+        await createBashWorkflowScript(project, "ralph", "check", `printf '{"result":"check"}'`);
+
+        const tmpdirParent = await mkdtemp(join(tmpdir(), "loopx-test-disc42f-"));
+        extraCleanups.push(async () => {
+          await rm(tmpdirParent, { recursive: true, force: true }).catch(() => {});
+        });
+
+        const driverCode = `
+import { run } from "loopx";
+import { renameSync, readdirSync } from "node:fs";
+const tmpdirParent = ${JSON.stringify(tmpdirParent)};
+function listResidue() {
+  try {
+    return readdirSync(tmpdirParent)
+      .filter((e) => e.startsWith("loopx-"))
+      .filter((e) =>
+        !e.startsWith("loopx-nodepath-shim-") &&
+        !e.startsWith("loopx-bun-jsx-") &&
+        !e.startsWith("loopx-install-"));
+  } catch { return []; }
+}
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  maxIterations: 3,
+});
+const first = await gen.next();
+const firstHasGoto = first && first.value && first.value.goto === "check";
+// Mid-loop external rename between the first and second next() calls.
+renameSync(${JSON.stringify(stepPath)}, ${JSON.stringify(renamed)});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+const residue = listResidue();
+console.log(JSON.stringify({ firstDone: first.done, firstHasGoto, threw, message, name, residue }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.firstDone).toBe(false);
+        expect(parsed.firstHasGoto).toBe(true);
+        expect(parsed.threw).toBe(true);
+        expect(parsed.message).not.toMatch(/not.*found.*workflow|not.*found.*\.loopx|discover/i);
+        expect(parsed.residue).toEqual([]);
+      });
+
+      it("T-DISC-42g: runPromise() — in-loop self-rename of discovered script rejects with spawn-failure and cleans tmpdir before rejection", async () => {
+        project = await createTempProject();
+        const stepPath = join(project.loopxDir, "ralph", "check.sh");
+        const renamed = join(project.loopxDir, "ralph", "check-new.sh");
+        const counter = join(project.dir, "counter-42g.txt");
+        const body = [
+          `COUNT_FILE=${JSON.stringify(counter)}`,
+          `printf '1' >> "$COUNT_FILE"`,
+          `COUNT=$(wc -c < "$COUNT_FILE" | tr -d ' ')`,
+          `if [ "$COUNT" = "1" ]; then`,
+          `  mv ${JSON.stringify(stepPath)} ${JSON.stringify(renamed)}`,
+          `  printf '{"goto":"check"}'`,
+          `else`,
+          `  printf '{"stop":true}'`,
+          `fi`,
+        ].join("\n");
+        await createBashWorkflowScript(project, "ralph", "index", body);
+        await createBashWorkflowScript(project, "ralph", "check", `printf '{"result":"check"}'`);
+
+        const tmpdirParent = await mkdtemp(join(tmpdir(), "loopx-test-disc42g-"));
+        extraCleanups.push(async () => {
+          await rm(tmpdirParent, { recursive: true, force: true }).catch(() => {});
+        });
+
+        const driverCode = `
+import { runPromise } from "loopx";
+import { readdirSync } from "node:fs";
+const tmpdirParent = ${JSON.stringify(tmpdirParent)};
+function listResidue() {
+  try {
+    return readdirSync(tmpdirParent)
+      .filter((e) => e.startsWith("loopx-"))
+      .filter((e) =>
+        !e.startsWith("loopx-nodepath-shim-") &&
+        !e.startsWith("loopx-bun-jsx-") &&
+        !e.startsWith("loopx-install-"));
+  } catch { return []; }
+}
+let rejected = false, message = "", name = "", resolvedTo = null;
+try {
+  const out = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    maxIterations: 3,
+  });
+  resolvedTo = JSON.stringify(out);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+const residue = listResidue();
+console.log(JSON.stringify({ rejected, message, name, resolvedTo, residue }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.resolvedTo).toBeNull();
+        expect(parsed.message).not.toMatch(/not.*found.*workflow|not.*found.*\.loopx|discover/i);
+        expect(parsed.residue).toEqual([]);
+      });
     });
   });
 
