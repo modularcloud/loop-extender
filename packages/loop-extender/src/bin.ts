@@ -531,6 +531,7 @@ async function main(): Promise<void> {
       cwd,
       selectedWorkflow: installArgs.selectedWorkflow ?? null,
       override: installArgs.override,
+      noInstall: installArgs.noInstall,
       runningVersion: getVersion(),
     });
     process.exit(0);

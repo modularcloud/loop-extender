@@ -15,7 +15,7 @@ import {
   copyFileSync,
 } from "node:fs";
 import { join, basename, extname } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { classifySource } from "./parsers/classify-source.js";
 import {
@@ -30,6 +30,7 @@ export interface InstallOptions {
   cwd: string;
   selectedWorkflow?: string | null; // -w <name>
   override: boolean; // -y
+  noInstall: boolean; // --no-install (SPEC §10.10)
   runningVersion: string;
 }
 
@@ -68,6 +69,7 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
     cwd,
     selectedWorkflow,
     override,
+    noInstall,
     runningVersion,
   } = opts;
 
@@ -149,6 +151,7 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
   // Preflight
   const failures: PreflightFailure[] = [];
   const pkgWarnings: string[] = []; // non-blocking package.json warnings
+  const warnedWorkflows = new Set<string>(); // workflows already warned about during preflight (SPEC §10.10 once-per-install dedup)
   const replacements = new Set<string>(); // workflow names to replace at commit time
 
   for (const wf of selected) {
@@ -248,16 +251,19 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
         pkgWarnings.push(
           `Warning: workflow '${wf.name}' package.json is unreadable (permission denied); skipping check`
         );
+        warnedWorkflows.add(wf.name);
         break;
       case "invalid-json":
         pkgWarnings.push(
           `Warning: workflow '${wf.name}' package.json contains invalid JSON; skipping check`
         );
+        warnedWorkflows.add(wf.name);
         break;
       case "invalid-semver":
         pkgWarnings.push(
           `Warning: workflow '${wf.name}' has an invalid semver specifier for loopx in package.json; skipping check`
         );
+        warnedWorkflows.add(wf.name);
         break;
       case "mismatched":
         if (!override) {
@@ -366,6 +372,270 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
     }
     process.exit(1);
   }
+
+  // ─────────────────────────────────────────────────────────────
+  // Post-commit auto-install pass (SPEC §10.10)
+  // ─────────────────────────────────────────────────────────────
+  if (!noInstall) {
+    const exitCode = await runAutoInstall(
+      loopxDir,
+      committed,
+      runningVersion,
+      warnedWorkflows
+    );
+    if (exitCode !== 0) {
+      process.exit(exitCode);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SPEC §10.10 auto-install pass.
+// ─────────────────────────────────────────────────────────────────────
+
+interface AutoInstallFailure {
+  workflow: string;
+  reason: string;
+}
+
+/**
+ * Runs the post-commit auto-install pass over each committed workflow that has
+ * a top-level `package.json`. Returns the exit code (0 on success, 1 if any
+ * workflow's auto-install failed).
+ *
+ * Per SPEC §10.10:
+ * - Iterates committed workflows in the order returned by the commit phase.
+ * - For each workflow with a top-level `package.json`:
+ *     1. Re-validate the committed `package.json` (skip silently if absent;
+ *        warn + skip if malformed, with at-most-one warning per install).
+ *     2. Run the `.gitignore` safeguard (synthesize on ENOENT, leave regular,
+ *        treat any non-regular entry as a safeguard failure).
+ *     3. Spawn `npm install` with cwd = workflow directory, env inherited
+ *        unchanged, stdio inherited (streaming passthrough).
+ * - Workflows without a top-level `package.json` are skipped silently.
+ * - Failures are aggregated and an aggregate failure report is emitted
+ *   on stderr at the end if any failures occurred.
+ */
+async function runAutoInstall(
+  loopxDir: string,
+  committed: string[],
+  runningVersion: string,
+  warnedFromPreflight: Set<string>
+): Promise<number> {
+  const failures: AutoInstallFailure[] = [];
+  // Per SPEC §10.10: dedupe warnings across the whole install operation,
+  // not just the auto-install pass. Seed with workflows already warned at
+  // preflight time so we don't double-warn here.
+  const warnedAbout = new Set<string>(warnedFromPreflight);
+
+  for (const workflowName of committed) {
+    const workflowDir = join(loopxDir, workflowName);
+    const pkgPath = join(workflowDir, "package.json");
+
+    // 1. Re-validate the committed package.json. SPEC §10.10:
+    //   - Absent → silent skip (no auto-install).
+    //   - Unreadable / invalid JSON / invalid semver / non-regular path
+    //     → emit at-most-one workflow-level warning (matching SPEC §3.2)
+    //       if not already emitted for this workflow during this install,
+    //       then silent skip auto-install (and the .gitignore safeguard).
+    let pkgLstat;
+    try {
+      pkgLstat = lstatSync(pkgPath);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        continue; // Silent skip: no top-level package.json.
+      }
+      // Other lstat failure → treat as malformed.
+      if (!warnedAbout.has(workflowName)) {
+        process.stderr.write(
+          `Warning: workflow '${workflowName}' package.json could not be read; skipping auto-install\n`
+        );
+        warnedAbout.add(workflowName);
+      }
+      continue;
+    }
+    // SPEC §3.2 / §10.10: a non-regular package.json (directory, symlink,
+    // FIFO, socket, etc.) is treated as malformed → warn + skip.
+    if (!pkgLstat.isFile()) {
+      if (!warnedAbout.has(workflowName)) {
+        process.stderr.write(
+          `Warning: workflow '${workflowName}' package.json is not a regular file; skipping auto-install\n`
+        );
+        warnedAbout.add(workflowName);
+      }
+      continue;
+    }
+    // Validate JSON / semver via checkWorkflowVersion.
+    const versionResult = checkWorkflowVersion(workflowDir, runningVersion);
+    let malformed = false;
+    switch (versionResult.kind) {
+      case "unreadable":
+        if (!warnedAbout.has(workflowName)) {
+          process.stderr.write(
+            `Warning: workflow '${workflowName}' package.json is unreadable (permission denied); skipping auto-install\n`
+          );
+          warnedAbout.add(workflowName);
+        }
+        malformed = true;
+        break;
+      case "invalid-json":
+        if (!warnedAbout.has(workflowName)) {
+          process.stderr.write(
+            `Warning: workflow '${workflowName}' package.json contains invalid JSON; skipping auto-install\n`
+          );
+          warnedAbout.add(workflowName);
+        }
+        malformed = true;
+        break;
+      case "invalid-semver":
+        if (!warnedAbout.has(workflowName)) {
+          process.stderr.write(
+            `Warning: workflow '${workflowName}' has an invalid semver specifier for loopx in package.json; skipping auto-install\n`
+          );
+          warnedAbout.add(workflowName);
+        }
+        malformed = true;
+        break;
+      // satisfied / mismatched / no-loopx-declared / no-package-json:
+      // none of these block auto-install (mismatched is a §10.6 preflight
+      // concern that already gated commit).
+      default:
+        break;
+    }
+    if (malformed) continue;
+
+    // 2. Run the .gitignore safeguard.
+    const gitignoreOk = runGitignoreSafeguard(workflowDir);
+    if (!gitignoreOk.ok) {
+      failures.push({ workflow: workflowName, reason: gitignoreOk.reason });
+      continue;
+    }
+
+    // 3. Spawn `npm install`.
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn("npm", ["install"], {
+          cwd: workflowDir,
+          stdio: "inherit",
+          env: process.env,
+        });
+        child.on("error", (err) => {
+          // Spawn failure (most commonly: npm not on PATH → ENOENT).
+          reject(err);
+        });
+        child.on("exit", (code, signal) => {
+          if (signal) {
+            reject(
+              Object.assign(new Error(`npm install terminated by ${signal}`), {
+                code: "NPM_SIGNAL",
+                signal,
+              })
+            );
+            return;
+          }
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(
+              Object.assign(
+                new Error(`npm install exited with code ${code}`),
+                { code: "NPM_NONZERO_EXIT", exitCode: code }
+              )
+            );
+          }
+        });
+      });
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException & {
+        code?: string;
+        exitCode?: number;
+        signal?: NodeJS.Signals;
+      };
+      if (e.code === "ENOENT") {
+        failures.push({
+          workflow: workflowName,
+          reason: "npm install spawn failed (npm not found on PATH)",
+        });
+      } else if (e.code === "NPM_NONZERO_EXIT") {
+        failures.push({
+          workflow: workflowName,
+          reason: `npm install exited with code ${e.exitCode}`,
+        });
+      } else if (e.code === "NPM_SIGNAL") {
+        failures.push({
+          workflow: workflowName,
+          reason: `npm install terminated by signal ${e.signal}`,
+        });
+      } else {
+        failures.push({
+          workflow: workflowName,
+          reason: `npm install failed: ${e.message}`,
+        });
+      }
+    }
+  }
+
+  if (failures.length > 0) {
+    process.stderr.write("Error: auto-install failures:\n");
+    for (const f of failures) {
+      process.stderr.write(`  [${f.workflow}] ${f.reason}\n`);
+    }
+    return 1;
+  }
+  return 0;
+}
+
+/**
+ * Apply the SPEC §10.10 .gitignore safeguard. Returns ok=true and writes a
+ * synthesized .gitignore on ENOENT; returns ok=true unchanged on a regular
+ * file; returns ok=false (with a reason) on any non-regular entry, on a
+ * non-ENOENT lstat failure, or on a write failure when synthesizing.
+ */
+function runGitignoreSafeguard(
+  workflowDir: string
+): { ok: true } | { ok: false; reason: string } {
+  const gitignorePath = join(workflowDir, ".gitignore");
+  let st;
+  try {
+    st = lstatSync(gitignorePath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      // Synthesize a .gitignore with `node_modules`.
+      try {
+        writeFileSync(gitignorePath, "node_modules\n", "utf-8");
+        return { ok: true };
+      } catch (writeErr) {
+        return {
+          ok: false,
+          reason: `failed to synthesize .gitignore: ${(writeErr as Error).message}`,
+        };
+      }
+    }
+    return {
+      ok: false,
+      reason: `failed to lstat .gitignore: ${(err as Error).message}`,
+    };
+  }
+  if (st.isFile()) {
+    return { ok: true };
+  }
+  // Any non-regular entry (directory, symlink, FIFO, socket, etc.).
+  return {
+    ok: false,
+    reason: `.gitignore exists but is not a regular file (${describeFsType(st)})`,
+  };
+}
+
+function describeFsType(st: NonNullable<ReturnType<typeof lstatSync>>): string {
+  if (st.isSymbolicLink()) return "symlink";
+  if (st.isDirectory()) return "directory";
+  if (st.isFIFO()) return "FIFO";
+  if (st.isSocket()) return "socket";
+  if (st.isBlockDevice()) return "block device";
+  if (st.isCharacterDevice()) return "character device";
+  return "non-regular";
 }
 
 function mkTempDir(prefix: string, parent?: string): string {
