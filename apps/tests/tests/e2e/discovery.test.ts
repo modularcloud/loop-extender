@@ -1229,6 +1229,74 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
       expect(readFileSync(marker, "utf-8")).toBe("disc30b");
     });
 
+    it("T-DISC-30c: workflow name MyWorkflow (uppercase) is valid", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "marker-30c.txt");
+      await createWorkflowScript(
+        project,
+        "MyWorkflow",
+        "index",
+        ".sh",
+        writeValueToFile("disc30c", marker),
+      );
+
+      const result = await runCLI(["run", "-n", "1", "MyWorkflow"], { cwd: project.dir });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc30c");
+      expect(hasWarningCategoryFor(result.stderr, "MyWorkflow")).toBe(false);
+    });
+
+    it("T-DISC-30d: script base name CheckReady (uppercase) is valid and targetable", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash\nprintf '{"result":"idx"}'\n`,
+      );
+      const marker = join(project.dir, "marker-30d.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "CheckReady",
+        ".sh",
+        writeValueToFile("disc30d", marker),
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph:CheckReady"], { cwd: project.dir });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc30d");
+      expect(hasWarningCategoryFor(result.stderr, "CheckReady")).toBe(false);
+    });
+
+    it("T-DISC-30e: script base name _check (underscore prefix) is valid and targetable", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash\nprintf '{"result":"idx"}'\n`,
+      );
+      const marker = join(project.dir, "marker-30e.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "_check",
+        ".sh",
+        writeValueToFile("disc30e", marker),
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph:_check"], { cwd: project.dir });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc30e");
+      expect(hasWarningCategoryFor(result.stderr, "_check")).toBe(false);
+    });
+
     it("T-DISC-31: script name with colon is rejected (global validation catches sibling)", async () => {
       project = await createTempProject();
       await createWorkflowScript(
