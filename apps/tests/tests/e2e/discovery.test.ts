@@ -160,6 +160,36 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
       expect(result.exitCode).toBe(1);
     });
 
+    it("T-DISC-07b: .cjs sibling of valid script is silently ignored (workflow runs, .cjs not discovered as script)", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "marker-07b.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc07b", marker),
+      );
+      // .cjs sibling — unsupported extension, must be silently ignored during discovery.
+      const wf = join(project.loopxDir, "ralph");
+      writeFileSync(join(wf, "helper.cjs"), `console.log("helper");\n`);
+
+      // (a) ralph:index runs successfully
+      const idxRes = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(idxRes.exitCode).toBe(0);
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, "utf-8")).toBe("disc07b");
+
+      // (b) no warning about helper.cjs being unsupported (silent exclusion, not a warning)
+      expect(hasWarningCategoryFor(idxRes.stderr, "helper.cjs")).toBe(false);
+      expect(idxRes.stderr).not.toMatch(/helper\.cjs/);
+
+      // (c) ralph:helper fails — .cjs was not discovered as a `helper` script
+      const helperRes = await runCLI(["run", "-n", "1", "ralph:helper"], { cwd: project.dir });
+      expect(helperRes.exitCode).toBe(1);
+      expect(helperRes.stderr).toMatch(/not found/i);
+    });
+
     it("T-DISC-08: subdir with only non-script files (readme.txt, config.json) is not a workflow, no warning", async () => {
       project = await createTempProject();
       const wf = await createWorkflow(project, "ralph");
@@ -180,6 +210,75 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
 
       expect(result.exitCode).toBe(1);
       expect(hasWarningCategoryFor(result.stderr, "ralph")).toBe(false);
+    });
+
+    it("T-DISC-09a: top-level entry shaped as <name>.<ext> but typed as a directory does not count as a script (workflow detection requires real files)", async () => {
+      project = await createTempProject();
+      // ralph/ contains only a directory entry "index.sh/" — must NOT be discovered as a workflow.
+      const ralphDir = join(project.loopxDir, "ralph");
+      mkdirSync(join(ralphDir, "index.sh"), { recursive: true });
+      // Sibling workflow (real) so .loopx/ has at least one valid workflow.
+      const otherMarker = join(project.dir, "marker-09a-other.txt");
+      await createWorkflowScript(
+        project,
+        "other",
+        "index",
+        ".sh",
+        writeValueToFile("disc09a-other", otherMarker),
+      );
+
+      // (a) ralph is not a discovered workflow
+      const ralphRes = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(ralphRes.exitCode).toBe(1);
+      // (b) error category is missing-workflow (NOT missing-default-entry-point, NOT script-execution)
+      expect(ralphRes.stderr).toMatch(/not found in \.loopx\//);
+      expect(ralphRes.stderr).not.toMatch(/has no default entry point/);
+      // (c) directory-shaped index.sh/ is silently ignored — no validation warning
+      expect(hasWarningCategoryFor(ralphRes.stderr, "index.sh")).toBe(false);
+
+      // (d) sibling workflow is still discoverable
+      const otherRes = await runCLI(["run", "-n", "1", "other"], { cwd: project.dir });
+      expect(otherRes.exitCode).toBe(0);
+      expect(existsSync(otherMarker)).toBe(true);
+      expect(readFileSync(otherMarker, "utf-8")).toBe("disc09a-other");
+    });
+
+    it("T-DISC-09b: top-level directory shaped as <name>.<ext> alongside a real script is silently ignored during script discovery", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "marker-09b.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc09b", marker),
+      );
+      // Top-level directory whose name shapes as check.ts/ — not a real .ts file.
+      const checkDir = join(project.loopxDir, "ralph", "check.ts");
+      mkdirSync(checkDir, { recursive: true });
+      writeFileSync(join(checkDir, "notes.md"), "internal notes\n");
+
+      // (a) ralph:index runs successfully
+      const idxRes = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(idxRes.exitCode).toBe(0);
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, "utf-8")).toBe("disc09b");
+
+      // (b) ralph:check fails — the directory check.ts/ was not discovered as a script
+      const checkRes = await runCLI(["run", "-n", "1", "ralph:check"], { cwd: project.dir });
+      expect(checkRes.exitCode).toBe(1);
+      expect(checkRes.stderr).toMatch(/not found/i);
+
+      // (c-e) loopx run -h: ralph listed with index, "check" NOT in script list, no warning
+      const helpRes = await runCLI(["run", "-h"], { cwd: project.dir });
+      expect(helpRes.exitCode).toBe(0);
+      expect(helpRes.stdout).toMatch(/ralph/);
+      // Within the help body, "check" must not appear as a script line. Script lines
+      // begin with at least 4 spaces of indent then the script name. "    check (.ts)"
+      // would be the buggy output we're guarding against.
+      expect(helpRes.stdout).not.toMatch(/^\s{4,}check\b/m);
+      // No warning about check.ts being a directory — silent ignore, like nested subdirs (T-DISC-14).
+      expect(hasWarningCategoryFor(helpRes.stderr, "check.ts")).toBe(false);
     });
 
     it("T-DISC-10: files directly in .loopx/ are never discovered (loose-script.sh alongside ralph)", async () => {
@@ -555,6 +654,99 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
 
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toMatch(/eslint\.config/);
+    });
+
+    it("T-DISC-15c: uppercase script extensions (.SH/.TS/.JS) are not supported — case-sensitive matching, single-file workflow not discovered", async () => {
+      project = await createTempProject();
+      // .loopx/ralph/ contains a single file index.SH (uppercase only — no lowercase counterpart).
+      // Per SPEC 5.1, the supported extension set (.sh/.ts/.js/.jsx/.tsx) is case-sensitive,
+      // so this directory has zero supported-extension files and is NOT a workflow.
+      const ralphDir = join(project.loopxDir, "ralph");
+      mkdirSync(ralphDir, { recursive: true });
+      const upperMarker = join(project.dir, "marker-15c-uppercase.txt");
+      const upperPath = join(ralphDir, "index.SH");
+      writeFileSync(
+        upperPath,
+        `#!/bin/bash\nprintf 'should-not-run' > ${JSON.stringify(upperMarker)}\n`,
+      );
+      chmodSync(upperPath, 0o755);
+
+      // Sibling workflow with a real lowercase ext so .loopx/ itself discovers something.
+      const otherMarker = join(project.dir, "marker-15c-other.txt");
+      await createWorkflowScript(
+        project,
+        "other",
+        "index",
+        ".sh",
+        writeValueToFile("disc15c-other", otherMarker),
+      );
+
+      // (a) ralph is not a discovered workflow — error category is missing-workflow,
+      //     NOT missing-default-entry-point, NOT a spawn-time "is-a-directory" / exec error.
+      const ralphRes = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(ralphRes.exitCode).toBe(1);
+      expect(ralphRes.stderr).toMatch(/not found in \.loopx\//);
+      expect(ralphRes.stderr).not.toMatch(/has no default entry point/);
+
+      // (b) the .SH file did not run — marker absent
+      expect(existsSync(upperMarker)).toBe(false);
+
+      // (c) sibling workflow still runs
+      const otherRes = await runCLI(["run", "-n", "1", "other"], { cwd: project.dir });
+      expect(otherRes.exitCode).toBe(0);
+      expect(readFileSync(otherMarker, "utf-8")).toBe("disc15c-other");
+    });
+
+    it("T-DISC-15c (companion): when index.SH and index.sh coexist on a case-sensitive filesystem, only index.sh is discovered", async () => {
+      // Probe whether the filesystem is case-sensitive. On case-insensitive FS the two
+      // filenames cannot coexist as distinct files, so the companion case is unrunnable.
+      const probeDir = await mkdtemp(join(tmpdir(), "loopx-15c-probe-"));
+      let caseSensitive = true;
+      try {
+        const lower = join(probeDir, "probe.txt");
+        const upper = join(probeDir, "PROBE.TXT");
+        writeFileSync(lower, "lower");
+        try {
+          writeFileSync(upper, "upper");
+          // Distinct content survives only on a case-sensitive filesystem.
+          caseSensitive = readFileSync(lower, "utf-8") === "lower" &&
+            readFileSync(upper, "utf-8") === "upper";
+        } catch {
+          caseSensitive = false;
+        }
+      } finally {
+        await rm(probeDir, { recursive: true, force: true });
+      }
+      if (!caseSensitive) {
+        // Skip silently — the fixture cannot be constructed.
+        return;
+      }
+
+      project = await createTempProject();
+      const ralphDir = join(project.loopxDir, "ralph");
+      mkdirSync(ralphDir, { recursive: true });
+      const lowerMarker = join(project.dir, "marker-15c-companion-lower.txt");
+      const upperMarker = join(project.dir, "marker-15c-companion-upper.txt");
+      const lowerPath = join(ralphDir, "index.sh");
+      const upperPath = join(ralphDir, "index.SH");
+      writeFileSync(lowerPath, `#!/bin/bash\nprintf 'lower-ran' > ${JSON.stringify(lowerMarker)}\n`);
+      chmodSync(lowerPath, 0o755);
+      writeFileSync(upperPath, `#!/bin/bash\nprintf 'upper-ran' > ${JSON.stringify(upperMarker)}\n`);
+      chmodSync(upperPath, 0o755);
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+
+      // (a) ralph IS a discovered workflow because index.sh has a supported extension
+      expect(result.exitCode).toBe(0);
+      // (b) only index.sh ran (lower marker present, upper marker absent)
+      expect(existsSync(lowerMarker)).toBe(true);
+      expect(readFileSync(lowerMarker, "utf-8")).toBe("lower-ran");
+      expect(existsSync(upperMarker)).toBe(false);
+      // (c) no name-collision warning about index.SH (collisions are checked across the
+      //     recognized extension set only — index.SH is not a recognized extension).
+      expect(result.stderr).not.toMatch(/index\.SH/);
+      expect(hasWarningCategoryFor(result.stderr, "index.SH")).toBe(false);
+      expect(result.stderr).not.toMatch(/collision|conflict|duplicate/i);
     });
 
     it("T-DISC-16: workflow directory with only subdirectory scripts (no top-level supported-ext files) is not a workflow", async () => {
