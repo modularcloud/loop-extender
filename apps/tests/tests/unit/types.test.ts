@@ -1,6 +1,7 @@
 import { describe, it, expectTypeOf } from "vitest";
 import type { Output, RunOptions } from "loopx";
 import type { run, runPromise } from "loopx";
+import { output, input } from "loopx";
 
 /**
  * TEST-SPEC §6.4 — Compile-time type surface verification.
@@ -126,5 +127,36 @@ describe("SPEC: Type Surface Verification", () => {
     // Calling with zero arguments should NOT be valid (scriptName is required)
     expectTypeOf<[]>().not.toMatchTypeOf<RunParams>();
     expectTypeOf<[]>().not.toMatchTypeOf<RunPromiseParams>();
+  });
+
+  // T-TYPE-08: import { output, input } from "loopx" type-checks and exposes
+  // the expected script-helper signatures. (SPEC 6.4 / 6.5 / 9.4 / 9.5.)
+  it("T-TYPE-08: output and input are value-importable from 'loopx' with expected script-helper signatures", () => {
+    // (a) Value imports compile (the import statement at the top of this file
+    //     proves it). Guard ensures the resolved values are not `any`, which
+    //     would silently satisfy every assertion if "loopx" were unresolved.
+    expectTypeOf(output).not.toBeAny();
+    expectTypeOf(input).not.toBeAny();
+    expectTypeOf(output).toBeFunction();
+    expectTypeOf(input).toBeFunction();
+
+    // (b) input() takes no arguments and returns Promise<string> (SPEC 6.5).
+    type InputParams = Parameters<typeof input>;
+    expectTypeOf<InputParams>().not.toBeAny();
+    expectTypeOf<[]>().toMatchTypeOf<InputParams>();
+    expectTypeOf<ReturnType<typeof input>>().toEqualTypeOf<Promise<string>>();
+
+    // (c) output(...) is callable with structured Output-shaped values
+    //     (`{ result }`, `{ goto }`, `{ stop }`) and with primitive values
+    //     accepted by the parser's coerce-path (`number`, `string`).
+    //     Per TEST-SPEC: do NOT pin a specific return type symbol — both
+    //     `void` and `never` are conformant.
+    type OutputParams = Parameters<typeof output>;
+    expectTypeOf<OutputParams>().not.toBeAny();
+    expectTypeOf<[{ result: string }]>().toMatchTypeOf<OutputParams>();
+    expectTypeOf<[{ goto: string }]>().toMatchTypeOf<OutputParams>();
+    expectTypeOf<[{ stop: boolean }]>().toMatchTypeOf<OutputParams>();
+    expectTypeOf<[number]>().toMatchTypeOf<OutputParams>();
+    expectTypeOf<[string]>().toMatchTypeOf<OutputParams>();
   });
 });
