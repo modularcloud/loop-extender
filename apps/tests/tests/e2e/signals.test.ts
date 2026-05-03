@@ -1,10 +1,17 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { readFileSync, existsSync, readdirSync } from "node:fs";
-import { mkdtemp, chmod, rm } from "node:fs/promises";
+import {
+  readFileSync,
+  existsSync,
+  readdirSync,
+  writeFileSync,
+  chmodSync,
+} from "node:fs";
+import { mkdtemp, chmod, rm, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir as osTmpdir } from "node:os";
 import {
   createTempProject,
+  createWorkflow,
   createWorkflowScript,
   type TempProject,
 } from "../helpers/fixtures.js";
@@ -632,6 +639,46 @@ printf '{"result":"%s"}' "$COUNT"
   );
 
   it(
+    "T-SIG-25: SIGINT pre-iteration wins over discovery-time sibling validation failure",
+    async () => {
+      project = await createTempProject();
+      // Target workflow `ralph` is valid; sibling `broken` workflow has an
+      // invalid script name (`-bad.sh`). Discovery in run mode (SPEC §5.4
+      // global validation) raises a fatal error for the sibling — the
+      // signal-wins precedence rule must displace it.
+      await createWorkflowScript(project, "ralph", "index", ".sh", emitStop());
+      const broken = await createWorkflow(project, "broken");
+      writeFileSync(join(broken, "-bad.sh"), `#!/bin/bash\necho bad\n`);
+      chmodSync(join(broken, "-bad.sh"), 0o755);
+
+      const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+        ["run", "-n", "1", "ralph"],
+        {
+          cwd: project.dir,
+          timeout: 30_000,
+          env: PREITERATION_ENV,
+        },
+      );
+
+      await waitForStderr(PREITERATION_SENTINEL, { timeoutMs: 10_000 });
+      sendSignal("SIGINT");
+
+      const outcome = await result;
+      expect(outcome.exitCode).toBe(130);
+      // The displaced failure (sibling validation error) must NOT surface as
+      // the fatal-exit reason on stderr. Discovery emits
+      //   `Error: Workflow 'broken' contains script '-bad' with invalid name: ...`
+      // — we negative-match on the offending script-name token and on the
+      // generic "invalid name" prose. Discovery `Warning:` lines are allowed
+      // (warnings stream first, then the signal-wins guard fires before the
+      // fatal `Error:` line is written and `process.exit(1)` is called).
+      expect(outcome.stderr).not.toMatch(/Error:.*invalid name/i);
+      expect(outcome.stderr).not.toMatch(/-bad/);
+    },
+    { timeout: 30_000, retry: 3 },
+  );
+
+  it(
     "T-SIG-27: SIGINT pre-iteration wins over missing script in existing workflow",
     async () => {
       project = await createTempProject();
@@ -686,6 +733,61 @@ printf '{"result":"%s"}' "$COUNT"
     },
     { timeout: 30_000, retry: 3 },
   );
+
+  // T-SIG-30 — pre-iteration signal wins over an unreadable global env file
+  // (mode 000 / EACCES). XDG_CONFIG_HOME is injected only into the spawned
+  // CLI's environment (NOT process.env) so parallel tests are not perturbed.
+  // Parameterized over SIGINT (130) and SIGTERM (143). Skipped under root,
+  // which can read mode-000 files and defeat the unreadable-permission setup.
+
+  for (const variant of [
+    { signal: "SIGINT" as NodeJS.Signals, expectedExit: 130, label: "sigint" },
+    { signal: "SIGTERM" as NodeJS.Signals, expectedExit: 143, label: "sigterm" },
+  ]) {
+    it.skipIf(IS_ROOT)(
+      `T-SIG-30 (${variant.label}): pre-iteration signal wins over unreadable global env file → ${variant.expectedExit}`,
+      async () => {
+        project = await createTempProject();
+        await createWorkflowScript(project, "ralph", "index", ".sh", emitStop());
+
+        // Isolated XDG_CONFIG_HOME with `loopx/env` chmod 000. We inject this
+        // via the CLI child's env only — never via process.env — so the
+        // parent test process and parallel workers are unaffected.
+        const xdgHome = await mkdtemp(join(osTmpdir(), "loopx-sig-30-xdg-"));
+        const loopxConfigDir = join(xdgHome, "loopx");
+        await mkdir(loopxConfigDir, { recursive: true });
+        const envFilePath = join(loopxConfigDir, "env");
+        await writeFile(envFilePath, "FOO=bar\n", "utf-8");
+        await chmod(envFilePath, 0o000);
+
+        try {
+          const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+            ["run", "-n", "1", "ralph"],
+            {
+              cwd: project.dir,
+              timeout: 30_000,
+              env: { ...PREITERATION_ENV, XDG_CONFIG_HOME: xdgHome },
+            },
+          );
+
+          await waitForStderr(PREITERATION_SENTINEL, { timeoutMs: 10_000 });
+          sendSignal(variant.signal);
+
+          const outcome = await result;
+          expect(outcome.exitCode).toBe(variant.expectedExit);
+          // The displaced failure (unreadable global env file EACCES) must
+          // NOT surface as the fatal-exit reason on stderr. The non-signal
+          // path emits `Error: Global env file is unreadable: <path>`.
+          expect(outcome.stderr).not.toMatch(/Global env file is unreadable/);
+          expect(outcome.stderr).not.toMatch(/EACCES/);
+        } finally {
+          await chmod(envFilePath, 0o600).catch(() => {});
+          await rm(xdgHome, { recursive: true, force: true }).catch(() => {});
+        }
+      },
+      { timeout: 30_000, retry: 3 },
+    );
+  }
 
   // T-SIG-31 — positive contract: signal observed by the installed pre-
   // iteration handler on a fully VALID pre-iteration (no failure injected)
