@@ -1,11 +1,14 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { mkdtemp, chmod, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { tmpdir as osTmpdir } from "node:os";
 import {
   createTempProject,
   createWorkflowScript,
   type TempProject,
 } from "../helpers/fixtures.js";
+import { createEnvFile } from "../helpers/env.js";
 import { runCLIWithSignal } from "../helpers/cli.js";
 import {
   signalReadyThenSleep,
@@ -14,7 +17,10 @@ import {
   signalTrapReport,
   spawnGrandchild,
   counter,
+  emitStop,
 } from "../helpers/fixture-scripts.js";
+
+const IS_ROOT = typeof process.getuid === "function" && process.getuid() === 0;
 
 // ---------------------------------------------------------------------------
 // Utility: check whether a PID is still alive
@@ -444,4 +450,301 @@ printf '{"result":"%s"}' "$COUNT"
     const signal = readFileSync(reportPath, "utf-8");
     expect(signal).toBe("SIGTERM");
   });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // SPEC §7.3 — Pre-iteration Signal-Wins Precedence
+  //
+  // SIGINT/SIGTERM observed by loopx's pre-iteration signal handler wins
+  // over non-signal pre-iteration failures: loopx exits with 128+N
+  // regardless of which non-signal pre-iteration step (target syntax
+  // validation, .loopx/ discovery, env-file loading, target resolution,
+  // tmpdir creation) would otherwise have failed.
+  //
+  // Synchronization: tests set LOOPX_TEST_PREITERATION_SENTINEL=1 (in
+  // addition to NODE_ENV=test) so loopx emits the sentinel stderr marker
+  // `LOOPX_PREITERATION_READY` immediately after pre-iteration signal
+  // handler installation but before any pre-iteration step. The harness
+  // waits for that marker, then delivers the signal — placing the signal
+  // deterministically inside the pre-iteration window.
+  // ─────────────────────────────────────────────────────────────────────
+
+  const PREITERATION_ENV = {
+    NODE_ENV: "test",
+    LOOPX_TEST_PREITERATION_SENTINEL: "1",
+  } as const;
+  const PREITERATION_SENTINEL = "LOOPX_PREITERATION_READY";
+
+  it(
+    "T-SIG-20: SIGINT pre-iteration wins over missing -e env file",
+    async () => {
+      project = await createTempProject();
+      // Valid workflow exists; the displaced failure is the missing env file.
+      await createWorkflowScript(project, "ralph", "index", ".sh", emitStop());
+
+      const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+        ["run", "-n", "1", "-e", "nonexistent.env", "ralph"],
+        {
+          cwd: project.dir,
+          timeout: 30_000,
+          env: PREITERATION_ENV,
+        },
+      );
+
+      await waitForStderr(PREITERATION_SENTINEL, { timeoutMs: 10_000 });
+      sendSignal("SIGINT");
+
+      const outcome = await result;
+      expect(outcome.exitCode).toBe(130);
+      // The displaced failure (missing env file) must NOT be the surfaced
+      // fatal-exit reason on stderr.
+      expect(outcome.stderr).not.toMatch(/nonexistent\.env/);
+      expect(outcome.stderr).not.toMatch(/Error:.*env/i);
+    },
+    { timeout: 30_000, retry: 3 },
+  );
+
+  it(
+    "T-SIG-21: SIGINT pre-iteration wins over missing workflow",
+    async () => {
+      project = await createTempProject();
+      // A different workflow exists; we target a non-existent one.
+      await createWorkflowScript(project, "ralph", "index", ".sh", emitStop());
+
+      const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+        ["run", "-n", "1", "nonexistent-workflow"],
+        {
+          cwd: project.dir,
+          timeout: 30_000,
+          env: PREITERATION_ENV,
+        },
+      );
+
+      await waitForStderr(PREITERATION_SENTINEL, { timeoutMs: 10_000 });
+      sendSignal("SIGINT");
+
+      const outcome = await result;
+      expect(outcome.exitCode).toBe(130);
+      expect(outcome.stderr).not.toMatch(/nonexistent-workflow/);
+      expect(outcome.stderr).not.toMatch(/not found/);
+    },
+    { timeout: 30_000, retry: 3 },
+  );
+
+  it(
+    "T-SIG-22: SIGINT pre-iteration wins over invalid target",
+    async () => {
+      project = await createTempProject();
+      await createWorkflowScript(project, "ralph", "index", ".sh", emitStop());
+
+      const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+        ["run", "-n", "1", ":script"],
+        {
+          cwd: project.dir,
+          timeout: 30_000,
+          env: PREITERATION_ENV,
+        },
+      );
+
+      await waitForStderr(PREITERATION_SENTINEL, { timeoutMs: 10_000 });
+      sendSignal("SIGINT");
+
+      const outcome = await result;
+      expect(outcome.exitCode).toBe(130);
+      expect(outcome.stderr).not.toMatch(/:script/);
+      expect(outcome.stderr).not.toMatch(/invalid target/i);
+    },
+    { timeout: 30_000, retry: 3 },
+  );
+
+  it.skipIf(IS_ROOT)(
+    "T-SIG-23: SIGINT pre-iteration wins over tmpdir creation failure",
+    async () => {
+      project = await createTempProject();
+      await createWorkflowScript(project, "ralph", "index", ".sh", emitStop());
+
+      // Make TMPDIR unwritable so tmpdir creation would fail (mkdtemp -EACCES).
+      const unwritableParent = await mkdtemp(
+        join(osTmpdir(), "loopx-sig-23-parent-"),
+      );
+      try {
+        await chmod(unwritableParent, 0o500);
+
+        const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+          ["run", "-n", "1", "ralph"],
+          {
+            cwd: project.dir,
+            timeout: 30_000,
+            env: { ...PREITERATION_ENV, TMPDIR: unwritableParent },
+          },
+        );
+
+        await waitForStderr(PREITERATION_SENTINEL, { timeoutMs: 10_000 });
+        sendSignal("SIGINT");
+
+        const outcome = await result;
+        expect(outcome.exitCode).toBe(130);
+        // The displaced failure (tmpdir creation EACCES) must NOT surface as
+        // the fatal-exit reason.
+        expect(outcome.stderr).not.toMatch(/EACCES/);
+        expect(outcome.stderr).not.toMatch(/permission/i);
+        expect(outcome.stderr).not.toMatch(/tmpdir/i);
+        // Best-effort cleanup: no `loopx-*` directory remains under the
+        // configured (unwritable) TMPDIR parent. Since mkdtemp itself is
+        // expected to fail when reached, no partial path is created.
+        const entries = readdirSync(unwritableParent).filter((e) =>
+          e.startsWith("loopx-"),
+        );
+        expect(entries).toEqual([]);
+      } finally {
+        await chmod(unwritableParent, 0o700).catch(() => {});
+        await rm(unwritableParent, { recursive: true, force: true }).catch(
+          () => {},
+        );
+      }
+    },
+    { timeout: 30_000, retry: 3 },
+  );
+
+  it(
+    "T-SIG-24: SIGINT pre-iteration wins over missing .loopx/ directory",
+    async () => {
+      project = await createTempProject();
+      // No .loopx/ subdir is created.
+
+      const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+        ["run", "-n", "1", "ralph"],
+        {
+          cwd: project.dir,
+          timeout: 30_000,
+          env: PREITERATION_ENV,
+        },
+      );
+
+      await waitForStderr(PREITERATION_SENTINEL, { timeoutMs: 10_000 });
+      sendSignal("SIGINT");
+
+      const outcome = await result;
+      expect(outcome.exitCode).toBe(130);
+      expect(outcome.stderr).not.toMatch(/No \.loopx\/ directory/);
+      expect(outcome.stderr).not.toMatch(/Create a \.loopx\/ directory/);
+    },
+    { timeout: 30_000, retry: 3 },
+  );
+
+  it(
+    "T-SIG-27: SIGINT pre-iteration wins over missing script in existing workflow",
+    async () => {
+      project = await createTempProject();
+      // The workflow exists with `index` only; we target the non-existent
+      // `check` script (missing-script-in-existing-workflow sub-path).
+      await createWorkflowScript(project, "ralph", "index", ".sh", emitStop());
+
+      const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+        ["run", "-n", "1", "ralph:check"],
+        {
+          cwd: project.dir,
+          timeout: 30_000,
+          env: PREITERATION_ENV,
+        },
+      );
+
+      await waitForStderr(PREITERATION_SENTINEL, { timeoutMs: 10_000 });
+      sendSignal("SIGINT");
+
+      const outcome = await result;
+      expect(outcome.exitCode).toBe(130);
+      expect(outcome.stderr).not.toMatch(/script 'check' not found/);
+      expect(outcome.stderr).not.toMatch(/not found in workflow/);
+    },
+    { timeout: 30_000, retry: 3 },
+  );
+
+  it(
+    "T-SIG-28: SIGINT pre-iteration wins over missing default index for bare target",
+    async () => {
+      project = await createTempProject();
+      // Workflow has scripts but no `index.*` — bare-target resolution
+      // would fail with the missing-default-entry-point error.
+      await createWorkflowScript(project, "ralph", "check", ".sh", emitStop());
+
+      const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+        ["run", "-n", "1", "ralph"],
+        {
+          cwd: project.dir,
+          timeout: 30_000,
+          env: PREITERATION_ENV,
+        },
+      );
+
+      await waitForStderr(PREITERATION_SENTINEL, { timeoutMs: 10_000 });
+      sendSignal("SIGINT");
+
+      const outcome = await result;
+      expect(outcome.exitCode).toBe(130);
+      expect(outcome.stderr).not.toMatch(/no default entry point/);
+      expect(outcome.stderr).not.toMatch(/'index' script/);
+    },
+    { timeout: 30_000, retry: 3 },
+  );
+
+  // T-SIG-31 — positive contract: signal observed by the installed pre-
+  // iteration handler on a fully VALID pre-iteration (no failure injected)
+  // must still produce the signal exit code, must not spawn any child, and
+  // must not leave a `loopx-*` directory under the test-isolated TMPDIR
+  // parent. Parameterized over SIGINT (130) and SIGTERM (143).
+
+  for (const variant of [
+    { signal: "SIGINT" as NodeJS.Signals, expectedExit: 130 },
+    { signal: "SIGTERM" as NodeJS.Signals, expectedExit: 143 },
+  ]) {
+    it(
+      `T-SIG-31 (${variant.signal.toLowerCase()}): signal on a fully valid pre-iteration → ${variant.expectedExit}, no child spawned, no tmpdir leftover`,
+      async () => {
+        project = await createTempProject();
+        const ranMarker = join(project.dir, "ran.txt");
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash\nprintf 'ran' > "${ranMarker}"\nprintf '{"stop":true}'\n`,
+        );
+
+        // Test-isolated TMPDIR parent so we can scan it for `loopx-*` leftovers.
+        const tmpParent = await mkdtemp(join(osTmpdir(), "loopx-sig-31-parent-"));
+        try {
+          const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+            ["run", "-n", "1", "ralph"],
+            {
+              cwd: project.dir,
+              timeout: 30_000,
+              env: { ...PREITERATION_ENV, TMPDIR: tmpParent },
+            },
+          );
+
+          await waitForStderr(PREITERATION_SENTINEL, { timeoutMs: 10_000 });
+          sendSignal(variant.signal);
+
+          const outcome = await result;
+          expect(outcome.exitCode).toBe(variant.expectedExit);
+          // No child spawned: the workflow script never wrote its marker.
+          expect(existsSync(ranMarker)).toBe(false);
+          // Stderr must not contain any pre-iteration error — the run was
+          // fully valid; only the signal exit-code path applies. Discovery
+          // warnings are fine; "Error:" lines are not.
+          expect(outcome.stderr).not.toMatch(/^Error:/m);
+          // Best-effort cleanup: no `loopx-*` entry persists under the
+          // test-isolated TMPDIR parent (per SPEC §7.4 — either tmpdir was
+          // never created, or it was cleaned up before exit).
+          const leftovers = readdirSync(tmpParent).filter((e) =>
+            e.startsWith("loopx-"),
+          );
+          expect(leftovers).toEqual([]);
+        } finally {
+          await rm(tmpParent, { recursive: true, force: true }).catch(() => {});
+        }
+      },
+      { timeout: 30_000, retry: 3 },
+    );
+  }
 });

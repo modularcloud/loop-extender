@@ -601,96 +601,12 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Discovery (global validation per SPEC §5.4).
-  const discovery = discoverScripts(loopxDir, "run");
-  for (const w of discovery.warnings) {
-    process.stderr.write(w + "\n");
-  }
-  if (discovery.errors.length > 0) {
-    for (const err of discovery.errors) {
-      process.stderr.write(`Error: ${err}\n`);
-    }
-    process.exit(1);
-  }
-
-  ensureLoopxPackageJson(loopxDir);
-
-  let globalEnv: Record<string, string> = {};
-  let localEnv: Record<string, string> = {};
-
-  try {
-    const globalResult = loadGlobalEnv();
-    globalEnv = globalResult.vars;
-    for (const w of globalResult.warnings) {
-      process.stderr.write(`Warning: ${w}\n`);
-    }
-  } catch (err: unknown) {
-    process.stderr.write(
-      `Error: ${err instanceof Error ? err.message : String(err)}\n`
-    );
-    process.exit(1);
-  }
-
-  if (runArgs.envFile) {
-    try {
-      const envFilePath = resolve(cwd, runArgs.envFile);
-      const localResult = loadLocalEnv(envFilePath);
-      localEnv = localResult.vars;
-      for (const w of localResult.warnings) {
-        process.stderr.write(`Warning: ${w}\n`);
-      }
-    } catch (err: unknown) {
-      process.stderr.write(
-        `Error: ${err instanceof Error ? err.message : String(err)}\n`
-      );
-      process.exit(1);
-    }
-  }
-
-  const mergedEnv = mergeEnv(globalEnv, localEnv);
-
-  // Target resolution
-  const parsed = parseTarget(runArgs.target);
-  if (!parsed.ok) {
-    process.stderr.write(`Error: ${parsed.error}\n`);
-    process.exit(1);
-  }
-
-  const workflow = discovery.workflows.get(parsed.workflow);
-  if (!workflow) {
-    process.stderr.write(
-      `Error: workflow '${parsed.workflow}' not found in .loopx/\n`
-    );
-    process.exit(1);
-  }
-
-  let scriptName: string;
-  if (parsed.script === null) {
-    if (!workflow.hasIndex || !workflow.scripts.has("index")) {
-      process.stderr.write(
-        `Error: workflow '${parsed.workflow}' has no default entry point ('index' script)\n`
-      );
-      process.exit(1);
-    }
-    scriptName = "index";
-  } else {
-    scriptName = parsed.script;
-  }
-
-  const scriptFile = workflow.scripts.get(scriptName);
-  if (!scriptFile) {
-    process.stderr.write(
-      `Error: script '${scriptName}' not found in workflow '${parsed.workflow}'\n`
-    );
-    process.exit(1);
-  }
-
-  // -n 0: validate then exit (SPEC §3.2 — no workflow-level version check).
-  if (runArgs.maxIterations === 0) {
-    process.exit(0);
-  }
-
-  // Signal handling
+  // SPEC §7.3 — install pre-iteration signal handlers BEFORE any pre-iteration
+  // step (discovery, env-file loading, target resolution, tmpdir creation).
+  // A signal observed by these handlers wins over non-signal pre-iteration
+  // failures: every pre-iteration failure site below checks `receivedSignal`
+  // first and exits via `exitWithSignal()` so the signal exit code (128+N) is
+  // surfaced and the displaced failure error is not.
   const ac = new AbortController();
   let receivedSignal: NodeJS.Signals | null = null;
 
@@ -713,6 +629,131 @@ async function main(): Promise<void> {
   };
   process.on("SIGINT", signalHandler);
   process.on("SIGTERM", signalHandler);
+
+  // TEST-SPEC §1.4 — pre-iteration sentinel seam. Emit a marker line on
+  // stderr after handler installation but before any pre-iteration step so a
+  // parent harness can deterministically synchronize signal delivery into the
+  // pre-iteration window (T-SIG-20..T-SIG-31). After emission, hold the
+  // pre-iteration window open with a bounded sleep so the harness has a
+  // deterministic interval to deliver the signal before pre-iteration
+  // proceeds — without this, fast pre-iteration paths (small `.loopx/`,
+  // valid targets) finish before the signal arrives, defeating the
+  // signal-wins precedence assertion. Gated on NODE_ENV=test AND
+  // LOOPX_TEST_PREITERATION_SENTINEL=1 so production behavior is
+  // unaffected.
+  if (
+    process.env.NODE_ENV === "test" &&
+    process.env.LOOPX_TEST_PREITERATION_SENTINEL
+  ) {
+    process.stderr.write("LOOPX_PREITERATION_READY\n");
+    await new Promise<void>((r) => setTimeout(r, 300));
+  }
+
+  // Discovery (global validation per SPEC §5.4).
+  const discovery = discoverScripts(loopxDir, "run");
+  if (receivedSignal) exitWithSignal();
+  for (const w of discovery.warnings) {
+    process.stderr.write(w + "\n");
+  }
+  if (discovery.errors.length > 0) {
+    if (receivedSignal) exitWithSignal();
+    for (const err of discovery.errors) {
+      process.stderr.write(`Error: ${err}\n`);
+    }
+    process.exit(1);
+  }
+
+  if (receivedSignal) exitWithSignal();
+  ensureLoopxPackageJson(loopxDir);
+
+  let globalEnv: Record<string, string> = {};
+  let localEnv: Record<string, string> = {};
+
+  try {
+    const globalResult = loadGlobalEnv();
+    globalEnv = globalResult.vars;
+    for (const w of globalResult.warnings) {
+      process.stderr.write(`Warning: ${w}\n`);
+    }
+  } catch (err: unknown) {
+    if (receivedSignal) exitWithSignal();
+    process.stderr.write(
+      `Error: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+    process.exit(1);
+  }
+
+  if (runArgs.envFile) {
+    try {
+      const envFilePath = resolve(cwd, runArgs.envFile);
+      const localResult = loadLocalEnv(envFilePath);
+      localEnv = localResult.vars;
+      for (const w of localResult.warnings) {
+        process.stderr.write(`Warning: ${w}\n`);
+      }
+    } catch (err: unknown) {
+      if (receivedSignal) exitWithSignal();
+      process.stderr.write(
+        `Error: ${err instanceof Error ? err.message : String(err)}\n`
+      );
+      process.exit(1);
+    }
+  }
+
+  const mergedEnv = mergeEnv(globalEnv, localEnv);
+
+  if (receivedSignal) exitWithSignal();
+
+  // Target resolution
+  const parsed = parseTarget(runArgs.target);
+  if (!parsed.ok) {
+    if (receivedSignal) exitWithSignal();
+    process.stderr.write(`Error: ${parsed.error}\n`);
+    process.exit(1);
+  }
+
+  const workflow = discovery.workflows.get(parsed.workflow);
+  if (!workflow) {
+    if (receivedSignal) exitWithSignal();
+    process.stderr.write(
+      `Error: workflow '${parsed.workflow}' not found in .loopx/\n`
+    );
+    process.exit(1);
+  }
+
+  let scriptName: string;
+  if (parsed.script === null) {
+    if (!workflow.hasIndex || !workflow.scripts.has("index")) {
+      if (receivedSignal) exitWithSignal();
+      process.stderr.write(
+        `Error: workflow '${parsed.workflow}' has no default entry point ('index' script)\n`
+      );
+      process.exit(1);
+    }
+    scriptName = "index";
+  } else {
+    scriptName = parsed.script;
+  }
+
+  const scriptFile = workflow.scripts.get(scriptName);
+  if (!scriptFile) {
+    if (receivedSignal) exitWithSignal();
+    process.stderr.write(
+      `Error: script '${scriptName}' not found in workflow '${parsed.workflow}'\n`
+    );
+    process.exit(1);
+  }
+
+  // -n 0: validate then exit (SPEC §3.2 — no workflow-level version check).
+  if (runArgs.maxIterations === 0) {
+    if (receivedSignal) exitWithSignal();
+    process.exit(0);
+  }
+
+  // SPEC §7.3 — final pre-iteration signal check before iteration begins.
+  // Covers T-SIG-31 (fully valid pre-iteration with signal observed by the
+  // installed handler — the run would otherwise have proceeded).
+  if (receivedSignal) exitWithSignal();
 
   const starting: LoopStartingTarget = { workflow, script: scriptFile };
 
