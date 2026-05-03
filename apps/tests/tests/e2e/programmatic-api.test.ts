@@ -13520,6 +13520,7 @@ console.log(JSON.stringify({ synchronousThrew, callSiteMessage, scriptReachedRea
 //   T-API-65m  run        + pre-aborted + missing .loopx/ → abort error
 //   T-API-65n  run        + pre-aborted + tmpdir creation fail → abort error
 //   T-API-65o  run        + pre-aborted + target-resolution variants → abort error
+//   T-API-65r  {runPromise,run} + pre-aborted + unreadable global env (mode 000) → abort error
 //   T-API-65v  runPromise + invalid options wrapper + aborted signal → NOT abort
 //   T-API-65w  run        + invalid options wrapper + aborted signal → NOT abort
 //
@@ -13777,6 +13778,159 @@ console.log(JSON.stringify({ rejected, message, name }));
         ).toBe(true);
         expect(parsed.message).not.toMatch(
           /unreadable\.env|envFile|env file|EACCES|permission/i,
+        );
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      },
+    );
+
+    // ------------------------------------------------------------------------
+    // T-API-65r-promise: runPromise() — pre-aborted signal beats env-file-
+    // load failure when the GLOBAL env file ($XDG_CONFIG_HOME/loopx/env) is
+    // unreadable (mode 000). SPEC §9.3 explicitly displaces "env-file
+    // loading" failures, and SPEC §7.1 step 2 covers both local `-e` and
+    // global env files in that loading step. T-API-65 / 65k cover MISSING
+    // local env file; T-API-65c covers UNREADABLE LOCAL env file (mode 000);
+    // this test covers the unreadable GLOBAL env file sub-path on the
+    // programmatic abort-precedence surface (counterpart to T-TMP-12-global-
+    // env-unreadable on the no-abort surface, and T-SIG-30 on the CLI
+    // signal-wins surface).
+    //
+    // Per SPEC §8.1, XDG_CONFIG_HOME is read from the inherited environment
+    // (NOT from RunOptions.env), so the harness injects it via the driver's
+    // inherited env (the `env:` parameter to runAPIDriver — same channel
+    // that delivers TMPDIR).
+    //
+    // Skipped under root: mode 000 does not block reads for uid 0.
+    // SPEC §9.3, §9.5, §9.1, §8.1, §7.1.
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-API-65r-promise: runPromise() pre-aborted signal beats unreadable global env file (mode 000)",
+      async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent("api65r-promise");
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const xdg = join(project.dir, "xdg-config");
+        await mkdir(join(xdg, "loopx"), { recursive: true });
+        const globalEnv = join(xdg, "loopx", "env");
+        await writeFile(globalEnv, "FOO=bar\n", "utf-8");
+        await chmod(globalEnv, 0o000);
+        cleanups.push(async () => {
+          await chmod(globalEnv, 0o644).catch(() => {});
+        });
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdg },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected with the abort error, not the
+        //     global-env-file-unreadable error (EACCES / read failure).
+        expect(parsed.rejected).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(
+          /xdg|global.*env|loopx\/env|EACCES|permission/i,
+        );
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      },
+    );
+
+    // ------------------------------------------------------------------------
+    // T-API-65r-generator: run() — pre-aborted signal beats env-file-load
+    // failure when the GLOBAL env file is unreadable (mode 000). Generator-
+    // surface counterpart to T-API-65r-promise. SPEC §9.3, §9.5, §9.1, §8.1,
+    // §7.1.
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-API-65r-generator: run() pre-aborted signal beats unreadable global env file (mode 000)",
+      async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent("api65r-generator");
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const xdg = join(project.dir, "xdg-config");
+        await mkdir(join(xdg, "loopx"), { recursive: true });
+        const globalEnv = join(xdg, "loopx", "env");
+        await writeFile(globalEnv, "FOO=bar\n", "utf-8");
+        await chmod(globalEnv, 0o000);
+        cleanups.push(async () => {
+          await chmod(globalEnv, 0o644).catch(() => {});
+        });
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdg },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First next() threw abort error, not the global-env-file-
+        //     unreadable error (EACCES / read failure).
+        expect(parsed.threw).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(
+          /xdg|global.*env|loopx\/env|EACCES|permission/i,
         );
         // (b) Workflow script did not run.
         expect(existsSync(marker)).toBe(false);
