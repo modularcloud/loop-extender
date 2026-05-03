@@ -13520,6 +13520,8 @@ console.log(JSON.stringify({ synchronousThrew, callSiteMessage, scriptReachedRea
 //   T-API-65m  run        + pre-aborted + missing .loopx/ → abort error
 //   T-API-65n  run        + pre-aborted + tmpdir creation fail → abort error
 //   T-API-65o  run        + pre-aborted + target-resolution variants → abort error
+//   T-API-65p  runPromise + pre-aborted + 16-variant option-snapshot matrix → abort error
+//   T-API-65q  run        + pre-aborted + 16-variant option-snapshot matrix → abort error
 //   T-API-65r  {runPromise,run} + pre-aborted + unreadable global env (mode 000) → abort error
 //   T-API-65v  runPromise + invalid options wrapper + aborted signal → NOT abort
 //   T-API-65w  run        + invalid options wrapper + aborted signal → NOT abort
@@ -14405,6 +14407,293 @@ console.log(JSON.stringify({ rejected, message, name }));
       const after = listLoopxEntries(tmpdirParent);
       expect(after.filter((e) => !before.includes(e))).toEqual([]);
     });
+
+    // ------------------------------------------------------------------------
+    // T-API-65p / T-API-65q: pre-aborted signal beats option-snapshot
+    // failures across the full enumerated `maxIterations` set plus a
+    // representative selection of remaining option-snapshot families.
+    //
+    // SPEC §9.3 abort-precedence rule displaces "captured option-snapshot
+    // errors" once a usable signal is captured (already-aborted at call
+    // time, or aborts during pre-iteration). T-API-65f / T-API-65g cover one
+    // representative option-snapshot variant (throwing `env` getter) on each
+    // surface; this matrix extends that coverage by parameterizing
+    // EXHAUSTIVELY over every invalid `maxIterations` value (i)–(vi) and
+    // REPRESENTATIVELY over the remaining option-snapshot families
+    // (vii)–(xvi):
+    //
+    //   (i)–(vi)  invalid `maxIterations` (-1, 1.5, NaN, Infinity, null, "1")
+    //   (vii)     non-string `cwd` (42)
+    //   (viii)    throwing `cwd` getter
+    //   (ix)      non-string `envFile` (42)
+    //   (x)       throwing `envFile` getter
+    //   (xi)      invalid `env` shape ([])
+    //   (xii)     non-string env entry value ({ KEY: 42 })
+    //   (xiii)    throwing enumerable getter inside `env`
+    //   (xiv)     throwing `env` proxy `ownKeys` trap
+    //   (xv)      throwing `env` proxy `get` trap on an included key
+    //   (xvi)     throwing `options.maxIterations` getter
+    //
+    // Construction rule (SPEC §9.5 "snapshot-time throws" / TEST-SPEC §1.3
+    // "test-construction sanity for getter/proxy variants"): for getter /
+    // proxy variants (viii, x, xiii, xiv, xv, xvi), the throwing accessor
+    // or proxy is installed directly on the object passed to runPromise() /
+    // run() — NEVER via object-spread of an accessor-bearing object —
+    // because spreading invokes the accessor in the test harness BEFORE the
+    // call, surfacing the exception at the call site rather than letting
+    // loopx capture it via the SPEC §9.5 snapshot path.
+    //
+    // T-API-65p drives the runPromise() surface; T-API-65q drives run().
+    // Together they close the abort-precedence-over-option-snapshot
+    // category across both API surfaces. Invalid `options.signal` is
+    // excluded per SPEC §9.3 carve-out (ii) and is covered by T-API-65e
+    // separately. The full invalid `env` shape/value matrix is intentionally
+    // not exhaustively re-parameterized — those validation paths converge
+    // on a single "captured option-snapshot error" code path and tests at
+    // the env-shape-validation surface (T-API-53–55, 55a–55d) carry the
+    // exhaustive coverage without abort-precedence pinning.
+    //
+    // SPEC §9.1, §9.2, §9.3, §9.5.
+    //
+    // Per-variant assertions (each surface):
+    //   (a) the surfaced rejection / throw is the abort error — NOT the
+    //       configured option-snapshot error (positive: AbortError name OR
+    //       /abort/i in message; negative: per-variant marker absent);
+    //   (b) no child was spawned (marker file absent);
+    //   (c) no `loopx-*` tmpdir was created.
+    // ------------------------------------------------------------------------
+    type AbortPrecedenceVariant = {
+      id: string;
+      label: string;
+      // Returns driver-side JS that constructs `const opts = ...` such that
+      // the variant's invalid value is preserved on the final options
+      // object. `cwd` is the JSON-stringified project dir literal.
+      buildOpts: (cwd: string) => string;
+      // Pattern that the displaced option-snapshot error message would
+      // mention but the abort error must NOT match.
+      negativePattern: RegExp;
+    };
+
+    const ABORT_PRECEDENCE_VARIANTS: AbortPrecedenceVariant[] = [
+      {
+        id: "i",
+        label: "maxIterations: -1",
+        buildOpts: (cwd) =>
+          `const opts = { cwd: ${cwd}, signal: c.signal, maxIterations: -1 };`,
+        negativePattern: /maxIterations|integer|negative/i,
+      },
+      {
+        id: "ii",
+        label: "maxIterations: 1.5",
+        buildOpts: (cwd) =>
+          `const opts = { cwd: ${cwd}, signal: c.signal, maxIterations: 1.5 };`,
+        negativePattern: /maxIterations|integer|1\.5/i,
+      },
+      {
+        id: "iii",
+        label: "maxIterations: NaN",
+        buildOpts: (cwd) =>
+          `const opts = { cwd: ${cwd}, signal: c.signal, maxIterations: NaN };`,
+        negativePattern: /maxIterations|NaN|integer/i,
+      },
+      {
+        id: "iv",
+        label: "maxIterations: Infinity",
+        buildOpts: (cwd) =>
+          `const opts = { cwd: ${cwd}, signal: c.signal, maxIterations: Infinity };`,
+        negativePattern: /maxIterations|Infinity|integer/i,
+      },
+      {
+        id: "v",
+        label: "maxIterations: null",
+        buildOpts: (cwd) =>
+          `const opts: any = { cwd: ${cwd}, signal: c.signal, maxIterations: null as any };`,
+        negativePattern: /maxIterations|null|integer/i,
+      },
+      {
+        id: "vi",
+        label: 'maxIterations: "1"',
+        buildOpts: (cwd) =>
+          `const opts: any = { cwd: ${cwd}, signal: c.signal, maxIterations: "1" as any };`,
+        negativePattern: /maxIterations|integer/i,
+      },
+      {
+        id: "vii",
+        label: "cwd: 42",
+        buildOpts: (_cwd) =>
+          `const opts: any = { cwd: 42 as any, signal: c.signal, maxIterations: 1 };`,
+        negativePattern: /RunOptions\.cwd|cwd must|cwd.*string/i,
+      },
+      {
+        id: "viii",
+        label: "throwing cwd getter",
+        buildOpts: (_cwd) =>
+          `const opts: any = { signal: c.signal, maxIterations: 1 };
+Object.defineProperty(opts, "cwd", { enumerable: true, get() { throw new Error("cwd-getter-boom"); } });`,
+        negativePattern: /cwd-getter-boom/i,
+      },
+      {
+        id: "ix",
+        label: "envFile: 42",
+        buildOpts: (cwd) =>
+          `const opts: any = { cwd: ${cwd}, signal: c.signal, envFile: 42 as any, maxIterations: 1 };`,
+        negativePattern: /envFile/i,
+      },
+      {
+        id: "x",
+        label: "throwing envFile getter",
+        buildOpts: (cwd) =>
+          `const opts: any = { cwd: ${cwd}, signal: c.signal, maxIterations: 1 };
+Object.defineProperty(opts, "envFile", { enumerable: true, get() { throw new Error("envFile-getter-boom"); } });`,
+        negativePattern: /envFile-getter-boom/i,
+      },
+      {
+        id: "xi",
+        label: "env: []",
+        buildOpts: (cwd) =>
+          `const opts: any = { cwd: ${cwd}, signal: c.signal, env: [] as any, maxIterations: 1 };`,
+        negativePattern: /RunOptions\.env|env.*shape|env.*array|env must/i,
+      },
+      {
+        id: "xii",
+        label: "env: { KEY: 42 }",
+        buildOpts: (cwd) =>
+          `const opts: any = { cwd: ${cwd}, signal: c.signal, env: { KEY: 42 as any }, maxIterations: 1 };`,
+        negativePattern: /RunOptions\.env|env.*KEY|env.*string|KEY.*string/i,
+      },
+      {
+        id: "xiii",
+        label: "throwing enumerable getter inside env",
+        buildOpts: (cwd) =>
+          `const env: any = {};
+Object.defineProperty(env, "KEY", { enumerable: true, get() { throw new Error("env-entry-getter-boom"); } });
+const opts: any = { cwd: ${cwd}, signal: c.signal, maxIterations: 1, env };`,
+        negativePattern: /env-entry-getter-boom/i,
+      },
+      {
+        id: "xiv",
+        label: "throwing env proxy ownKeys trap",
+        buildOpts: (cwd) =>
+          `const env: any = new Proxy({}, { ownKeys() { throw new Error("ownKeys-trap-boom"); } });
+const opts: any = { cwd: ${cwd}, signal: c.signal, maxIterations: 1, env };`,
+        negativePattern: /ownKeys-trap-boom/i,
+      },
+      {
+        id: "xv",
+        label: "throwing env proxy get trap on included key",
+        buildOpts: (cwd) =>
+          `const env: any = new Proxy({ KEY: "value" }, {
+  ownKeys() { return ["KEY"]; },
+  getOwnPropertyDescriptor() { return { enumerable: true, configurable: true, value: undefined, writable: true }; },
+  get() { throw new Error("get-trap-boom"); },
+});
+const opts: any = { cwd: ${cwd}, signal: c.signal, maxIterations: 1, env };`,
+        negativePattern: /get-trap-boom/i,
+      },
+      {
+        id: "xvi",
+        label: "throwing options.maxIterations getter",
+        buildOpts: (cwd) =>
+          `const opts: any = { cwd: ${cwd}, signal: c.signal };
+Object.defineProperty(opts, "maxIterations", { enumerable: true, get() { throw new Error("maxIterations-getter-boom"); } });`,
+        negativePattern: /maxIterations-getter-boom/i,
+      },
+    ];
+
+    for (const v of ABORT_PRECEDENCE_VARIANTS) {
+      it(`T-API-65p (${v.id}): runPromise() pre-aborted signal beats option-snapshot — ${v.label}`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api65p-${v.id}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+${v.buildOpts(JSON.stringify(project.dir))}
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", opts);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected with the abort error, not the option-snapshot error.
+        expect(parsed.rejected).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(v.negativePattern);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      });
+
+      it(`T-API-65q (${v.id}): run() pre-aborted signal beats option-snapshot — ${v.label}`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api65q-${v.id}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+${v.buildOpts(JSON.stringify(project.dir))}
+const gen = run("ralph", opts);
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First next() threw the abort error, not the option-snapshot error.
+        expect(parsed.threw).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(v.negativePattern);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      });
+    }
 
     // ------------------------------------------------------------------------
     // T-API-65a2 (i)–(iii): pre-aborted signal beats NON-STRING target
