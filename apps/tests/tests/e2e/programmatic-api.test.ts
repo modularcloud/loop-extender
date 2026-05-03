@@ -14170,5 +14170,152 @@ console.log(JSON.stringify({ rejected, message, name }));
       const after = listLoopxEntries(tmpdirParent);
       expect(after.filter((e) => !before.includes(e))).toEqual([]);
     });
+
+    // ------------------------------------------------------------------------
+    // T-API-65a2 (i)–(iii): pre-aborted signal beats NON-STRING target
+    // arguments. SPEC §9.3 / §9.5 / §9.1 / §9.2.
+    //
+    // T-API-65a / T-API-65l cover the target-syntax branch (invalid string
+    // ":bad"); this test covers the target-argument branch — non-string
+    // target values per SPEC §9.1 ("runtime-invalid `target` values
+    // (e.g., `undefined`, `null`, `42`, or any non-string) are rejected
+    // lazily"). Together they close both target-argument-validation
+    // sub-branches under SPEC §9.3's "target argument / target syntax
+    // validation" displacement.
+    //
+    // Variants: (i) target = undefined, (ii) target = null, (iii) target = 42.
+    // Each variant runs on both surfaces — runPromise() (eager-snapshot
+    // surface per SPEC §9.2) and run() (lazy-on-first-next() surface per
+    // SPEC §9.1) — so a buggy implementation that routed only one surface's
+    // non-string-target rejection through the abort-precedence pathway
+    // (e.g., honored precedence in run() but not runPromise(), or vice
+    // versa) would pass the same-target tests on the conforming surface yet
+    // fail on the non-conforming surface.
+    //
+    // A buggy implementation that routed target-syntax validation
+    // (parseTarget on the captured string) through the abort-precedence
+    // pathway but rejected non-string targets via a separate eager
+    // type-check (e.g., a synchronous `typeof target !== "string"` guard at
+    // the call site that escaped the captured-error path) would pass
+    // T-API-65a / T-API-65l yet fail this test.
+    //
+    // The fixture creates a valid `.loopx/ralph/index.sh` workflow that
+    // would write a marker if it ever ran — even though `undefined` /
+    // `null` / `42` can never resolve to "ralph", the marker check (b) is
+    // a belt-and-suspenders sanity net against an impl that somehow
+    // routes the call past target validation despite the non-string input.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      { id: "i", label: "undefined", expr: "undefined" },
+      { id: "ii", label: "null", expr: "null" },
+      { id: "iii", label: "numeric (42)", expr: "42" },
+    ]) {
+      it(`T-API-65a2 (${variant.id} ${variant.label}): runPromise() pre-aborted signal beats non-string target ${variant.expr}`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(
+          `api65a2-promise-${variant.id}`,
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise(${variant.expr} as any, {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected with abort error, not non-string-target error.
+        expect(parsed.rejected).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(
+          /target is required|must be a string|invalid.*target|target.*syntax/i,
+        );
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      });
+
+      it(`T-API-65a2 (${variant.id} ${variant.label}): run() pre-aborted signal beats non-string target ${variant.expr}`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(
+          `api65a2-run-${variant.id}`,
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run(${variant.expr} as any, {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First next() throws abort error, not non-string-target error.
+        expect(parsed.threw).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(
+          /target is required|must be a string|invalid.*target|target.*syntax/i,
+        );
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      });
+    }
   });
 });
