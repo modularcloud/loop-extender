@@ -10362,3 +10362,773 @@ console.log(JSON.stringify({ threw, message, outputCount: outputs.length, lastSt
     });
   });
 });
+
+// ═════════════════════════════════════════════════════════════
+// §4.10 — Throwing Option-Field Getters (SPEC §9.1 / §9.5)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.1: "Any exception raised during the snapshot — a throwing
+// option-field getter, throwing entry getter, throwing proxy ownKeys /
+// get trap, or throwing addEventListener — is captured and surfaced via
+// the standard pre-iteration error path on the first next(), not at
+// the call site." SPEC §9.2: "Identical to run() (section 9.1)" —
+// errors surface as promise rejection.
+//
+// T-API-62 series pins the captured-not-escape contract on every option
+// field that the snapshot reads via [[Get]] semantics, plus the
+// throwing-trap branches inside options.env (Proxy ownKeys / get traps,
+// own enumerable getter on an entry).
+
+describe("SPEC: Throwing Option-Field Getters", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-62 / T-API-62a / T-API-62b / T-API-62c / T-API-62d:
+    // Throwing getter on a single options field — generator throws on first
+    // next() with the captured exception. The call site does NOT throw
+    // synchronously. No child is spawned. SPEC §9.1 / §9.5.
+    //
+    // Each variant installs a throwing getter on a different option field
+    // via Object.defineProperty (per the §1.1 getter-construction rule —
+    // never via object spread, since spreading invokes the getter at the
+    // spread expression in the test harness BEFORE run() / runPromise() is
+    // called, which would surface the throw at the test call site rather
+    // than letting the implementation observe it).
+    // ------------------------------------------------------------------------
+    interface ThrowingFieldVariant {
+      id: string;
+      field: "env" | "signal" | "cwd" | "envFile" | "maxIterations";
+      message: string;
+    }
+
+    const throwingFieldVariants: ThrowingFieldVariant[] = [
+      { id: "T-API-62", field: "env", message: "env-getter-boom" },
+      { id: "T-API-62a", field: "signal", message: "signal-getter-boom" },
+      { id: "T-API-62b", field: "cwd", message: "cwd-getter-boom" },
+      { id: "T-API-62c", field: "envFile", message: "envFile-getter-boom" },
+      {
+        id: "T-API-62d",
+        field: "maxIterations",
+        message: "maxIterations-getter-boom",
+      },
+    ];
+
+    for (const v of throwingFieldVariants) {
+      it(`${v.id}: run() with throwing options.${v.field} getter — captured at call site, surfaced on first next()`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const opts = {};
+Object.defineProperty(opts, ${JSON.stringify(v.field)}, {
+  enumerable: true,
+  configurable: true,
+  get() { throw new Error(${JSON.stringify(v.message)}); },
+});
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let threw = false, message = "";
+let isObject = false, hasNext = false, hasReturn = false, hasThrow = false;
+if (!synchronousThrew) {
+  isObject = gen !== null && typeof gen === "object";
+  hasNext = typeof gen.next === "function";
+  hasReturn = typeof gen.return === "function";
+  hasThrow = typeof gen.throw === "function";
+  try {
+    await gen.next();
+  } catch (e) {
+    threw = true;
+    message = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message, isObject, hasNext, hasReturn, hasThrow }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // SPEC §9.1: never throws at the call site; captured into snapshot.
+        expect(parsed.synchronousThrew).toBe(false);
+        // run() returns a generator-shaped object even under invalid options.
+        expect(parsed.isObject).toBe(true);
+        expect(parsed.hasNext).toBe(true);
+        expect(parsed.hasReturn).toBe(true);
+        expect(parsed.hasThrow).toBe(true);
+        // Captured throw surfaces on first next().
+        expect(parsed.threw).toBe(true);
+        expect(parsed.message).toContain(v.message);
+        // No child spawned (pre-iteration error fires before any spawn).
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-62e: Throwing enumerable getter on a NAMED ENTRY inside
+    // options.env — captured during snapshotEnv's value-read pass and
+    // surfaced as a snapshot error on first next().
+    //
+    // Distinct from T-API-62 (throwing getter on options.env itself) — this
+    // test exercises the per-entry value-read path inside snapshotEnv.
+    // ------------------------------------------------------------------------
+    it("T-API-62e: run() — throwing enumerable getter on options.env entry surfaces on first next()", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "spawn-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const env = { A: "a" };
+Object.defineProperty(env, "B", {
+  enumerable: true,
+  configurable: true,
+  get() { throw new Error("entry-getter-boom"); },
+});
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", { env });
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let threw = false, message = "";
+if (!synchronousThrew) {
+  try {
+    await gen.next();
+  } catch (e) {
+    threw = true;
+    message = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.synchronousThrew).toBe(false);
+      expect(parsed.threw).toBe(true);
+      expect(parsed.message).toContain("entry-getter-boom");
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62f: Proxy ownKeys trap that throws while enumerating
+    // options.env — captured during snapshotEnv's Object.keys pass and
+    // surfaced on first next().
+    // ------------------------------------------------------------------------
+    it("T-API-62f: run() — throwing Proxy ownKeys trap on options.env surfaces on first next()", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "spawn-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const env = new Proxy({ A: "a" }, {
+  ownKeys() { throw new Error("ownKeys-trap-boom"); },
+});
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", { env });
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let threw = false, message = "";
+if (!synchronousThrew) {
+  try {
+    await gen.next();
+  } catch (e) {
+    threw = true;
+    message = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.synchronousThrew).toBe(false);
+      expect(parsed.threw).toBe(true);
+      expect(parsed.message).toContain("ownKeys-trap-boom");
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62f3: Throwing Proxy `get` trap on an INCLUDED options.env key
+    // — SPEC §9.5 normatively requires `[[Get]]` semantics for value reads,
+    // so a throwing get trap is captured during the per-key value-read pass
+    // and surfaced on first next(). This pins the value-read axis (vs
+    // T-API-62f's enumeration axis).
+    // ------------------------------------------------------------------------
+    it("T-API-62f3: run() — throwing Proxy get trap on included options.env key surfaces on first next()", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "spawn-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const env = new Proxy({ A: "a", B: "b" }, {
+  ownKeys() { return ["A", "B"]; },
+  getOwnPropertyDescriptor(_t, _key) {
+    return { enumerable: true, configurable: true, value: undefined, writable: true };
+  },
+  get(_t, _key) { throw new Error("get-trap-boom"); },
+});
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", { env });
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let threw = false, message = "";
+if (!synchronousThrew) {
+  try {
+    await gen.next();
+  } catch (e) {
+    threw = true;
+    message = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.synchronousThrew).toBe(false);
+      expect(parsed.threw).toBe(true);
+      expect(parsed.message).toContain("get-trap-boom");
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62g: Throwing getter under runPromise — promise rejects, no
+    // synchronous throw at the call site. SPEC §9.2: "the call itself
+    // always returns a promise."
+    //
+    // Uses a Proxy whose `get` trap throws on the `env` key (per the
+    // TEST-SPEC fixture), exercising the runPromise() surface counterpart
+    // of T-API-62.
+    // ------------------------------------------------------------------------
+    it("T-API-62g: runPromise() with throwing options.env getter — promise rejects, no synchronous throw", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "spawn-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const opts = new Proxy({}, {
+  get(_t, k) { if (k === "env") throw new Error("proxy-get-boom"); return undefined; },
+});
+let synchronousThrew = false, callTimeMessage = "";
+let p;
+try {
+  p = runPromise("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let isPromise = false;
+if (!synchronousThrew) {
+  isPromise = p !== null && typeof p === "object" && typeof p.then === "function";
+}
+let rejected = false, message = "";
+if (!synchronousThrew) {
+  try {
+    await p;
+  } catch (e) {
+    rejected = true;
+    message = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, isPromise, rejected, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // SPEC §9.2: call always returns a promise; never throws synchronously.
+      expect(parsed.synchronousThrew).toBe(false);
+      expect(parsed.isPromise).toBe(true);
+      expect(parsed.rejected).toBe(true);
+      expect(parsed.message).toContain("proxy-get-boom");
+      expect(existsSync(marker)).toBe(false);
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.11 — Option-Field Single-Read Contract (SPEC §9.1 / §9.2 / §9.5)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.1 / §9.2: "Each option field is read at most once per call,
+// and a throwing getter or proxy trap is not re-invoked to retry."
+// T-API-62h series pins the single-read contract on the success path
+// (each non-throwing getter fires exactly once) and the no-retry
+// contract on the throwing path (a throwing getter / trap fires
+// exactly once and is not re-invoked during error surfacing).
+
+describe("SPEC: Option-Field Single-Read Contract", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-62h: run() reads each option field at most once per call.
+    // Counter-based getters on every pinned field. After settlement,
+    // each counter must be exactly 1.
+    // ------------------------------------------------------------------------
+    it("T-API-62h: run() reads each option field at most once per call", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+      const envFilePath = join(project.dir, "valid.env");
+      await writeFile(envFilePath, "OTHER=other-val\n");
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let signalCount = 0, cwdCount = 0, envFileCount = 0, maxIterCount = 0, envCount = 0;
+const opts = {};
+const ac = new AbortController();
+Object.defineProperty(opts, "signal", { enumerable: true, configurable: true, get() { signalCount++; return ac.signal; } });
+Object.defineProperty(opts, "cwd", { enumerable: true, configurable: true, get() { cwdCount++; return ${JSON.stringify(project.dir)}; } });
+Object.defineProperty(opts, "envFile", { enumerable: true, configurable: true, get() { envFileCount++; return ${JSON.stringify(envFilePath)}; } });
+Object.defineProperty(opts, "maxIterations", { enumerable: true, configurable: true, get() { maxIterCount++; return 2; } });
+Object.defineProperty(opts, "env", { enumerable: true, configurable: true, get() { envCount++; return { MYVAR: "value" }; } });
+const gen = run("ralph", opts);
+const outputs = [];
+for await (const o of gen) { outputs.push(o); }
+console.log(JSON.stringify({ signalCount, cwdCount, envFileCount, maxIterCount, envCount, outputs: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.signalCount).toBe(1);
+      expect(parsed.cwdCount).toBe(1);
+      expect(parsed.envFileCount).toBe(1);
+      expect(parsed.maxIterCount).toBe(1);
+      expect(parsed.envCount).toBe(1);
+      expect(parsed.outputs).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("value");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62h2: runPromise() reads each option field at most once per call.
+    // ------------------------------------------------------------------------
+    it("T-API-62h2: runPromise() reads each option field at most once per call", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+      const envFilePath = join(project.dir, "valid.env");
+      await writeFile(envFilePath, "OTHER=other-val\n");
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let signalCount = 0, cwdCount = 0, envFileCount = 0, maxIterCount = 0, envCount = 0;
+const opts = {};
+const ac = new AbortController();
+Object.defineProperty(opts, "signal", { enumerable: true, configurable: true, get() { signalCount++; return ac.signal; } });
+Object.defineProperty(opts, "cwd", { enumerable: true, configurable: true, get() { cwdCount++; return ${JSON.stringify(project.dir)}; } });
+Object.defineProperty(opts, "envFile", { enumerable: true, configurable: true, get() { envFileCount++; return ${JSON.stringify(envFilePath)}; } });
+Object.defineProperty(opts, "maxIterations", { enumerable: true, configurable: true, get() { maxIterCount++; return 2; } });
+Object.defineProperty(opts, "env", { enumerable: true, configurable: true, get() { envCount++; return { MYVAR: "value" }; } });
+const outputs = await runPromise("ralph", opts);
+console.log(JSON.stringify({ signalCount, cwdCount, envFileCount, maxIterCount, envCount, outputs: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.signalCount).toBe(1);
+      expect(parsed.cwdCount).toBe(1);
+      expect(parsed.envFileCount).toBe(1);
+      expect(parsed.maxIterCount).toBe(1);
+      expect(parsed.envCount).toBe(1);
+      expect(parsed.outputs).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("value");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62h3 / T-API-62h4: throwing options.env getter — invoked once,
+    // not retried during error surfacing.
+    // ------------------------------------------------------------------------
+    interface NoRetryFieldVariant {
+      id: string;
+      surface: "run" | "runPromise";
+      field: "env" | "signal";
+      message: string;
+    }
+
+    const noRetryFieldVariants: NoRetryFieldVariant[] = [
+      { id: "T-API-62h3", surface: "run", field: "env", message: "env-getter-boom" },
+      { id: "T-API-62h4", surface: "runPromise", field: "env", message: "env-getter-boom" },
+      { id: "T-API-62h7", surface: "run", field: "signal", message: "signal-getter-boom" },
+      { id: "T-API-62h8", surface: "runPromise", field: "signal", message: "signal-getter-boom" },
+    ];
+
+    for (const v of noRetryFieldVariants) {
+      it(`${v.id}: ${v.surface}() throwing options.${v.field} getter is invoked exactly once (no retry)`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driver =
+          v.surface === "run"
+            ? `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const opts = {};
+Object.defineProperty(opts, ${JSON.stringify(v.field)}, {
+  enumerable: true,
+  configurable: true,
+  get() { count++; throw new Error(${JSON.stringify(v.message)}); },
+});
+let threw = false, message = "";
+try {
+  const gen = run("ralph", opts);
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`
+            : `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const opts = {};
+Object.defineProperty(opts, ${JSON.stringify(v.field)}, {
+  enumerable: true,
+  configurable: true,
+  get() { count++; throw new Error(${JSON.stringify(v.message)}); },
+});
+let rejected = false, message = "";
+try {
+  await runPromise("ralph", opts);
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw: rejected, message }));
+`;
+        const result = await runAPIDriver(runtime, driver);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.threw).toBe(true);
+        expect(parsed.message).toContain(v.message);
+        // Load-bearing: getter invoked exactly once (no retry).
+        expect(parsed.count).toBe(1);
+        // No spawn occurred.
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-62h5 / T-API-62h6: throwing Proxy ownKeys trap inside options.env
+    // — invoked once, not retried.
+    // ------------------------------------------------------------------------
+    interface NoRetryProxyVariant {
+      id: string;
+      surface: "run" | "runPromise";
+    }
+
+    const noRetryOwnKeysVariants: NoRetryProxyVariant[] = [
+      { id: "T-API-62h5", surface: "run" },
+      { id: "T-API-62h6", surface: "runPromise" },
+    ];
+
+    for (const v of noRetryOwnKeysVariants) {
+      it(`${v.id}: ${v.surface}() throwing Proxy ownKeys trap on options.env invoked exactly once (no retry)`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driver =
+          v.surface === "run"
+            ? `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const env = new Proxy({ A: "a" }, {
+  ownKeys() { count++; throw new Error("ownKeys-boom"); },
+});
+let threw = false, message = "";
+try {
+  const gen = run("ralph", { env });
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`
+            : `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const env = new Proxy({ A: "a" }, {
+  ownKeys() { count++; throw new Error("ownKeys-boom"); },
+});
+let rejected = false, message = "";
+try {
+  await runPromise("ralph", { env });
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw: rejected, message }));
+`;
+        const result = await runAPIDriver(runtime, driver);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.threw).toBe(true);
+        expect(parsed.message).toContain("ownKeys-boom");
+        expect(parsed.count).toBe(1);
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-62h9: throwing Proxy `get` trap on included options.env key —
+    // invoked once on the first included key, not retried. Pins the
+    // [[Get]]-semantics no-retry axis on both run surfaces.
+    // ------------------------------------------------------------------------
+    interface NoRetryGetVariant {
+      id: string;
+      surface: "run" | "runPromise";
+    }
+
+    const noRetryGetVariants: NoRetryGetVariant[] = [
+      { id: "T-API-62h9 (run)", surface: "run" },
+      { id: "T-API-62h9 (runPromise)", surface: "runPromise" },
+    ];
+
+    for (const v of noRetryGetVariants) {
+      it(`${v.id}: ${v.surface}() throwing Proxy get trap on options.env included key invoked exactly once (no retry)`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driver =
+          v.surface === "run"
+            ? `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const env = new Proxy({ A: "a", B: "b" }, {
+  ownKeys() { return ["A", "B"]; },
+  getOwnPropertyDescriptor() { return { enumerable: true, configurable: true, value: undefined, writable: true }; },
+  get() { count++; throw new Error("get-trap-boom"); },
+});
+let threw = false, message = "";
+try {
+  const gen = run("ralph", { env });
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`
+            : `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const env = new Proxy({ A: "a", B: "b" }, {
+  ownKeys() { return ["A", "B"]; },
+  getOwnPropertyDescriptor() { return { enumerable: true, configurable: true, value: undefined, writable: true }; },
+  get() { count++; throw new Error("get-trap-boom"); },
+});
+let rejected = false, message = "";
+try {
+  await runPromise("ralph", { env });
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw: rejected, message }));
+`;
+        const result = await runAPIDriver(runtime, driver);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.threw).toBe(true);
+        expect(parsed.message).toContain("get-trap-boom");
+        // Load-bearing: get trap invoked exactly once on the first included
+        // key, then captured. A buggy implementation that retried would
+        // report count > 1; a buggy descriptor-extraction implementation
+        // (count === 0) would never observe the throw and fail on `threw`.
+        expect(parsed.count).toBe(1);
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-62h10 / T-API-62h11: throwing own enumerable getter on a NAMED
+    // ENTRY inside options.env — invoked once, not retried. Structurally
+    // distinct from the env-on-options-object getter (T-API-62h3/h4) and
+    // the proxy variants (T-API-62h5/h6/h9).
+    // ------------------------------------------------------------------------
+    interface NoRetryEntryVariant {
+      id: string;
+      surface: "run" | "runPromise";
+    }
+
+    const noRetryEntryVariants: NoRetryEntryVariant[] = [
+      { id: "T-API-62h10", surface: "run" },
+      { id: "T-API-62h11", surface: "runPromise" },
+    ];
+
+    for (const v of noRetryEntryVariants) {
+      it(`${v.id}: ${v.surface}() throwing own enumerable getter on options.env entry invoked exactly once (no retry)`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driver =
+          v.surface === "run"
+            ? `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const env = { A: "a" };
+Object.defineProperty(env, "B", {
+  enumerable: true,
+  configurable: true,
+  get() { count++; throw new Error("env-entry-getter-boom"); },
+});
+let threw = false, message = "";
+try {
+  const gen = run("ralph", { env });
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`
+            : `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const env = { A: "a" };
+Object.defineProperty(env, "B", {
+  enumerable: true,
+  configurable: true,
+  get() { count++; throw new Error("env-entry-getter-boom"); },
+});
+let rejected = false, message = "";
+try {
+  await runPromise("ralph", { env });
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw: rejected, message }));
+`;
+        const result = await runAPIDriver(runtime, driver);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.threw).toBe(true);
+        expect(parsed.message).toContain("env-entry-getter-boom");
+        expect(parsed.count).toBe(1);
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+  });
+});
