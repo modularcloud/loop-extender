@@ -6695,6 +6695,125 @@ console.log(JSON.stringify({ loopx, observed }));
     });
 
     // ========================================================================
+    // T-TMP-30 / T-TMP-31 — LOOPX_TMPDIR Protocol-Variable Precedence.
+    //
+    // SPEC §8.3 / §13: protocol variables (`LOOPX_*`) are reserved at tier 1
+    // and silently override values at every lower tier. SPEC §7.4 produces a
+    // tier-1 `LOOPX_TMPDIR` injection per run that points at the freshly-
+    // created run-scoped temp directory under `os.tmpdir()`. T-TMP-30 covers
+    // the inherited-env (tier 5) collision; T-TMP-31 covers the local
+    // env-file (tier 3, `-e`) collision. The "silent" half of the contract
+    // requires that no diagnostic for `LOOPX_TMPDIR` appears on stderr —
+    // mirroring the T-WFDIR-06/07 (LOOPX_WORKFLOW_DIR) and T-ENV-21a
+    // (LOOPX_PROJECT_ROOT) precedents at the same tiers.
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // T-TMP-30: LOOPX_TMPDIR overrides inherited-env value (silent).
+    // The fixture additionally `stat`s the observed `$LOOPX_TMPDIR` while
+    // the script is still running — SPEC §7.4 cleanup removes the path on
+    // run completion, so the during-run stat proves the injected path is
+    // a real loopx-created directory rather than an arbitrary substitution.
+    // ------------------------------------------------------------------------
+    it("T-TMP-30: LOOPX_TMPDIR overrides inherited-env value (silent)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const statMarker = join(project.dir, "stat.txt");
+      const fakePath = "/tmp/fake-loopx-tmp";
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'exists-as-dir' > "${statMarker}"
+else
+  printf 'missing' > "${statMarker}"
+fi
+printf '{"stop":true}'
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent, LOOPX_TMPDIR: fakePath },
+      });
+
+      expect(result.exitCode).toBe(0);
+      const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      const stat = readFileSync(statMarker, "utf-8");
+
+      // (a) The marker records the real injected tmpdir under the test-
+      //     isolated parent and matches the `loopx-*` naming pattern, NOT
+      //     the bogus inherited value.
+      expect(observedLoopxTmpdir).not.toBe(fakePath);
+      expect(dirname(observedLoopxTmpdir)).toBe(tmpdirParent);
+      expect(basename(observedLoopxTmpdir).startsWith("loopx-")).toBe(true);
+
+      // (b) The during-run stat proves it was a real, existing directory
+      //     while the script was running — not merely a substitution into
+      //     the env-map.
+      expect(stat).toBe("exists-as-dir");
+
+      // (c) Silent override: stderr must not announce any per-tier
+      //     `LOOPX_TMPDIR` override notice / warning / error.
+      expect(result.stderr.toLowerCase()).not.toMatch(
+        /loopx_tmpdir.*(override|overrid|ignored|warning|notice)/i,
+      );
+    });
+
+    // ------------------------------------------------------------------------
+    // T-TMP-31: LOOPX_TMPDIR overrides local env-file (-e) value (silent).
+    // ------------------------------------------------------------------------
+    it("T-TMP-31: LOOPX_TMPDIR overrides local env file (-e) value (silent)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const envFilePath = join(project.dir, "local.env");
+      const fakePath = "/tmp/fake-loopx-tmp";
+      await createEnvFile(envFilePath, { LOOPX_TMPDIR: fakePath });
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '{"stop":true}'
+`,
+      );
+
+      const result = await runCLI(
+        ["run", "-e", envFilePath, "-n", "1", "ralph"],
+        {
+          cwd: project.dir,
+          runtime,
+          env: { TMPDIR: tmpdirParent },
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+
+      // (a) The marker records the real injected tmpdir under the test-
+      //     isolated parent and matches the `loopx-*` naming pattern, NOT
+      //     the bogus env-file value.
+      expect(observedLoopxTmpdir).not.toBe(fakePath);
+      expect(dirname(observedLoopxTmpdir)).toBe(tmpdirParent);
+      expect(basename(observedLoopxTmpdir).startsWith("loopx-")).toBe(true);
+
+      // (b) Silent override: stderr must not announce any per-tier
+      //     `LOOPX_TMPDIR` override notice / warning / error.
+      expect(result.stderr.toLowerCase()).not.toMatch(
+        /loopx_tmpdir.*(override|overrid|ignored|warning|notice)/i,
+      );
+    });
+
+    // ========================================================================
     // T-TMP-32 / T-TMP-32a / T-TMP-32b / T-TMP-32c — Stale-tmpdir non-reaping.
     // T-TMP-33 — Renamed-away tmpdir cleanup is silent (no warning).
     //
