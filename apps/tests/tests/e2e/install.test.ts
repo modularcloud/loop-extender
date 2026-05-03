@@ -5608,6 +5608,238 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         });
       });
 
+      it("T-INST-112b: .gitignore synthesis is skipped when the workflow has no top-level package.json", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "no-pkg",
+            files: {
+              "index.sh": BASH_STOP,
+              // Deliberately no package.json — auto-install must be silently
+              // skipped, AND the .gitignore safeguard must not run.
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/no-pkg.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+          expect(result.exitCode).toBe(0);
+
+          // Workflow committed.
+          expect(
+            existsSync(join(project!.loopxDir, "no-pkg", "index.sh")),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "no-pkg", "package.json")),
+          ).toBe(false);
+
+          // Auto-install was skipped (no package.json) — npm not invoked.
+          expect(fake.readInvocations().length).toBe(0);
+
+          // .gitignore was NOT synthesized — the safeguard runs only under
+          // the same trigger as `npm install` per SPEC §10.10.
+          expect(
+            existsSync(join(project!.loopxDir, "no-pkg", ".gitignore")),
+          ).toBe(false);
+
+          // No aggregate failure report.
+          expect(result.stderr).not.toMatch(
+            /auto-install|aggregate|failed/i,
+          );
+        });
+      });
+
+      it("T-INST-112e: pre-existing .gitignore directory is a safeguard failure (non-regular branch)", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              // alpha/.gitignore is a non-empty directory at the workflow
+              // root — committed as a directory through git, preserved
+              // through SPEC §10.11 file-level install, and then triggers
+              // SPEC §10.10's non-regular `lstat` dispatch.
+              "alpha/.gitignore/README": "# placeholder content\n",
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          { exitCode: 0, sleepSeconds: 1, logFile },
+          async (fake) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/multi.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            // (a) Safeguard failure on alpha contributes to final exit 1.
+            expect(result.exitCode).toBe(1);
+
+            // (b) Exactly one shim invocation, for beta only — auto-install
+            //     pass continued past alpha's failure rather than aborting.
+            const invocations = fake.readInvocations();
+            expect(invocations.length).toBe(1);
+            expect(invocations[0].cwd).toBe(
+              join(project!.loopxDir, "beta"),
+            );
+
+            // (c) Aggregate report lists alpha as a .gitignore failure;
+            //     beta is not listed (its safeguard + npm both succeeded).
+            const reportStart = result.stderr.indexOf(
+              "auto-install failures",
+            );
+            expect(reportStart).toBeGreaterThanOrEqual(0);
+            const report = result.stderr.slice(reportStart);
+            expect(report).toMatch(/\[alpha\]/);
+            expect(report).toMatch(/\.gitignore/);
+            expect(report).not.toMatch(/\[beta\]/);
+
+            // (d) alpha's committed files remain — SPEC §10.10 no-rollback.
+            expect(
+              existsSync(join(project!.loopxDir, "alpha", "index.sh")),
+            ).toBe(true);
+            expect(
+              existsSync(
+                join(project!.loopxDir, "alpha", "package.json"),
+              ),
+            ).toBe(true);
+
+            // (e) alpha/.gitignore is still a directory; placeholder
+            //     unchanged. loopx did not delete, replace, or mutate it.
+            const alphaGitignore = join(
+              project!.loopxDir,
+              "alpha",
+              ".gitignore",
+            );
+            const alphaLstat = lstatSync(alphaGitignore);
+            expect(alphaLstat.isSymbolicLink()).toBe(false);
+            expect(alphaLstat.isDirectory()).toBe(true);
+            const placeholderPath = join(alphaGitignore, "README");
+            expect(existsSync(placeholderPath)).toBe(true);
+            expect(readFileSync(placeholderPath, "utf-8")).toBe(
+              "# placeholder content\n",
+            );
+
+            // (f) beta got a synthesized regular .gitignore via the
+            //     ENOENT-creation branch (single line `node_modules`).
+            const betaGitignore = join(
+              project!.loopxDir,
+              "beta",
+              ".gitignore",
+            );
+            const betaLstat = lstatSync(betaGitignore);
+            expect(betaLstat.isSymbolicLink()).toBe(false);
+            expect(betaLstat.isFile()).toBe(true);
+            expect(readFileSync(betaGitignore, "utf-8").trim()).toBe(
+              "node_modules",
+            );
+            expect(
+              existsSync(join(project!.loopxDir, "beta", "index.sh")),
+            ).toBe(true);
+            expect(
+              existsSync(
+                join(project!.loopxDir, "beta", "package.json"),
+              ),
+            ).toBe(true);
+          },
+        );
+      });
+
+      it("T-INST-112f: --no-install suppresses the .gitignore safeguard entirely, even with a non-regular pre-existing entry", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              // Same non-regular .gitignore directory as T-INST-112e —
+              // would cause a safeguard failure if the safeguard ran.
+              "alpha/.gitignore/README": "# placeholder content\n",
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", "--no-install", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+          // (a) Exit 0 — safeguard never ran, so the non-regular entry
+          //     is not a failure under --no-install.
+          expect(result.exitCode).toBe(0);
+
+          // (b) Zero npm invocations.
+          expect(fake.readInvocations().length).toBe(0);
+
+          // (c) alpha/.gitignore is still a directory; placeholder
+          //     unchanged (loopx did not touch the entry).
+          const alphaGitignore = join(
+            project!.loopxDir,
+            "alpha",
+            ".gitignore",
+          );
+          const alphaLstat = lstatSync(alphaGitignore);
+          expect(alphaLstat.isSymbolicLink()).toBe(false);
+          expect(alphaLstat.isDirectory()).toBe(true);
+          expect(
+            readFileSync(join(alphaGitignore, "README"), "utf-8"),
+          ).toBe("# placeholder content\n");
+
+          // (d) beta has no synthesized .gitignore — the safeguard was
+          //     skipped entirely under --no-install, not just for the
+          //     workflow with the non-regular entry.
+          expect(
+            existsSync(join(project!.loopxDir, "beta", ".gitignore")),
+          ).toBe(false);
+
+          // (e) Both workflows committed — only auto-install was
+          //     suppressed, file-level commit ran for both.
+          expect(
+            existsSync(join(project!.loopxDir, "alpha", "index.sh")),
+          ).toBe(true);
+          expect(
+            existsSync(
+              join(project!.loopxDir, "alpha", "package.json"),
+            ),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "beta", "index.sh")),
+          ).toBe(true);
+          expect(
+            existsSync(
+              join(project!.loopxDir, "beta", "package.json"),
+            ),
+          ).toBe(true);
+
+          // (f) No aggregate failure report — safeguard never produced
+          //     a failure to aggregate.
+          expect(result.stderr).not.toMatch(
+            /auto-install|aggregate|failed/i,
+          );
+        });
+      });
+
       it("T-INST-114: npm install non-zero exit emits aggregate report and exits 1", async () => {
         project = await createTempProject();
         const logFile = join(project.dir, "fake-npm.log");
