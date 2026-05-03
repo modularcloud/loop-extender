@@ -379,6 +379,17 @@ function parseRunArgs(argv: string[]): RunArgs {
   while (i < argv.length) {
     const arg = argv[i];
 
+    // SPEC §4.1: `--` is rejected wherever it appears. The rejection cites
+    // `--` as the offending token — including when `--` would otherwise be
+    // consumed as the operand of `-n` or `-e` (covered by the operand-slot
+    // checks below before they read `argv[i]` as a value).
+    if (arg === "--") {
+      process.stderr.write(
+        "Error: unrecognized token '--' (loopx run does not accept '--' as an end-of-options marker)\n"
+      );
+      process.exit(1);
+    }
+
     if (arg === "-n") {
       if (sawN) {
         process.stderr.write("Error: duplicate -n flag\n");
@@ -391,6 +402,14 @@ function parseRunArgs(argv: string[]): RunArgs {
         process.exit(1);
       }
       const val = argv[i];
+      // SPEC §4.1: `--` in the `-n` operand slot is rejected as `--`
+      // itself, not as a non-integer operand value.
+      if (val === "--") {
+        process.stderr.write(
+          "Error: unrecognized token '--' (loopx run does not accept '--' as an end-of-options marker)\n"
+        );
+        process.exit(1);
+      }
       const num = Number(val);
       if (!Number.isInteger(num) || num < 0 || val.trim() === "") {
         process.stderr.write(
@@ -410,22 +429,16 @@ function parseRunArgs(argv: string[]): RunArgs {
         process.stderr.write("Error: -e requires a value\n");
         process.exit(1);
       }
-      result.envFile = argv[i];
-    } else if (arg === "--") {
-      i++;
-      if (i < argv.length) {
-        if (result.target) {
-          process.stderr.write(`Error: unexpected argument '${argv[i]}'\n`);
-          process.exit(1);
-        }
-        result.target = argv[i];
-        i++;
-      }
-      if (i < argv.length) {
-        process.stderr.write(`Error: unexpected argument '${argv[i]}'\n`);
+      const val = argv[i];
+      // SPEC §4.1: `--` in the `-e` operand slot is rejected as `--`
+      // itself, not loaded as the env-file path.
+      if (val === "--") {
+        process.stderr.write(
+          "Error: unrecognized token '--' (loopx run does not accept '--' as an end-of-options marker)\n"
+        );
         process.exit(1);
       }
-      break;
+      result.envFile = val;
     } else if (arg.startsWith("-")) {
       process.stderr.write(`Error: unknown flag '${arg}'\n`);
       process.exit(1);
