@@ -14104,6 +14104,184 @@ console.log(JSON.stringify({ threw, message, name }));
     });
 
     // ------------------------------------------------------------------------
+    // T-API-65t: pre-aborted signal beats invalid-name discovery validation
+    // on both surfaces. Companion to T-API-65s: 65s exercises the same-base-
+    // name collision sibling-validation failure path (SPEC §5.2), this test
+    // exercises the name-restriction sibling-validation failure path
+    // (SPEC §5.3) as a distinct sub-path. Both share the SPEC §5.4
+    // "fatal in run mode" classification, but the error class and the
+    // validation code path are distinct (collision vs. name-pattern). A
+    // buggy implementation that routed one path through abort precedence
+    // and the other not would pass T-API-65s yet surface the
+    // name-restriction error here.
+    //
+    // Parameterized over (a) `.loopx/-bad-workflow/index.sh` invalid
+    // workflow name and (b) `.loopx/broken/-bad.sh` invalid script name,
+    // each driven on both `runPromise()` and `run()` surfaces (4 sub-cases
+    // total). The valid target workflow `ralph/index.sh` is present in
+    // every fixture so the sibling-validation error is the only failure
+    // that would surface absent abort precedence. Per SPEC §9.3 / §9.5 /
+    // §9.1 / §5.1 / §5.3 / §5.4, the abort-precedence rule must displace
+    // the name-restriction error.
+    //
+    // Per-variant assertions (each surface):
+    //   (a) the surfaced rejection / throw is the abort error — NOT the
+    //       configured name-restriction error (positive: AbortError name
+    //       OR /abort/i in message; negative: name-restriction marker
+    //       absent from message);
+    //   (b) no child was spawned (marker file absent);
+    //   (c) no `loopx-*` tmpdir was created under the isolated parent.
+    // ------------------------------------------------------------------------
+    type InvalidNameVariant = {
+      id: string;
+      label: string;
+      // Builds the invalid sibling in the project; the valid target
+      // `ralph/index.sh` is created separately by every test.
+      setup: (project: TempProject) => Promise<void>;
+      // Pattern that the displaced name-restriction error would mention
+      // but the abort error must NOT match.
+      negativePattern: RegExp;
+    };
+
+    const INVALID_NAME_VARIANTS: InvalidNameVariant[] = [
+      {
+        id: "a",
+        label: "invalid workflow name (-bad-workflow)",
+        setup: async (project) => {
+          await createBashWorkflowScript(
+            project,
+            "-bad-workflow",
+            "index",
+            `printf '{"stop":true}'`,
+          );
+        },
+        negativePattern: /-bad-workflow|invalid|must match|\[a-zA-Z0-9_\]/i,
+      },
+      {
+        id: "b",
+        label: "invalid script name (broken/-bad.sh)",
+        setup: async (project) => {
+          await createBashWorkflowScript(
+            project,
+            "broken",
+            "-bad",
+            `printf '{"stop":true}'`,
+          );
+        },
+        negativePattern: /-bad|invalid|must match|\[a-zA-Z0-9_\]/i,
+      },
+    ];
+
+    for (const v of INVALID_NAME_VARIANTS) {
+      it(`T-API-65t-promise (${v.id}): runPromise() pre-aborted signal beats discovery name-restriction failure — ${v.label}`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(
+          `api65t-promise-${v.id}`,
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        await v.setup(project);
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected with the abort error, not the discovery
+        //     name-restriction error.
+        expect(parsed.rejected).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(v.negativePattern);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      });
+
+      it(`T-API-65t-generator (${v.id}): run() pre-aborted signal beats discovery name-restriction failure — ${v.label}`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(
+          `api65t-generator-${v.id}`,
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        await v.setup(project);
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First next() threw abort error, not the discovery
+        //     name-restriction error.
+        expect(parsed.threw).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(v.negativePattern);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      });
+    }
+
+    // ------------------------------------------------------------------------
     // T-API-65d: runPromise() — pre-aborted signal beats tmpdir-creation
     // failure. SPEC §9.3, §9.5, §7.4.
     //
