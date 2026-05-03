@@ -214,6 +214,7 @@ Sources:
 Options:
   -w <name>, --workflow <name>   Install only the named workflow (multi-workflow source)
   -y                             Override version mismatch and workflow collision checks
+  --no-install                   Skip auto-install of workflow dependencies (Spec 10.10)
   -h, --help                     Print this help message`);
 }
 
@@ -295,18 +296,20 @@ interface InstallArgs {
   help: boolean;
   selectedWorkflow?: string | null;
   override: boolean;
+  noInstall: boolean;
   source?: string;
 }
 
 function parseInstallArgs(argv: string[]): InstallArgs {
   // Short-circuit: `-h` / `--help` anywhere ignores all validation.
   if (argv.includes("-h") || argv.includes("--help")) {
-    return { help: true, override: false };
+    return { help: true, override: false, noInstall: false };
   }
 
-  const result: InstallArgs = { help: false, override: false };
+  const result: InstallArgs = { help: false, override: false, noInstall: false };
   let sawW = false;
   let sawY = false;
+  let sawNoInstall = false;
   let i = 0;
 
   while (i < argv.length) {
@@ -330,6 +333,13 @@ function parseInstallArgs(argv: string[]): InstallArgs {
       }
       sawY = true;
       result.override = true;
+    } else if (arg === "--no-install") {
+      if (sawNoInstall) {
+        process.stderr.write(`Error: duplicate --no-install flag\n`);
+        process.exit(1);
+      }
+      sawNoInstall = true;
+      result.noInstall = true;
     } else if (arg.startsWith("-")) {
       process.stderr.write(`Error: unknown install flag '${arg}'\n`);
       process.exit(1);

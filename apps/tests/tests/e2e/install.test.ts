@@ -622,7 +622,16 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(result.exitCode).toBe(1);
       });
 
-      it("T-INST-41: -h → install help, no single-file URL advertised", async () => {
+      it("T-INST-40f: --no-install with no source → usage error", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "--no-install"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-41: -h → install help, lists --no-install w/ no short alias, no single-file URL advertised", async () => {
         project = await createTempProject();
         const result = await runCLI(["install", "-h"], {
           cwd: project.dir,
@@ -632,10 +641,25 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         const out = result.stdout + result.stderr;
         expect(out).toMatch(/-w|--workflow/);
         expect(out).toMatch(/-y/);
+        // (c) `--no-install` option with description (per SPEC 4.2 / 11.3 — Spec 10.10).
+        expect(out).toMatch(/--no-install/);
         // Either git or tarball terminology should appear
         expect(out).toMatch(/git|tarball|repo/i);
-        // Single-file URL install is removed — help must NOT advertise it
+        // (e) Single-file URL install is removed — help must NOT advertise it
         expect(out).not.toMatch(/single[- ]file/i);
+        // (f) `--no-install` has "No short form" per SPEC 4.2. The help text's
+        // option line for `--no-install` (and any synopsis / usage block listing
+        // install-scoped flags) must not list `-n`, `-N`, `-i`, `-I`, or any
+        // other single-character form alongside `--no-install`.
+        const noInstallLines = out
+          .split(/\r?\n/)
+          .filter((line) => /--no-install/.test(line));
+        expect(noInstallLines.length).toBeGreaterThan(0);
+        for (const line of noInstallLines) {
+          // No `-X, --no-install` or `-X | --no-install` style alias on the same line.
+          expect(line).not.toMatch(/-[a-zA-Z][, |]+--no-install/);
+          expect(line).not.toMatch(/--no-install[, |]+-[a-zA-Z]\b/);
+        }
       });
 
       it("T-INST-41a: --help produces byte-identical output to -h", async () => {
@@ -874,6 +898,155 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           { cwd: project.dir, runtime },
         );
         expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-44a: --no-install --no-install <source> → usage error (duplicate)", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "--no-install", "--no-install", "org/repo"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-44b: -h --no-install <source> → install help, exit 0, no network", async () => {
+        gitServer = await startLocalGitServer([
+          { name: "ni-pkg", files: { "index.sh": BASH_STOP } },
+        ]);
+        const sourceUrl = `${gitServer.url}/ni-pkg.git`;
+
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "-h", "--no-install", sourceUrl],
+          { cwd: project.dir, runtime },
+        );
+        const ref = await runCLI(["install", "-h"], {
+          cwd: project.dir,
+          runtime,
+        });
+        // (a) help stdout, (b) exit 0
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toBe(ref.stdout);
+        // (c) no source download / network activity, (d) `.loopx/` untouched
+        expect(existsSync(join(project.loopxDir, "ni-pkg"))).toBe(false);
+        expect(readdirSync(project.loopxDir).length).toBe(0);
+      });
+
+      it("T-INST-44c: --help --no-install --no-install <source> → install help, exit 0, no duplicate-flag error", async () => {
+        gitServer = await startLocalGitServer([
+          { name: "ni-pkg", files: { "index.sh": BASH_STOP } },
+        ]);
+        const sourceUrl = `${gitServer.url}/ni-pkg.git`;
+
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "--help", "--no-install", "--no-install", sourceUrl],
+          { cwd: project.dir, runtime },
+        );
+        const ref = await runCLI(["install", "--help"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toBe(ref.stdout);
+        // No duplicate-flag error on stderr (short-circuit suppresses T-INST-44a usage error).
+        expect(result.stderr).not.toMatch(/duplicate.*--no-install/i);
+        // No source download / network activity.
+        expect(existsSync(join(project.loopxDir, "ni-pkg"))).toBe(false);
+        expect(readdirSync(project.loopxDir).length).toBe(0);
+      });
+
+      it("T-INST-44d: --no-install -h <source> → install help, exit 0 (late-help suppresses)", async () => {
+        gitServer = await startLocalGitServer([
+          { name: "ni-pkg", files: { "index.sh": BASH_STOP } },
+        ]);
+        const sourceUrl = `${gitServer.url}/ni-pkg.git`;
+
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "--no-install", "-h", sourceUrl],
+          { cwd: project.dir, runtime },
+        );
+        const ref = await runCLI(["install", "-h"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toBe(ref.stdout);
+        expect(existsSync(join(project.loopxDir, "ni-pkg"))).toBe(false);
+        expect(readdirSync(project.loopxDir).length).toBe(0);
+      });
+
+      it("T-INST-44e: --no-install --no-install -h/--help <source> → install help, exit 0 (late-help suppresses duplicate)", async () => {
+        gitServer = await startLocalGitServer([
+          { name: "ni-pkg", files: { "index.sh": BASH_STOP } },
+        ]);
+        const sourceUrl = `${gitServer.url}/ni-pkg.git`;
+
+        // Parameterize over both forms: variant (a) `-h`, variant (b) `--help`.
+        for (const helpFlag of ["-h", "--help"] as const) {
+          const subProject = await createTempProject();
+          try {
+            const result = await runCLI(
+              [
+                "install",
+                "--no-install",
+                "--no-install",
+                helpFlag,
+                sourceUrl,
+              ],
+              { cwd: subProject.dir, runtime },
+            );
+            const ref = await runCLI(["install", helpFlag], {
+              cwd: subProject.dir,
+              runtime,
+            });
+            // (a) install help on stdout (matches help reference)
+            expect(result.stdout).toBe(ref.stdout);
+            // (b) exit code 0
+            expect(result.exitCode).toBe(0);
+            // (c) no duplicate-flag error on stderr
+            expect(result.stderr).not.toMatch(/duplicate.*--no-install/i);
+            // (d) no source download / network activity
+            expect(existsSync(join(subProject.loopxDir, "ni-pkg"))).toBe(false);
+            // (e) `.loopx/` is untouched
+            expect(readdirSync(subProject.loopxDir).length).toBe(0);
+          } finally {
+            await subProject.cleanup();
+          }
+        }
+      });
+
+      it("T-INST-44f: --no-install has no short form — -n/-N/-i/-I rejected as unknown short flags", async () => {
+        gitServer = await startLocalGitServer([
+          { name: "ni-pkg", files: { "index.sh": BASH_STOP } },
+        ]);
+        const sourceUrl = `${gitServer.url}/ni-pkg.git`;
+
+        // Parameterize over the four most-plausible candidate aliases.
+        for (const candidate of ["-n", "-N", "-i", "-I"] as const) {
+          const subProject = await createTempProject();
+          try {
+            const result = await runCLI(
+              ["install", candidate, sourceUrl],
+              { cwd: subProject.dir, runtime },
+            );
+            // (a) exit code 1 (unrecognized install-scoped short flag).
+            expect(result.exitCode).toBe(1);
+            // (b) stderr references the unrecognized-flag rejection.
+            expect(result.stderr).toMatch(
+              new RegExp(`unknown.*install.*flag.*${candidate}|${candidate}.*unknown|unrecognized.*${candidate}`, "i"),
+            );
+            // (d) `.loopx/` untouched, no workflow committed (parser-time exit;
+            // this also indirectly catches a buggy implementation that aliased
+            // the short form to `--no-install` and proceeded with a successful
+            // install — the would-be `ni-pkg` workflow would be committed).
+            expect(existsSync(join(subProject.loopxDir, "ni-pkg"))).toBe(false);
+            expect(readdirSync(subProject.loopxDir).length).toBe(0);
+          } finally {
+            await subProject.cleanup();
+          }
+        }
       });
 
       it("T-INST-45: --unknown <source> → usage error", async () => {
