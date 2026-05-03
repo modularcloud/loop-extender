@@ -383,6 +383,17 @@ function runWithInternal(
   // an abort observed before the next consumer interaction surfaces the
   // abort error (with cleanup first) rather than allowing silent completion.
   let postFinalYield = false;
+  // SPEC §9.1 pre-first-`next()` consumer-cancellation carve-out: tracks
+  // whether the inner generator body has been driven via a wrapper.next()
+  // call. When false, a `.return()` / `.throw()` / `[Symbol.asyncDispose]`
+  // settles per standard async-generator semantics — the loop body never
+  // runs, no pre-iteration step executes, no captured signal is consulted,
+  // and no captured option-snapshot / discovery / env-file / tmpdir-creation
+  // error surfaces. Set true the moment wrapper.next() is dispatched (before
+  // awaiting the inner gen.next()) so a concurrent .return() / .throw() that
+  // arrives while wrapper.next() is in-flight follows the post-first-`next()`
+  // consumer-cancellation path, not the carve-out.
+  let bodyEntered = false;
 
   const surfacePostFinalYieldAbort = async (): Promise<never> => {
     // Drive inner gen to settlement so its `finally` runs cleanupTmpdir
@@ -417,6 +428,12 @@ function runWithInternal(
         settled = true;
         await surfacePostFinalYieldAbort();
       }
+      // SPEC §9.1 pre-first-`next()` carve-out boundary: the consumer's first
+      // interaction is `.next()`, so the body is now entered. Pin BEFORE
+      // dispatching to gen.next() so a racing `.return()` / `.throw()` that
+      // arrives while gen.next() is in flight observes bodyEntered=true and
+      // routes through the post-first-`next()` consumer-cancellation path.
+      bodyEntered = true;
       try {
         const result = await gen.next();
         if (!result.done && result.value !== undefined) {
@@ -455,6 +472,25 @@ function runWithInternal(
       if (settled) {
         returnCalled = true;
         return { done: true, value: undefined } as IteratorResult<Output>;
+      }
+      // SPEC §9.1 pre-first-`next()` consumer-cancellation carve-out: when
+      // .return() is the consumer's first interaction (no prior wrapper.next()
+      // has driven the inner generator body), settle per standard async-
+      // generator semantics. The loop body is never entered, no pre-iteration
+      // step runs, no captured signal is consulted (even an already-aborted
+      // signal does not surface an abort error), and every captured pre-
+      // iteration error (option-snapshot, target validation, discovery,
+      // env-file load, target resolution, tmpdir creation) is suppressed.
+      // gen.return(value) on a not-yet-started async generator returns
+      // `{ value, done: true }` per ES semantics without entering the body.
+      if (!bodyEntered) {
+        settled = true;
+        returnCalled = true;
+        try {
+          return await gen.return(value as Output);
+        } catch {
+          return { done: true, value: undefined } as IteratorResult<Output>;
+        }
       }
       // SPEC §9.3 abort-after-final-yield: abort observed before this
       // .return() displaces silent completion; abort error surfaces (with
@@ -525,10 +561,26 @@ function runWithInternal(
     // been observed in the post-final-yield window before this .throw()
     // arrives, the abort error displaces both silent completion AND the
     // consumer-supplied error.
-    throw: async (_err: unknown) => {
+    throw: async (err: unknown) => {
       if (settled) {
         returnCalled = true;
         return { done: true, value: undefined } as IteratorResult<Output>;
+      }
+      // SPEC §9.1 pre-first-`next()` consumer-cancellation carve-out: when
+      // .throw() is the consumer's first interaction, settle per standard
+      // async-generator semantics — the consumer-supplied `err` surfaces
+      // (rather than the post-first-`next()` silent-completion contract that
+      // swallows consumer errors). The loop body is never entered, no pre-
+      // iteration step runs, no captured signal is consulted, and every
+      // captured pre-iteration error is suppressed in favor of `err`.
+      // gen.throw(err) on a not-yet-started async generator rejects with
+      // `err` per ES semantics without entering the body; `await` propagates
+      // that rejection up through this async function so the consumer sees
+      // a rejected promise carrying their original error.
+      if (!bodyEntered) {
+        settled = true;
+        returnCalled = true;
+        return await gen.throw(err);
       }
       if (
         postFinalYield &&
@@ -581,6 +633,20 @@ function runWithInternal(
     async [Symbol.asyncDispose](): Promise<void> {
       if (settled) {
         returnCalled = true;
+        return;
+      }
+      // SPEC §9.1 pre-first-`next()` consumer-cancellation carve-out applies
+      // to async dispose: standard async-generator semantics drive
+      // gen.return() on a not-yet-started body without surfacing any
+      // captured pre-iteration error.
+      if (!bodyEntered) {
+        settled = true;
+        returnCalled = true;
+        try {
+          await gen.return(undefined as unknown as Output);
+        } catch {
+          // Swallow errors during dispose
+        }
         return;
       }
       // SPEC §7.2 first-observed-wins (mirror of .return()): if an abort was

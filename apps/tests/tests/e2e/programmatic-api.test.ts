@@ -4556,6 +4556,1907 @@ console.log(JSON.stringify({
 });
 
 // ═════════════════════════════════════════════════════════════
+// §4.9 — Pre-first-`next()` Consumer-Cancellation Carve-out
+//        (SPEC §9.1 — `.return()` and `.throw()` as first interaction)
+// ═════════════════════════════════════════════════════════════
+//
+// Per SPEC §9.1: "A `.return(value)` or `.throw(err)` call as the consumer's
+// *first* interaction with the generator returned by `run()` settles the
+// generator per standard JS async-generator semantics; the loop body is
+// never entered. No pre-iteration step runs and no pre-iteration error is
+// surfaced: captured option-snapshot errors, invalid `target` values and
+// target-syntax validation, `.loopx/` discovery failures, env-file loading
+// failures, target resolution failures, and tmpdir creation failures are
+// all suppressed. A `signal` captured at call time is not consulted; even
+// an already-aborted signal does not surface the abort error through this
+// path. This carve-out applies only to `run()`; `runPromise()` has no
+// equivalent."
+//
+// Standard async-generator semantics: `.return(value)` settles with
+// `{ value, done: true }` without entering the body; `.throw(err)` rejects
+// with the consumer-supplied `err` without entering the body — so for the
+// `.throw()` surface, the consumer's error surfaces (rather than the post-
+// first-`next()` silent-completion contract that swallows consumer errors).
+
+describe("SPEC: Pre-first-next() Consumer-Cancellation Carve-out — .return()", () => {
+  let project: TempProject | null = null;
+  let projectB: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    if (projectB) {
+      await projectB.cleanup().catch(() => {});
+      projectB = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-68: .return() as first interaction suppresses invalid-target
+    // error. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68: .return() suppresses invalid-target error (no throw, no spawn)", async () => {
+      project = await createTempProject();
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const gen = run(undefined);
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+const next = await gen.next();
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+  settledValueIsUndefined: settled && settled.value === undefined,
+  nextDone: next.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(data.settledValueIsUndefined).toBe(true);
+      expect(data.nextDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68a: .return() as first interaction suppresses .loopx/ discovery
+    // failure. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68a: .return() suppresses .loopx/ discovery failure", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).toBe("");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68b: .return() as first interaction suppresses missing-envFile
+    // failure. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68b: .return() suppresses missing-envFile failure", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: "nonexistent.env",
+});
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68c: .return() as first interaction suppresses option-snapshot
+    // failure (maxIterations: -1). SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68c: .return() suppresses invalid maxIterations option-snapshot failure", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  maxIterations: -1,
+});
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68d: .return() as first interaction suppresses pre-aborted
+    // signal. Per SPEC §9.1: "A `signal` captured at call time is not
+    // consulted; even an already-aborted signal does not surface the abort
+    // error through this path."
+    // ------------------------------------------------------------------------
+    it("T-API-68d: .return() suppresses pre-aborted signal (real AbortSignal)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+});
+let threw = false;
+let errMsg = null;
+let errName = null;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? e.name : null;
+}
+console.log(JSON.stringify({
+  threw,
+  errMsg,
+  errName,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68e: .return() as first interaction does NOT create a tmpdir.
+    // SPEC §9.1, §7.4.
+    // ------------------------------------------------------------------------
+    it("T-API-68e: .return() does NOT create LOOPX_TMPDIR", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+
+      const isolatedTmp = await mkdtemp(join(osTmpdir(), "loopx-test-tmpdir-"));
+      try {
+        const driverCode = `
+import { run } from "loopx";
+import { readdirSync } from "node:fs";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+});
+const before = readdirSync(${JSON.stringify(isolatedTmp)}).filter(n => n.startsWith("loopx-"));
+await gen.return(undefined);
+const after = readdirSync(${JSON.stringify(isolatedTmp)}).filter(n => n.startsWith("loopx-"));
+console.log(JSON.stringify({
+  before,
+  after,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: isolatedTmp },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.before).toEqual([]);
+        expect(data.after).toEqual([]);
+      } finally {
+        await rm(isolatedTmp, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68f: .return(value) as first interaction settles with the
+    // supplied value per standard async-generator semantics. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68f: .return(value) propagates supplied value through settlement", async () => {
+      project = await createTempProject();
+      const driverCode = `
+import { run } from "loopx";
+const gen = run(undefined);
+const result = await gen.return("my-return-value");
+const next = await gen.next();
+console.log(JSON.stringify({
+  resultValue: result.value,
+  resultDone: result.done,
+  nextValue: next.value === undefined ? "<undef>" : next.value,
+  nextDone: next.done,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.resultValue).toBe("my-return-value");
+      expect(data.resultDone).toBe(true);
+      expect(data.nextValue).toBe("<undef>");
+      expect(data.nextDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68h: .return() suppresses a throwing options.env getter.
+    // SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68h: .return() suppresses throwing options.env getter", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "env", {
+  enumerable: true,
+  get() { throw new Error("evil-env-getter"); },
+});
+const gen = run("ralph", opts);
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+  settledValueIsUndefined: settled && settled.value === undefined,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(data.settledValueIsUndefined).toBe(true);
+      expect(result.stderr).not.toContain("evil-env-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68j: .return(value) suppresses a live-signal abort that fires
+    // between run() returning and consumer's first interaction. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68j: .return(value) suppresses live-signal abort fired between run() and first interaction", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+});
+c.abort();
+let threw = false;
+let result;
+try {
+  result = await gen.return("my-return-value");
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  resultValue: result && result.value,
+  resultDone: result && result.done,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.resultValue).toBe("my-return-value");
+      expect(data.resultDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68k: .return() suppresses a throwing options.signal getter.
+    // SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68k: .return() suppresses throwing options.signal getter", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "signal", {
+  enumerable: true,
+  get() { throw new Error("evil-signal-getter"); },
+});
+const gen = run("ralph", opts);
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).not.toContain("evil-signal-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68l: .return() suppresses a throwing options.cwd getter.
+    // SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68l: .return() suppresses throwing options.cwd getter", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = {};
+Object.defineProperty(opts, "cwd", {
+  enumerable: true,
+  get() { throw new Error("evil-cwd-getter"); },
+});
+const gen = run("ralph", opts);
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).not.toContain("evil-cwd-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68m: .return() suppresses a throwing options.envFile getter.
+    // SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68m: .return() suppresses throwing options.envFile getter", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "envFile", {
+  enumerable: true,
+  get() { throw new Error("evil-envFile-getter"); },
+});
+const gen = run("ralph", opts);
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).not.toContain("evil-envFile-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68n: .return() suppresses a throwing options.maxIterations
+    // getter. SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68n: .return() suppresses throwing options.maxIterations getter", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "maxIterations", {
+  enumerable: true,
+  get() { throw new Error("evil-maxIterations-getter"); },
+});
+const gen = run("ralph", opts);
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).not.toContain("evil-maxIterations-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68v: .return(value) suppresses abort observation on a static
+    // duck-typed signal whose `aborted` field is true at call time and whose
+    // `addEventListener` is a no-op. SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68v: .return(value) suppresses static duck-signal aborted:true at call time", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const duck = {
+  aborted: true,
+  addEventListener(_type, _fn) { /* no-op: never fires */ },
+};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+let threw = false;
+let result;
+try {
+  result = await gen.return("my-return-value");
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  resultValue: result && result.value,
+  resultDone: result && result.done,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.resultValue).toBe("my-return-value");
+      expect(data.resultDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68s: .return(value) suppresses reentrant duck-signal abort
+    // (listener fires synchronously during registration AND mutates aborted).
+    // SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68s: .return(value) suppresses reentrant duck-signal (listener-fires + aborted mutation)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") {
+      this.aborted = true;
+      fn();
+    }
+  },
+};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+let threw = false;
+let result;
+try {
+  result = await gen.return("my-return-value");
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  resultValue: result && result.value,
+  resultDone: result && result.done,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.resultValue).toBe("my-return-value");
+      expect(data.resultDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68s2: .return(value) suppresses reentrant duck-signal abort
+    // (listener fires synchronously during registration WITHOUT mutating
+    // aborted). SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68s2: .return(value) suppresses reentrant duck-signal (listener-fires only, no aborted mutation)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") fn();
+    /* do NOT mutate this.aborted */
+  },
+};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+let threw = false;
+let result;
+try {
+  result = await gen.return("my-return-value");
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  resultValue: result && result.value,
+  resultDone: result && result.done,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.resultValue).toBe("my-return-value");
+      expect(data.resultDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68t: .return() suppresses discovery validation failures (sibling
+    // workflows with same-base-name collisions, invalid workflow names, or
+    // invalid script names — SPEC §5.2 / §5.3 / §5.4). SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68t: .return() suppresses sibling-workflow same-base-name collision (SPEC §5.2)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      // Sibling workflow with collision: `check.sh` and `check.ts` collide
+      // on base name "check" per SPEC §5.2.
+      await createBashWorkflowScript(project, "broken", "check", `printf '{"stop":true}'`);
+      await createWorkflowScript(project, "broken", "check", ".ts", `output({ stop: true });`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).toBe("");
+    });
+
+    it("T-API-68t (invalid-workflow-name): .return() suppresses sibling invalid-workflow-name violation (SPEC §5.3)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      // Sibling workflow with leading-dash name violates SPEC §5.3.
+      await createBashWorkflowScript(project, "-bad-workflow", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).toBe("");
+    });
+
+    it("T-API-68t (invalid-script-name): .return() suppresses sibling invalid-script-name violation (SPEC §5.3)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      await createBashWorkflowScript(project, "other", "index", `printf '{"stop":true}'`);
+      // Sibling workflow with leading-dash script name violates SPEC §5.3.
+      await createBashWorkflowScript(project, "other", "-bad", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).toBe("");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68i: .return() suppresses a representative sample of pre-iteration
+    // failure modes — full enumerated invalid-maxIterations set plus
+    // representative selections of remaining option-snapshot families,
+    // target-resolution sub-paths, and target-syntax validation. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    const t68iVariants: Array<{ name: string; opts: string; target: string }> = [
+      { name: "i-options-null", opts: "null", target: '"ralph"' },
+      { name: "ii-options-array", opts: "[]", target: '"ralph"' },
+      { name: "iii-options-function", opts: "(() => {})", target: '"ralph"' },
+      { name: "iv-options-number", opts: "42", target: '"ralph"' },
+      { name: "v-signal-non-shape", opts: '{ signal: "not-a-signal" }', target: '"ralph"' },
+      { name: "vi-cwd-non-string", opts: "{ cwd: 42 }", target: '"ralph"' },
+      { name: "vii-envFile-non-string", opts: "{ envFile: 42 }", target: '"ralph"' },
+      { name: "viii-maxIter-fractional", opts: "{ maxIterations: 1.5 }", target: '"ralph"' },
+      { name: "ix-maxIter-NaN", opts: "{ maxIterations: NaN }", target: '"ralph"' },
+      { name: "x-maxIter-Infinity", opts: "{ maxIterations: Infinity }", target: '"ralph"' },
+      { name: "xi-maxIter-null", opts: "{ maxIterations: null }", target: '"ralph"' },
+      { name: "xii-maxIter-string", opts: '{ maxIterations: "1" }', target: '"ralph"' },
+      { name: "xiii-env-array", opts: "{ env: [] }", target: '"ralph"' },
+      { name: "xiv-env-non-string", opts: "{ env: { KEY: 42 } }", target: '"ralph"' },
+      { name: "xix-target-syntax", opts: "undefined", target: '"a:b:c"' },
+    ];
+
+    for (const v of t68iVariants) {
+      it(`T-API-68i (${v.name}): .return() suppresses ${v.name}`, async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+        const optsExpr = v.opts === "undefined" ? "undefined" : v.opts;
+        const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const opts = ${optsExpr};
+const gen = run(${v.target}, opts);
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.threw).toBe(false);
+        expect(data.settledDone).toBe(true);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-68i (xv-env-ownKeys-throw): proxy ownKeys trap that throws.
+    // ------------------------------------------------------------------------
+    it("T-API-68i (xv-env-ownKeys-throw): .return() suppresses Proxy ownKeys throw", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const env = new Proxy({}, {
+  ownKeys() { throw new Error("ownKeys-trap-boom"); },
+});
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, env });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).not.toContain("ownKeys-trap-boom");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68i (xx-env-entry-throw): throwing enumerable getter inside env.
+    // ------------------------------------------------------------------------
+    it("T-API-68i (xx-env-entry-getter-throw): .return() suppresses throwing env-entry getter", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const env = {};
+Object.defineProperty(env, "KEY", {
+  enumerable: true,
+  get() { throw new Error("env-entry-getter-boom"); },
+});
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, env });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).not.toContain("env-entry-getter-boom");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68i (xvi-target-missing-workflow): target-resolution sub-path —
+    // missing workflow.
+    // ------------------------------------------------------------------------
+    it("T-API-68i (xvi-target-missing-workflow): .return() suppresses missing-workflow target-resolution", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "other", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68i (xvii-target-missing-script): target-resolution sub-path —
+    // missing script in existing workflow.
+    // ------------------------------------------------------------------------
+    it("T-API-68i (xvii-target-missing-script): .return() suppresses missing-script target-resolution", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph:check", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68i (xviii-target-missing-default): target-resolution sub-path —
+    // missing default `index`.
+    // ------------------------------------------------------------------------
+    it("T-API-68i (xviii-target-missing-default): .return() suppresses missing-default-index target-resolution", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "check", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68g: .return() suppresses tmpdir-creation failure (TMPDIR points
+    // to mode-000 parent so mkdtemp would fail). SPEC §9.1, §7.4.
+    // Conditional on uid != 0 (root can write to mode-000 dirs).
+    // ------------------------------------------------------------------------
+    (IS_ROOT ? it.skip : it)("T-API-68g: .return() suppresses tmpdir-creation failure", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+
+      const unwritableParent = await mkdtemp(join(osTmpdir(), "loopx-test-unwritable-"));
+      try {
+        await chmod(unwritableParent, 0o000);
+        const driverCode = `
+import { run } from "loopx";
+import { readdirSync } from "node:fs";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+let after = [];
+try {
+  after = readdirSync(${JSON.stringify(unwritableParent)}).filter(n => n.startsWith("loopx-"));
+} catch {
+  // Mode-000 parent — readdir may also fail; not creating a tmpdir is the
+  // observable outcome. The throw=false assertion is the canonical pin.
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+  after,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: unwritableParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.threw).toBe(false);
+        expect(data.settledDone).toBe(true);
+        expect(data.after).toEqual([]);
+        expect(result.stderr).not.toMatch(/tmpdir|mkdtemp|EACCES|EPERM/i);
+      } finally {
+        await chmod(unwritableParent, 0o700).catch(() => {});
+        await rm(unwritableParent, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68u: .return() suppresses unreadable local envFile (mode 000).
+    // SPEC §9.1, §8.2. Conditional on uid != 0.
+    // ------------------------------------------------------------------------
+    (IS_ROOT ? it.skip : it)("T-API-68u: .return() suppresses unreadable local envFile (mode 000)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const envPath = join(project.dir, "local.env");
+      await writeFile(envPath, "OK=fine\n", "utf-8");
+      try {
+        await chmod(envPath, 0o000);
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(envPath)},
+});
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.threw).toBe(false);
+        expect(data.settledDone).toBe(true);
+        expect(result.stderr).toBe("");
+      } finally {
+        await chmod(envPath, 0o600).catch(() => {});
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68o: .return() suppresses unreadable global env file. SPEC §9.1,
+    // §8.1. Conditional on uid != 0.
+    // ------------------------------------------------------------------------
+    (IS_ROOT ? it.skip : it)("T-API-68o: .return() suppresses unreadable global env file", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const xdgConfigHome = await mkdtemp(join(osTmpdir(), "loopx-test-xdg-"));
+      const loopxConfigDir = join(xdgConfigHome, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const envPath = join(loopxConfigDir, "env");
+      await writeFile(envPath, "OK=fine\n", "utf-8");
+      try {
+        await chmod(envPath, 0o000);
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { XDG_CONFIG_HOME: xdgConfigHome },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.threw).toBe(false);
+        expect(data.settledDone).toBe(true);
+        expect(result.stderr).toBe("");
+      } finally {
+        await chmod(envPath, 0o600).catch(() => {});
+        await rm(xdgConfigHome, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68p: .return() suppresses local env-file parser warnings —
+    // the env-file parse step never runs under the carve-out. SPEC §9.1,
+    // §8.1, §8.2.
+    // ------------------------------------------------------------------------
+    it("T-API-68p: .return() suppresses local env-file parser warnings", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const envPath = join(project.dir, "local.env");
+      await writeFile(envPath, "1BAD=val\nOK=fine\n", "utf-8");
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(envPath)},
+});
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).toBe("");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68q: .return() suppresses global env-file parser warnings.
+    // SPEC §9.1, §8.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68q: .return() suppresses global env-file parser warnings", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const xdgConfigHome = await mkdtemp(join(osTmpdir(), "loopx-test-xdg-"));
+      const loopxConfigDir = join(xdgConfigHome, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const envPath = join(loopxConfigDir, "env");
+      await writeFile(envPath, "1BAD=val\nOK=fine\n", "utf-8");
+      try {
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { XDG_CONFIG_HOME: xdgConfigHome },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.threw).toBe(false);
+        expect(data.settledDone).toBe(true);
+        expect(result.stderr).toBe("");
+      } finally {
+        await rm(xdgConfigHome, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68r: .return() suppresses workflow `package.json` warnings from
+    // the starting-workflow version check (SPEC §3.2 / §7.1 step 5).
+    // ------------------------------------------------------------------------
+    interface PkgVariant {
+      name: string;
+      pkgContent: string | null; // null means "directory" variant
+    }
+    const t68rVariants: PkgVariant[] = [
+      { name: "i-unsatisfied-range", pkgContent: JSON.stringify({ dependencies: { loopx: ">=999.0.0" } }) },
+      { name: "ii-invalid-json", pkgContent: "{broken" },
+      { name: "iii-invalid-semver-range", pkgContent: JSON.stringify({ dependencies: { loopx: "not-a-range!!!" } }) },
+    ];
+    for (const v of t68rVariants) {
+      it(`T-API-68r (${v.name}): .return() suppresses workflow package.json warning`, async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+        if (v.pkgContent !== null) {
+          await createWorkflowPackageJson(project, "ralph", v.pkgContent);
+        }
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.threw).toBe(false);
+        expect(data.settledDone).toBe(true);
+        expect(result.stderr).toBe("");
+      });
+    }
+  });
+});
+
+describe("SPEC: Pre-first-next() Consumer-Cancellation Carve-out — .throw()", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-69: .throw() as first interaction — the consumer-supplied error
+    // surfaces, NOT the invalid-target / pre-iteration error. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-69: .throw() surfaces consumer error (invalid-target suppressed)", async () => {
+      project = await createTempProject();
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const gen = run(undefined);
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const next = await gen.next();
+console.log(JSON.stringify({
+  errMsg,
+  nextDone: next.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(data.nextDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69a: .throw() suppresses missing-envFile failure.
+    // ------------------------------------------------------------------------
+    it("T-API-69a: .throw() surfaces consumer error (missing-envFile suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: "nonexistent.env",
+});
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69b: .throw() suppresses pre-aborted signal — consumer error
+    // surfaces, not abort error. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-69b: .throw() surfaces consumer error (pre-aborted signal suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+});
+let errMsg = null;
+let errName = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? e.name : null;
+}
+console.log(JSON.stringify({ errMsg, errName }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(data.errName).not.toBe("AbortError");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69c: .throw() does NOT create a tmpdir. SPEC §9.1, §7.4.
+    // ------------------------------------------------------------------------
+    it("T-API-69c: .throw() does NOT create LOOPX_TMPDIR", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const isolatedTmp = await mkdtemp(join(osTmpdir(), "loopx-test-tmpdir-"));
+      try {
+        const driverCode = `
+import { run } from "loopx";
+import { readdirSync } from "node:fs";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+const before = readdirSync(${JSON.stringify(isolatedTmp)}).filter(n => n.startsWith("loopx-"));
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const after = readdirSync(${JSON.stringify(isolatedTmp)}).filter(n => n.startsWith("loopx-"));
+console.log(JSON.stringify({ errMsg, before, after }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: isolatedTmp },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.errMsg).toBe("my-err");
+        expect(data.before).toEqual([]);
+        expect(data.after).toEqual([]);
+      } finally {
+        await rm(isolatedTmp, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69d: .throw() suppresses tmpdir-creation failure. Conditional
+    // on uid != 0.
+    // ------------------------------------------------------------------------
+    (IS_ROOT ? it.skip : it)("T-API-69d: .throw() surfaces consumer error (tmpdir-creation failure suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const unwritableParent = await mkdtemp(join(osTmpdir(), "loopx-test-unwritable-"));
+      try {
+        await chmod(unwritableParent, 0o000);
+        const driverCode = `
+import { run } from "loopx";
+import { readdirSync } from "node:fs";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+let after = [];
+try {
+  after = readdirSync(${JSON.stringify(unwritableParent)}).filter(n => n.startsWith("loopx-"));
+} catch { /* readdir may fail on mode-000 dir */ }
+console.log(JSON.stringify({ errMsg, after }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: unwritableParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.errMsg).toBe("my-err");
+        expect(data.after).toEqual([]);
+        expect(result.stderr).not.toMatch(/tmpdir|mkdtemp|EACCES|EPERM/i);
+      } finally {
+        await chmod(unwritableParent, 0o700).catch(() => {});
+        await rm(unwritableParent, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69e: .throw() suppresses throwing options.env getter.
+    // ------------------------------------------------------------------------
+    it("T-API-69e: .throw() surfaces consumer error (throwing options.env getter suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "env", {
+  enumerable: true,
+  get() { throw new Error("evil-env-getter"); },
+});
+const gen = run("ralph", opts);
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(result.stderr).not.toContain("evil-env-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69f: .throw() suppresses .loopx/ discovery failure.
+    // ------------------------------------------------------------------------
+    it("T-API-69f: .throw() surfaces consumer error (.loopx/ discovery failure suppressed)", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69i: .throw(err) surfaces consumer error even when a live signal
+    // aborts between run() and the consumer's first interaction. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-69i: .throw() surfaces consumer error (live-signal abort between run() and first interaction suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+});
+c.abort();
+let errMsg = null;
+let errName = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? e.name : null;
+}
+console.log(JSON.stringify({ errMsg, errName }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(data.errName).not.toBe("AbortError");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69r: .throw(err) surfaces consumer error on reentrant duck-signal
+    // (listener fires synchronously + aborted mutation). SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-69r: .throw() surfaces consumer error (reentrant duck-signal with mutation suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") {
+      this.aborted = true;
+      fn();
+    }
+  },
+};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+let errMsg = null;
+let errName = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? e.name : null;
+}
+console.log(JSON.stringify({ errMsg, errName }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(data.errName).not.toBe("AbortError");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69r2: .throw(err) surfaces consumer error on reentrant duck-signal
+    // (listener fires only, no aborted mutation). SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-69r2: .throw() surfaces consumer error (reentrant duck-signal listener-only suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") fn();
+    /* do NOT mutate this.aborted */
+  },
+};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+let errMsg = null;
+let errName = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? e.name : null;
+}
+console.log(JSON.stringify({ errMsg, errName }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(data.errName).not.toBe("AbortError");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69u: .throw(err) surfaces consumer error on static duck-typed
+    // signal aborted:true at call time. SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-69u: .throw() surfaces consumer error (static duck-signal aborted:true suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const duck = {
+  aborted: true,
+  addEventListener(_type, _fn) { /* no-op: never fires */ },
+};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+let errMsg = null;
+let errName = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? e.name : null;
+}
+console.log(JSON.stringify({ errMsg, errName }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(data.errName).not.toBe("AbortError");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69j: .throw() surfaces consumer error (throwing options.signal
+    // getter suppressed). SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-69j: .throw() surfaces consumer error (throwing options.signal getter suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "signal", {
+  enumerable: true,
+  get() { throw new Error("evil-signal-getter"); },
+});
+const gen = run("ralph", opts);
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(result.stderr).not.toContain("evil-signal-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69k: .throw() surfaces consumer error (throwing options.cwd getter).
+    // ------------------------------------------------------------------------
+    it("T-API-69k: .throw() surfaces consumer error (throwing options.cwd getter suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = {};
+Object.defineProperty(opts, "cwd", {
+  enumerable: true,
+  get() { throw new Error("evil-cwd-getter"); },
+});
+const gen = run("ralph", opts);
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(result.stderr).not.toContain("evil-cwd-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69l: .throw() surfaces consumer error (throwing options.envFile
+    // getter suppressed).
+    // ------------------------------------------------------------------------
+    it("T-API-69l: .throw() surfaces consumer error (throwing options.envFile getter suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "envFile", {
+  enumerable: true,
+  get() { throw new Error("evil-envFile-getter"); },
+});
+const gen = run("ralph", opts);
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(result.stderr).not.toContain("evil-envFile-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69m: .throw() surfaces consumer error (throwing
+    // options.maxIterations getter suppressed).
+    // ------------------------------------------------------------------------
+    it("T-API-69m: .throw() surfaces consumer error (throwing options.maxIterations getter suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "maxIterations", {
+  enumerable: true,
+  get() { throw new Error("evil-maxIterations-getter"); },
+});
+const gen = run("ralph", opts);
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(result.stderr).not.toContain("evil-maxIterations-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69h: .throw() suppresses representative pre-iteration failures —
+    // full enumerated invalid-maxIterations set + representative selections
+    // of remaining option-snapshot, target-resolution, and target-syntax
+    // sub-paths. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    const t69hVariants: Array<{ name: string; opts: string; target: string }> = [
+      { name: "i-options-null", opts: "null", target: '"ralph"' },
+      { name: "ii-options-array", opts: "[]", target: '"ralph"' },
+      { name: "iii-options-function", opts: "(() => {})", target: '"ralph"' },
+      { name: "iv-options-number", opts: "42", target: '"ralph"' },
+      { name: "v-signal-non-shape", opts: '{ signal: "not-a-signal" }', target: '"ralph"' },
+      { name: "vi-cwd-non-string", opts: "{ cwd: 42 }", target: '"ralph"' },
+      { name: "vii-envFile-non-string", opts: "{ envFile: 42 }", target: '"ralph"' },
+      { name: "viii-maxIter-fractional", opts: "{ maxIterations: 1.5 }", target: '"ralph"' },
+      { name: "ix-maxIter-NaN", opts: "{ maxIterations: NaN }", target: '"ralph"' },
+      { name: "x-maxIter-Infinity", opts: "{ maxIterations: Infinity }", target: '"ralph"' },
+      { name: "xi-maxIter-null", opts: "{ maxIterations: null }", target: '"ralph"' },
+      { name: "xii-maxIter-string", opts: '{ maxIterations: "1" }', target: '"ralph"' },
+      { name: "xix-target-syntax", opts: "undefined", target: '"a:b:c"' },
+    ];
+    for (const v of t69hVariants) {
+      it(`T-API-69h (${v.name}): .throw() surfaces consumer error (${v.name} suppressed)`, async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+        const optsExpr = v.opts === "undefined" ? "undefined" : v.opts;
+        const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const opts = ${optsExpr};
+const gen = run(${v.target}, opts);
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.errMsg).toBe("my-err");
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-69s: .throw() suppresses sibling-workflow discovery validation
+    // failures. SPEC §5.2 / §5.3 / §5.4 × §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-69s (collision): .throw() surfaces consumer error (sibling collision suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      await createBashWorkflowScript(project, "broken", "check", `printf '{"stop":true}'`);
+      await createWorkflowScript(project, "broken", "check", ".ts", `output({ stop: true });`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(result.stderr).toBe("");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69t: .throw() suppresses unreadable local envFile (mode 000).
+    // SPEC §9.1, §8.2. Conditional on uid != 0.
+    // ------------------------------------------------------------------------
+    (IS_ROOT ? it.skip : it)("T-API-69t: .throw() surfaces consumer error (unreadable local envFile suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const envPath = join(project.dir, "local.env");
+      await writeFile(envPath, "OK=fine\n", "utf-8");
+      try {
+        await chmod(envPath, 0o000);
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(envPath)},
+});
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.errMsg).toBe("my-err");
+        expect(result.stderr).toBe("");
+      } finally {
+        await chmod(envPath, 0o600).catch(() => {});
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69n: .throw() suppresses unreadable global env file. Conditional
+    // on uid != 0.
+    // ------------------------------------------------------------------------
+    (IS_ROOT ? it.skip : it)("T-API-69n: .throw() surfaces consumer error (unreadable global env file suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const xdgConfigHome = await mkdtemp(join(osTmpdir(), "loopx-test-xdg-"));
+      const loopxConfigDir = join(xdgConfigHome, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const envPath = join(loopxConfigDir, "env");
+      await writeFile(envPath, "OK=fine\n", "utf-8");
+      try {
+        await chmod(envPath, 0o000);
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { XDG_CONFIG_HOME: xdgConfigHome },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.errMsg).toBe("my-err");
+        expect(result.stderr).toBe("");
+      } finally {
+        await chmod(envPath, 0o600).catch(() => {});
+        await rm(xdgConfigHome, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69o: .throw() suppresses local env-file parser warnings.
+    // ------------------------------------------------------------------------
+    it("T-API-69o: .throw() surfaces consumer error (local env-file parser warnings suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const envPath = join(project.dir, "local.env");
+      await writeFile(envPath, "1BAD=val\nOK=fine\n", "utf-8");
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(envPath)},
+});
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(result.stderr).toBe("");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69p: .throw() suppresses global env-file parser warnings.
+    // ------------------------------------------------------------------------
+    it("T-API-69p: .throw() surfaces consumer error (global env-file parser warnings suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const xdgConfigHome = await mkdtemp(join(osTmpdir(), "loopx-test-xdg-"));
+      const loopxConfigDir = join(xdgConfigHome, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const envPath = join(loopxConfigDir, "env");
+      await writeFile(envPath, "1BAD=val\nOK=fine\n", "utf-8");
+      try {
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { XDG_CONFIG_HOME: xdgConfigHome },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.errMsg).toBe("my-err");
+        expect(result.stderr).toBe("");
+      } finally {
+        await rm(xdgConfigHome, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69q: .throw() suppresses workflow package.json warnings (parameterized).
+    // ------------------------------------------------------------------------
+    interface PkgVariantThrow { name: string; pkgContent: string; }
+    const t69qVariants: PkgVariantThrow[] = [
+      { name: "i-unsatisfied-range", pkgContent: JSON.stringify({ dependencies: { loopx: ">=999.0.0" } }) },
+      { name: "ii-invalid-json", pkgContent: "{broken" },
+      { name: "iii-invalid-semver-range", pkgContent: JSON.stringify({ dependencies: { loopx: "not-a-range!!!" } }) },
+    ];
+    for (const v of t69qVariants) {
+      it(`T-API-69q (${v.name}): .throw() surfaces consumer error (workflow package.json warning suppressed)`, async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+        await createWorkflowPackageJson(project, "ralph", v.pkgContent);
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.errMsg).toBe("my-err");
+        expect(result.stderr).toBe("");
+      });
+    }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
 // §4.9 — RunOptions.env Basic Injection (SPEC §9.5 / §8.3)
 // ═════════════════════════════════════════════════════════════
 //
