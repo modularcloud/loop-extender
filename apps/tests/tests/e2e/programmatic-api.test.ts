@@ -13507,6 +13507,7 @@ console.log(JSON.stringify({ synchronousThrew, callSiteMessage, scriptReachedRea
 //   T-API-65a  runPromise + pre-aborted + invalid target  → abort error
 //   T-API-65a2 (param)    + non-string target argument matrix → abort error
 //   T-API-65b  runPromise + pre-aborted + missing .loopx/ → abort error
+//   T-API-65c  runPromise + pre-aborted + unreadable envFile (mode 000) → abort error
 //   T-API-65d  runPromise + pre-aborted + tmpdir creation fail → abort error
 //   T-API-65e  run        + invalid signal shape + missing envFile → NOT abort
 //   T-API-65f  run        + pre-aborted + throwing later-option getter → abort error
@@ -13711,6 +13712,79 @@ console.log(JSON.stringify({ rejected, message, name }));
       const after = listLoopxEntries(tmpdirParent);
       expect(after.filter((e) => !before.includes(e))).toEqual([]);
     });
+
+    // ------------------------------------------------------------------------
+    // T-API-65c: runPromise() — pre-aborted signal beats env-file-load
+    // failure when the local env file is unreadable (mode 000). SPEC §8.2
+    // classifies an unreadable env file as a real pre-iteration failure
+    // (distinct from the missing-env-file path covered by T-API-65 and
+    // distinct from malformed-line warnings, which are non-fatal per
+    // SPEC §8.1). SPEC §9.3 abort-precedence over pre-iteration failures
+    // covers env-file loading explicitly. SPEC §9.3, §9.5, §8.2.
+    //
+    // Skipped under root: mode 000 does not block reads for uid 0.
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-API-65c: runPromise() pre-aborted signal beats unreadable env-file (mode 000)",
+      async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent("api65c");
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const envFilePath = join(project.dir, "unreadable.env");
+        await writeEnvFileRaw(envFilePath, "FOO=bar\n");
+        await chmod(envFilePath, 0o000);
+        cleanups.push(async () => {
+          await chmod(envFilePath, 0o644).catch(() => {});
+        });
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    envFile: "unreadable.env",
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected with the abort error, not the
+        //     env-file-unreadable error (EACCES / read failure).
+        expect(parsed.rejected).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(
+          /unreadable\.env|envFile|env file|EACCES|permission/i,
+        );
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      },
+    );
 
     // ------------------------------------------------------------------------
     // T-API-65d: runPromise() — pre-aborted signal beats tmpdir-creation
