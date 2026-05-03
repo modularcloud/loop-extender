@@ -192,6 +192,72 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
       expect(helperRes.stderr).toMatch(/not found/i);
     });
 
+    it("T-DISC-07a: .mjs sibling of valid script is silently ignored (workflow runs, .mjs not discovered as script)", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "marker-07a.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc07a", marker),
+      );
+      // .mjs sibling — unsupported extension, must be silently ignored during discovery.
+      const wf = join(project.loopxDir, "ralph");
+      writeFileSync(join(wf, "helper.mjs"), `export const x = 1;\n`);
+
+      // (a) ralph:index runs successfully
+      const idxRes = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(idxRes.exitCode).toBe(0);
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, "utf-8")).toBe("disc07a");
+
+      // (b) no warning about helper.mjs being unsupported (silent exclusion, not a warning)
+      expect(hasWarningCategoryFor(idxRes.stderr, "helper.mjs")).toBe(false);
+      expect(idxRes.stderr).not.toMatch(/helper\.mjs/);
+
+      // (c) ralph:helper fails — .mjs was not discovered as a `helper` script
+      const helperRes = await runCLI(["run", "-n", "1", "ralph:helper"], { cwd: project.dir });
+      expect(helperRes.exitCode).toBe(1);
+      expect(helperRes.stderr).toMatch(/not found/i);
+    });
+
+    it("T-DISC-07c: loopx run -h does not warn about .mjs/.cjs siblings of valid scripts", async () => {
+      project = await createTempProject();
+      // Same fixture pattern as T-DISC-07a + T-DISC-07b combined: a single workflow with
+      // both a .mjs and a .cjs sibling beside the valid index.sh entry. Help-mode discovery
+      // must silently ignore both unsupported extensions.
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash\necho disc07c\n`,
+      );
+      const wf = join(project.loopxDir, "ralph");
+      writeFileSync(join(wf, "helper.mjs"), `export const m = 1;\n`);
+      writeFileSync(join(wf, "tool.cjs"), `module.exports = 1;\n`);
+
+      const helpRes = await runCLI(["run", "-h"], { cwd: project.dir });
+
+      // (a) exit 0
+      expect(helpRes.exitCode).toBe(0);
+
+      // (b) the discovered-workflows section lists ralph with `index` as its default entry.
+      expect(helpRes.stdout).toMatch(/ralph/);
+      // `index` appears as a script line under ralph (4+ space indent then "index").
+      expect(helpRes.stdout).toMatch(/^\s{4,}index\b/m);
+      // `helper` and `tool` must NOT appear as script lines under ralph.
+      expect(helpRes.stdout).not.toMatch(/^\s{4,}helper\b/m);
+      expect(helpRes.stdout).not.toMatch(/^\s{4,}tool\b/m);
+
+      // (c) stderr contains no warning that mentions helper.mjs or tool.cjs.
+      expect(hasWarningCategoryFor(helpRes.stderr, "helper.mjs")).toBe(false);
+      expect(hasWarningCategoryFor(helpRes.stderr, "tool.cjs")).toBe(false);
+      expect(helpRes.stderr).not.toMatch(/helper\.mjs/);
+      expect(helpRes.stderr).not.toMatch(/tool\.cjs/);
+    });
+
     it("T-DISC-08: subdir with only non-script files (readme.txt, config.json) is not a workflow, no warning", async () => {
       project = await createTempProject();
       const wf = await createWorkflow(project, "ralph");
@@ -1045,6 +1111,75 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
       const betaRes = await runCLI(["run", "-n", "1", "ralph:beta"], { cwd: project.dir });
       expect(betaRes.exitCode).toBe(0);
       expect(readFileSync(betaMarker, "utf-8")).toBe("beta-ran");
+    });
+
+    it("T-DISC-24a: same-base-name collision immunity for unsupported .mjs extension (check.ts + check.mjs is not a collision)", async () => {
+      project = await createTempProject();
+      // ralph/index.sh exists so the workflow is unambiguously discovered without depending
+      // on `check` being the default entry.
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash\nprintf '{"result":"idx"}'\n`,
+      );
+      // The discovered script: check.ts writes a marker and emits stop:true.
+      const marker = join(project.dir, "marker-24a.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "check",
+        ".ts",
+        `${tsMarker(marker, "disc24a")}console.log(JSON.stringify({stop:true}));\n`,
+      );
+      // .mjs same-base sibling — unsupported extension, never a discovery candidate.
+      const wf = join(project.loopxDir, "ralph");
+      writeFileSync(join(wf, "check.mjs"), `export const m = 1;\n`);
+
+      // (a)+(b) ralph:check resolves to check.ts (not blocked by spurious collision).
+      const result = await runCLI(["run", "-n", "1", "ralph:check"], { cwd: project.dir });
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, "utf-8")).toBe("disc24a");
+
+      // (c) no collision warning or error referencing check.mjs.
+      expect(result.stderr).not.toMatch(/collision|conflict|duplicate|multiple/i);
+      expect(result.stderr).not.toMatch(/check\.mjs/);
+      expect(hasWarningCategoryFor(result.stderr, "check.mjs")).toBe(false);
+    });
+
+    it("T-DISC-24b: same-base-name collision immunity for unsupported .cjs extension (check.ts + check.cjs is not a collision)", async () => {
+      project = await createTempProject();
+      // Same fixture pattern as T-DISC-24a but with .cjs as the unsupported sibling.
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash\nprintf '{"result":"idx"}'\n`,
+      );
+      const marker = join(project.dir, "marker-24b.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "check",
+        ".ts",
+        `${tsMarker(marker, "disc24b")}console.log(JSON.stringify({stop:true}));\n`,
+      );
+      const wf = join(project.loopxDir, "ralph");
+      writeFileSync(join(wf, "check.cjs"), `module.exports = 1;\n`);
+
+      // (a)+(b) ralph:check resolves to check.ts.
+      const result = await runCLI(["run", "-n", "1", "ralph:check"], { cwd: project.dir });
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, "utf-8")).toBe("disc24b");
+
+      // (c) no collision warning or error referencing check.cjs.
+      expect(result.stderr).not.toMatch(/collision|conflict|duplicate|multiple/i);
+      expect(result.stderr).not.toMatch(/check\.cjs/);
+      expect(hasWarningCategoryFor(result.stderr, "check.cjs")).toBe(false);
     });
   });
 
