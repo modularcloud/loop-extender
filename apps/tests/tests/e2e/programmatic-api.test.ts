@@ -11132,3 +11132,322 @@ console.log(JSON.stringify({ count, threw: rejected, message }));
     }
   });
 });
+
+describe("SPEC: Option-Field Call-Site Read Timing", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-62i: run() reads cwd, envFile, maxIterations, env getters
+    // synchronously at the call site, before returning the generator.
+    // SPEC §9.1: "run() reads its options argument at the call site as a
+    // synchronous snapshot ... Each option field is read at most once per
+    // call." T-API-62h pins the at-most-once contract via a post-settlement
+    // observation; this test pins call-site invocation timing for all four
+    // non-signal fields with a pre-next() observation point. (Signal
+    // call-site timing is covered separately by T-API-64k.) A buggy
+    // implementation that deferred non-signal option reads to first next()
+    // would observe all four counters at 0 immediately after run() returned
+    // and fail this test. Each getter returns a value the implementation
+    // must consume (project dir for cwd, valid env-file path for envFile,
+    // 1 for maxIterations, { MYVAR: "value" } for env), so the
+    // "must have been read at call site" claim is load-bearing rather than
+    // satisfied by short-circuiting on undefined.
+    // ------------------------------------------------------------------------
+    it("T-API-62i: run() reads cwd, envFile, maxIterations, env getters synchronously at call site", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+      const envFilePath = join(project.dir, "valid.env");
+      await writeFile(envFilePath, "OTHER=other-val\n");
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let cwdCount = 0, envFileCount = 0, maxIterCount = 0, envCount = 0;
+const opts = {};
+Object.defineProperty(opts, "cwd", { enumerable: true, configurable: true, get() { cwdCount++; return ${JSON.stringify(project.dir)}; } });
+Object.defineProperty(opts, "envFile", { enumerable: true, configurable: true, get() { envFileCount++; return ${JSON.stringify(envFilePath)}; } });
+Object.defineProperty(opts, "maxIterations", { enumerable: true, configurable: true, get() { maxIterCount++; return 1; } });
+Object.defineProperty(opts, "env", { enumerable: true, configurable: true, get() { envCount++; return { MYVAR: "value" }; } });
+const gen = run("ralph", opts);
+const callTimeCounts = { cwdCount, envFileCount, maxIterCount, envCount };
+const outputs = [];
+for await (const o of gen) { outputs.push(o); }
+const finalCounts = { cwdCount, envFileCount, maxIterCount, envCount };
+console.log(JSON.stringify({ callTimeCounts, finalCounts, outputs: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Each non-signal field read exactly once at call site, BEFORE
+      // first next() drove the generator. A buggy lazy implementation
+      // would observe all four counters at 0 here.
+      expect(parsed.callTimeCounts.cwdCount).toBe(1);
+      expect(parsed.callTimeCounts.envFileCount).toBe(1);
+      expect(parsed.callTimeCounts.maxIterCount).toBe(1);
+      expect(parsed.callTimeCounts.envCount).toBe(1);
+      // (b) Counts unchanged after generator settles — no re-read on
+      // iteration. Complements T-API-62h's at-most-once assertion at the
+      // post-settlement observation point with a stronger pre-next()
+      // observation point.
+      expect(parsed.finalCounts.cwdCount).toBe(1);
+      expect(parsed.finalCounts.envFileCount).toBe(1);
+      expect(parsed.finalCounts.maxIterCount).toBe(1);
+      expect(parsed.finalCounts.envCount).toBe(1);
+      // (c) Run completed normally with the getter return values consumed
+      // (env actually reached the spawned script, maxIterations bounded
+      // the loop, cwd controlled the spawn cwd, envFile loaded successfully).
+      expect(parsed.outputs).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("value");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62i2: runPromise() reads cwd, envFile, maxIterations, env
+    // getters synchronously at the call site, before returning the promise.
+    // SPEC §9.2 inherits §9.1's option-snapshot timing contract verbatim.
+    // The async function body runs synchronously up to its first `await`;
+    // runWithInternal is called BEFORE the first `await Promise.resolve()`,
+    // so the option-snapshot pass fires at the call site even on the
+    // promise-returning surface.
+    // ------------------------------------------------------------------------
+    it("T-API-62i2: runPromise() reads cwd, envFile, maxIterations, env getters synchronously at call site", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+      const envFilePath = join(project.dir, "valid.env");
+      await writeFile(envFilePath, "OTHER=other-val\n");
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let cwdCount = 0, envFileCount = 0, maxIterCount = 0, envCount = 0;
+const opts = {};
+Object.defineProperty(opts, "cwd", { enumerable: true, configurable: true, get() { cwdCount++; return ${JSON.stringify(project.dir)}; } });
+Object.defineProperty(opts, "envFile", { enumerable: true, configurable: true, get() { envFileCount++; return ${JSON.stringify(envFilePath)}; } });
+Object.defineProperty(opts, "maxIterations", { enumerable: true, configurable: true, get() { maxIterCount++; return 1; } });
+Object.defineProperty(opts, "env", { enumerable: true, configurable: true, get() { envCount++; return { MYVAR: "value" }; } });
+const p = runPromise("ralph", opts);
+const callTimeCounts = { cwdCount, envFileCount, maxIterCount, envCount };
+const outputs = await p;
+const finalCounts = { cwdCount, envFileCount, maxIterCount, envCount };
+console.log(JSON.stringify({ callTimeCounts, finalCounts, outputs: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.callTimeCounts.cwdCount).toBe(1);
+      expect(parsed.callTimeCounts.envFileCount).toBe(1);
+      expect(parsed.callTimeCounts.maxIterCount).toBe(1);
+      expect(parsed.callTimeCounts.envCount).toBe(1);
+      expect(parsed.finalCounts.cwdCount).toBe(1);
+      expect(parsed.finalCounts.envFileCount).toBe(1);
+      expect(parsed.finalCounts.maxIterCount).toBe(1);
+      expect(parsed.finalCounts.envCount).toBe(1);
+      expect(parsed.outputs).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("value");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62i3: run() — throwing non-signal option-field getter is
+    // invoked exactly once at the call site without escaping synchronously,
+    // and the captured error is surfaced lazily on first next(). SPEC §9.1:
+    // "Any exception raised during the snapshot ... is captured and
+    // surfaced via the standard pre-iteration error path on the first
+    // next(), not at the call site." Parameterized over each non-signal
+    // field {cwd, envFile, maxIterations, env}. The combined
+    // assertion (b) throwCount===1 immediately after run() returns +
+    // (d) throwCount===1 post-next() pins the captured-exactly-once-at-
+    // call-site contract — the new surface this test pins beyond
+    // T-API-62 (error surfaces) and T-API-62h3/h4 (no retry post-next).
+    // ------------------------------------------------------------------------
+    interface ThrowingFieldVariant {
+      field: "cwd" | "envFile" | "maxIterations" | "env";
+      siblingField: "cwd" | "envFile" | "maxIterations" | "env";
+      siblingValueLiteral: "PROJECT_DIR" | "1";
+    }
+
+    const throwingFieldVariantsRun: ThrowingFieldVariant[] = [
+      { field: "cwd", siblingField: "maxIterations", siblingValueLiteral: "1" },
+      { field: "envFile", siblingField: "maxIterations", siblingValueLiteral: "1" },
+      { field: "maxIterations", siblingField: "cwd", siblingValueLiteral: "PROJECT_DIR" },
+      { field: "env", siblingField: "maxIterations", siblingValueLiteral: "1" },
+    ];
+
+    for (const v of throwingFieldVariantsRun) {
+      it(`T-API-62i3: run() throwing options.${v.field} getter invoked exactly once at call site (no synchronous throw, no retry)`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const siblingValueExpr =
+          v.siblingValueLiteral === "PROJECT_DIR"
+            ? JSON.stringify(project.dir)
+            : v.siblingValueLiteral;
+        const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let throwCount = 0, siblingCount = 0;
+const opts = {};
+Object.defineProperty(opts, ${JSON.stringify(v.field)}, { enumerable: true, configurable: true, get() { throwCount++; throw new Error(${JSON.stringify(v.field + "-getter-boom")}); } });
+Object.defineProperty(opts, ${JSON.stringify(v.siblingField)}, { enumerable: true, configurable: true, get() { siblingCount++; return ${siblingValueExpr}; } });
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+const callTimeCounts = { throwCount, siblingCount, synchronousThrew };
+let nextThrew = false, nextMessage = "";
+if (!synchronousThrew) {
+  try {
+    await gen.next();
+  } catch (e) {
+    nextThrew = true;
+    nextMessage = e.message || String(e);
+  }
+}
+const finalCounts = { throwCount, siblingCount };
+console.log(JSON.stringify({ callTimeCounts, callTimeMessage, finalCounts, nextThrew, nextMessage }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at call site — the call returned a
+        // generator, matching SPEC §9.1 "never throws at the call site".
+        expect(parsed.callTimeCounts.synchronousThrew).toBe(false);
+        expect(parsed.callTimeMessage).toBe("");
+        // (b) throwCount === 1 immediately after run() returns: the
+        // throwing getter was invoked once at call time, captured rather
+        // than escaping. A buggy lazy implementation that deferred the
+        // read to first next() would observe throwCount === 0 here.
+        expect(parsed.callTimeCounts.throwCount).toBe(1);
+        // (c) The captured exception surfaces on first next().
+        expect(parsed.nextThrew).toBe(true);
+        expect(parsed.nextMessage).toContain(`${v.field}-getter-boom`);
+        // (d) throwCount === 1 post-next() — the captured error was not
+        // re-derived by re-invoking the getter (no-retry contract).
+        expect(parsed.finalCounts.throwCount).toBe(1);
+        // No child spawn (snapshot error fires pre-iteration before any
+        // spawn — sibling read order is implementation-defined, but
+        // marker MUST NOT exist).
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-62i4: runPromise() — throwing non-signal option-field getter
+    // is invoked exactly once at the call site without escaping
+    // synchronously, and the captured error is surfaced via promise
+    // rejection. runPromise() counterpart to T-API-62i3. SPEC §9.2
+    // "Option-snapshot timing. Identical to run() (section 9.1)" — the
+    // same call-site invocation contract holds; the captured error
+    // surfaces via promise rejection rather than first-next() throw.
+    // The async-function-body-runs-synchronously-up-to-first-await
+    // semantics combined with runWithInternal being called BEFORE the
+    // first `await Promise.resolve()` mean the option-snapshot pass
+    // (and any throwing getter) fires before runPromise() returns the
+    // promise.
+    // ------------------------------------------------------------------------
+    const throwingFieldVariantsRunPromise: ThrowingFieldVariant[] = [
+      { field: "cwd", siblingField: "maxIterations", siblingValueLiteral: "1" },
+      { field: "envFile", siblingField: "maxIterations", siblingValueLiteral: "1" },
+      { field: "maxIterations", siblingField: "cwd", siblingValueLiteral: "PROJECT_DIR" },
+      { field: "env", siblingField: "maxIterations", siblingValueLiteral: "1" },
+    ];
+
+    for (const v of throwingFieldVariantsRunPromise) {
+      it(`T-API-62i4: runPromise() throwing options.${v.field} getter invoked exactly once at call site (no synchronous throw, no retry)`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const siblingValueExpr =
+          v.siblingValueLiteral === "PROJECT_DIR"
+            ? JSON.stringify(project.dir)
+            : v.siblingValueLiteral;
+        const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let throwCount = 0, siblingCount = 0;
+const opts = {};
+Object.defineProperty(opts, ${JSON.stringify(v.field)}, { enumerable: true, configurable: true, get() { throwCount++; throw new Error(${JSON.stringify(v.field + "-getter-boom")}); } });
+Object.defineProperty(opts, ${JSON.stringify(v.siblingField)}, { enumerable: true, configurable: true, get() { siblingCount++; return ${siblingValueExpr}; } });
+let synchronousThrew = false, callTimeMessage = "";
+let p;
+try {
+  p = runPromise("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+const isPromise = p !== undefined && p !== null && typeof p.then === "function";
+const callTimeCounts = { throwCount, siblingCount, synchronousThrew, isPromise };
+let rejected = false, rejMessage = "";
+if (!synchronousThrew && isPromise) {
+  try {
+    await p;
+  } catch (e) {
+    rejected = true;
+    rejMessage = e.message || String(e);
+  }
+}
+const finalCounts = { throwCount, siblingCount };
+console.log(JSON.stringify({ callTimeCounts, callTimeMessage, finalCounts, rejected, rejMessage }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at call site — runPromise() always
+        // returns a promise per SPEC §9.2.
+        expect(parsed.callTimeCounts.synchronousThrew).toBe(false);
+        expect(parsed.callTimeMessage).toBe("");
+        expect(parsed.callTimeCounts.isPromise).toBe(true);
+        // (b) throwCount === 1 immediately after runPromise() returns:
+        // the throwing getter was invoked once at call time, captured
+        // rather than escaping. A buggy implementation that deferred
+        // option reads to its internal pre-iteration sequence (run after
+        // promise creation) would observe throwCount === 0 here.
+        expect(parsed.callTimeCounts.throwCount).toBe(1);
+        // (c) Promise rejects with the captured exception.
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.rejMessage).toContain(`${v.field}-getter-boom`);
+        // (d) throwCount === 1 post-rejection — no retry.
+        expect(parsed.finalCounts.throwCount).toBe(1);
+        // No child spawn.
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+  });
+});
