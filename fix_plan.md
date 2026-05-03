@@ -16,6 +16,20 @@
 
 ## P0/P1 — RESOLVED
 
+### SPEC §12 (T-EXIT-17 — Invalid target string `:script` non-signal path → exit 1) — RESOLVED this iteration
+
+Test-only iteration — existing implementation already conformed. `parseTarget(":script")` at `packages/loop-extender/src/target-validation.ts:53-57` returns `{ ok: false, error: "Invalid target ':script': leading ':' (empty workflow)" }` because the split-by-`:` produces `["", "script"]` and `wf === ""` triggers the leading-colon branch. `bin.ts:709-713` consumes that result, writes `Error: <message>\n` to stderr, and calls `process.exit(1)`. The rejection is post-discovery: discovery (`discoverScripts`) at `bin.ts:573` runs before `parseTarget` at `bin.ts:708`, satisfying SPEC §12's "rejected after discovery, at the same point as a missing workflow or missing script" wording.
+
+T-EXIT-17 is the non-signal counterpart to T-SIG-22 (`apps/tests/tests/e2e/signals.test.ts:534`), which exercises the same `:script` invalid-target shape on the signal-wins precedence path. Setup mirrors T-SIG-22: a valid `.loopx/ralph/index.sh` workflow tree is created so discovery succeeds, ensuring the rejection really happens at the post-discovery target-resolution checkpoint and not earlier (e.g., at the missing-`.loopx/` exit per T-EXIT-09).
+
+1 unique ID × 2 runtimes (Node + Bun) = 2 tests added to `apps/tests/tests/e2e/exit-codes.test.ts` after T-EXIT-16 inside the existing `forEachRuntime((runtime) => ...)` block under `describe("SPEC: Error Exit Codes")`:
+
+- **T-EXIT-17** asserts `result.exitCode === 1`, `result.stderr.length > 0`, `result.stderr` matches `/[Ii]nvalid target/`, `result.stderr` contains the literal `":script"` (proving the invalid-target diagnostic surfaced rather than a delegating-error path or a missing-workflow message), and `result.stdout === ""` (CLI stdout silence on the failure path per SPEC §7.1 / T-LOOP-46). The assertion against literal `":script"` is essential — a buggy implementation that swallowed the offending token in the diagnostic (or rerouted to the missing-workflow exit path) would leave the test green on `exitCode === 1` alone.
+
+exit-codes.test.ts: 32 → 34 tests, all 34 passing in 1.46s. Adjacent suites zero-regression: cli-grammar.test.ts 58/58 (1 Bun-skipped), cli-basics.test.ts 338/338, signals.test.ts 18/18 (T-SIG-22 still passes alongside the new non-signal counterpart). Typecheck clean.
+
+Closes the SPEC §12 invalid-target-string exit-code contract for the non-signal path.
+
 ### SPEC §7.4 / §8.3 / §13 (T-TMP-30 / T-TMP-31 — `LOOPX_TMPDIR` Protocol-Variable Precedence: tier-1 silent override at inherited-env and local env-file tiers) — RESOLVED this iteration
 
 Test-only iteration — existing `packages/loop-extender/src/execution.ts` already conformed across both IDs. The single source of truth is the `scriptEnv` construction at `execution.ts:179-203`: the `LOOPX_TMPDIR: loopxTmpdir` assignment at line 185 is placed AFTER the `...env` spread at line 180, so any user-supplied `LOOPX_TMPDIR` from `RunOptions.env`, env-file (`-e` local or global), or inherited process env is unconditionally overwritten by the freshly-`mkdtemp`'d run-scoped path. No diagnostic is emitted from this code path or any other site that touches `LOOPX_TMPDIR` — the override is silent per SPEC §13 / §8.3.
@@ -1607,11 +1621,11 @@ After this iteration the following unauthored TEST-SPEC IDs are recorded for fut
 - **T-INST-116** — SIGINT during `npm install` forwards to child process group (§10.10 / §7.3).
 - **T-VER-28** — workflow `package.json` is a directory → one warning, version check skipped, execution continues (§10/§11).
 - **T-ENV-27** — global env-file with literal NUL byte in value surfaces as spawn failure (§6.6).
-- **T-EXIT-17** — invalid target string `":script"` → exit code 1 (§12). NOTE: the new T-SIG-22 already exercises invalid target via `:script` for the signal-wins path; the T-EXIT-17 counterpart asserts the non-signal path explicitly returns exit 1.
+- ~~**T-EXIT-17**~~ — RESOLVED this iteration (1 unique ID × 2 runtimes = 2 tests; test-only — existing implementation already conformed via parseTarget rejection at target-validation.ts:53-57 and bin.ts:709-713 stderr-write + exit(1); see RESOLVED subsection above).
 - **T-TYPE-08** — `import { output, input } from "loopx"` type-checks and exposes script-helper signatures (§6.4/§6.5/§9.4) — typecheck-only.
 - Known-gap IDs (NOT to be implemented; documented as such in TEST-SPEC): T-SIG-26, T-SIG-29, T-TMP-43/44/45, T-DISC-49 parent prefix, T-RUNTIME-MATRIX, T-API-10i, T-SIG-30b, T-API-10j (cleanup-window race needing additional seams).
 
-**NEXT-UP RECOMMENDATION**: `T-EXIT-17` + `T-TYPE-08` singletons (small targeted iteration). Alternative: `T-SIG-25` + `T-SIG-30` (the two remaining pre-iteration signal-wins IDs left from the §7.3 cluster — both require unreadable env-file / sibling-validation collision setup that the existing T-SIG cluster did not need). Alternative: `T-TERM-01 / T-TERM-03 / T-TERM-05` (racing-trigger first-observed-wins — each reuses the already-shipped `LOOPX_TEST_TERMINAL_TRIGGER_PAUSE` seam at `test-seams.ts`).
+**NEXT-UP RECOMMENDATION**: `T-TYPE-08` singleton (the natural remaining half of the prior T-EXIT-17 + T-TYPE-08 small-targeted-iteration pairing — typecheck-only test for `import { output, input } from "loopx"` exposing script-helper signatures per SPEC §6.4 / §6.5 / §9.4). Alternative: `T-SIG-25` + `T-SIG-30` (the two remaining pre-iteration signal-wins IDs left from the §7.3 cluster — both require unreadable env-file / sibling-validation collision setup that the existing T-SIG cluster did not need). Alternative: `T-TERM-01 / T-TERM-03 / T-TERM-05` (racing-trigger first-observed-wins — each reuses the already-shipped `LOOPX_TEST_TERMINAL_TRIGGER_PAUSE` seam at `test-seams.ts`).
 
 ## P1 — Discovered open issues
 
@@ -1631,7 +1645,7 @@ This sub-section is the authoritative TDD-gate audit and supersedes earlier per-
 - **§4.11 Signals** — T-SIG-04a, 05a, 06a, 07a, 20a, 20b, ~~T-SIG-20..25/27/28/30/31~~ ~~T-SIG-20, 21, 22, 23, 24, 27, 28, 31~~ RESOLVED this iteration (8 unique IDs = 9 tests; mixed implementation + test-only — see Prior iteration entry at top of file). Remaining: T-SIG-25, T-SIG-30 (require unreadable env-file setups; defer to a separate iteration). Known gaps not authored: T-SIG-26, 29, 30b (require additional seams).
 - **§4.12 Delegation** — ~~T-DEL-04a, 07a, 09a, 15a, 15b, 26a, 28..28e, 29, 30.~~ RESOLVED this iteration (14 unique IDs; test-only — existing `checkDelegation` + `hasLoopxDep` in bin.ts:70-142 already conformed; new `createArgvRecorderBinary` helper for argv byte-for-byte assertions; full delegation.test.ts goes from 29 → 43 tests, all passing).
 - **§4.13 Workflow-Level Version Checking** — ~~T-VER-09a, 11b2, 11d, 12c, 13b2, 13d, 14b, 14c, 14d, 15b~~ RESOLVED in earlier iteration (10 unique IDs × 2 runtimes = 20 tests; implementation iteration in `version-check.ts` to detect non-string `loopx` values as `invalid-semver` per SPEC §3.2). ~~T-VER-15c, 15d~~ RESOLVED this iteration (2 unique IDs × 2 runtimes = 4 tests; test-only — existing `runAutoInstall` at install.ts:499-535 already routes both invalid-range strings and non-string values through the `invalid-semver` switch case which sets `malformed = true` and skips both `.gitignore` safeguard and `npm install` spawn; uses `withFakeNpm` to assert zero npm invocations and no `.gitignore` synthesis; see RESOLVED subsection above). Remaining: T-VER-26d, 27d, 28..28ai2 (entire non-regular package.json block — depends on `lstat`-based dispatch for non-regular `package.json` entries; SPEC §3.2 P-0004-03 branch).
-- **§4.14 Exit Codes** — T-EXIT-17.
+- **§4.14 Exit Codes** — ~~T-EXIT-17~~ RESOLVED this iteration (see RESOLVED subsection above).
 
 **CHOSEN-FOR-THIS-ITERATION**: T-DISC-40j / T-DISC-40k / T-DISC-40l / T-DISC-40m / T-DISC-40n / T-DISC-40o / T-DISC-40p / T-DISC-40q / T-DISC-40r / T-DISC-40s / T-DISC-40t / T-DISC-40u / T-DISC-40v / T-DISC-40w (Discovery Symlinks failed-resolution / wrong-type cluster — SPEC §5.1 "Symlink policy" + "Failed symlink resolution during runtime discovery" + §9.1 / §9.3). Test-only iteration — existing `discovery.ts` already conformed: `statSync` (follows symlinks) wrapped in bare `try/catch` at lines 83-87 (workflow layer) and 108-113 (script layer) silently skips broken (ENOENT) / cyclic (ELOOP) symlinks; resolved-wrong-types are filtered by `!wfStat.isDirectory()` at line 91 (workflow layer accepts only directories) and `!fileStat.isFile()` at line 114 (script layer accepts only files); name validation at lines 137 / 150-158 is gated behind successful stat + type + extension checks, so an invalid alias on a skipped entry is structurally unreachable. Both `run()` and `runPromise()` call the identical `discoverScripts(loopxDir, "run")` from `runWithInternal()` at `run.ts:706` and surface standard "Workflow not found" / "Script not found" errors at `run.ts:766-769` / `785-789` for skipped entries — same code path as the CLI surface. 14 unique IDs (T-DISC-40n + 40q parameterized over broken/cyclic; T-DISC-40r/40s/40u/40v parameterized over `runPromise` / `run`; T-DISC-40t/40w parameterized over both surfaces × broken/cyclic) added to `apps/tests/tests/e2e/discovery.test.ts` after T-DISC-40i = 42 vitest invocations (8 CLI + 4×2-surface × 2-runtimes for 40r/40s/40u/40v + 8×2-runtimes for 40t/40w). discovery.test.ts: 103 → 145 tests, all passing in 14.98s. Adjacent suites zero-regression: symlink.test.ts + programmatic-api.test.ts: 1370 passed + 4 skipped (1374 total), typecheck clean. Closes the {broken, cyclic, wrong-type} × {workflow-layer, script-layer} × {CLI, runPromise(), run()} × {valid-name, invalid-name} symlink-resolution-failure matrix at the runtime-discovery layer (complementing T-DISC-40a..40i, which covered the resolved-success and resolved-wrong-name cases). — DELIVERED
 
@@ -1693,14 +1707,14 @@ This sub-section is the authoritative TDD-gate audit and supersedes earlier per-
 - **Signals**: T-SIG-04a, 05a, 06a, 07a (SIGINT parity); T-SIG-20..31 (full pre-iteration signal-wins precedence).
 - **Types**: T-TYPE-08 (compile-time check for `output()`/`input()`).
 - **Env**: T-ENV-05f, 08a, 15g..15n; T-ENV-21e..21h; T-ENV-24a2..24a6; T-ENV-26..26g (NUL bytes); T-ENV-27..27e (`RunOptions.env` tier interaction); T-ENV-28..29a.
-- **Exit codes**: T-EXIT-17 (invalid target string).
+- **Exit codes**: ~~T-EXIT-17 (invalid target string)~~ RESOLVED this iteration (see RESOLVED subsection above).
 - **Source detection**: T-INST-05a, 08g..08m.
 - **Other install**: T-INST-56f..56i, 60t/60u, 63f/63g, 64e, 70e, 76b, 79a, 80c2, 80f2, 83b, 92a..92c, 97a2, 97c.
 - **Subcommands**: ~~T-SUB-14l, 19a, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 29a, 29b, 29c, 29d~~ RESOLVED this iteration (env / output subcommand grammar + scope edges; see P0/P1 RESOLVED subsection above).
 
 ## P3 — Test-suite gap inventory (unauthored TEST-SPEC IDs as of this iteration)
 
-After this iteration, **~403 TEST-SPEC test IDs remain unauthored** in the test suite (417 prior minus the 14 T-DISC-40j..40w IDs landed here, counted as 14 unique IDs from a TEST-SPEC point of view). The gap is concentrated in:
+After this iteration, **~402 TEST-SPEC test IDs remain unauthored** in the test suite (403 prior minus the 1 T-EXIT-17 ID landed here, counted as 1 unique ID from a TEST-SPEC point of view). The gap is concentrated in:
 - T-INST-* (~141): mostly auto-install / SPEC §10.10 follow-on edges (T-INST-112a2..a5, 112g..o, 113a..n, 114b..d, 115a..d, 116*, 120e) and install-source symlink validation (T-INST-55f..55zj). Foundational subset already RESOLVED in earlier iterations; -y Replacement Freshness T-INST-120/120a/120b/120c/120d RESOLVED this iteration (only 120e remains in that subsection).
 - T-API-* (~71): the bulk are AbortSignal × process-group / SIGKILL-escalation tests on the programmatic API surface (T-API-10d/10e/10f/10g/10h variants — both `run()` and `runPromise()` axes), plus parameterized variants of T-API-21*, 24*, and the broader option-snapshot validation matrix (T-API-61i..61t5).
 - T-VER-* (~44): runtime workflow `package.json` failure-mode edges and install-time version checking sub-paths.
@@ -1714,7 +1728,7 @@ After this iteration, **~403 TEST-SPEC test IDs remain unauthored** in the test 
 - T-CLI-* (~10): minor remaining CLI grammar edges.
 - T-TERM-* (~5): terminal-outcome precedence sub-paths.
 - T-TYPE-* (~1): T-TYPE-08 (compile-time output/input type-surface check).
-- T-EXIT-* (~1): T-EXIT-17 (invalid target string exit code 1).
+- ~~T-EXIT-* (~1): T-EXIT-17 (invalid target string exit code 1)~~ RESOLVED this iteration (see RESOLVED subsection above).
 
 Excluded from this count: 15 known carve-outs (T-API-10i, T-API-10j, T-DISC-49-block-char-device, T-INST-79a / 112-block-char-device / 113-package-json-block-char-device / 116o-other-categories, T-PWD-05, T-SIG-26 / 29 / 30b, T-TMP-43 / 44 / 45, T-VER-28-block-char-device — explicit Known-Gap or Non-Normative entries in TEST-SPEC.md).
 
