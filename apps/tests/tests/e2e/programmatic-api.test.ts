@@ -13124,6 +13124,86 @@ console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message }
     });
 
     // ------------------------------------------------------------------------
+    // T-API-62f2 (observational, NOT a direct conformance pin):
+    // Proxy `getOwnPropertyDescriptor` trap behavior while enumerating
+    // options.env. SPEC §9.5 explicitly leaves the enumerability-
+    // determination strategy implementation-defined ("The strategy used
+    // to determine enumerability may invoke descriptor-related proxy
+    // traps and remains otherwise implementation-defined"), so it does
+    // NOT pin a single conforming outcome for a throwing descriptor trap.
+    // The test passes if EXACTLY ONE of:
+    //   (a) generator threw on first next() with the captured trap
+    //       exception (descriptor trap was invoked and snapshot path
+    //       captured the throw); OR
+    //   (b) snapshot completed without surfacing the trap throw and the
+    //       run reached the spawn step normally (descriptor trap was
+    //       not invoked during enumeration).
+    // The test FAILS on any third outcome (synchronous throw at call
+    // site, error message mismatch, or run produced corrupted env + a
+    // misleading spawn failure).
+    // ------------------------------------------------------------------------
+    it("T-API-62f2: run() — Proxy getOwnPropertyDescriptor trap (observational, two valid outcomes)", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "spawn-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const env = new Proxy({ A: "a" }, {
+  getOwnPropertyDescriptor() { throw new Error("descriptor-trap-boom"); },
+});
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", { env });
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let threw = false, message = "", reachedNext = false;
+if (!synchronousThrew) {
+  try {
+    await gen.next();
+    reachedNext = true;
+  } catch (e) {
+    threw = true;
+    message = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message, reachedNext }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+
+      // SPEC §9.1: run() never throws synchronously at the call site.
+      expect(parsed.synchronousThrew).toBe(false);
+
+      const markerExists = existsSync(marker);
+
+      // Exactly one of the two implementation-defined outcomes.
+      if (parsed.threw) {
+        // Outcome (a): descriptor trap invoked, throw captured and
+        // surfaced as an option-snapshot error on first next().
+        expect(parsed.message).toContain("descriptor-trap-boom");
+        // No child spawned: no marker, no spawn-failure leakage.
+        expect(markerExists).toBe(false);
+      } else {
+        // Outcome (b): descriptor trap not invoked; run reached the
+        // spawn step normally — script ran, marker exists.
+        expect(parsed.reachedNext).toBe(true);
+        expect(markerExists).toBe(true);
+      }
+    });
+
+    // ------------------------------------------------------------------------
     // T-API-62f3: Throwing Proxy `get` trap on an INCLUDED options.env key
     // — SPEC §9.5 normatively requires `[[Get]]` semantics for value reads,
     // so a throwing get trap is captured during the per-key value-read pass

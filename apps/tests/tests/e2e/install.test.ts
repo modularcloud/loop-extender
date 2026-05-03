@@ -864,6 +864,148 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(readdirSync(project.loopxDir).length).toBe(0);
       });
 
+      // ──────────────────────────────────────────────────────────
+      // T-INST-42m / T-INST-42n: Install-time treatment of
+      // unsupported `.mjs` / `.cjs` extensions. SPEC §10.4 install-
+      // time validation reuses SPEC §5.1 / §5.2 (discovered scripts
+      // only); `.mjs` / `.cjs` are not in the supported-extension
+      // set, so they are not discovered as scripts, not validated
+      // against the name pattern, and not subject to same-base-name
+      // collision detection. They are copied byte-for-byte as
+      // workflow content. See TEST-SPEC §3 (install) and §2
+      // (discovery) for the runtime-side counterparts (T-DISC-07a
+      // through T-DISC-07c, T-DISC-24a / T-DISC-24b).
+      // ──────────────────────────────────────────────────────────
+
+      it("T-INST-42m: install copies .mjs/.cjs as non-script workflow content alongside scripts", async () => {
+        project = await createTempProject();
+        const helperMjsContent = 'export const helper = "from-mjs";\n';
+        const toolCjsContent = 'module.exports = { tool: "from-cjs" };\n';
+        const tarball = await makeTarball({
+          "index.sh": BASH_STOP,
+          "helper.mjs": helperMjsContent,
+          "tool.cjs": toolCjsContent,
+        });
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/my-agent.tar.gz", tarball),
+        ]);
+        const installResult = await runCLI(
+          ["install", `${httpServer.url}/my-agent.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+
+        // (a) install succeeds
+        expect(installResult.exitCode).toBe(0);
+
+        const wfDir = join(project.loopxDir, "my-agent");
+
+        // (b) all three files preserved byte-for-byte
+        expect(existsSync(join(wfDir, "index.sh"))).toBe(true);
+        expect(existsSync(join(wfDir, "helper.mjs"))).toBe(true);
+        expect(existsSync(join(wfDir, "tool.cjs"))).toBe(true);
+        expect(readFileSync(join(wfDir, "helper.mjs"), "utf-8")).toBe(
+          helperMjsContent,
+        );
+        expect(readFileSync(join(wfDir, "tool.cjs"), "utf-8")).toBe(
+          toolCjsContent,
+        );
+
+        // (c) no validation warning about .mjs/.cjs extensions
+        expect(hasWarningCategoryFor(installResult.stderr, "helper.mjs")).toBe(
+          false,
+        );
+        expect(hasWarningCategoryFor(installResult.stderr, "tool.cjs")).toBe(
+          false,
+        );
+        expect(installResult.stderr).not.toMatch(
+          /helper\.mjs.*(unsupported|invalid|extension)/i,
+        );
+        expect(installResult.stderr).not.toMatch(
+          /tool\.cjs.*(unsupported|invalid|extension)/i,
+        );
+
+        // (d-i) `loopx run -n 1 my-agent` runs the index script
+        const runIndex = await runCLI(["run", "-n", "1", "my-agent"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(runIndex.exitCode).toBe(0);
+
+        // (d-ii) helper / tool are not discovered as scripts
+        const runHelper = await runCLI(
+          ["run", "-n", "1", "my-agent:helper"],
+          { cwd: project.dir, runtime },
+        );
+        expect(runHelper.exitCode).toBe(1);
+        expect(runHelper.stderr).toMatch(/(not.*found|missing|unknown)/i);
+
+        const runTool = await runCLI(
+          ["run", "-n", "1", "my-agent:tool"],
+          { cwd: project.dir, runtime },
+        );
+        expect(runTool.exitCode).toBe(1);
+        expect(runTool.stderr).toMatch(/(not.*found|missing|unknown)/i);
+      });
+
+      it("T-INST-42n: install does not flag same-base-name collision between .ts and unsupported .mjs/.cjs siblings", async () => {
+        project = await createTempProject();
+        // check.ts: writes a marker file then emits {stop:true}.
+        // process.cwd() is LOOPX_PROJECT_ROOT per SPEC §6.1.
+        const checkTsContent =
+          'import { writeFileSync } from "node:fs";\n' +
+          'writeFileSync("check-marker.txt", "ran");\n' +
+          "process.stdout.write('{\"stop\":true}');\n";
+        const checkMjsContent = 'export const check = "mjs-version";\n';
+        const checkCjsContent = 'module.exports = { check: "cjs-version" };\n';
+        const tarball = await makeTarball({
+          "check.ts": checkTsContent,
+          "check.mjs": checkMjsContent,
+          "check.cjs": checkCjsContent,
+        });
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/my-agent.tar.gz", tarball),
+        ]);
+        const installResult = await runCLI(
+          ["install", `${httpServer.url}/my-agent.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+
+        // (a) install succeeds — no collision rejection
+        expect(installResult.exitCode).toBe(0);
+
+        const wfDir = join(project.loopxDir, "my-agent");
+
+        // (b) all three files preserved byte-for-byte
+        expect(existsSync(join(wfDir, "check.ts"))).toBe(true);
+        expect(existsSync(join(wfDir, "check.mjs"))).toBe(true);
+        expect(existsSync(join(wfDir, "check.cjs"))).toBe(true);
+        expect(readFileSync(join(wfDir, "check.ts"), "utf-8")).toBe(
+          checkTsContent,
+        );
+        expect(readFileSync(join(wfDir, "check.mjs"), "utf-8")).toBe(
+          checkMjsContent,
+        );
+        expect(readFileSync(join(wfDir, "check.cjs"), "utf-8")).toBe(
+          checkCjsContent,
+        );
+
+        // (c) no collision warning or error referencing the .mjs/.cjs files
+        expect(installResult.stderr).not.toMatch(
+          /collision|conflict|same.*base|multiple.*files/i,
+        );
+
+        // (d) `loopx run -n 1 my-agent:check` runs check.ts unambiguously
+        const runCheck = await runCLI(
+          ["run", "-n", "1", "my-agent:check"],
+          { cwd: project.dir, runtime },
+        );
+        expect(runCheck.exitCode).toBe(0);
+        expect(existsSync(join(project.dir, "check-marker.txt"))).toBe(true);
+        expect(
+          readFileSync(join(project.dir, "check-marker.txt"), "utf-8"),
+        ).toBe("ran");
+      });
+
       it("T-INST-43: -w a -w b <source> → usage error", async () => {
         project = await createTempProject();
         const result = await runCLI(
