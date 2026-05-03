@@ -4887,6 +4887,186 @@ console.log(JSON.stringify({ count }));
         expect(readFileSync(join(markerDir, `${key}.txt`), "utf-8")).toBe(expected);
       }
     });
+
+    // ------------------------------------------------------------------------
+    // T-API-50f: Concurrent runPromise() calls receive isolated RunOptions.env
+    // values. Pins ADR-0004's core motivation: per-run env values reach scripts
+    // without racy global process.env mutation. Two distinct workflows in the
+    // same project (alpha, beta), each observing MYVAR into a caller-supplied
+    // marker, each waiting on a caller-supplied release file before emitting
+    // stop:true. The release-file barrier guarantees the two scripts overlap
+    // on the RunOptions.env snapshot / spawn boundary — when one script blocks
+    // waiting for its release file, the other is already past runPromise()-call
+    // and has spawned. A buggy implementation that mutated process.env to
+    // apply per-run values would observably leak across concurrent runs.
+    // SPEC §9.5 / §9.2 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-50f: concurrent runPromise() calls receive isolated RunOptions.env values", async () => {
+      project = await createTempProject();
+      const alphaMarker = join(project.dir, "alpha-marker.txt");
+      const betaMarker = join(project.dir, "beta-marker.txt");
+      const releaseAlpha = join(project.dir, "release-alpha");
+      const releaseBeta = join(project.dir, "release-beta");
+
+      await createBashWorkflowScript(
+        project,
+        "alpha",
+        "index",
+        `printf '%s' "$MYVAR" > "$ALPHA_MARKER"
+while [ ! -f "$ALPHA_RELEASE" ]; do sleep 0.05; done
+printf '{"stop":true}'`,
+      );
+      await createBashWorkflowScript(
+        project,
+        "beta",
+        "index",
+        `printf '%s' "$MYVAR" > "$BETA_MARKER"
+while [ ! -f "$BETA_RELEASE" ]; do sleep 0.05; done
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, writeFileSync } from "node:fs";
+const cwd = ${JSON.stringify(project.dir)};
+const releaseAlpha = ${JSON.stringify(releaseAlpha)};
+const releaseBeta = ${JSON.stringify(releaseBeta)};
+const alphaMarker = ${JSON.stringify(alphaMarker)};
+const betaMarker = ${JSON.stringify(betaMarker)};
+const pAlpha = runPromise("alpha", {
+  cwd,
+  maxIterations: 1,
+  env: { MYVAR: "alpha-value", ALPHA_MARKER: alphaMarker, ALPHA_RELEASE: releaseAlpha },
+});
+const pBeta = runPromise("beta", {
+  cwd,
+  maxIterations: 1,
+  env: { MYVAR: "beta-value", BETA_MARKER: betaMarker, BETA_RELEASE: releaseBeta },
+});
+// Wait for both markers — proves both scripts have spawned and observed
+// MYVAR before either completes. The two runs genuinely overlap.
+const deadline = Date.now() + 20000;
+while (Date.now() < deadline) {
+  if (existsSync(alphaMarker) && existsSync(betaMarker)) break;
+  await new Promise((r) => setTimeout(r, 50));
+}
+writeFileSync(releaseAlpha, "");
+writeFileSync(releaseBeta, "");
+const [outA, outB] = await Promise.all([pAlpha, pBeta]);
+console.log(JSON.stringify({ alphaCount: outA.length, betaCount: outB.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, { timeout: 25_000 });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.alphaCount).toBe(1);
+      expect(data.betaCount).toBe(1);
+      // (a) alpha saw only its own value.
+      expect(readFileSync(alphaMarker, "utf-8")).toBe("alpha-value");
+      // (b) beta saw only its own value.
+      expect(readFileSync(betaMarker, "utf-8")).toBe("beta-value");
+      // (c) no cross-contamination either way.
+      expect(readFileSync(alphaMarker, "utf-8")).not.toBe("beta-value");
+      expect(readFileSync(betaMarker, "utf-8")).not.toBe("alpha-value");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50g: Concurrent run() generator calls receive isolated
+    // RunOptions.env values. Generator-surface counterpart to T-API-50f.
+    // SPEC §9.1 lazy-process.env-snapshot timing differs from §9.2 eager-
+    // snapshot; an implementation that wired RunOptions.env correctly on the
+    // eager runPromise() path while losing isolation on the lazy run() path —
+    // for example, by re-reading shared mutable state at first next() rather
+    // than from a captured snapshot — would pass T-API-50f and fail this test.
+    // Same fixture; both next() calls are issued WITHOUT awaiting so both
+    // generators advance past their RunOptions.env snapshot and into their
+    // first child spawn before either fixture script can yield (both block
+    // on the release file). SPEC §9.5 / §9.1 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-50g: concurrent run() generator calls receive isolated RunOptions.env values", async () => {
+      project = await createTempProject();
+      const alphaMarker = join(project.dir, "alpha-marker.txt");
+      const betaMarker = join(project.dir, "beta-marker.txt");
+      const releaseAlpha = join(project.dir, "release-alpha");
+      const releaseBeta = join(project.dir, "release-beta");
+
+      await createBashWorkflowScript(
+        project,
+        "alpha",
+        "index",
+        `printf '%s' "$MYVAR" > "$ALPHA_MARKER"
+while [ ! -f "$ALPHA_RELEASE" ]; do sleep 0.05; done
+printf '{"stop":true}'`,
+      );
+      await createBashWorkflowScript(
+        project,
+        "beta",
+        "index",
+        `printf '%s' "$MYVAR" > "$BETA_MARKER"
+while [ ! -f "$BETA_RELEASE" ]; do sleep 0.05; done
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, writeFileSync } from "node:fs";
+const cwd = ${JSON.stringify(project.dir)};
+const releaseAlpha = ${JSON.stringify(releaseAlpha)};
+const releaseBeta = ${JSON.stringify(releaseBeta)};
+const alphaMarker = ${JSON.stringify(alphaMarker)};
+const betaMarker = ${JSON.stringify(betaMarker)};
+const ga = run("alpha", {
+  cwd,
+  maxIterations: 1,
+  env: { MYVAR: "alpha-value", ALPHA_MARKER: alphaMarker, ALPHA_RELEASE: releaseAlpha },
+});
+const gb = run("beta", {
+  cwd,
+  maxIterations: 1,
+  env: { MYVAR: "beta-value", BETA_MARKER: betaMarker, BETA_RELEASE: releaseBeta },
+});
+// Drive both generators to their first yield concurrently. Awaiting
+// Promise.all([ga.next(), gb.next()]) directly would deadlock — both fixtures
+// block at the release-file barrier before yielding the first Output.
+// Issuing the next() promises without immediately awaiting lets the harness
+// advance both generators past their first spawn while retaining control.
+const aNextP = ga.next();
+const bNextP = gb.next();
+const deadline = Date.now() + 20000;
+while (Date.now() < deadline) {
+  if (existsSync(alphaMarker) && existsSync(betaMarker)) break;
+  await new Promise((r) => setTimeout(r, 50));
+}
+writeFileSync(releaseAlpha, "");
+writeFileSync(releaseBeta, "");
+const [aFirst, bFirst] = await Promise.all([aNextP, bNextP]);
+// Drain to settlement.
+let aCount = aFirst.done ? 0 : 1;
+let bCount = bFirst.done ? 0 : 1;
+while (true) {
+  const r = await ga.next();
+  if (r.done) break;
+  aCount++;
+}
+while (true) {
+  const r = await gb.next();
+  if (r.done) break;
+  bCount++;
+}
+console.log(JSON.stringify({ alphaCount: aCount, betaCount: bCount }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, { timeout: 25_000 });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.alphaCount).toBe(1);
+      expect(data.betaCount).toBe(1);
+      // (a) alpha saw only its own value.
+      expect(readFileSync(alphaMarker, "utf-8")).toBe("alpha-value");
+      // (b) beta saw only its own value.
+      expect(readFileSync(betaMarker, "utf-8")).toBe("beta-value");
+      // (c) no cross-contamination either way.
+      expect(readFileSync(alphaMarker, "utf-8")).not.toBe("beta-value");
+      expect(readFileSync(betaMarker, "utf-8")).not.toBe("alpha-value");
+    });
   });
 });
 
