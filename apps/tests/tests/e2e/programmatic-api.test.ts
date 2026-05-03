@@ -15636,6 +15636,188 @@ console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message, 
     });
 
     // ------------------------------------------------------------------------
+    // T-API-65x: runPromise() — pre-aborted signal does not compete with the
+    // workflow-level version warning. ADR-0004 §1: "Version checking is not a
+    // failure mode per SPEC §3.2, so it does not compete." The version-mismatch
+    // warning sits OUTSIDE the SPEC §9.3 abort-precedence dispatch entirely
+    // — it is not displaced by an aborted signal because it is not a competing
+    // failure, but it also does not block abort from surfacing as the run's
+    // terminal outcome.
+    //
+    // T-API-08s / T-API-08t / T-API-14j establish that version warnings fire
+    // under normal runPromise() execution; T-API-65 / 65a / 65b / 65d / 65h /
+    // 65i / 65j / 65q / 65r / 65t / 65u / 65v / 65w establish that pre-aborted
+    // signals displace pre-iteration FAILURES. The combined intersection —
+    // pre-aborted signal PLUS unsatisfied workflow-level loopx semver range —
+    // is otherwise uncovered. A buggy implementation could (a) route version-
+    // warning emission through the abort-precedence pathway and incorrectly
+    // SUPPRESS the warning under abort (treating it as a competing failure
+    // that abort displaces), (b) treat the version-mismatch state as a fatal
+    // pre-iteration failure that abort precedence then displaces (still
+    // disrupting the surfaced outcome compared to a no-version-warning
+    // fixture), or (c) spawn a child or create a tmpdir on the version-check
+    // path before abort precedence is observed.
+    //
+    // Per TEST-SPEC, the test deliberately does NOT assert whether the
+    // version-mismatch warning appears on stderr — SPEC does not pin the
+    // relative ordering between abort precedence and version-warning emission,
+    // and the ADR-0004 wording places version checking outside the abort-
+    // precedence dispatch entirely; an implementation that emits the warning,
+    // suppresses it, or partially writes it before abort surfaces is all
+    // conforming under the current SPEC. SPEC §9.2, §9.3, §9.5, §3.2.
+    // ------------------------------------------------------------------------
+    it("T-API-65x: runPromise() pre-aborted signal does not compete with workflow-level version warning", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65x");
+      const marker = join(project.dir, "child-ran.txt");
+      // Valid script that would emit `{"result":"ok"}` if it ran.
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"result":"ok"}'`,
+      );
+      // Workflow-level package.json with an unsatisfied loopx semver range
+      // — same fixture pattern as T-VER-02 / T-API-08s.
+      await createWorkflowPackageJson(project, "ralph", {
+        name: "ralph",
+        version: "1.0.0",
+        dependencies: { loopx: UNSATISFIED_RANGE },
+      });
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "", looksLikeAbort = false, captured = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+  // If the run somehow resolved (buggy impl: version warning suppressed
+  // abort and let the run complete), capture the outputs so the test fails
+  // loudly on assertion (b) — no child should have spawned.
+  captured = JSON.stringify(outputs);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+  looksLikeAbort = (name === "AbortError") || /\\babort(ed)?\\b/i.test(message);
+}
+console.log(JSON.stringify({ rejected, message, name, looksLikeAbort, captured }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with the abort error class — matching T-API-65 /
+      //     T-API-64d. The rejection MUST be the abort error; an
+      //     implementation that surfaced the version-mismatch state as a
+      //     fatal failure would either resolve normally (failing here) or
+      //     reject with a non-abort error (also failing here).
+      expect(parsed.rejected).toBe(true);
+      expect(parsed.looksLikeAbort).toBe(true);
+      // (b) No child was spawned: no marker file written, no `result: "ok"`
+      //     output captured anywhere (stdout from the driver or the run).
+      expect(existsSync(marker)).toBe(false);
+      expect(parsed.captured).toBe("");
+      expect(result.stdout).not.toMatch(/result.*ok/);
+      // (c) No loopx-* tmpdir was created under the isolated parent — the
+      //     version-check path must not have created LOOPX_TMPDIR before
+      //     abort precedence was observed.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      // Per TEST-SPEC: deliberately NOT asserting on stderr version-warning
+      // emission. SPEC does not pin that ordering; the ADR-0004 wording
+      // places version checking outside the abort-precedence dispatch.
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65y: run() — pre-aborted signal does not compete with the
+    // workflow-level version warning. Generator-surface counterpart to
+    // T-API-65x. Same fixture: `.loopx/ralph/index.sh` (a valid script) +
+    // `.loopx/ralph/package.json` declaring an unsatisfied loopx semver range.
+    //
+    // Together with T-API-65x, this closes the abort-precedence × version-
+    // warning intersection across both API surfaces, complementing T-API-08s
+    // / T-API-08t (normal-execution version warnings) and the broader
+    // T-API-65 series (abort-precedence over true pre-iteration FAILURES).
+    // The SPEC-quoted disclaimer in the rationale ("Version checking is not
+    // a failure mode") makes the bug class precise: any implementation that
+    // surfaced the version-mismatch state to displace abort, that suppressed
+    // abort to emit the warning, or that performed a child spawn / tmpdir
+    // creation step on the version-check path before abort precedence is
+    // observed would fail at least one of (a)–(c).
+    //
+    // As in T-API-65x, the test deliberately does NOT assert on the stderr
+    // version-warning emission. SPEC §9.1, §9.3, §9.5, §3.2.
+    // ------------------------------------------------------------------------
+    it("T-API-65y: run() pre-aborted signal does not compete with workflow-level version warning", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65y");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"result":"ok"}'`,
+      );
+      await createWorkflowPackageJson(project, "ralph", {
+        name: "ralph",
+        version: "1.0.0",
+        dependencies: { loopx: UNSATISFIED_RANGE },
+      });
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "", looksLikeAbort = false, firstYield = "";
+try {
+  const r = await gen.next();
+  // If the first next() resolved (buggy impl: version warning suppressed
+  // abort and produced a yield), capture the yielded value so the test
+  // fails loudly on assertion (b) — no child should have spawned.
+  firstYield = JSON.stringify(r);
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+  looksLikeAbort = (name === "AbortError") || /\\babort(ed)?\\b/i.test(message);
+}
+console.log(JSON.stringify({ threw, message, name, looksLikeAbort, firstYield }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() threw the abort error class.
+      expect(parsed.threw).toBe(true);
+      expect(parsed.looksLikeAbort).toBe(true);
+      // (b) No child was spawned.
+      expect(existsSync(marker)).toBe(false);
+      expect(parsed.firstYield).toBe("");
+      expect(result.stdout).not.toMatch(/result.*ok/);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      // Per TEST-SPEC: deliberately NOT asserting on stderr version-warning.
+    });
+
+    // ------------------------------------------------------------------------
     // T-API-65u / 65u2 / 65u3: Reentrant or already-aborted DUCK signal beats
     // a separately-configured later pre-iteration failure on the same call.
     // SPEC §9.3, §9.5, §9.1, §9.2.
