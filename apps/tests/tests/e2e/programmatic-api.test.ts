@@ -16046,3 +16046,564 @@ console.log(JSON.stringify({ threw, message, name, looksLikeAbort }));
     }
   });
 });
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — Pinned Pre-Iteration Priority (TEST-SPEC §4.9 → "Pinned Priority")
+//
+// SPEC §9.3 names two pinned-priority option-snapshot fields whose
+// validation must surface BEFORE the four project-root-dependent failures:
+//   • options.cwd  (non-string type or throwing getter)
+//   • options.envFile  (non-string type or throwing getter)
+//
+// The four downstream failures, per SPEC §9.3 / §7.1:
+//   (a) `.loopx/` discovery error
+//   (b) env-file loading error
+//   (c) target-resolution error
+//   (d) tmpdir-creation error
+//
+// T-API-65 series pinned ABORT precedence over these failures; T-API-67*
+// pins the cwd/envFile validation precedence over the same set. Each test
+// parameterizes over the four downstream-failure variants — the variant
+// configures a fixture under which the named downstream failure WOULD fire
+// in a buggy implementation that bypassed pinned cwd/envFile validation.
+// ═════════════════════════════════════════════════════════════
+
+describe("SPEC: Pinned Pre-Iteration Priority", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    if (project) {
+      restorePerms(project.dir);
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    for (const cleanup of cleanups.splice(0)) {
+      await cleanup().catch(() => {});
+    }
+  });
+
+  // Creates a writable test-isolated TMPDIR parent under the system tmpdir.
+  async function makeIsolatedTmpdirParent(label: string): Promise<string> {
+    const dir = await mkdtemp(join(osTmpdir(), `loopx-test-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  // List `loopx-*` entries directly under `parent`, filtering implementation-
+  // internal helpers (per AGENT.md / SPEC §7.4).
+  function listLoopxEntries(parent: string): string[] {
+    try {
+      return readdirSync(parent)
+        .filter((e) => e.startsWith("loopx-"))
+        .filter(
+          (e) =>
+            !e.startsWith("loopx-nodepath-shim-") &&
+            !e.startsWith("loopx-bun-jsx-") &&
+            !e.startsWith("loopx-install-") &&
+            !e.startsWith("loopx-test-"),
+        );
+    } catch {
+      return [];
+    }
+  }
+
+  interface VariantContext {
+    /** Workflow target to pass to run/runPromise. */
+    target: string;
+    /** Extra env variables to inject into the driver process. */
+    extraEnv: Record<string, string>;
+    /** Path to scan for new loopx-* entries (the configured TMPDIR). */
+    tmpdirCheckParent: string;
+    /** Path to the marker file the workflow script (if any) writes. */
+    marker: string;
+    /** Negative-assertion pattern: error message must NOT match this. */
+    negativePattern: RegExp;
+  }
+
+  interface VariantSpec {
+    id: string;
+    label: string;
+    /** Skip under root (mode-000 / mode-0o500 setups don't block uid 0). */
+    skipUnderRoot: boolean;
+    setup: () => Promise<VariantContext>;
+  }
+
+  // Build the four variant specs. Each variant configures a fixture under
+  // which the named downstream failure WOULD fire in a buggy implementation
+  // that bypassed pinned cwd/envFile validation.
+  function makeVariants(testLabel: string): VariantSpec[] {
+    return [
+      {
+        // Variant (a): project lacks `.loopx/`. With a valid cwd pointing at
+        // project.dir, discovery would fail with no-`.loopx/` error.
+        id: "a",
+        label: "discovery",
+        skipUnderRoot: false,
+        setup: async () => {
+          project = await createTempProject({ withLoopxDir: false });
+          const tmpdirParent = await makeIsolatedTmpdirParent(`${testLabel}-a`);
+          const marker = join(project.dir, "child-ran.txt");
+          return {
+            target: "ralph",
+            extraEnv: { TMPDIR: tmpdirParent },
+            tmpdirCheckParent: tmpdirParent,
+            marker,
+            negativePattern: /\.loopx|discover|no.*such.*directory|ENOENT/i,
+          };
+        },
+      },
+      {
+        // Variant (b): project has `.loopx/ralph` and a mode-000 global env
+        // file at $XDG_CONFIG_HOME/loopx/env. Env-file loading would fail
+        // with EACCES. Skipped under root (mode-000 doesn't block uid 0).
+        // Mirrors T-API-65r-promise / T-API-65r-generator setup.
+        id: "b",
+        label: "env-file loading",
+        skipUnderRoot: true,
+        setup: async () => {
+          project = await createTempProject();
+          await createBashWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            `printf '{"stop":true}'`,
+          );
+          const tmpdirParent = await makeIsolatedTmpdirParent(`${testLabel}-b`);
+          const xdg = join(project.dir, "xdg-config");
+          await mkdir(join(xdg, "loopx"), { recursive: true });
+          const globalEnv = join(xdg, "loopx", "env");
+          await writeFile(globalEnv, "FOO=bar\n", "utf-8");
+          await chmod(globalEnv, 0o000);
+          cleanups.push(async () => {
+            await chmod(globalEnv, 0o644).catch(() => {});
+          });
+          const marker = join(project.dir, "child-ran.txt");
+          return {
+            target: "ralph",
+            extraEnv: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdg },
+            tmpdirCheckParent: tmpdirParent,
+            marker,
+            negativePattern: /xdg|global.*env|loopx\/env|EACCES|permission/i,
+          };
+        },
+      },
+      {
+        // Variant (c): project has `.loopx/other/index.sh` but no `ralph`
+        // workflow. Target `ralph` would fail with missing-workflow error.
+        // Mirrors T-API-65h pattern.
+        id: "c",
+        label: "target-resolution",
+        skipUnderRoot: false,
+        setup: async () => {
+          project = await createTempProject();
+          await createBashWorkflowScript(
+            project,
+            "other",
+            "index",
+            `printf '{"stop":true}'`,
+          );
+          const tmpdirParent = await makeIsolatedTmpdirParent(`${testLabel}-c`);
+          const marker = join(project.dir, "child-ran.txt");
+          return {
+            target: "ralph",
+            extraEnv: { TMPDIR: tmpdirParent },
+            tmpdirCheckParent: tmpdirParent,
+            marker,
+            negativePattern:
+              /workflow.*not.*found|not.*found.*workflow|workflow.*'ralph'|'ralph'.*not.*found/i,
+          };
+        },
+      },
+      {
+        // Variant (d): project has `.loopx/ralph/index.sh`; TMPDIR is
+        // mode-0o500 (read+execute only — `mkdtemp` blocked). Skipped under
+        // root. Mirrors T-API-65d / T-API-65n setup.
+        id: "d",
+        label: "tmpdir-creation",
+        skipUnderRoot: true,
+        setup: async () => {
+          project = await createTempProject();
+          await createBashWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            `printf '{"stop":true}'`,
+          );
+          const unwritableParent = await mkdtemp(
+            join(osTmpdir(), `loopx-test-${testLabel}-d-unwritable-`),
+          );
+          cleanups.push(async () => {
+            await chmod(unwritableParent, 0o700).catch(() => {});
+            await rm(unwritableParent, { recursive: true, force: true }).catch(
+              () => {},
+            );
+          });
+          await chmod(unwritableParent, 0o500);
+          const marker = join(project.dir, "child-ran.txt");
+          return {
+            target: "ralph",
+            extraEnv: { TMPDIR: unwritableParent },
+            tmpdirCheckParent: unwritableParent,
+            marker,
+            negativePattern: /EACCES|mkdtemp|tmpdir.*creat/i,
+          };
+        },
+      },
+    ];
+  }
+
+  // Positive-assertion patterns — the captured error must match one of these
+  // to confirm the cwd/envFile snapshot-error surfaced as the failure.
+  const POSITIVE_CWD_INVALID = /RunOptions\.cwd|cwd must|cwd.*string/i;
+  const POSITIVE_CWD_GETTER = /cwd-getter-boom/i;
+  const POSITIVE_ENVFILE_INVALID =
+    /RunOptions\.envFile|envFile must|envFile.*string/i;
+  const POSITIVE_ENVFILE_GETTER = /envFile-getter-boom/i;
+
+  forEachRuntime((runtime) => {
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67: run() — invalid options.cwd (non-string) surfaces before
+    //                   each of the four project-root-dependent failures.
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67 (${variant.id}): run() invalid options.cwd surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { run } from "loopx";
+const opts: any = { cwd: 42 as any, maxIterations: 1 };
+const gen = run(${JSON.stringify(ctx.target)}, opts);
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          // (a) First next() throws the cwd-validation error.
+          expect(parsed.threw).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_CWD_INVALID);
+          // The downstream failure pattern must NOT appear.
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          // (b) No workflow script ran.
+          expect(existsSync(ctx.marker)).toBe(false);
+          // (c) No loopx-* tmpdir was created under the configured TMPDIR.
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67a: run() — throwing options.cwd getter surfaces before each
+    //                    of the four project-root-dependent failures.
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67a")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67a (${variant.id}): run() throwing options.cwd getter surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { run } from "loopx";
+const opts: any = { maxIterations: 1 };
+Object.defineProperty(opts, "cwd", { enumerable: true, get() { throw new Error("cwd-getter-boom"); } });
+const gen = run(${JSON.stringify(ctx.target)}, opts);
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.threw).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_CWD_GETTER);
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          expect(existsSync(ctx.marker)).toBe(false);
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67b: run() — invalid options.envFile (non-string) surfaces
+    //                    before each of the four project-root-dependent
+    //                    failures. Variant (b) "env-file loading" is
+    //                    exercised via an INDEPENDENT global env file
+    //                    (mode-000 $XDG_CONFIG_HOME/loopx/env), so the
+    //                    snapshot-validation pinning is observable against
+    //                    a real env-file-load failure (not just the invalid
+    //                    envFile path's own deferred load).
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67b")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67b (${variant.id}): run() invalid options.envFile surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { run } from "loopx";
+const opts: any = { cwd: ${JSON.stringify(project!.dir)}, envFile: 42 as any, maxIterations: 1 };
+const gen = run(${JSON.stringify(ctx.target)}, opts);
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.threw).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_ENVFILE_INVALID);
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          expect(existsSync(ctx.marker)).toBe(false);
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67c: run() — throwing options.envFile getter surfaces before
+    //                    each of the four project-root-dependent failures.
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67c")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67c (${variant.id}): run() throwing options.envFile getter surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { run } from "loopx";
+const opts: any = { cwd: ${JSON.stringify(project!.dir)}, maxIterations: 1 };
+Object.defineProperty(opts, "envFile", { enumerable: true, get() { throw new Error("envFile-getter-boom"); } });
+const gen = run(${JSON.stringify(ctx.target)}, opts);
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.threw).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_ENVFILE_GETTER);
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          expect(existsSync(ctx.marker)).toBe(false);
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67d: runPromise() — invalid options.cwd (non-string) surfaces
+    //                            before each downstream failure. Promise-
+    //                            surface counterpart to T-API-67.
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67d")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67d (${variant.id}): runPromise() invalid options.cwd surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { runPromise } from "loopx";
+const opts: any = { cwd: 42 as any, maxIterations: 1 };
+let rejected = false, message = "", name = "";
+try {
+  await runPromise(${JSON.stringify(ctx.target)}, opts);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.rejected).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_CWD_INVALID);
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          expect(existsSync(ctx.marker)).toBe(false);
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67e: runPromise() — throwing options.cwd getter surfaces before
+    //                            each downstream failure. Promise-surface
+    //                            counterpart to T-API-67a.
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67e")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67e (${variant.id}): runPromise() throwing options.cwd getter surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { runPromise } from "loopx";
+const opts: any = { maxIterations: 1 };
+Object.defineProperty(opts, "cwd", { enumerable: true, get() { throw new Error("cwd-getter-boom"); } });
+let rejected = false, message = "", name = "";
+try {
+  await runPromise(${JSON.stringify(ctx.target)}, opts);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.rejected).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_CWD_GETTER);
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          expect(existsSync(ctx.marker)).toBe(false);
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67f: runPromise() — invalid options.envFile (non-string)
+    //                            surfaces before each downstream failure.
+    //                            Promise-surface counterpart to T-API-67b.
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67f")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67f (${variant.id}): runPromise() invalid options.envFile surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { runPromise } from "loopx";
+const opts: any = { cwd: ${JSON.stringify(project!.dir)}, envFile: 42 as any, maxIterations: 1 };
+let rejected = false, message = "", name = "";
+try {
+  await runPromise(${JSON.stringify(ctx.target)}, opts);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.rejected).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_ENVFILE_INVALID);
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          expect(existsSync(ctx.marker)).toBe(false);
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67g: runPromise() — throwing options.envFile getter surfaces
+    //                            before each downstream failure. Promise-
+    //                            surface counterpart to T-API-67c.
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67g")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67g (${variant.id}): runPromise() throwing options.envFile getter surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { runPromise } from "loopx";
+const opts: any = { cwd: ${JSON.stringify(project!.dir)}, maxIterations: 1 };
+Object.defineProperty(opts, "envFile", { enumerable: true, get() { throw new Error("envFile-getter-boom"); } });
+let rejected = false, message = "", name = "";
+try {
+  await runPromise(${JSON.stringify(ctx.target)}, opts);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.rejected).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_ENVFILE_GETTER);
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          expect(existsSync(ctx.marker)).toBe(false);
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+  });
+});
