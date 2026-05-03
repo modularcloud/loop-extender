@@ -6716,6 +6716,380 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           },
         );
       });
+
+      // ─────────────────────────────────────────────────────────
+      // `-y` Replacement: Auto-install Freshness
+      // (T-INST-120 / 120a / 120b / 120c / 120d) — SPEC §10.10
+      // "Interaction with `-y`": "File-level replacement removes
+      // the existing workflow directory (including any previously
+      // installed `node_modules/` and any previously synthesized
+      // `.gitignore`) before the replacement is committed; the
+      // safeguard and `npm install` then run fresh against the
+      // replacement's `package.json` and `.gitignore` (or absence
+      // thereof)."
+      // ─────────────────────────────────────────────────────────
+
+      /**
+       * Pre-seed `.loopx/<workflowName>/` with a workflow-by-structure
+       * directory containing an `index.sh`, a `package.json`, a stale
+       * `node_modules/old-marker`, and a `.gitignore` whose content is
+       * exactly `node_modules\n` (matches loopx's synthesized form).
+       * This represents the on-disk state left over from a prior
+       * `loopx install` + auto-install pass; the `-y` replacement
+       * cluster verifies that the entire pre-seeded directory is
+       * removed before the replacement is committed.
+       */
+      async function preSeedReplacementTarget(
+        loopxDir: string,
+        workflowName: string,
+      ): Promise<void> {
+        const workflowDir = join(loopxDir, workflowName);
+        await mkdir(workflowDir, { recursive: true });
+        await writeFile(join(workflowDir, "index.sh"), BASH_STOP, "utf-8");
+        await chmod(join(workflowDir, "index.sh"), 0o755);
+        await writeFile(
+          join(workflowDir, "package.json"),
+          JSON.stringify({ name: workflowName, version: "0.0.1" }),
+          "utf-8",
+        );
+        await mkdir(join(workflowDir, "node_modules"), { recursive: true });
+        await writeFile(
+          join(workflowDir, "node_modules", "old-marker"),
+          "stale",
+          "utf-8",
+        );
+        await writeFile(
+          join(workflowDir, ".gitignore"),
+          "node_modules\n",
+          "utf-8",
+        );
+      }
+
+      it("T-INST-120: -y replacement removes old node_modules and synthesized .gitignore, then auto-install runs fresh", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        await preSeedReplacementTarget(project.loopxDir, "ralph");
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "ralph",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", "-y", `${gitServer!.url}/ralph.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+          // (a) exit 0
+          expect(result.exitCode).toBe(0);
+
+          // (b) old node_modules removed by `-y` file-level
+          //     replacement — the stale marker must not survive.
+          expect(
+            existsSync(
+              join(
+                project!.loopxDir,
+                "ralph",
+                "node_modules",
+                "old-marker",
+              ),
+            ),
+          ).toBe(false);
+
+          // (c) fresh .gitignore synthesized against the replacement
+          //     (which had no .gitignore). Trim allowance handles the
+          //     SPEC's "optionally with a single trailing newline"
+          //     implementation-defined permission.
+          const gitignorePath = join(
+            project!.loopxDir,
+            "ralph",
+            ".gitignore",
+          );
+          expect(existsSync(gitignorePath)).toBe(true);
+          expect(readFileSync(gitignorePath, "utf-8").trim()).toBe(
+            "node_modules",
+          );
+
+          // (d) fake-npm shim recorded exactly one invocation for
+          //     .loopx/ralph/ — auto-install ran fresh against the
+          //     replacement.
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(1);
+          expect(invocations[0].cwd).toBe(join(project!.loopxDir, "ralph"));
+          expect(invocations[0].argv).toEqual(["install"]);
+        });
+      });
+
+      it("T-INST-120a: -y replacement preserves a pre-existing .gitignore in the replacement source", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        await preSeedReplacementTarget(project.loopxDir, "ralph");
+        const replacementGitignore = "dist/\n# custom\n";
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "ralph",
+                version: "1.0.0",
+              }),
+              ".gitignore": replacementGitignore,
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", "-y", `${gitServer!.url}/ralph.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+          // (a) exit 0
+          expect(result.exitCode).toBe(0);
+
+          // (b) old node_modules removed — `-y` replacement deleted
+          //     the entire prior workflow directory before commit.
+          expect(
+            existsSync(
+              join(
+                project!.loopxDir,
+                "ralph",
+                "node_modules",
+                "old-marker",
+              ),
+            ),
+          ).toBe(false);
+
+          // (c) installed .gitignore is the replacement's pre-existing
+          //     content — the safeguard sees an existing regular file
+          //     and leaves it alone (T-INST-112a behavior applies fresh).
+          const gitignorePath = join(
+            project!.loopxDir,
+            "ralph",
+            ".gitignore",
+          );
+          expect(existsSync(gitignorePath)).toBe(true);
+          expect(readFileSync(gitignorePath, "utf-8")).toBe(
+            replacementGitignore,
+          );
+
+          // (d) fake-npm shim ran once for .loopx/ralph/.
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(1);
+          expect(invocations[0].cwd).toBe(join(project!.loopxDir, "ralph"));
+        });
+      });
+
+      it("T-INST-120b: auto-install still runs when -y overrides a workflow version mismatch", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        // No pre-existing .loopx/<name>/ — this is a fresh install
+        // whose preflight version-mismatch is suppressed by `-y`.
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "ralph",
+                version: "1.0.0",
+                dependencies: { loopx: unsatisfiedRange() },
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", "-y", `${gitServer!.url}/ralph.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+          // (a) exit 0 — `-y` suppressed the preflight version-mismatch
+          //     error per SPEC §10.6.
+          expect(result.exitCode).toBe(0);
+
+          // (b) workflow committed with index.sh + package.json. The
+          //     declared `loopx` range is preserved byte-for-byte from
+          //     the source — `-y` overrides preflight without rewriting
+          //     the manifest.
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", "index.sh")),
+          ).toBe(true);
+          const committedPkg = JSON.parse(
+            readFileSync(
+              join(project!.loopxDir, "ralph", "package.json"),
+              "utf-8",
+            ),
+          );
+          expect(committedPkg.dependencies.loopx).toBe(unsatisfiedRange());
+
+          // (c) auto-install ran exactly once for the committed
+          //     workflow — the load-bearing assertion: a buggy
+          //     implementation that gated auto-install on "preflight
+          //     reported no version mismatch" rather than on "the
+          //     commit succeeded for this workflow" would fail here.
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(1);
+          expect(invocations[0].cwd).toBe(join(project!.loopxDir, "ralph"));
+          expect(invocations[0].argv).toEqual(["install"]);
+
+          // (d) .gitignore safeguard synthesized.
+          const gitignorePath = join(
+            project!.loopxDir,
+            "ralph",
+            ".gitignore",
+          );
+          expect(existsSync(gitignorePath)).toBe(true);
+          expect(readFileSync(gitignorePath, "utf-8").trim()).toBe(
+            "node_modules",
+          );
+        });
+      });
+
+      it("T-INST-120c: -y replacement where replacement has no package.json removes old contents and skips auto-install entirely", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        await preSeedReplacementTarget(project.loopxDir, "ralph");
+        // Replacement source: index.sh only — no package.json,
+        // no .gitignore, no node_modules/.
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", "-y", `${gitServer!.url}/ralph.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+          // (a) exit 0
+          expect(result.exitCode).toBe(0);
+
+          // (b) old node_modules removed — file-level replacement
+          //     happened regardless of whether the replacement had a
+          //     package.json.
+          expect(
+            existsSync(
+              join(
+                project!.loopxDir,
+                "ralph",
+                "node_modules",
+                "old-marker",
+              ),
+            ),
+          ).toBe(false);
+
+          // (c) old package.json gone — the replacement had none, so
+          //     the prior package.json was removed with the rest of
+          //     the old workflow directory.
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", "package.json")),
+          ).toBe(false);
+
+          // (d) old synthesized .gitignore gone, and no fresh one
+          //     synthesized — the auto-install trigger condition
+          //     (top-level package.json present) failed, so the
+          //     safeguard was not invoked.
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", ".gitignore")),
+          ).toBe(false);
+
+          // (e) fake-npm shim recorded zero invocations — no
+          //     package.json ⇒ silent skip per SPEC §10.10.
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(0);
+
+          // (f) replacement workflow files (index.sh) committed.
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", "index.sh")),
+          ).toBe(true);
+        });
+      });
+
+      it("T-INST-120d: -y --no-install replacement removes old contents and skips both npm install and .gitignore synthesis", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        await preSeedReplacementTarget(project.loopxDir, "ralph");
+        // Replacement source has package.json (so auto-install would
+        // normally fire) but no .gitignore, so a buggy implementation
+        // that ignored --no-install and synthesized a fresh .gitignore
+        // would be observable.
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "ralph",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", "-y", "--no-install", `${gitServer!.url}/ralph.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+          // (a) exit 0
+          expect(result.exitCode).toBe(0);
+
+          // (b) old node_modules removed — `-y` removal happens
+          //     regardless of --no-install (which only suppresses the
+          //     post-commit auto-install pass).
+          expect(
+            existsSync(
+              join(
+                project!.loopxDir,
+                "ralph",
+                "node_modules",
+                "old-marker",
+              ),
+            ),
+          ).toBe(false);
+
+          // (c) fake-npm shim recorded zero invocations —
+          //     --no-install suppressed the auto-install pass.
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(0);
+
+          // (d) no .gitignore — the prior synthesized one was removed
+          //     with the old workflow directory, the replacement had
+          //     none, and --no-install skipped the safeguard alongside
+          //     `npm install`.
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", ".gitignore")),
+          ).toBe(false);
+
+          // (e) replacement source files committed byte-for-byte.
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", "index.sh")),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", "package.json")),
+          ).toBe(true);
+          const committedPkg = JSON.parse(
+            readFileSync(
+              join(project!.loopxDir, "ralph", "package.json"),
+              "utf-8",
+            ),
+          );
+          expect(committedPkg.name).toBe("ralph");
+
+          // (f) no fresh node_modules/ populated — the old one was
+          //     removed in (b) and --no-install skipped re-population.
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", "node_modules")),
+          ).toBe(false);
+        });
+      });
     });
   });
 
