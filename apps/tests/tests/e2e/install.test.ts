@@ -4758,6 +4758,111 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         });
       });
 
+      it("T-INST-110f: auto-install fires on a selected no-index workflow under -w", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "tools/check.sh": BASH_STOP,
+              "tools/package.json": JSON.stringify({
+                name: "tools",
+                version: "1.0.0",
+              }),
+              "other/index.sh": BASH_STOP,
+              "other/package.json": JSON.stringify({
+                name: "other",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", "-w", "tools", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+          expect(result.exitCode).toBe(0);
+
+          // Exactly one invocation, for the selected no-index workflow.
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(1);
+          expect(invocations[0].cwd).toBe(join(project!.loopxDir, "tools"));
+          expect(invocations[0].argv).toEqual(["install"]);
+
+          // .gitignore synthesized for the selected workflow.
+          const gitignorePath = join(
+            project!.loopxDir,
+            "tools",
+            ".gitignore",
+          );
+          expect(existsSync(gitignorePath)).toBe(true);
+          expect(readFileSync(gitignorePath, "utf-8").trim()).toBe(
+            "node_modules",
+          );
+
+          // check.sh is present; no index.* invented by loopx.
+          const toolsDir = join(project!.loopxDir, "tools");
+          expect(existsSync(join(toolsDir, "check.sh"))).toBe(true);
+          const toolsFiles = readdirSync(toolsDir);
+          expect(toolsFiles.some((f) => f.startsWith("index."))).toBe(false);
+
+          // Unselected workflow not committed.
+          expect(existsSync(join(project!.loopxDir, "other"))).toBe(false);
+        });
+      });
+
+      it("T-INST-110g: auto-install fires on a tarball source with a top-level package.json", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        // Archive name and wrapper directory deliberately match so that the
+        // SPEC §10.2 archive-name-derived workflow name and the wrapper-dir
+        // name agree (eliminating ambiguity in the `<name>` assertions below).
+        const tarball = await makeTarball(
+          {
+            "index.sh": BASH_STOP,
+            "package.json": JSON.stringify({
+              name: "tarball-workflow",
+              version: "1.0.0",
+            }),
+          },
+          { wrapperDir: "tarball-workflow" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/tarball-workflow.tar.gz", tarball),
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", `${httpServer!.url}/tarball-workflow.tar.gz`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+          expect(result.exitCode).toBe(0);
+
+          // Workflow committed at the archive-name-derived workflow name.
+          const wfDir = join(project!.loopxDir, "tarball-workflow");
+          expect(existsSync(join(wfDir, "index.sh"))).toBe(true);
+          expect(existsSync(join(wfDir, "package.json"))).toBe(true);
+          const pkg = JSON.parse(
+            readFileSync(join(wfDir, "package.json"), "utf-8"),
+          );
+          expect(pkg.name).toBe("tarball-workflow");
+
+          // Exactly one invocation, with cwd = .loopx/tarball-workflow/.
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(1);
+          expect(invocations[0].argv).toEqual(["install"]);
+          expect(invocations[0].cwd).toBe(wfDir);
+
+          // .gitignore synthesized on the tarball path.
+          const gitignorePath = join(wfDir, ".gitignore");
+          expect(existsSync(gitignorePath)).toBe(true);
+          expect(readFileSync(gitignorePath, "utf-8").trim()).toBe(
+            "node_modules",
+          );
+        });
+      });
+
       it("T-INST-111: --no-install suppresses both npm install and .gitignore synthesis", async () => {
         project = await createTempProject();
         const logFile = join(project.dir, "fake-npm.log");
