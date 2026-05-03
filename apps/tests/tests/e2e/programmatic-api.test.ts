@@ -6457,6 +6457,169 @@ console.log(JSON.stringify({ errMsg }));
 });
 
 // ═════════════════════════════════════════════════════════════
+// §4.9 — runPromise() has no Pre-First-next() Carve-out (SPEC §9.2)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.2: "There is no runPromise() equivalent of the run() pre-first-
+// next() consumer-cancellation carve-out: any pre-iteration error surfaces
+// via promise rejection." T-API-70 parameterizes over the same invalid-input
+// fixtures used by T-API-68 / T-API-68a / T-API-68b / T-API-68c / T-API-68d
+// on the .return() carve-out surface — invalid target, missing-`.loopx/`
+// discovery, missing local envFile, invalid maxIterations:-1, and a
+// pre-aborted signal — and asserts that runPromise() rejects with some
+// applicable pre-iteration error in each case (per the "any applicable
+// pre-iteration error" implementation-neutral form: SPEC §9.3 leaves relative
+// priority among non-abort pre-iteration errors largely implementation-
+// defined, so the test does not over-specify which error wins; the
+// pre-aborted-signal sub-case rejects with the abort error per SPEC §9.3
+// "Abort precedence over pre-iteration failures").
+
+describe("SPEC: runPromise() has no Pre-First-next() Carve-out", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-70 (invalid-target): counterpart fixture to T-API-68. Invalid
+    // target argument (undefined) — the .return() carve-out on the run()
+    // surface would suppress this error and settle silently, but runPromise()
+    // has no such carve-out so the promise must reject.
+    // ------------------------------------------------------------------------
+    it("T-API-70 (invalid-target): runPromise(undefined) rejects (no carve-out)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, errMsg = "";
+try { await runPromise(undefined, { cwd: ${JSON.stringify(project.dir)} }); }
+catch (e) { rejected = true; errMsg = e instanceof Error ? e.message : String(e); }
+console.log(JSON.stringify({ rejected, errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.rejected).toBe(true);
+      expect(data.errMsg.length).toBeGreaterThan(0);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-70 (discovery-missing): counterpart fixture to T-API-68a. Missing
+    // .loopx/ directory — the .return() carve-out on the run() surface would
+    // suppress the discovery failure and settle silently, but runPromise()
+    // must reject.
+    // ------------------------------------------------------------------------
+    it("T-API-70 (discovery-missing): runPromise rejects on missing .loopx/ (no carve-out)", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, errMsg = "";
+try { await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)} }); }
+catch (e) { rejected = true; errMsg = e instanceof Error ? e.message : String(e); }
+console.log(JSON.stringify({ rejected, errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.rejected).toBe(true);
+      expect(data.errMsg.length).toBeGreaterThan(0);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-70 (missing-envFile): counterpart fixture to T-API-68b. Missing
+    // local env file — the .return() carve-out on the run() surface would
+    // suppress the env-file-load failure and settle silently, but
+    // runPromise() must reject.
+    // ------------------------------------------------------------------------
+    it("T-API-70 (missing-envFile): runPromise rejects on missing local envFile (no carve-out)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, errMsg = "";
+try { await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: "nonexistent.env",
+}); }
+catch (e) { rejected = true; errMsg = e instanceof Error ? e.message : String(e); }
+console.log(JSON.stringify({ rejected, errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.rejected).toBe(true);
+      expect(data.errMsg.length).toBeGreaterThan(0);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-70 (invalid-maxIterations): counterpart fixture to T-API-68c.
+    // Invalid maxIterations: -1 — the .return() carve-out on the run() surface
+    // would suppress the option-snapshot failure and settle silently, but
+    // runPromise() must reject.
+    // ------------------------------------------------------------------------
+    it("T-API-70 (invalid-maxIterations): runPromise rejects on maxIterations:-1 (no carve-out)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, errMsg = "";
+try { await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  maxIterations: -1,
+}); }
+catch (e) { rejected = true; errMsg = e instanceof Error ? e.message : String(e); }
+console.log(JSON.stringify({ rejected, errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.rejected).toBe(true);
+      expect(data.errMsg.length).toBeGreaterThan(0);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-70 (pre-aborted-signal): counterpart fixture to T-API-68d. A real
+    // pre-aborted AbortSignal — the .return() carve-out on the run() surface
+    // would suppress the abort and settle silently, but runPromise() must
+    // reject. Per SPEC §9.3 "Abort precedence over pre-iteration failures",
+    // the rejection reason is specifically the abort error (not a generic
+    // option-snapshot or pre-iteration error).
+    // ------------------------------------------------------------------------
+    it("T-API-70 (pre-aborted-signal): runPromise rejects with abort error (no carve-out)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, errMsg = "", errName = null;
+try { await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+}); }
+catch (e) {
+  rejected = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? e.name : null;
+}
+console.log(JSON.stringify({ rejected, errMsg, errName }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.rejected).toBe(true);
+      // SPEC §9.3: pre-aborted signal rejects with the abort error.
+      expect(data.errName === "AbortError" || /\babort(ed)?\b/i.test(data.errMsg)).toBe(true);
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
 // §4.9 — RunOptions.env Basic Injection (SPEC §9.5 / §8.3)
 // ═════════════════════════════════════════════════════════════
 //
