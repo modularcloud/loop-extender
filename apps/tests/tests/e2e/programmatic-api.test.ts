@@ -13525,6 +13525,9 @@ console.log(JSON.stringify({ synchronousThrew, callSiteMessage, scriptReachedRea
 //   T-API-65r  {runPromise,run} + pre-aborted + unreadable global env (mode 000) → abort error
 //   T-API-65v  runPromise + invalid options wrapper + aborted signal → NOT abort
 //   T-API-65w  run        + invalid options wrapper + aborted signal → NOT abort
+//   T-API-65u  {runPromise,run} + reentrant duck (conjunction) + later failure → abort
+//   T-API-65u2 {runPromise,run} + reentrant duck (first-disjunct) + later failure → abort
+//   T-API-65u3 {runPromise,run} + already-aborted duck + later failure → abort
 //
 // All abort-path tests additionally verify (per SPEC §7.4):
 //   (b) no child was spawned (marker file absent)
@@ -15631,5 +15634,233 @@ console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message, 
       const after = listLoopxEntries(tmpdirParent);
       expect(after.filter((e) => !before.includes(e))).toEqual([]);
     });
+
+    // ------------------------------------------------------------------------
+    // T-API-65u / 65u2 / 65u3: Reentrant or already-aborted DUCK signal beats
+    // a separately-configured later pre-iteration failure on the same call.
+    // SPEC §9.3, §9.5, §9.1, §9.2.
+    //
+    // SPEC §9.5 names two abort-treatment disjuncts for duck-typed signals:
+    //   (1) listener invoked synchronously during addEventListener, and/or
+    //   (2) `aborted` observed as `true` at call-time capture.
+    // Once a usable signal is captured and observed as aborted, SPEC §9.3
+    // displaces all other pre-iteration failure modes on the same call.
+    // T-API-64b / 64b2 / 64c cover each disjunct in ISOLATION (no competing
+    // failure); T-API-65 / 65a / 65b / 65c / 65d / 65h–65j cover abort
+    // precedence over individual pre-iteration failures using REAL
+    // pre-aborted AbortSignal instances. The combination — duck signal
+    // satisfying §9.5 PLUS a separately-configured later pre-iteration
+    // failure on the same call — is uncovered.
+    //
+    // T-API-65u  — conjunction (listener fires reentrantly + `aborted`
+    //              transitions to true during the same addEventListener call)
+    // T-API-65u2 — first-disjunct only (listener fires reentrantly while
+    //              `aborted` stays false)
+    // T-API-65u3 — second-disjunct only (already-`aborted: true` duck signal;
+    //              addEventListener stores the listener but does NOT fire it)
+    //
+    // Variants per test (later pre-iteration failure modes — option-snapshot
+    // failures intentionally excluded per fix_plan rationale: SPEC §9.5 leaves
+    // intra-snapshot ordering implementation-defined for duck signals, so an
+    // option-snapshot failure surfacing before listener registration would
+    // not satisfy the "treats the signal as aborted" precondition; the
+    // option-snapshot axis is covered exhaustively for REAL pre-aborted
+    // signals at T-API-65p / 65q):
+    //   (i)  missing local env file (envFile: "nonexistent.env")
+    //   (ii) target-resolution failure (workflow "ralph" missing — only
+    //        `.loopx/other/index.sh` exists)
+    //
+    // Surfaces: runPromise() and run().
+    //
+    // Per-variant assertions:
+    //   (a) the surfaced rejection / throw is the abort error — NOT the
+    //       configured later pre-iteration failure (env-file-missing or
+    //       missing-workflow);
+    //   (b) no child was spawned (marker file absent);
+    //   (c) no `loopx-*` tmpdir was created under the test-isolated parent.
+    // ------------------------------------------------------------------------
+    type DuckVariant = {
+      id: "u" | "u2" | "u3";
+      label: string;
+      // Driver-side JS expression evaluating to the duck signal object. Each
+      // duck satisfies one (or both) of the two SPEC §9.5 abort-treatment
+      // disjuncts when passed to addEventListener.
+      duckExpr: string;
+    };
+
+    type LaterFailureVariant = {
+      id: "i" | "ii";
+      label: string;
+      // Sets up the .loopx/ tree. The marker is wired into the ONLY workflow
+      // in each fixture so that a buggy spawn — regardless of which target
+      // would have been selected on the non-abort path — would touch it.
+      setup: (project: TempProject, marker: string) => Promise<void>;
+      target: string;
+      // Extra options merged into the driver call (e.g. envFile).
+      extraOptsExpr: string;
+      // Pattern that the displaced later-pre-iteration error message would
+      // mention; the abort error must NOT match it.
+      negativePattern: RegExp;
+    };
+
+    const DUCK_VARIANTS: DuckVariant[] = [
+      {
+        id: "u",
+        label: "conjunction (listener fires + aborted=true)",
+        duckExpr: `{
+      aborted: false,
+      addEventListener(type, fn) {
+        if (type === "abort") { this.aborted = true; fn(); }
+      }
+    }`,
+      },
+      {
+        id: "u2",
+        label: "isolated reentrant (listener fires; aborted stays false)",
+        duckExpr: `{
+      aborted: false,
+      addEventListener(type, fn) {
+        if (type === "abort") fn();
+        /* deliberately do NOT mutate this.aborted */
+      }
+    }`,
+      },
+      {
+        id: "u3",
+        label: "already-aborted (aborted:true at capture; no listener firing)",
+        duckExpr: `{
+      aborted: true,
+      addEventListener(type, fn) { if (type === "abort") this._listener = fn; }
+    }`,
+      },
+    ];
+
+    const LATER_FAILURE_VARIANTS: LaterFailureVariant[] = [
+      {
+        id: "i",
+        label: "missing envFile",
+        setup: async (project, marker) => {
+          await createBashWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+          );
+        },
+        target: "ralph",
+        extraOptsExpr: `, envFile: "nonexistent.env"`,
+        negativePattern: /env.*file|nonexistent\.env|ENOENT/i,
+      },
+      {
+        id: "ii",
+        label: "missing workflow (target ralph; only .loopx/other/ exists)",
+        setup: async (project, marker) => {
+          await createBashWorkflowScript(
+            project,
+            "other",
+            "index",
+            `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+          );
+        },
+        target: "ralph",
+        extraOptsExpr: ``,
+        negativePattern: /workflow.*not.*found|not.*found.*workflow/i,
+      },
+    ];
+
+    for (const duck of DUCK_VARIANTS) {
+      for (const lf of LATER_FAILURE_VARIANTS) {
+        it(`T-API-65${duck.id}-promise (${lf.id}): runPromise() duck signal — ${duck.label} — beats ${lf.label}`, async () => {
+          project = await createTempProject();
+          const tmpdirParent = await makeIsolatedTmpdirParent(
+            `api65${duck.id}-promise-${lf.id}`,
+          );
+          const marker = join(project.dir, "child-ran.txt");
+          await lf.setup(project, marker);
+
+          const before = listLoopxEntries(tmpdirParent);
+          const driverCode = `
+import { runPromise } from "loopx";
+const duck = ${duck.duckExpr};
+let rejected = false, message = "", name = "", looksLikeAbort = false;
+try {
+  await runPromise(${JSON.stringify(lf.target)}, {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1${lf.extraOptsExpr}
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+  looksLikeAbort = (name === "AbortError") || /abort/i.test(message);
+}
+console.log(JSON.stringify({ rejected, message, name, looksLikeAbort }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: { TMPDIR: tmpdirParent },
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          // (a) Promise rejected with the abort error, not the later
+          //     pre-iteration failure.
+          expect(parsed.rejected).toBe(true);
+          expect(parsed.looksLikeAbort).toBe(true);
+          expect(parsed.message).not.toMatch(lf.negativePattern);
+          // (b) No script spawned.
+          expect(existsSync(marker)).toBe(false);
+          // (c) No loopx-* tmpdir was created under the isolated parent.
+          const after = listLoopxEntries(tmpdirParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        });
+
+        it(`T-API-65${duck.id}-generator (${lf.id}): run() duck signal — ${duck.label} — beats ${lf.label}`, async () => {
+          project = await createTempProject();
+          const tmpdirParent = await makeIsolatedTmpdirParent(
+            `api65${duck.id}-generator-${lf.id}`,
+          );
+          const marker = join(project.dir, "child-ran.txt");
+          await lf.setup(project, marker);
+
+          const before = listLoopxEntries(tmpdirParent);
+          const driverCode = `
+import { run } from "loopx";
+const duck = ${duck.duckExpr};
+const gen = run(${JSON.stringify(lf.target)}, {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1${lf.extraOptsExpr}
+});
+let threw = false, message = "", name = "", looksLikeAbort = false;
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+  looksLikeAbort = (name === "AbortError") || /abort/i.test(message);
+}
+console.log(JSON.stringify({ threw, message, name, looksLikeAbort }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: { TMPDIR: tmpdirParent },
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          // (a) First next() threw the abort error, not the later
+          //     pre-iteration failure.
+          expect(parsed.threw).toBe(true);
+          expect(parsed.looksLikeAbort).toBe(true);
+          expect(parsed.message).not.toMatch(lf.negativePattern);
+          // (b) No script spawned.
+          expect(existsSync(marker)).toBe(false);
+          // (c) No loopx-* tmpdir was created under the isolated parent.
+          const after = listLoopxEntries(tmpdirParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        });
+      }
+    }
   });
 });
