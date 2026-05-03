@@ -17,6 +17,7 @@ import {
 } from "../helpers/fixture-scripts.js";
 import { runCLI } from "../helpers/cli.js";
 import { runAPIDriver } from "../helpers/api-driver.js";
+import { withFakeNpm } from "../helpers/fake-npm.js";
 import { forEachRuntime, isRuntimeAvailable } from "../helpers/runtime.js";
 
 // ============================================================================
@@ -975,7 +976,7 @@ console.log(JSON.stringify(outputs));
 });
 
 // ----------------------------------------------------------------------------
-// Workflow-Local Dependencies & cwd semantics (T-EXEC-15, 16, 16a, 16b)
+// Workflow-Local Dependencies & cwd semantics (T-EXEC-15, 15a, 15b, 15c, 16, 16a, 16b)
 // ----------------------------------------------------------------------------
 
 describe("TEST-SPEC §4.4 Workflow-Local Dependencies", () => {
@@ -1037,6 +1038,154 @@ process.stdout.write(JSON.stringify({ result: greeting }));
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
       expect(readFileSync(markerPath, "utf-8")).toBe("hello-from-local-dep");
+    });
+
+    it("T-EXEC-15a: loopx run does NOT auto-install workflow dependencies (CLI surface)", async () => {
+      // SPEC §2.1: "At runtime, loopx does not re-install dependencies — loopx
+      // run does not invoke `npm install` on a missing `node_modules/`." This
+      // is the runtime counterpart to the install-time auto-install coverage
+      // (T-INST-110 block); the auto-install seam is exclusive to `loopx
+      // install`. A buggy implementation that gated auto-install on the run
+      // surface (e.g., enabled it under run() but disabled it under the CLI)
+      // would pass T-EXEC-15b/15c but fail this test.
+      project = await createTempProject();
+      const markerPath = join(project.dir, "ran.marker");
+      const logFile = join(project.dir, "fake-npm.log");
+
+      // index.sh writes a marker (proving execution succeeded) and emits
+      // {"stop":true} so the loop halts after one iteration.
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '' > "${markerPath}"
+printf '{"stop":true}'`,
+      );
+      // Workflow has package.json declaring a dependency, but no node_modules/.
+      await writeFile(
+        join(project.loopxDir, "ralph", "package.json"),
+        JSON.stringify({
+          name: "ralph",
+          version: "1.0.0",
+          dependencies: { "some-pkg": "*" },
+        }),
+        "utf-8",
+      );
+
+      await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project!.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        // Zero npm invocations — `loopx run` does not trigger auto-install.
+        expect(fake.readInvocations().length).toBe(0);
+        // node_modules/ was not created.
+        expect(
+          existsSync(join(project!.loopxDir, "ralph", "node_modules")),
+        ).toBe(false);
+        // The script ran (marker exists).
+        expect(existsSync(markerPath)).toBe(true);
+      });
+    });
+
+    it("T-EXEC-15b: runPromise() does NOT auto-install workflow dependencies (programmatic API surface)", async () => {
+      // Programmatic-API counterpart to T-EXEC-15a per SPEC §2.1 / §9.2.
+      project = await createTempProject();
+      const markerPath = join(project.dir, "ran.marker");
+      const logFile = join(project.dir, "fake-npm.log");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '' > "${markerPath}"
+printf '{"stop":true}'`,
+      );
+      await writeFile(
+        join(project.loopxDir, "ralph", "package.json"),
+        JSON.stringify({
+          name: "ralph",
+          version: "1.0.0",
+          dependencies: { "some-pkg": "*" },
+        }),
+        "utf-8",
+      );
+
+      await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+        const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project!.dir)},
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length, hasStop: outputs[0]?.stop === true }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.count).toBe(1);
+        expect(parsed.hasStop).toBe(true);
+        // Zero npm invocations — runPromise() does not trigger auto-install.
+        expect(fake.readInvocations().length).toBe(0);
+        expect(
+          existsSync(join(project!.loopxDir, "ralph", "node_modules")),
+        ).toBe(false);
+        expect(existsSync(markerPath)).toBe(true);
+      });
+    });
+
+    it("T-EXEC-15c: run() generator does NOT auto-install workflow dependencies (generator API surface)", async () => {
+      // Generator-API counterpart to T-EXEC-15a / T-EXEC-15b per SPEC §2.1 /
+      // §9.1 / §10.10. Closes the third API-surface gap and completes the
+      // "no runtime auto-install" coverage across all three run surfaces
+      // (CLI, runPromise(), run()).
+      project = await createTempProject();
+      const markerPath = join(project.dir, "ran.marker");
+      const logFile = join(project.dir, "fake-npm.log");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '' > "${markerPath}"
+printf '{"stop":true}'`,
+      );
+      await writeFile(
+        join(project.loopxDir, "ralph", "package.json"),
+        JSON.stringify({
+          name: "ralph",
+          version: "1.0.0",
+          dependencies: { "some-pkg": "*" },
+        }),
+        "utf-8",
+      );
+
+      await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+        const driverCode = `
+import { run } from "loopx";
+const outputs = [];
+for await (const output of run("ralph", {
+  cwd: ${JSON.stringify(project!.dir)},
+  maxIterations: 1,
+})) {
+  outputs.push(output);
+}
+console.log(JSON.stringify({ count: outputs.length, hasStop: outputs[0]?.stop === true }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.count).toBe(1);
+        expect(parsed.hasStop).toBe(true);
+        // Zero npm invocations — run() does not trigger auto-install.
+        expect(fake.readInvocations().length).toBe(0);
+        expect(
+          existsSync(join(project!.loopxDir, "ralph", "node_modules")),
+        ).toBe(false);
+        expect(existsSync(markerPath)).toBe(true);
+      });
     });
 
     it("T-EXEC-16: script cwd is the project root in JS/TS runtimes too", async () => {
