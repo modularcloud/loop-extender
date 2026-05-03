@@ -1617,3 +1617,168 @@ printf '{"stop":true}'`,
     }
   });
 });
+
+// ============================================================================
+// SPEC: CLI -e file does NOT redirect global env-file lookup
+//   (T-API-59f / T-API-59g — CLI-surface counterparts to T-API-59d / T-API-59e
+//   for the local env-file tier). SPEC §8.1: "Global env file path resolution
+//   reads XDG_CONFIG_HOME / HOME from the inherited environment on the same
+//   schedule." A local env file containing XDG_CONFIG_HOME=fake or HOME=fake
+//   reaches the spawned child but does not redirect WHERE loopx looks for
+//   its own global env file.
+// ============================================================================
+
+describe("SPEC: CLI Env File Does Not Affect Loopx's Own Lookups", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    while (cleanups.length > 0) {
+      const cleanup = cleanups.shift();
+      if (cleanup) await cleanup().catch(() => {});
+    }
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  async function setupRealAndFakeXdg(label: string): Promise<{
+    realXdg: string;
+    fakeXdg: string;
+  }> {
+    const realXdg = await mkdtemp(join(tmpdir(), `loopx-test-real-xdg-${label}-`));
+    cleanups.push(async () => {
+      await rm(realXdg, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(realXdg, "loopx"), { recursive: true });
+    await createEnvFile(join(realXdg, "loopx", "env"), { MARKER: "real" });
+
+    const fakeXdg = await mkdtemp(join(tmpdir(), `loopx-test-fake-xdg-${label}-`));
+    cleanups.push(async () => {
+      await rm(fakeXdg, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(fakeXdg, "loopx"), { recursive: true });
+    await createEnvFile(join(fakeXdg, "loopx", "env"), { MARKER: "fake" });
+
+    return { realXdg, fakeXdg };
+  }
+
+  async function setupRealAndFakeHome(label: string): Promise<{
+    realHome: string;
+    fakeHome: string;
+  }> {
+    const realHome = await mkdtemp(join(tmpdir(), `loopx-test-real-home-${label}-`));
+    cleanups.push(async () => {
+      await rm(realHome, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(realHome, ".config", "loopx"), { recursive: true });
+    await createEnvFile(join(realHome, ".config", "loopx", "env"), {
+      MARKER: "real",
+    });
+
+    const fakeHome = await mkdtemp(join(tmpdir(), `loopx-test-fake-home-${label}-`));
+    cleanups.push(async () => {
+      await rm(fakeHome, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(fakeHome, ".config", "loopx"), { recursive: true });
+    await createEnvFile(join(fakeHome, ".config", "loopx", "env"), {
+      MARKER: "fake",
+    });
+
+    return { realHome, fakeHome };
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-59f: CLI -e file does NOT redirect global env-file lookup via
+    //   XDG_CONFIG_HOME. CLI-surface parity for T-API-59d (programmatic
+    //   RunOptions.envFile). The CLI argv-parsing path for -e is structurally
+    //   distinct from the programmatic envFile field. SPEC §8.1, §8.2, §8.3,
+    //   §4.2.
+    // ------------------------------------------------------------------------
+    it("T-API-59f: CLI -e file does NOT redirect global env-file lookup via XDG_CONFIG_HOME", async () => {
+      project = await createTempProject();
+      const xdgMarker = join(project.dir, "xdg.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${XDG_CONFIG_HOME:-UNSET}" > "${xdgMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realXdg, fakeXdg } = await setupRealAndFakeXdg("api59f");
+
+      const localEnvFile = join(project.dir, "local.env");
+      await createEnvFile(localEnvFile, { XDG_CONFIG_HOME: fakeXdg });
+
+      // Pass real XDG_CONFIG_HOME via runCLI's extraEnv (inherited env in the
+      // spawned loopx process). The local env file supplied via -e contains
+      // XDG_CONFIG_HOME=fakeXdg — that value reaches the script, but loopx
+      // resolves the global env file from its OWN inherited XDG_CONFIG_HOME.
+      const result = await runCLI(["run", "-e", localEnvFile, "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { XDG_CONFIG_HOME: realXdg },
+      });
+
+      // (a) Exit code 0.
+      expect(result.exitCode).toBe(0);
+      // (b) Child observed XDG_CONFIG_HOME from -e file (the fake path).
+      expect(readFileSync(xdgMarker, "utf-8")).toBe(fakeXdg);
+      // (c) loopx loaded global env file using inherited XDG_CONFIG_HOME
+      //     (real path) — so MARKER=real.
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59g: CLI -e file does NOT redirect global env-file lookup via
+    //   HOME. CLI-surface, HOME-fallback parity for T-API-59e. SPEC §8.1,
+    //   §8.2, §8.3, §4.2.
+    // ------------------------------------------------------------------------
+    it("T-API-59g: CLI -e file does NOT redirect global env-file lookup via HOME", async () => {
+      project = await createTempProject();
+      const homeMarker = join(project.dir, "home.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${HOME:-UNSET}" > "${homeMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realHome, fakeHome } = await setupRealAndFakeHome("api59g");
+
+      const localEnvFile = join(project.dir, "local.env");
+      await createEnvFile(localEnvFile, { HOME: fakeHome });
+
+      // Strategy: pass HOME=realHome via runCLI's extraEnv. Also explicitly
+      // unset XDG_CONFIG_HOME in the spawned loopx's inherited env (otherwise
+      // loopx might consult an unrelated $XDG_CONFIG_HOME inherited from the
+      // test runner and the HOME fallback path wouldn't be exercised).
+      // runCLI's `env` option SPREADS over process.env (line 56-59 of cli.ts).
+      // Setting XDG_CONFIG_HOME to undefined in the spread does not delete
+      // it. We need a value that loopx will treat as unset. Empty string
+      // (per env.ts line 24: `env.XDG_CONFIG_HOME || ...`) is treated as
+      // falsy and triggers the HOME fallback.
+      const result = await runCLI(["run", "-e", localEnvFile, "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { HOME: realHome, XDG_CONFIG_HOME: "" },
+      });
+
+      // (a) Exit code 0.
+      expect(result.exitCode).toBe(0);
+      // (b) Child observed HOME from -e file (the fake path).
+      expect(readFileSync(homeMarker, "utf-8")).toBe(fakeHome);
+      // (c) loopx loaded global env file using inherited HOME (real path)
+      //     via the fallback — so MARKER=real.
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+  });
+});

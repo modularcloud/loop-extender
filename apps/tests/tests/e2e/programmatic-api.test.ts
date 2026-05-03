@@ -9073,3 +9073,442 @@ console.log(JSON.stringify({ count, threw, message }));
     }
   });
 });
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — RunOptions.env / RunOptions.envFile do NOT redirect loopx's own
+//        global env-file path resolution (SPEC §8.1 / §8.3 / §9.1 / §9.5)
+//
+// SPEC §8.1: "Global env file path resolution ($XDG_CONFIG_HOME/loopx/env,
+// with the documented HOME-based fallback) reads XDG_CONFIG_HOME / HOME
+// from the inherited environment on the same schedule." User-supplied
+// XDG_CONFIG_HOME / HOME values via RunOptions.env (tier 2) or env files
+// (tiers 3/4) reach the spawned child but do not redirect WHERE loopx looks
+// for its own global env file.
+// ═════════════════════════════════════════════════════════════
+
+describe("SPEC: RunOptions.env Does Not Affect Loopx's Own Lookups", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    for (const cleanup of cleanups.splice(0)) {
+      await cleanup().catch(() => {});
+    }
+  });
+
+  // mkdtemp two distinct config homes: one for "real" inherited env,
+  // one for "fake" RunOptions.env / env-file value. Both are registered
+  // for cleanup. Each receives a loopx/env file with MARKER set distinctly.
+  async function setupRealAndFakeXdg(label: string): Promise<{
+    realXdg: string;
+    fakeXdg: string;
+  }> {
+    const realXdg = await mkdtemp(join(osTmpdir(), `loopx-test-real-xdg-${label}-`));
+    cleanups.push(async () => {
+      await rm(realXdg, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(realXdg, "loopx"), { recursive: true });
+    await writeFile(join(realXdg, "loopx", "env"), "MARKER=real\n", "utf-8");
+
+    const fakeXdg = await mkdtemp(join(osTmpdir(), `loopx-test-fake-xdg-${label}-`));
+    cleanups.push(async () => {
+      await rm(fakeXdg, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(fakeXdg, "loopx"), { recursive: true });
+    await writeFile(join(fakeXdg, "loopx", "env"), "MARKER=fake\n", "utf-8");
+
+    return { realXdg, fakeXdg };
+  }
+
+  // For HOME-fallback tests: the global env file lives at
+  // <HOME>/.config/loopx/env (when XDG_CONFIG_HOME is unset).
+  async function setupRealAndFakeHome(label: string): Promise<{
+    realHome: string;
+    fakeHome: string;
+  }> {
+    const realHome = await mkdtemp(join(osTmpdir(), `loopx-test-real-home-${label}-`));
+    cleanups.push(async () => {
+      await rm(realHome, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(realHome, ".config", "loopx"), { recursive: true });
+    await writeFile(
+      join(realHome, ".config", "loopx", "env"),
+      "MARKER=real\n",
+      "utf-8",
+    );
+
+    const fakeHome = await mkdtemp(join(osTmpdir(), `loopx-test-fake-home-${label}-`));
+    cleanups.push(async () => {
+      await rm(fakeHome, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(fakeHome, ".config", "loopx"), { recursive: true });
+    await writeFile(
+      join(fakeHome, ".config", "loopx", "env"),
+      "MARKER=fake\n",
+      "utf-8",
+    );
+
+    return { realHome, fakeHome };
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-59: runPromise() — RunOptions.env does not redirect global env-
+    //   file lookup via XDG_CONFIG_HOME. Inherited XDG_CONFIG_HOME points at
+    //   real config dir (containing MARKER=real). RunOptions.env supplies a
+    //   fake XDG_CONFIG_HOME value (with a decoy global env file containing
+    //   MARKER=fake). The script observes both XDG_CONFIG_HOME (which should
+    //   reflect the user-supplied fake value, proving the merge into the
+    //   child env happened) AND MARKER (which should reflect the real value,
+    //   proving loopx loaded the global env file from the inherited env, not
+    //   from RunOptions.env). SPEC §8.1, §8.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59: runPromise() — RunOptions.env does NOT redirect global env-file lookup via XDG_CONFIG_HOME", async () => {
+      project = await createTempProject();
+      const xdgMarker = join(project.dir, "xdg.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${XDG_CONFIG_HOME:-UNSET}" > "${xdgMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realXdg, fakeXdg } = await setupRealAndFakeXdg("api59");
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(realXdg)};
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { XDG_CONFIG_HOME: ${JSON.stringify(fakeXdg)} },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed XDG_CONFIG_HOME from RunOptions.env (the fake path).
+      expect(readFileSync(xdgMarker, "utf-8")).toBe(fakeXdg);
+      // (b) But loopx loaded the global env file using its OWN inherited
+      //     process.env.XDG_CONFIG_HOME (the real path) — so MARKER=real.
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59a: runPromise() — RunOptions.env does not redirect global env-
+    //   file lookup via HOME (the fallback when XDG_CONFIG_HOME is unset).
+    //   SPEC §8.1, §8.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59a: runPromise() — RunOptions.env does NOT redirect global env-file lookup via HOME", async () => {
+      project = await createTempProject();
+      const homeMarker = join(project.dir, "home.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${HOME:-UNSET}" > "${homeMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realHome, fakeHome } = await setupRealAndFakeHome("api59a");
+
+      // Unset XDG_CONFIG_HOME so HOME fallback applies, then set HOME=realHome.
+      const driverCode = `
+import { runPromise } from "loopx";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(realHome)};
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { HOME: ${JSON.stringify(fakeHome)} },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed HOME from RunOptions.env (the fake path).
+      expect(readFileSync(homeMarker, "utf-8")).toBe(fakeHome);
+      // (b) But loopx loaded the global env file using its OWN inherited
+      //     process.env.HOME (the real path) — so MARKER=real.
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59b: run() generator — RunOptions.env does not redirect global
+    //   env-file lookup via XDG_CONFIG_HOME. Generator-surface counterpart to
+    //   T-API-59. The two run surfaces have different snapshot timing for
+    //   inherited process.env (lazy under run() per SPEC §9.1; eager under
+    //   runPromise() per SPEC §9.2) but both must apply SPEC §8.1's rule.
+    //   A buggy implementation that re-read RunOptions.env at first next()
+    //   and merged it into the lazy process.env snapshot before resolving
+    //   the global env-file path on the run() path — but performed eager
+    //   resolution correctly under runPromise() — would pass T-API-59 but
+    //   fail this test. SPEC §8.1, §8.3, §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59b: run() — RunOptions.env does NOT redirect global env-file lookup via XDG_CONFIG_HOME", async () => {
+      project = await createTempProject();
+      const xdgMarker = join(project.dir, "xdg.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${XDG_CONFIG_HOME:-UNSET}" > "${xdgMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realXdg, fakeXdg } = await setupRealAndFakeXdg("api59b");
+
+      const driverCode = `
+import { run } from "loopx";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(realXdg)};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { XDG_CONFIG_HOME: ${JSON.stringify(fakeXdg)} },
+  maxIterations: 1,
+});
+const results = [];
+for await (const o of gen) { results.push(o); }
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed XDG_CONFIG_HOME from RunOptions.env (fake path).
+      expect(readFileSync(xdgMarker, "utf-8")).toBe(fakeXdg);
+      // (b) loopx loaded global env file using inherited process.env (real).
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59c: run() generator — RunOptions.env does not redirect global
+    //   env-file lookup via HOME. SPEC §8.1, §8.3, §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59c: run() — RunOptions.env does NOT redirect global env-file lookup via HOME", async () => {
+      project = await createTempProject();
+      const homeMarker = join(project.dir, "home.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${HOME:-UNSET}" > "${homeMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realHome, fakeHome } = await setupRealAndFakeHome("api59c");
+
+      const driverCode = `
+import { run } from "loopx";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(realHome)};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { HOME: ${JSON.stringify(fakeHome)} },
+  maxIterations: 1,
+});
+const results = [];
+for await (const o of gen) { results.push(o); }
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed HOME from RunOptions.env (fake path).
+      expect(readFileSync(homeMarker, "utf-8")).toBe(fakeHome);
+      // (b) loopx loaded global env file using inherited HOME (real path).
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59d: runPromise() — Local envFile (RunOptions.envFile, tier 3)
+    //   does not redirect global env-file lookup via XDG_CONFIG_HOME.
+    //   The local env file containing XDG_CONFIG_HOME=fakePath is loaded
+    //   AFTER loopx has already located the global env file using the
+    //   inherited environment. The child sees the fake XDG_CONFIG_HOME
+    //   (proving the local env file values reach the spawned script) but
+    //   loopx loaded the real global env file. SPEC §8.1, §8.2, §8.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59d: runPromise() — Local envFile does NOT redirect global env-file lookup via XDG_CONFIG_HOME", async () => {
+      project = await createTempProject();
+      const xdgMarker = join(project.dir, "xdg.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${XDG_CONFIG_HOME:-UNSET}" > "${xdgMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realXdg, fakeXdg } = await setupRealAndFakeXdg("api59d");
+
+      // Local env file containing XDG_CONFIG_HOME=<fakeXdg>.
+      const localEnvFile = join(project.dir, "local.env");
+      await writeFile(localEnvFile, `XDG_CONFIG_HOME=${fakeXdg}\n`, "utf-8");
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(realXdg)};
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(localEnvFile)},
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed XDG_CONFIG_HOME from local env file (fake).
+      expect(readFileSync(xdgMarker, "utf-8")).toBe(fakeXdg);
+      // (b) loopx loaded global env file using inherited XDG_CONFIG_HOME (real).
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59e: runPromise() — Local envFile does not redirect global env-
+    //   file lookup via HOME. SPEC §8.1, §8.2, §8.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59e: runPromise() — Local envFile does NOT redirect global env-file lookup via HOME", async () => {
+      project = await createTempProject();
+      const homeMarker = join(project.dir, "home.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${HOME:-UNSET}" > "${homeMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realHome, fakeHome } = await setupRealAndFakeHome("api59e");
+
+      const localEnvFile = join(project.dir, "local.env");
+      await writeFile(localEnvFile, `HOME=${fakeHome}\n`, "utf-8");
+
+      const driverCode = `
+import { runPromise } from "loopx";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(realHome)};
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(localEnvFile)},
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed HOME from local env file (fake).
+      expect(readFileSync(homeMarker, "utf-8")).toBe(fakeHome);
+      // (b) loopx loaded global env file using inherited HOME (real path).
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59h: run() generator — Local envFile does not redirect global
+    //   env-file lookup via XDG_CONFIG_HOME. Generator-surface counterpart to
+    //   T-API-59d; exercises the lazy pre-iteration timing per SPEC §9.1.
+    //   SPEC §8.1, §8.2, §8.3, §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59h: run() — Local envFile does NOT redirect global env-file lookup via XDG_CONFIG_HOME", async () => {
+      project = await createTempProject();
+      const xdgMarker = join(project.dir, "xdg.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${XDG_CONFIG_HOME:-UNSET}" > "${xdgMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realXdg, fakeXdg } = await setupRealAndFakeXdg("api59h");
+
+      const localEnvFile = join(project.dir, "local.env");
+      await writeFile(localEnvFile, `XDG_CONFIG_HOME=${fakeXdg}\n`, "utf-8");
+
+      const driverCode = `
+import { run } from "loopx";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(realXdg)};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(localEnvFile)},
+  maxIterations: 1,
+});
+const results = [];
+for await (const o of gen) { results.push(o); }
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed XDG_CONFIG_HOME from local env file (fake).
+      expect(readFileSync(xdgMarker, "utf-8")).toBe(fakeXdg);
+      // (b) loopx loaded global env file using inherited XDG_CONFIG_HOME (real).
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59i: run() generator — Local envFile does not redirect global
+    //   env-file lookup via HOME. SPEC §8.1, §8.2, §8.3, §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59i: run() — Local envFile does NOT redirect global env-file lookup via HOME", async () => {
+      project = await createTempProject();
+      const homeMarker = join(project.dir, "home.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${HOME:-UNSET}" > "${homeMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realHome, fakeHome } = await setupRealAndFakeHome("api59i");
+
+      const localEnvFile = join(project.dir, "local.env");
+      await writeFile(localEnvFile, `HOME=${fakeHome}\n`, "utf-8");
+
+      const driverCode = `
+import { run } from "loopx";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(realHome)};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(localEnvFile)},
+  maxIterations: 1,
+});
+const results = [];
+for await (const o of gen) { results.push(o); }
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed HOME from local env file (fake).
+      expect(readFileSync(homeMarker, "utf-8")).toBe(fakeHome);
+      // (b) loopx loaded global env file using inherited HOME (real).
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+  });
+});
