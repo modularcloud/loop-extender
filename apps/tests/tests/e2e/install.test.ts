@@ -1004,6 +1004,145 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
   });
 
   // ═══════════════════════════════════════════════════════════
+  // Install-scoped `--` Rejection (T-INST-DASHDASH-01 … 04)
+  // ═══════════════════════════════════════════════════════════
+  //
+  // SPEC 4.2: `--` is not a recognized install-scoped token (no end-of-options
+  // separator semantics, no positional separator). Reject at any position when
+  // the `-h`/`--help` short-circuit is not present; suppress the rejection when
+  // it is.
+
+  describe("Install-scoped `--` Rejection", () => {
+    forEachRuntime((runtime) => {
+      it("T-INST-DASHDASH-01: install -- <source> → usage error, exit 1", async () => {
+        // Use a genuinely valid file:// bare-git source so that exit 1 is
+        // distinguishable from a downstream "unsupported source" error.
+        gitServer = await startLocalGitServer([
+          { name: "dd-pkg", files: { "index.sh": BASH_STOP } },
+        ]);
+        const sourceUrl = `${gitServer.url}/dd-pkg.git`;
+
+        // Pre-verify: same source succeeds without `--` against a fresh project.
+        const preProject = await createTempProject();
+        try {
+          const pre = await runCLI(["install", sourceUrl], {
+            cwd: preProject.dir,
+            runtime,
+          });
+          expect(pre.exitCode).toBe(0);
+          expect(existsSync(join(preProject.loopxDir, "dd-pkg"))).toBe(true);
+        } finally {
+          await preProject.cleanup();
+        }
+
+        // Actual test: leading `--` is rejected as a usage error.
+        project = await createTempProject();
+        const result = await runCLI(["install", "--", sourceUrl], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toContain("--");
+        // Distinguish a usage-error category from a "source unsupported" /
+        // network/clone failure category — the failure must be about the `--`
+        // token, not about resolving the source.
+        expect(result.stderr).not.toMatch(/single[- ]file/i);
+        expect(result.stderr).not.toMatch(/unsupported source/i);
+        expect(result.stderr).not.toMatch(/Failed to (download|clone)/i);
+        // No source clone activity occurred — the would-be `dd-pkg` workflow
+        // was not committed.
+        expect(existsSync(join(project.loopxDir, "dd-pkg"))).toBe(false);
+        expect(readdirSync(project.loopxDir).length).toBe(0);
+      });
+
+      it("T-INST-DASHDASH-02: install <source> -- → usage error, exit 1", async () => {
+        gitServer = await startLocalGitServer([
+          { name: "dd-pkg", files: { "index.sh": BASH_STOP } },
+        ]);
+        const sourceUrl = `${gitServer.url}/dd-pkg.git`;
+
+        // Pre-verify the same source is installable without the trailing `--`.
+        const preProject = await createTempProject();
+        try {
+          const pre = await runCLI(["install", sourceUrl], {
+            cwd: preProject.dir,
+            runtime,
+          });
+          expect(pre.exitCode).toBe(0);
+          expect(existsSync(join(preProject.loopxDir, "dd-pkg"))).toBe(true);
+        } finally {
+          await preProject.cleanup();
+        }
+
+        // Trailing `--` is rejected at any position when help short-circuit is absent.
+        project = await createTempProject();
+        const result = await runCLI(["install", sourceUrl, "--"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toContain("--");
+        expect(result.stderr).not.toMatch(/single[- ]file/i);
+        expect(result.stderr).not.toMatch(/unsupported source/i);
+        expect(result.stderr).not.toMatch(/Failed to (download|clone)/i);
+        expect(existsSync(join(project.loopxDir, "dd-pkg"))).toBe(false);
+        expect(readdirSync(project.loopxDir).length).toBe(0);
+      });
+
+      it("T-INST-DASHDASH-03: install -h -- <source> → help, exit 0", async () => {
+        // Use a genuinely valid source: a buggy implementation that consumed
+        // `--` as end-of-options would otherwise install successfully (exit 0)
+        // and leave `.loopx/dd-pkg/` behind — this test still detects that by
+        // asserting `.loopx/` remains empty after the `-h` short-circuit.
+        gitServer = await startLocalGitServer([
+          { name: "dd-pkg", files: { "index.sh": BASH_STOP } },
+        ]);
+        const sourceUrl = `${gitServer.url}/dd-pkg.git`;
+
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "-h", "--", sourceUrl],
+          { cwd: project.dir, runtime },
+        );
+        // Reference: byte-equal to plain `install -h`.
+        const ref = await runCLI(["install", "-h"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toBe(ref.stdout);
+        // No source clone activity occurred — `.loopx/` is untouched.
+        expect(existsSync(join(project.loopxDir, "dd-pkg"))).toBe(false);
+        expect(readdirSync(project.loopxDir).length).toBe(0);
+        // No usage-error message about `--` was surfaced.
+        expect(result.stderr).not.toMatch(/unknown.*install.*flag/i);
+      });
+
+      it("T-INST-DASHDASH-04: install --help -- <source> → help, exit 0", async () => {
+        gitServer = await startLocalGitServer([
+          { name: "dd-pkg", files: { "index.sh": BASH_STOP } },
+        ]);
+        const sourceUrl = `${gitServer.url}/dd-pkg.git`;
+
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "--help", "--", sourceUrl],
+          { cwd: project.dir, runtime },
+        );
+        const ref = await runCLI(["install", "--help"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toBe(ref.stdout);
+        expect(existsSync(join(project.loopxDir, "dd-pkg"))).toBe(false);
+        expect(readdirSync(project.loopxDir).length).toBe(0);
+        expect(result.stderr).not.toMatch(/unknown.*install.*flag/i);
+      });
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
   // Workflow Classification — Single-Workflow Source (T-INST-50 … 52d)
   // ═══════════════════════════════════════════════════════════
 
