@@ -4950,6 +4950,248 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         });
       });
 
+      it("T-INST-111b: --no-install does NOT suppress preflight version-mismatch (fatal exit 1)", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "my-workflow",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "my-workflow",
+                version: "1.0.0",
+                dependencies: { loopx: unsatisfiedRange() },
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            [
+              "install",
+              "--no-install",
+              `${gitServer!.url}/my-workflow.git`,
+            ],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+
+          // (a) Exit 1 with version-mismatch error.
+          expect(result.exitCode).toBe(1);
+          expect(hasVersionMismatchWarning(result.stderr, "my-workflow")).toBe(
+            true,
+          );
+
+          // (b) Shim log empty — auto-install never ran.
+          expect(fake.readInvocations().length).toBe(0);
+
+          // (c) No .gitignore was synthesized.
+          const gitignorePath = join(
+            project!.loopxDir,
+            "my-workflow",
+            ".gitignore",
+          );
+          expect(existsSync(gitignorePath)).toBe(false);
+
+          // (d) Workflow not committed — preflight failure exits before commit.
+          expect(existsSync(join(project!.loopxDir, "my-workflow"))).toBe(
+            false,
+          );
+        });
+      });
+
+      it("T-INST-111c: --no-install does NOT suppress non-fatal package.json parse warning", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "my-workflow",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": "{broken",
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            [
+              "install",
+              "--no-install",
+              `${gitServer!.url}/my-workflow.git`,
+            ],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+
+          // (a) Exit 0 — invalid JSON is non-fatal.
+          expect(result.exitCode).toBe(0);
+
+          // (b) Shim log empty — --no-install suppresses auto-install.
+          expect(fake.readInvocations().length).toBe(0);
+
+          // (c) Exactly one parse-failure warning. The runAutoInstall pass
+          // emits a second warning for the same workflow when it runs;
+          // --no-install skips that pass entirely so only the preflight
+          // warning fires.
+          expect(countInvalidJsonWarnings(result.stderr, "my-workflow")).toBe(
+            1,
+          );
+
+          // (d) No .gitignore was synthesized (safeguard skipped under
+          // --no-install).
+          const gitignorePath = join(
+            project!.loopxDir,
+            "my-workflow",
+            ".gitignore",
+          );
+          expect(existsSync(gitignorePath)).toBe(false);
+
+          // (e) Workflow committed at .loopx/<name>/ with both files
+          // byte-for-byte (file-level commit ran).
+          const indexPath = join(
+            project!.loopxDir,
+            "my-workflow",
+            "index.sh",
+          );
+          const pkgPath = join(
+            project!.loopxDir,
+            "my-workflow",
+            "package.json",
+          );
+          expect(existsSync(indexPath)).toBe(true);
+          expect(readFileSync(indexPath, "utf-8")).toBe(BASH_STOP);
+          expect(readFileSync(pkgPath, "utf-8")).toBe("{broken");
+        });
+      });
+
+      it("T-INST-111d: --no-install suppresses auto-install for every selected workflow in a multi-workflow source", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", "--no-install", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+
+          // (a) Exit 0.
+          expect(result.exitCode).toBe(0);
+
+          // (b) All three workflows committed byte-for-byte.
+          for (const wf of ["alpha", "beta", "gamma"]) {
+            const indexPath = join(project!.loopxDir, wf, "index.sh");
+            const pkgPath = join(project!.loopxDir, wf, "package.json");
+            expect(existsSync(indexPath)).toBe(true);
+            expect(readFileSync(indexPath, "utf-8")).toBe(BASH_STOP);
+            const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+            expect(pkg.name).toBe(wf);
+            expect(pkg.version).toBe("1.0.0");
+          }
+
+          // (c) Zero npm invocations across all workflows.
+          expect(fake.readInvocations().length).toBe(0);
+
+          // (d) None of the .gitignore files were synthesized.
+          for (const wf of ["alpha", "beta", "gamma"]) {
+            const gitignorePath = join(project!.loopxDir, wf, ".gitignore");
+            expect(existsSync(gitignorePath)).toBe(false);
+          }
+
+          // (e) No aggregate auto-install failure report.
+          expect(result.stderr).not.toMatch(
+            /auto-install|aggregate|failed/i,
+          );
+        });
+      });
+
+      it("T-INST-111e: --no-install × -w selective install only commits selected workflow and skips auto-install", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            [
+              "install",
+              "--no-install",
+              "-w",
+              "beta",
+              `${gitServer!.url}/multi.git`,
+            ],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+
+          // (a) Exit 0.
+          expect(result.exitCode).toBe(0);
+
+          // (b) Only beta committed; alpha and gamma absent.
+          expect(existsSync(join(project!.loopxDir, "alpha"))).toBe(false);
+          expect(existsSync(join(project!.loopxDir, "gamma"))).toBe(false);
+          expect(
+            existsSync(join(project!.loopxDir, "beta", "index.sh")),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "beta", "package.json")),
+          ).toBe(true);
+
+          // (c) Zero npm invocations.
+          expect(fake.readInvocations().length).toBe(0);
+
+          // (d) No .gitignore synthesized for the selected workflow.
+          const gitignorePath = join(
+            project!.loopxDir,
+            "beta",
+            ".gitignore",
+          );
+          expect(existsSync(gitignorePath)).toBe(false);
+
+          // (e) No aggregate auto-install failure report.
+          expect(result.stderr).not.toMatch(
+            /auto-install|aggregate|failed/i,
+          );
+        });
+      });
+
       it("T-INST-112: missing .gitignore is created with exactly 'node_modules' before npm install spawn", async () => {
         project = await createTempProject();
         const logFile = join(project.dir, "fake-npm.log");
