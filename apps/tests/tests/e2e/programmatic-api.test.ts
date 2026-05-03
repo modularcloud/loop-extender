@@ -12562,5 +12562,242 @@ console.log(JSON.stringify({ synchronousThrew, callSiteMessage, rejected, rejMes
         expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
       });
     }
+
+    // ----------------------------------------------------------------------
+    // T-API-64k / T-API-64k2 / T-API-64k3 — Call-Site Capture Timing.
+    // SPEC §9.1 / §9.2 / §9.5: options.signal is read at the call site as a
+    // synchronous snapshot; both run surfaces capture before returning. The
+    // duck-typed-signal pathway provides a clean observation surface — a real
+    // AbortSignal.addEventListener is not directly observable as a counter
+    // without monkey-patching the prototype. A buggy implementation that
+    // deferred the signal read (and addEventListener registration) until the
+    // first next() / iteration would still pass abort-during-iteration tests
+    // (the listener would register lazily but in time to observe a same-tick
+    // abort), yet would break the call-site snapshot contract — observable
+    // here via the synchronous post-call counter / order-array assertion.
+    // ----------------------------------------------------------------------
+
+    // T-API-64k: run() registers signal.addEventListener('abort', …) at the
+    // call site, observable synchronously after run() returns and before any
+    // consumer interaction with the generator.
+    it("T-API-64k: run() registers addEventListener at call site (synchronous snapshot)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      const driverCode = `
+import { run } from "loopx";
+let count = 0;
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") { count++; this._listener = fn; }
+  }
+};
+let synchronousThrew = false, callSiteMessage = "";
+let gen;
+try {
+  gen = run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+const countAfterCall = count;
+let drainErr = "";
+if (gen) {
+  try { for await (const _ of gen) {} } catch (e) { drainErr = e?.message || String(e); }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, countAfterCall, drainErr }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) NO synchronous throw at the call site.
+      expect(parsed.synchronousThrew).toBe(false);
+      expect(parsed.callSiteMessage).toBe("");
+      // (b) addEventListener was invoked synchronously during run() — count
+      //     observable === 1 BEFORE any generator interaction.
+      expect(parsed.countAfterCall).toBe(1);
+    });
+
+    // T-API-64k2: runPromise() registers signal.addEventListener('abort', …)
+    // at the call site, observable synchronously after runPromise() returns
+    // and before the promise is awaited. SPEC §9.2 specifies eager snapshot
+    // timing for runPromise — the synchronous body of runPromise runs before
+    // its first `await Promise.resolve()` microtask boundary, so the listener
+    // registration is observable to the caller before the returned promise
+    // suspends.
+    it("T-API-64k2: runPromise() registers addEventListener at call site (synchronous snapshot)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      const driverCode = `
+import { runPromise } from "loopx";
+let count = 0;
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") { count++; this._listener = fn; }
+  }
+};
+let synchronousThrew = false, callSiteMessage = "";
+let p;
+try {
+  p = runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+const countAfterCall = count;
+let awaitErr = "";
+if (p) {
+  try { await p; } catch (e) { awaitErr = e?.message || String(e); }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, countAfterCall, awaitErr }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) NO synchronous throw at the call site.
+      expect(parsed.synchronousThrew).toBe(false);
+      expect(parsed.callSiteMessage).toBe("");
+      // (b) addEventListener was invoked synchronously during runPromise() —
+      //     count observable === 1 BEFORE awaiting the returned promise.
+      expect(parsed.countAfterCall).toBe(1);
+    });
+
+    // T-API-64k3: options.signal is READ before every other recognized
+    // RunOptions field, on both run surfaces, against every other field
+    // independently. 8 cells: {run, runPromise} × {env, cwd, envFile,
+    // maxIterations}. The SPEC ordering rule is on the field READ, not on
+    // listener-registration completion — we assert order[0] === "signal"
+    // only, never "addEventListener fired before <other-field>".
+    interface OrderingFieldVariant {
+      field: "env" | "cwd" | "envFile" | "maxIterations";
+      returnExpr: string;
+    }
+    const orderingFields: OrderingFieldVariant[] = [
+      { field: "env", returnExpr: "undefined" },
+      { field: "cwd", returnExpr: "undefined" },
+      { field: "envFile", returnExpr: "undefined" },
+      { field: "maxIterations", returnExpr: "1" },
+    ];
+
+    for (const v of orderingFields) {
+      it(`T-API-64k3 (run, ${v.field}): run() reads options.signal before options.${v.field}`, async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        const driverCode = `
+import { run } from "loopx";
+const order = [];
+const duckSignal = { aborted: false, addEventListener() {} };
+const opts = {};
+Object.defineProperty(opts, "signal", {
+  enumerable: true,
+  get() { order.push("signal"); return duckSignal; }
+});
+Object.defineProperty(opts, ${JSON.stringify(v.field)}, {
+  enumerable: true,
+  get() { order.push(${JSON.stringify(v.field)}); return ${v.returnExpr}; }
+});
+process.chdir(${JSON.stringify(project.dir)});
+let synchronousThrew = false, callSiteMessage = "";
+let gen;
+try {
+  gen = run("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+const orderAfterCall = order.slice();
+let drainErr = "";
+if (gen) {
+  try { for await (const _ of gen) {} } catch (e) { drainErr = e?.message || String(e); }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, orderAfterCall, drainErr }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at the call site.
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.callSiteMessage).toBe("");
+        // (b) signal getter ran first across all recognized outer fields.
+        expect(parsed.orderAfterCall[0]).toBe("signal");
+        // (c) The other field's getter also ran (sanity — proves the
+        //     parameterized field is actually being read by the snapshot).
+        expect(parsed.orderAfterCall).toContain(v.field);
+      });
+
+      it(`T-API-64k3 (runPromise, ${v.field}): runPromise() reads options.signal before options.${v.field}`, async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        const driverCode = `
+import { runPromise } from "loopx";
+const order = [];
+const duckSignal = { aborted: false, addEventListener() {} };
+const opts = {};
+Object.defineProperty(opts, "signal", {
+  enumerable: true,
+  get() { order.push("signal"); return duckSignal; }
+});
+Object.defineProperty(opts, ${JSON.stringify(v.field)}, {
+  enumerable: true,
+  get() { order.push(${JSON.stringify(v.field)}); return ${v.returnExpr}; }
+});
+process.chdir(${JSON.stringify(project.dir)});
+let synchronousThrew = false, callSiteMessage = "";
+let p;
+try {
+  p = runPromise("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+const orderAfterCall = order.slice();
+let awaitErr = "";
+if (p) {
+  try { await p; } catch (e) { awaitErr = e?.message || String(e); }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, orderAfterCall, awaitErr }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at the call site.
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.callSiteMessage).toBe("");
+        // (b) signal getter ran first across all recognized outer fields.
+        expect(parsed.orderAfterCall[0]).toBe("signal");
+        // (c) The other field's getter also ran (sanity — proves the
+        //     parameterized field is actually being read by the snapshot).
+        expect(parsed.orderAfterCall).toContain(v.field);
+      });
+    }
   });
 });
