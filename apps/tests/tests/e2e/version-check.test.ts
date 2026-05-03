@@ -14,6 +14,7 @@ import {
 import { runCLI } from "../helpers/cli.js";
 import { startLocalGitServer, type GitServer } from "../helpers/servers.js";
 import { forEachRuntime } from "../helpers/runtime.js";
+import { withFakeNpm } from "../helpers/fake-npm.js";
 
 // ─────────────────────────────────────────────────────────────
 // Version & range helpers
@@ -2240,6 +2241,121 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
         expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
         expect(hasVersionMismatchWarning(result.stderr, "ralph")).toBe(false);
         expect(hasAnyPackageJsonWarning(result.stderr, "ralph")).toBe(false);
+      });
+
+      it("T-VER-15c: install — devDependencies.loopx only with invalid semver → warning, install succeeds, auto-install skips", async () => {
+        // SPEC §3.2: invalid semver range emits a warning (the version check
+        // is skipped) and installation proceeds. SPEC §10.10 "Malformed
+        // package.json": when the committed package.json has an invalid
+        // `loopx` semver range, auto-install **skips that workflow silently**
+        // — loopx does not invoke `npm install` against a file that failed
+        // version validation, and the .gitignore safeguard is also skipped.
+        //
+        // Install-time companion to T-VER-12c (which pins the same warning
+        // for `dependencies.loopx`). T-VER-12c uses `--no-install` to keep
+        // its scope narrow on the warning side; T-VER-15c uses `withFakeNpm`
+        // to assert the auto-install-skip contract explicitly — a buggy
+        // implementation that emitted the warning correctly but failed to
+        // gate `runAutoInstall` on the same `invalid-semver` classification
+        // would pass T-VER-12c yet fail this test.
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": INDEX_SH,
+              "package.json": JSON.stringify({
+                devDependencies: { loopx: INVALID_SEMVER },
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/ralph.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+
+          // (a) exit 0 — invalid semver does not block install.
+          expect(result.exitCode).toBe(0);
+
+          // (b) workflow installed at .loopx/ralph/.
+          expect(existsSync(join(project!.loopxDir, "ralph"))).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", "index.sh")),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", "package.json")),
+          ).toBe(true);
+
+          // (c) exactly one invalid-semver warning for the workflow.
+          expect(hasInvalidSemverWarning(result.stderr, "ralph")).toBe(true);
+          expect(countInvalidSemverWarnings(result.stderr, "ralph")).toBe(1);
+
+          // (d) auto-install skipped — fake-npm log empty (npm install never invoked).
+          expect(fake.readInvocations().length).toBe(0);
+
+          // (e) no .gitignore synthesis — safeguard skipped under same trigger.
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", ".gitignore")),
+          ).toBe(false);
+        });
+      });
+
+      it("T-VER-15d: install — devDependencies.loopx only with non-string value → warning, install succeeds, auto-install skips", async () => {
+        // Install-time companion to T-VER-14d (runtime non-string devDependencies.loopx)
+        // and parity with T-VER-12c (install-time non-string dependencies.loopx).
+        // SPEC §3.2 routes non-string `loopx` values through the `invalid-semver`
+        // warning class (a non-string cannot be a semver range). SPEC §10.10
+        // routes the same `invalid-semver` classification through the auto-install
+        // skip path — a buggy implementation might classify the warning correctly
+        // but fail to gate auto-install on the same classification.
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": INDEX_SH,
+              "package.json": JSON.stringify({
+                devDependencies: { loopx: 42 },
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/ralph.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+
+          // (a) exit 0.
+          expect(result.exitCode).toBe(0);
+
+          // (b) workflow installed at .loopx/ralph/.
+          expect(existsSync(join(project!.loopxDir, "ralph"))).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", "index.sh")),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", "package.json")),
+          ).toBe(true);
+
+          // (c) invalid-semver warning emitted exactly once for the workflow.
+          expect(hasInvalidSemverWarning(result.stderr, "ralph")).toBe(true);
+          expect(countInvalidSemverWarnings(result.stderr, "ralph")).toBe(1);
+
+          // (d) auto-install skipped — fake-npm log empty.
+          expect(fake.readInvocations().length).toBe(0);
+
+          // (e) no .gitignore synthesis.
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", ".gitignore")),
+          ).toBe(false);
+        });
       });
 
       it("T-VER-17: install — valid package.json with no loopx declared → no version check, no warnings", async () => {
