@@ -14317,5 +14317,305 @@ console.log(JSON.stringify({ threw, message, name }));
         expect(after.filter((e) => !before.includes(e))).toEqual([]);
       });
     }
+
+    // ------------------------------------------------------------------------
+    // T-API-65h: runPromise() — pre-aborted signal beats target-resolution
+    // failure (missing workflow). SPEC §9.3 / §9.5 / §7.1.
+    //
+    // SPEC §9.3 enumerates "target resolution" as one of the displaced
+    // pre-iteration failure modes. SPEC §7.1 step 3 enumerates target
+    // resolution sub-paths: missing workflow, missing script in existing
+    // workflow, and missing default entry point. T-API-65 covers env-file
+    // failure; T-API-65b covers `.loopx/` discovery failure; this test
+    // closes the missing-workflow branch — a distinct failure category per
+    // SPEC §7.1 step 3 that existing abort-precedence tests do not exercise
+    // directly.
+    //
+    // Setup: `.loopx/ralph/index.sh` (valid). Target a workflow that does
+    // not exist. The error path comes from runInternal's workflow lookup
+    // at run.ts:700 (`Workflow 'X' not found in .loopx/`).
+    //
+    // A buggy implementation that routed pre-aborted-signal precedence
+    // through env-file / discovery / target-syntax checks but bypassed
+    // abort-precedence on the workflow-lookup path would surface the
+    // missing-workflow error instead and fail (a).
+    // ------------------------------------------------------------------------
+    it("T-API-65h: runPromise() pre-aborted signal beats missing workflow", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65h");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("nonexistent-workflow", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with abort error, not missing-workflow error.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(
+        /workflow.*not.*found|not.*found.*workflow|nonexistent-workflow/i,
+      );
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65i: runPromise() — pre-aborted signal beats target-resolution
+    // failure (missing script in existing workflow). SPEC §9.3 / §9.5 /
+    // §7.1 / §4.1.
+    //
+    // Missing-script counterpart to T-API-65h (missing workflow). SPEC §7.1
+    // step 3 enumerates missing workflow and missing script as distinct
+    // target-resolution sub-paths, and SPEC §9.3's abort-precedence rule
+    // must cover both.
+    //
+    // Setup: `.loopx/ralph/index.sh` (valid, `index` present) but no
+    // `check` script. Target `ralph:check`. The error path comes from
+    // runInternal's script lookup at run.ts:719-724 (`Script 'X' not found
+    // in workflow 'Y'`).
+    // ------------------------------------------------------------------------
+    it("T-API-65i: runPromise() pre-aborted signal beats missing script in existing workflow", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65i");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph:check", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with abort error, not missing-script error.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(
+        /script.*not.*found|not.*found.*script|'check'/i,
+      );
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65j: runPromise() — pre-aborted signal beats target-resolution
+    // failure (missing default entry point — workflow has scripts but no
+    // `index`). SPEC §9.3 / §9.5 / §7.1 / §4.1 / §2.1.
+    //
+    // Missing-default-entry-point counterpart to T-API-65h (missing
+    // workflow) and T-API-65i (missing script under qualified target).
+    // The bare target `"ralph"` resolves to `ralph:index`, which fails
+    // with a distinct error path when no `index.*` exists. SPEC §7.1
+    // step 3 enumerates this as the third sub-path of target resolution.
+    //
+    // Setup: `.loopx/ralph/check.sh` only (no `index.*`). Target `"ralph"`.
+    // The error path comes from runInternal's index-presence check at
+    // run.ts:708-713 (`Workflow 'X' has no default entry point ('index'
+    // script)`).
+    //
+    // Together T-API-65h/65i/65j pin abort-precedence across all three
+    // SPEC §7.1 step 3 target-resolution sub-paths on the runPromise()
+    // surface.
+    // ------------------------------------------------------------------------
+    it("T-API-65j: runPromise() pre-aborted signal beats missing default entry point", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65j");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "check",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with abort error, not missing-default-entry error.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(
+        /default entry|no.*index|index.*script/i,
+      );
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65o: run() — pre-aborted signal beats target-resolution
+    // failures. Generator-surface counterpart to T-API-65h / 65i / 65j.
+    // SPEC §9.3 / §9.5 / §9.1 / §7.1.
+    //
+    // Parameterized over the three target-resolution sub-paths enumerated
+    // in SPEC §7.1 step 3:
+    //   (a) missing workflow            (counterpart to T-API-65h)
+    //   (b) missing script              (counterpart to T-API-65i)
+    //   (c) missing default entry point (counterpart to T-API-65j)
+    //
+    // For each fixture, assert the first next() throws the abort error,
+    // not the target-resolution error.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      {
+        id: "a",
+        label: "missing workflow",
+        targetExpr: '"nonexistent-workflow"',
+        scriptName: "index",
+        notMatch: /workflow.*not.*found|not.*found.*workflow|nonexistent-workflow/i,
+      },
+      {
+        id: "b",
+        label: "missing script",
+        targetExpr: '"ralph:check"',
+        scriptName: "index",
+        notMatch: /script.*not.*found|not.*found.*script|'check'/i,
+      },
+      {
+        id: "c",
+        label: "missing default entry point",
+        targetExpr: '"ralph"',
+        scriptName: "check",
+        notMatch: /default entry|no.*index|index.*script/i,
+      },
+    ]) {
+      it(`T-API-65o (${variant.id} ${variant.label}): run() pre-aborted signal beats target-resolution failure`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(
+          `api65o-${variant.id}`,
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          variant.scriptName,
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run(${variant.targetExpr}, {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First next() threw abort error, not target-resolution error.
+        expect(parsed.threw).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(variant.notMatch);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      });
+    }
   });
 });
