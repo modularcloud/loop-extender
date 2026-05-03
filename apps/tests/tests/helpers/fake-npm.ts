@@ -78,17 +78,27 @@ const RECORDED_ENV_VARS = [
  * The log entry is emitted via a Bash EXIT trap so signal-induced
  * termination still produces an entry.
  */
-function buildShimScript(opts: FakeNpmOptions): string {
+function buildShimScript(
+  opts: FakeNpmOptions,
+  payloadFiles: { stdoutFile: string | null; stderrFile: string | null },
+): string {
   const logFile = JSON.stringify(opts.logFile);
   const exitCode = opts.exitCode ?? 0;
   const sleepSeconds = opts.sleepSeconds ?? 0;
   const exitCodeByWorkflowJson = JSON.stringify(opts.exitCodeByWorkflow ?? {});
   const sleepByWorkflowJson = JSON.stringify(opts.sleepByWorkflow ?? {});
   const trapSignals = opts.trapSignals ?? [];
-  const stdoutBytes = opts.stdout ?? "";
-  const stderrBytes = opts.stderr ?? "";
-  const stdoutEsc = JSON.stringify(stdoutBytes);
-  const stderrEsc = JSON.stringify(stderrBytes);
+  // Bash double-quoted strings do NOT interpret \n / \t escapes — passing the
+  // bytes via `printf '%s' "<json-escaped>"` would emit literal backslashes.
+  // Instead we materialize the configured bytes to temp files at helper-setup
+  // time and `cat` them from the shim, which guarantees byte-for-byte fidelity
+  // (including embedded NULs, control bytes, and UTF-8 multi-byte sequences).
+  const stdoutFile = payloadFiles.stdoutFile
+    ? JSON.stringify(payloadFiles.stdoutFile)
+    : "";
+  const stderrFile = payloadFiles.stderrFile
+    ? JSON.stringify(payloadFiles.stderrFile)
+    : "";
   const pidFile = opts.pidFile ? JSON.stringify(opts.pidFile) : "";
   const spawnGrandchild = !!opts.spawnGrandchild;
   const grandchildPidFile = opts.grandchildPidFile
@@ -241,8 +251,8 @@ ${
 # stderr "ready" marker (precedes any sleep, after pidFile/createFiles).
 echo "ready" >&2
 
-${stdoutBytes ? `printf '%s' ${stdoutEsc}` : ""}
-${stderrBytes ? `printf '%s' ${stderrEsc} >&2` : ""}
+${stdoutFile ? `cat ${stdoutFile}` : ""}
+${stderrFile ? `cat ${stderrFile} >&2` : ""}
 
 if [ "$SLEEP_FOR" != "0" ]; then
   sleep "$SLEEP_FOR"
@@ -316,8 +326,25 @@ export async function withFakeNpm<T>(
     cleanDir = await buildPathExcludingNpm(originalPath);
     process.env.PATH = cleanDir;
   } else {
+    // Materialize stdout/stderr payloads to temp files so the shim can
+    // `cat` them and emit the bytes byte-for-byte (bash double-quoted
+    // strings would otherwise mangle \n / \t / multi-byte sequences).
+    let stdoutFile: string | null = null;
+    let stderrFile: string | null = null;
+    if (options.stdout && options.stdout.length > 0) {
+      stdoutFile = join(shimDir, "stdout.bin");
+      await writeFile(stdoutFile, options.stdout, "utf-8");
+    }
+    if (options.stderr && options.stderr.length > 0) {
+      stderrFile = join(shimDir, "stderr.bin");
+      await writeFile(stderrFile, options.stderr, "utf-8");
+    }
     const shimPath = join(shimDir, "npm");
-    await writeFile(shimPath, buildShimScript(options), "utf-8");
+    await writeFile(
+      shimPath,
+      buildShimScript(options, { stdoutFile, stderrFile }),
+      "utf-8",
+    );
     chmodSync(shimPath, 0o755);
     process.env.PATH = `${shimDir}:${originalPath}`;
   }

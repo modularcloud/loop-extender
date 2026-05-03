@@ -20,7 +20,7 @@ import {
   createWorkflow,
   type TempProject,
 } from "../helpers/fixtures.js";
-import { runCLI } from "../helpers/cli.js";
+import { runCLI, runCLIWithSignal } from "../helpers/cli.js";
 import {
   startLocalHTTPServer,
   startLocalGitServer,
@@ -6410,6 +6410,308 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
             expect(invocations.length).toBe(1);
             expect(invocations[0].cwd).toBe(
               join(project!.loopxDir, "ralph"),
+            );
+          },
+        );
+      });
+
+      // ─────────────────────────────────────────────────────────
+      // npm Stdout/Stderr Passthrough (T-INST-119 / 119a /
+      // 119a-stderr / 119b / 119c / 119d) — SPEC §10.10:
+      // "npm's stdout and stderr stream through to loopx's
+      // stdout and stderr unchanged; loopx neither buffers nor
+      // parses npm output and does not introduce a progress
+      // indicator of its own."
+      // ─────────────────────────────────────────────────────────
+
+      // Spinner glyphs and progress-bar/percentage patterns the
+      // SPEC §10.10 progress-indicator clause forbids.
+      const SPINNER_GLYPHS = /[⠇⠙⠹⠸⠼⠴⠦⠧⠇⠏]/;
+      const PROGRESS_BAR = /\[#+\s*\]|\[#+\s*#*\]/;
+      const PROGRESS_PCT = /^\s*\d{1,3}\s*%\s*$/m;
+
+      function expectNoProgressIndicator(text: string): void {
+        expect(text).not.toMatch(SPINNER_GLYPHS);
+        expect(text).not.toMatch(PROGRESS_BAR);
+        expect(text).not.toMatch(PROGRESS_PCT);
+      }
+
+      it("T-INST-119: npm stdout/stderr marker bytes appear unchanged in loopx's streams (success path)", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "passthrough",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "passthrough",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          {
+            exitCode: 0,
+            stdout: "npm-stdout-MARKER\n",
+            stderr: "npm-stderr-MARKER\n",
+            logFile,
+          },
+          async (fake) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/passthrough.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            // (a) exit 0
+            expect(result.exitCode).toBe(0);
+            // (b) marker bytes appear as exact standalone lines
+            expect(result.stdout).toMatch(/(^|\n)npm-stdout-MARKER\n/);
+            expect(result.stderr).toMatch(/(^|\n)npm-stderr-MARKER\n/);
+            // (c) no progress indicator
+            expectNoProgressIndicator(result.stdout);
+            expectNoProgressIndicator(result.stderr);
+            // (d) shim ran exactly once for the workflow
+            const invocations = fake.readInvocations();
+            expect(invocations.length).toBe(1);
+            expect(invocations[0].cwd).toBe(
+              join(project!.loopxDir, "passthrough"),
+            );
+          },
+        );
+      });
+
+      it("T-INST-119a: npm stdout streams through loopx in real time (no buffering until child exit)", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        const pidFile = join(project.dir, "fake-npm.pid");
+        gitServer = await startLocalGitServer([
+          {
+            name: "stream-stdout",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "stream-stdout",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          {
+            exitCode: 0,
+            stdout: "npm-streaming-MARKER\n",
+            sleepSeconds: 5,
+            pidFile,
+            logFile,
+          },
+          async () => {
+            const { result, waitForStdout } = runCLIWithSignal(
+              ["install", `${gitServer!.url}/stream-stdout.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            // (a) Marker appears as exact standalone line within 4s
+            // — well under the shim's 5s sleep.
+            await waitForStdout(/(^|\n)npm-streaming-MARKER\n/, {
+              timeoutMs: 4_000,
+            });
+            // (b) Shim PID is still alive at the moment we observed
+            // the marker (proving real-time, not buffered-until-exit).
+            const pid = Number.parseInt(readFileSync(pidFile, "utf-8"), 10);
+            expect(Number.isFinite(pid)).toBe(true);
+            expect(() => process.kill(pid, 0)).not.toThrow();
+
+            const outcome = await result;
+            // (c) eventual exit 0
+            expect(outcome.exitCode).toBe(0);
+          },
+        );
+      });
+
+      it("T-INST-119a-stderr: npm stderr streams through loopx in real time (no buffering until child exit)", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        const pidFile = join(project.dir, "fake-npm.pid");
+        gitServer = await startLocalGitServer([
+          {
+            name: "stream-stderr",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "stream-stderr",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          {
+            exitCode: 0,
+            stderr: "npm-streaming-stderr-MARKER\n",
+            sleepSeconds: 5,
+            pidFile,
+            logFile,
+          },
+          async () => {
+            const { result, waitForStderr } = runCLIWithSignal(
+              ["install", `${gitServer!.url}/stream-stderr.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            await waitForStderr(/(^|\n)npm-streaming-stderr-MARKER\n/, {
+              timeoutMs: 4_000,
+            });
+            const pid = Number.parseInt(readFileSync(pidFile, "utf-8"), 10);
+            expect(Number.isFinite(pid)).toBe(true);
+            expect(() => process.kill(pid, 0)).not.toThrow();
+
+            const outcome = await result;
+            expect(outcome.exitCode).toBe(0);
+          },
+        );
+      });
+
+      it("T-INST-119b: npm stdout/stderr marker bytes appear unchanged on the non-zero-exit failure path", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "passthrough-fail",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "passthrough-fail",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          {
+            exitCode: 1,
+            stdout: "npm-fail-stdout-MARKER\n",
+            stderr: "npm-fail-stderr-MARKER\n",
+            logFile,
+          },
+          async (fake) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/passthrough-fail.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            // (a) exit 1 from the npm non-zero-exit branch
+            expect(result.exitCode).toBe(1);
+            // (b)/(c) marker bytes survived the failure path
+            expect(result.stdout).toMatch(/(^|\n)npm-fail-stdout-MARKER\n/);
+            expect(result.stderr).toMatch(/(^|\n)npm-fail-stderr-MARKER\n/);
+            // (d) shim ran exactly once
+            const invocations = fake.readInvocations();
+            expect(invocations.length).toBe(1);
+            // (e) no progress indicator
+            expectNoProgressIndicator(result.stdout);
+            expectNoProgressIndicator(result.stderr);
+          },
+        );
+      });
+
+      it("T-INST-119c: npm stdout/stderr stream through loopx in real time on the failure path", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        const pidFile = join(project.dir, "fake-npm.pid");
+        gitServer = await startLocalGitServer([
+          {
+            name: "stream-fail",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "stream-fail",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          {
+            exitCode: 1,
+            stdout: "npm-fail-stream-stdout-MARKER\n",
+            stderr: "npm-fail-stream-stderr-MARKER\n",
+            sleepSeconds: 5,
+            pidFile,
+            logFile,
+          },
+          async () => {
+            const { result, waitForStdout, waitForStderr } = runCLIWithSignal(
+              ["install", `${gitServer!.url}/stream-fail.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            // (a)/(b) markers appear as standalone lines within 4s
+            // (well under the shim's 5s sleep).
+            await waitForStdout(/(^|\n)npm-fail-stream-stdout-MARKER\n/, {
+              timeoutMs: 4_000,
+            });
+            await waitForStderr(/(^|\n)npm-fail-stream-stderr-MARKER\n/, {
+              timeoutMs: 4_000,
+            });
+            // (c) shim PID still alive at observation time
+            const pid = Number.parseInt(readFileSync(pidFile, "utf-8"), 10);
+            expect(Number.isFinite(pid)).toBe(true);
+            expect(() => process.kill(pid, 0)).not.toThrow();
+
+            const outcome = await result;
+            // (d) exit 1 per the non-zero-exit branch
+            expect(outcome.exitCode).toBe(1);
+            // (e) no progress indicator
+            expectNoProgressIndicator(outcome.stdout);
+            expectNoProgressIndicator(outcome.stderr);
+          },
+        );
+      });
+
+      it("T-INST-119d: npm payloads with leading/trailing whitespace, tabs, no trailing newline, and UTF-8 are preserved byte-for-byte", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "byte-shape",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "byte-shape",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        // Payloads exercise:
+        //  - leading whitespace (trim-resistance)
+        //  - embedded tabs (tab-normalization-resistance)
+        //  - trailing whitespace (trim-resistance)
+        //  - no trailing newline (line-buffer-drop-partial-line-resistance)
+        //  - multi-byte UTF-8 (Unicode-mangling-resistance)
+        const stdoutPayload =
+          "  [LEAD-SPACES]npm-stdout-MARKER\twith-tab\twith-internal-spaces  [TRAIL-SPACES-NO-NEWLINE]";
+        const stderrPayload =
+          "\t[LEAD-TAB]npm-stderr-MARKER  with-spaces  naïve→END";
+        await withFakeNpm(
+          {
+            exitCode: 0,
+            stdout: stdoutPayload,
+            stderr: stderrPayload,
+            logFile,
+          },
+          async (fake) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/byte-shape.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            // (a) exit 0
+            expect(result.exitCode).toBe(0);
+            // (b)/(c) byte-exact substring presence (not line-anchored)
+            expect(result.stdout.includes(stdoutPayload)).toBe(true);
+            expect(result.stderr.includes(stderrPayload)).toBe(true);
+            // (d) shim ran once for this workflow
+            const invocations = fake.readInvocations();
+            expect(invocations.length).toBe(1);
+            expect(invocations[0].cwd).toBe(
+              join(project!.loopxDir, "byte-shape"),
             );
           },
         );
