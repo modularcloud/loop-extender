@@ -1860,6 +1860,724 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
       expect(helpRes.stdout).toMatch(/goodcheck/);
       expect(helpRes.stdout + helpRes.stderr).not.toMatch(/-bad-real-script/);
     });
+
+    // ---------------------------------------------------------------------
+    // T-DISC-40j..40q (CLI surfaces) and T-DISC-40r..40w (programmatic API
+    // surfaces) — symlink resolution failures and resolved-but-wrong-type
+    // entries at the workflow-entry and script-entry layers.
+    //
+    // SPEC §5.1 "Failed symlink resolution during runtime discovery": a
+    // broken or cyclic symlink at either layer is treated as absent for
+    // runtime discovery — silently skipped on every surface, no warning.
+    // SPEC §5.1 "Symlink policy": symlinks that resolve to the wrong type
+    // (workflow-layer → file, script-layer → directory) are also silently
+    // skipped. Name validation only fires AFTER successful classification,
+    // so an invalid alias on a skipped entry is never surfaced as a
+    // name-restriction violation.
+    // ---------------------------------------------------------------------
+
+    it("T-DISC-40j: workflow-level symlink whose target is a regular file is silently skipped — sibling discovery unaffected", async () => {
+      project = await createTempProject();
+      const external = await makeExternalDir("loopx-disc40j-");
+      const targetFile = join(external, "not-a-dir.txt");
+      writeFileSync(targetFile, "hello");
+      symlinkSync(targetFile, join(project.loopxDir, "foo"));
+      const marker = join(project.dir, "marker-40j.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc40j", marker),
+      );
+
+      // (a) Sibling workflow runs cleanly.
+      const ralphRes = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(ralphRes.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc40j");
+
+      // (b) Targeting the broken-type symlink fails as missing workflow.
+      const fooRes = await runCLI(["run", "foo"], { cwd: project.dir });
+      expect(fooRes.exitCode).toBe(1);
+
+      // (c) No warning category about `foo` on stderr from the sibling run.
+      expect(hasWarningCategoryFor(ralphRes.stderr, "foo")).toBe(false);
+
+      // (d) `loopx run -h` lists `ralph` but does not list or warn about `foo`.
+      const helpRes = await runCLI(["run", "-h"], { cwd: project.dir });
+      expect(helpRes.exitCode).toBe(0);
+      expect(helpRes.stdout).toMatch(/ralph/);
+      expect(helpRes.stdout + helpRes.stderr).not.toMatch(/\bfoo\b/);
+    });
+
+    it("T-DISC-40k: script-level symlink whose target is a directory is silently skipped — sibling script discovery unaffected", async () => {
+      project = await createTempProject();
+      const external = await makeExternalDir("loopx-disc40k-");
+      const targetDir = join(external, "not-a-script-dir");
+      mkdirSync(targetDir, { recursive: true });
+      writeFileSync(join(targetDir, "README.md"), "# not a script\n");
+      const marker = join(project.dir, "marker-40k.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc40k", marker),
+      );
+      symlinkSync(targetDir, join(project.loopxDir, "ralph", "check.sh"));
+
+      // (a) Bare run uses default `index` entry — succeeds.
+      const bareRes = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(bareRes.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc40k");
+
+      // (b) Targeting the directory-typed script fails as missing script.
+      const checkRes = await runCLI(["run", "-n", "1", "ralph:check"], { cwd: project.dir });
+      expect(checkRes.exitCode).toBe(1);
+
+      // (c) No warning category about `check` on stderr from the bare run.
+      expect(hasWarningCategoryFor(bareRes.stderr, "check")).toBe(false);
+
+      // (d) `loopx run -h` lists `ralph` with `index` but not `check`.
+      const helpRes = await runCLI(["run", "-h"], { cwd: project.dir });
+      expect(helpRes.exitCode).toBe(0);
+      expect(helpRes.stdout).toMatch(/ralph/);
+      expect(helpRes.stdout).toMatch(/index/);
+      expect(helpRes.stdout + helpRes.stderr).not.toMatch(/\bcheck\b/);
+    });
+
+    it("T-DISC-40l: broken workflow-level symlink (target missing) is silently skipped — sibling discovery unaffected", async () => {
+      project = await createTempProject();
+      symlinkSync("/missing/target", join(project.loopxDir, "broken-link"));
+      const marker = join(project.dir, "marker-40l.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc40l", marker),
+      );
+
+      // (a) Sibling workflow runs cleanly with no warning about broken-link.
+      const ralphRes = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(ralphRes.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc40l");
+      expect(hasWarningCategoryFor(ralphRes.stderr, "broken-link")).toBe(false);
+
+      // (b) Targeting the broken-link fails as missing workflow.
+      const brokenRes = await runCLI(["run", "broken-link"], { cwd: project.dir });
+      expect(brokenRes.exitCode).toBe(1);
+
+      // (c) `loopx run -h` lists `ralph` and does not list / warn about broken-link.
+      const helpRes = await runCLI(["run", "-h"], { cwd: project.dir });
+      expect(helpRes.exitCode).toBe(0);
+      expect(helpRes.stdout).toMatch(/ralph/);
+      expect(helpRes.stdout + helpRes.stderr).not.toMatch(/broken-link/);
+    });
+
+    it("T-DISC-40m: cyclic workflow-level symlinks (a→b→a) are silently skipped — sibling discovery unaffected", async () => {
+      project = await createTempProject();
+      symlinkSync("cycle-b", join(project.loopxDir, "cycle-a"));
+      symlinkSync("cycle-a", join(project.loopxDir, "cycle-b"));
+      const marker = join(project.dir, "marker-40m.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc40m", marker),
+      );
+
+      // (a) Sibling workflow runs cleanly with no warning about either cycle leg.
+      const ralphRes = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(ralphRes.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc40m");
+      expect(hasWarningCategoryFor(ralphRes.stderr, "cycle-a")).toBe(false);
+      expect(hasWarningCategoryFor(ralphRes.stderr, "cycle-b")).toBe(false);
+
+      // (b) Targeting either cycle leg fails as missing workflow.
+      const aRes = await runCLI(["run", "cycle-a"], { cwd: project.dir });
+      expect(aRes.exitCode).toBe(1);
+      const bRes = await runCLI(["run", "cycle-b"], { cwd: project.dir });
+      expect(bRes.exitCode).toBe(1);
+
+      // (c) `loopx run -h` lists `ralph` and does not list / warn about either leg.
+      const helpRes = await runCLI(["run", "-h"], { cwd: project.dir });
+      expect(helpRes.exitCode).toBe(0);
+      expect(helpRes.stdout).toMatch(/ralph/);
+      expect(helpRes.stdout + helpRes.stderr).not.toMatch(/cycle-a/);
+      expect(helpRes.stdout + helpRes.stderr).not.toMatch(/cycle-b/);
+    });
+
+    describe("T-DISC-40n: invalid-named broken/cyclic workflow symlink is skipped before name validation", () => {
+      it.each([
+        { kind: "broken" },
+        { kind: "cyclic" },
+      ] as const)(
+        "$kind workflow symlink with invalid alias name does not surface a name-restriction violation",
+        async ({ kind }) => {
+          project = await createTempProject();
+          if (kind === "broken") {
+            symlinkSync("/missing/target", join(project.loopxDir, "-bad-link"));
+          } else {
+            symlinkSync("-cycle-b", join(project.loopxDir, "-cycle-a"));
+            symlinkSync("-cycle-a", join(project.loopxDir, "-cycle-b"));
+          }
+          const marker = join(project.dir, `marker-40n-${kind}.txt`);
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            writeValueToFile(`disc40n-${kind}`, marker),
+          );
+
+          // (a) Sibling workflow runs cleanly — name-restriction error
+          // for `-bad-link` / `-cycle-a` / `-cycle-b` would be FATAL in run
+          // mode (SPEC §5.4 global validation), so a clean exit proves the
+          // name validation was never triggered.
+          const ralphRes = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+          expect(ralphRes.exitCode).toBe(0);
+          expect(readFileSync(marker, "utf-8")).toBe(`disc40n-${kind}`);
+
+          // (b) No warning or error about the invalid alias name on stderr.
+          if (kind === "broken") {
+            expect(ralphRes.stderr).not.toMatch(/-bad-link/);
+          } else {
+            expect(ralphRes.stderr).not.toMatch(/-cycle-a/);
+            expect(ralphRes.stderr).not.toMatch(/-cycle-b/);
+          }
+
+          // (c) `loopx run -h` lists `ralph` and does not list / warn about
+          // any of the invalid-named entries.
+          const helpRes = await runCLI(["run", "-h"], { cwd: project.dir });
+          expect(helpRes.exitCode).toBe(0);
+          expect(helpRes.stdout).toMatch(/ralph/);
+          if (kind === "broken") {
+            expect(helpRes.stdout + helpRes.stderr).not.toMatch(/-bad-link/);
+          } else {
+            expect(helpRes.stdout + helpRes.stderr).not.toMatch(/-cycle-a/);
+            expect(helpRes.stdout + helpRes.stderr).not.toMatch(/-cycle-b/);
+          }
+        },
+      );
+    });
+
+    it("T-DISC-40o: broken script-level symlink (target missing) is silently skipped — sibling script discovery unaffected", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "marker-40o.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc40o", marker),
+      );
+      symlinkSync("/missing/script.sh", join(project.loopxDir, "ralph", "check.sh"));
+
+      // (a) Bare run uses default `index` entry — succeeds.
+      const bareRes = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(bareRes.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc40o");
+      expect(hasWarningCategoryFor(bareRes.stderr, "check")).toBe(false);
+
+      // (b) Targeting the broken-link script fails as missing script.
+      const checkRes = await runCLI(["run", "-n", "1", "ralph:check"], { cwd: project.dir });
+      expect(checkRes.exitCode).toBe(1);
+
+      // (c) `loopx run -h` lists `ralph` with `index` but not `check`.
+      const helpRes = await runCLI(["run", "-h"], { cwd: project.dir });
+      expect(helpRes.exitCode).toBe(0);
+      expect(helpRes.stdout).toMatch(/ralph/);
+      expect(helpRes.stdout).toMatch(/index/);
+      expect(helpRes.stdout + helpRes.stderr).not.toMatch(/\bcheck\b/);
+    });
+
+    it("T-DISC-40p: cyclic script-level symlinks (a.sh→loop.sh→a.sh) are silently skipped — sibling script discovery unaffected", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "marker-40p.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc40p", marker),
+      );
+      symlinkSync("check-loop.sh", join(project.loopxDir, "ralph", "check.sh"));
+      symlinkSync("check.sh", join(project.loopxDir, "ralph", "check-loop.sh"));
+
+      // (a) Bare run uses default `index` entry — succeeds.
+      const bareRes = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(bareRes.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc40p");
+      expect(hasWarningCategoryFor(bareRes.stderr, "check")).toBe(false);
+      expect(hasWarningCategoryFor(bareRes.stderr, "check-loop")).toBe(false);
+
+      // (b) Targeting either cycle leg fails as missing script.
+      const checkRes = await runCLI(["run", "-n", "1", "ralph:check"], { cwd: project.dir });
+      expect(checkRes.exitCode).toBe(1);
+      const loopRes = await runCLI(["run", "-n", "1", "ralph:check-loop"], { cwd: project.dir });
+      expect(loopRes.exitCode).toBe(1);
+
+      // (c) `loopx run -h` lists `ralph` with `index` only — neither cycle leg.
+      const helpRes = await runCLI(["run", "-h"], { cwd: project.dir });
+      expect(helpRes.exitCode).toBe(0);
+      expect(helpRes.stdout).toMatch(/ralph/);
+      expect(helpRes.stdout).toMatch(/index/);
+      expect(helpRes.stdout + helpRes.stderr).not.toMatch(/\bcheck(-loop)?\b/);
+    });
+
+    describe("T-DISC-40q: invalid-named broken/cyclic script symlink is skipped before name validation", () => {
+      it.each([
+        { kind: "broken" },
+        { kind: "cyclic" },
+      ] as const)(
+        "$kind script symlink with invalid alias basename does not surface a name-restriction violation",
+        async ({ kind }) => {
+          project = await createTempProject();
+          const marker = join(project.dir, `marker-40q-${kind}.txt`);
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            writeValueToFile(`disc40q-${kind}`, marker),
+          );
+          if (kind === "broken") {
+            symlinkSync("/missing/script.sh", join(project.loopxDir, "ralph", "-bad.sh"));
+          } else {
+            symlinkSync("-cycle-b.sh", join(project.loopxDir, "ralph", "-cycle-a.sh"));
+            symlinkSync("-cycle-a.sh", join(project.loopxDir, "ralph", "-cycle-b.sh"));
+          }
+
+          // (a) Bare run uses default `index` entry — succeeds. A
+          // name-restriction violation would be FATAL in run mode (SPEC
+          // §5.4), so a clean exit proves the name validation never fired.
+          const bareRes = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+          expect(bareRes.exitCode).toBe(0);
+          expect(readFileSync(marker, "utf-8")).toBe(`disc40q-${kind}`);
+
+          // (b) No warning or error about the invalid script name on stderr.
+          if (kind === "broken") {
+            expect(bareRes.stderr).not.toMatch(/-bad/);
+          } else {
+            expect(bareRes.stderr).not.toMatch(/-cycle-a/);
+            expect(bareRes.stderr).not.toMatch(/-cycle-b/);
+          }
+
+          // (c) `loopx run -h` lists `ralph` with `index` and does not list /
+          // warn about any of the invalid-named entries.
+          const helpRes = await runCLI(["run", "-h"], { cwd: project.dir });
+          expect(helpRes.exitCode).toBe(0);
+          expect(helpRes.stdout).toMatch(/ralph/);
+          expect(helpRes.stdout).toMatch(/index/);
+          if (kind === "broken") {
+            expect(helpRes.stdout + helpRes.stderr).not.toMatch(/-bad/);
+          } else {
+            expect(helpRes.stdout + helpRes.stderr).not.toMatch(/-cycle-a/);
+            expect(helpRes.stdout + helpRes.stderr).not.toMatch(/-cycle-b/);
+          }
+        },
+      );
+    });
+
+    // ---------------------------------------------------------------------
+    // Programmatic API counterparts (T-DISC-40r..40w). The same SPEC §5.1
+    // failed-resolution rule is surface-agnostic; SPEC §9.1 / §9.3 say
+    // run() / runPromise() use the same loop-start discovery dispatch as
+    // the CLI surfaces.
+    // ---------------------------------------------------------------------
+
+    forEachRuntime((runtime) => {
+      it.each([
+        { surface: "runPromise" },
+        { surface: "run" },
+      ] as const)(
+        "T-DISC-40r: $surface — broken workflow-level symlink is silently skipped; missing-target on direct call",
+        async ({ surface }) => {
+          project = await createTempProject();
+          symlinkSync("/missing/target", join(project.loopxDir, "broken-link"));
+          const marker = join(project.dir, `marker-40r-${surface}.txt`);
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            writeValueToFile(`disc40r-${surface}`, marker),
+          );
+
+          const driverCode =
+            surface === "runPromise"
+              ? `
+import { runPromise } from "loopx";
+let ralphResolved = false, ralphErr = "";
+try {
+  await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  ralphResolved = true;
+} catch (e) { ralphErr = e && e.message ? e.message : String(e); }
+let brokenRejected = false, brokenErr = "";
+try {
+  await runPromise("broken-link", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) { brokenRejected = true; brokenErr = e && e.message ? e.message : String(e); }
+console.log(JSON.stringify({ ralphResolved, ralphErr, brokenRejected, brokenErr }));
+`
+              : `
+import { run } from "loopx";
+const gen1 = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+let ralphResolved = false, ralphErr = "";
+try {
+  await gen1.next();
+  await gen1.next();
+  ralphResolved = true;
+} catch (e) { ralphErr = e && e.message ? e.message : String(e); }
+const gen2 = run("broken-link", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+let brokenRejected = false, brokenErr = "";
+try {
+  await gen2.next();
+} catch (e) { brokenRejected = true; brokenErr = e && e.message ? e.message : String(e); }
+console.log(JSON.stringify({ ralphResolved, ralphErr, brokenRejected, brokenErr }));
+`;
+          const result = await runAPIDriver(runtime, driverCode);
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          // (a) Sibling workflow ran cleanly.
+          expect(parsed.ralphResolved).toBe(true);
+          expect(parsed.ralphErr).toBe("");
+          expect(readFileSync(marker, "utf-8")).toBe(`disc40r-${surface}`);
+          // (b) Direct call to broken-link surfaces a missing-target error.
+          expect(parsed.brokenRejected).toBe(true);
+          expect(parsed.brokenErr).toMatch(/broken-link/);
+          // (c) No warning prose about broken-link on stderr.
+          expect(result.stderr).not.toMatch(/Warning.*broken-link/);
+        },
+      );
+
+      it.each([
+        { surface: "runPromise" },
+        { surface: "run" },
+      ] as const)(
+        "T-DISC-40s: $surface — cyclic workflow-level symlinks are silently skipped; missing-target on either leg",
+        async ({ surface }) => {
+          project = await createTempProject();
+          symlinkSync("cycle-b", join(project.loopxDir, "cycle-a"));
+          symlinkSync("cycle-a", join(project.loopxDir, "cycle-b"));
+          const marker = join(project.dir, `marker-40s-${surface}.txt`);
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            writeValueToFile(`disc40s-${surface}`, marker),
+          );
+
+          const driverCode =
+            surface === "runPromise"
+              ? `
+import { runPromise } from "loopx";
+let ralphResolved = false, ralphErr = "";
+try {
+  await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  ralphResolved = true;
+} catch (e) { ralphErr = e && e.message ? e.message : String(e); }
+let aRejected = false, aErr = "";
+try {
+  await runPromise("cycle-a", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) { aRejected = true; aErr = e && e.message ? e.message : String(e); }
+let bRejected = false, bErr = "";
+try {
+  await runPromise("cycle-b", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) { bRejected = true; bErr = e && e.message ? e.message : String(e); }
+console.log(JSON.stringify({ ralphResolved, ralphErr, aRejected, aErr, bRejected, bErr }));
+`
+              : `
+import { run } from "loopx";
+const gen0 = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+let ralphResolved = false, ralphErr = "";
+try {
+  await gen0.next();
+  await gen0.next();
+  ralphResolved = true;
+} catch (e) { ralphErr = e && e.message ? e.message : String(e); }
+const genA = run("cycle-a", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+let aRejected = false, aErr = "";
+try {
+  await genA.next();
+} catch (e) { aRejected = true; aErr = e && e.message ? e.message : String(e); }
+const genB = run("cycle-b", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+let bRejected = false, bErr = "";
+try {
+  await genB.next();
+} catch (e) { bRejected = true; bErr = e && e.message ? e.message : String(e); }
+console.log(JSON.stringify({ ralphResolved, ralphErr, aRejected, aErr, bRejected, bErr }));
+`;
+          const result = await runAPIDriver(runtime, driverCode);
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.ralphResolved).toBe(true);
+          expect(readFileSync(marker, "utf-8")).toBe(`disc40s-${surface}`);
+          expect(parsed.aRejected).toBe(true);
+          expect(parsed.aErr).toMatch(/cycle-a/);
+          expect(parsed.bRejected).toBe(true);
+          expect(parsed.bErr).toMatch(/cycle-b/);
+          expect(result.stderr).not.toMatch(/Warning.*cycle-[ab]/);
+        },
+      );
+
+      it.each([
+        { surface: "runPromise", kind: "broken" },
+        { surface: "runPromise", kind: "cyclic" },
+        { surface: "run", kind: "broken" },
+        { surface: "run", kind: "cyclic" },
+      ] as const)(
+        "T-DISC-40t: $surface — $kind invalid-named workflow symlink does not surface a name-restriction violation",
+        async ({ surface, kind }) => {
+          project = await createTempProject();
+          if (kind === "broken") {
+            symlinkSync("/missing/target", join(project.loopxDir, "-bad-link"));
+          } else {
+            symlinkSync("-cycle-b", join(project.loopxDir, "-cycle-a"));
+            symlinkSync("-cycle-a", join(project.loopxDir, "-cycle-b"));
+          }
+          const marker = join(project.dir, `marker-40t-${surface}-${kind}.txt`);
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            writeValueToFile(`disc40t-${surface}-${kind}`, marker),
+          );
+
+          const driverCode =
+            surface === "runPromise"
+              ? `
+import { runPromise } from "loopx";
+let resolved = false, err = "";
+try {
+  await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  resolved = true;
+} catch (e) { err = e && e.message ? e.message : String(e); }
+console.log(JSON.stringify({ resolved, err }));
+`
+              : `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+let resolved = false, err = "";
+try {
+  await gen.next();
+  await gen.next();
+  resolved = true;
+} catch (e) { err = e && e.message ? e.message : String(e); }
+console.log(JSON.stringify({ resolved, err }));
+`;
+          const result = await runAPIDriver(runtime, driverCode);
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          // (a) Resolved cleanly — name validation would surface as a
+          // discovery error in pre-iteration if the entry had reached it.
+          expect(parsed.resolved).toBe(true);
+          expect(parsed.err).toBe("");
+          expect(readFileSync(marker, "utf-8")).toBe(`disc40t-${surface}-${kind}`);
+          // (b) No name-restriction warning prose on stderr.
+          if (kind === "broken") {
+            expect(result.stderr).not.toMatch(/-bad-link/);
+          } else {
+            expect(result.stderr).not.toMatch(/-cycle-a/);
+            expect(result.stderr).not.toMatch(/-cycle-b/);
+          }
+        },
+      );
+
+      it.each([
+        { surface: "runPromise" },
+        { surface: "run" },
+      ] as const)(
+        "T-DISC-40u: $surface — broken script-level symlink is silently skipped; missing-script on direct call",
+        async ({ surface }) => {
+          project = await createTempProject();
+          const marker = join(project.dir, `marker-40u-${surface}.txt`);
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            writeValueToFile(`disc40u-${surface}`, marker),
+          );
+          symlinkSync("/missing/script.sh", join(project.loopxDir, "ralph", "check.sh"));
+
+          const driverCode =
+            surface === "runPromise"
+              ? `
+import { runPromise } from "loopx";
+let bareResolved = false, bareErr = "";
+try {
+  await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  bareResolved = true;
+} catch (e) { bareErr = e && e.message ? e.message : String(e); }
+let checkRejected = false, checkErr = "";
+try {
+  await runPromise("ralph:check", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) { checkRejected = true; checkErr = e && e.message ? e.message : String(e); }
+console.log(JSON.stringify({ bareResolved, bareErr, checkRejected, checkErr }));
+`
+              : `
+import { run } from "loopx";
+const gen0 = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+let bareResolved = false, bareErr = "";
+try {
+  await gen0.next();
+  await gen0.next();
+  bareResolved = true;
+} catch (e) { bareErr = e && e.message ? e.message : String(e); }
+const gen1 = run("ralph:check", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+let checkRejected = false, checkErr = "";
+try {
+  await gen1.next();
+} catch (e) { checkRejected = true; checkErr = e && e.message ? e.message : String(e); }
+console.log(JSON.stringify({ bareResolved, bareErr, checkRejected, checkErr }));
+`;
+          const result = await runAPIDriver(runtime, driverCode);
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.bareResolved).toBe(true);
+          expect(readFileSync(marker, "utf-8")).toBe(`disc40u-${surface}`);
+          expect(parsed.checkRejected).toBe(true);
+          expect(parsed.checkErr).toMatch(/check/);
+          expect(result.stderr).not.toMatch(/Warning.*check\.sh/);
+        },
+      );
+
+      it.each([
+        { surface: "runPromise" },
+        { surface: "run" },
+      ] as const)(
+        "T-DISC-40v: $surface — cyclic script-level symlinks are silently skipped; missing-script on either leg",
+        async ({ surface }) => {
+          project = await createTempProject();
+          const marker = join(project.dir, `marker-40v-${surface}.txt`);
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            writeValueToFile(`disc40v-${surface}`, marker),
+          );
+          symlinkSync("check-loop.sh", join(project.loopxDir, "ralph", "check.sh"));
+          symlinkSync("check.sh", join(project.loopxDir, "ralph", "check-loop.sh"));
+
+          const driverCode =
+            surface === "runPromise"
+              ? `
+import { runPromise } from "loopx";
+let bareResolved = false, bareErr = "";
+try {
+  await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  bareResolved = true;
+} catch (e) { bareErr = e && e.message ? e.message : String(e); }
+let aRejected = false, aErr = "";
+try {
+  await runPromise("ralph:check", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) { aRejected = true; aErr = e && e.message ? e.message : String(e); }
+let bRejected = false, bErr = "";
+try {
+  await runPromise("ralph:check-loop", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} catch (e) { bRejected = true; bErr = e && e.message ? e.message : String(e); }
+console.log(JSON.stringify({ bareResolved, bareErr, aRejected, aErr, bRejected, bErr }));
+`
+              : `
+import { run } from "loopx";
+const gen0 = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+let bareResolved = false, bareErr = "";
+try {
+  await gen0.next();
+  await gen0.next();
+  bareResolved = true;
+} catch (e) { bareErr = e && e.message ? e.message : String(e); }
+const genA = run("ralph:check", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+let aRejected = false, aErr = "";
+try {
+  await genA.next();
+} catch (e) { aRejected = true; aErr = e && e.message ? e.message : String(e); }
+const genB = run("ralph:check-loop", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+let bRejected = false, bErr = "";
+try {
+  await genB.next();
+} catch (e) { bRejected = true; bErr = e && e.message ? e.message : String(e); }
+console.log(JSON.stringify({ bareResolved, bareErr, aRejected, aErr, bRejected, bErr }));
+`;
+          const result = await runAPIDriver(runtime, driverCode);
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.bareResolved).toBe(true);
+          expect(readFileSync(marker, "utf-8")).toBe(`disc40v-${surface}`);
+          expect(parsed.aRejected).toBe(true);
+          expect(parsed.aErr).toMatch(/check/);
+          expect(parsed.bRejected).toBe(true);
+          expect(parsed.bErr).toMatch(/check-loop/);
+          expect(result.stderr).not.toMatch(/Warning.*check(-loop)?\.sh/);
+        },
+      );
+
+      it.each([
+        { surface: "runPromise", kind: "broken" },
+        { surface: "runPromise", kind: "cyclic" },
+        { surface: "run", kind: "broken" },
+        { surface: "run", kind: "cyclic" },
+      ] as const)(
+        "T-DISC-40w: $surface — $kind invalid-named script symlink does not surface a name-restriction violation",
+        async ({ surface, kind }) => {
+          project = await createTempProject();
+          const marker = join(project.dir, `marker-40w-${surface}-${kind}.txt`);
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            writeValueToFile(`disc40w-${surface}-${kind}`, marker),
+          );
+          if (kind === "broken") {
+            symlinkSync("/missing/script.sh", join(project.loopxDir, "ralph", "-bad.sh"));
+          } else {
+            symlinkSync("-cycle-b.sh", join(project.loopxDir, "ralph", "-cycle-a.sh"));
+            symlinkSync("-cycle-a.sh", join(project.loopxDir, "ralph", "-cycle-b.sh"));
+          }
+
+          const driverCode =
+            surface === "runPromise"
+              ? `
+import { runPromise } from "loopx";
+let resolved = false, err = "";
+try {
+  await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  resolved = true;
+} catch (e) { err = e && e.message ? e.message : String(e); }
+console.log(JSON.stringify({ resolved, err }));
+`
+              : `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+let resolved = false, err = "";
+try {
+  await gen.next();
+  await gen.next();
+  resolved = true;
+} catch (e) { err = e && e.message ? e.message : String(e); }
+console.log(JSON.stringify({ resolved, err }));
+`;
+          const result = await runAPIDriver(runtime, driverCode);
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.resolved).toBe(true);
+          expect(parsed.err).toBe("");
+          expect(readFileSync(marker, "utf-8")).toBe(`disc40w-${surface}-${kind}`);
+          if (kind === "broken") {
+            expect(result.stderr).not.toMatch(/-bad/);
+          } else {
+            expect(result.stderr).not.toMatch(/-cycle-a/);
+            expect(result.stderr).not.toMatch(/-cycle-b/);
+          }
+        },
+      );
+    });
   });
 
   // =========================================================================
