@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   createTempProject,
@@ -7,6 +8,7 @@ import {
   type TempProject,
 } from "../helpers/fixtures.js";
 import { runAPIDriver } from "../helpers/api-driver.js";
+import { runCLI } from "../helpers/cli.js";
 import { forEachRuntime } from "../helpers/runtime.js";
 
 // ---------------------------------------------------------------------------
@@ -157,6 +159,59 @@ console.log(JSON.stringify(outputs));
         expect(outputs).toHaveLength(1);
         const output = outputs[0] as Record<string, unknown>;
         expect(output.stop).toBe(true);
+      });
+
+      it('T-PARSE-04a: stop:true beats invalid goto (validation short-circuited)', async () => {
+        // SPEC 2.3 "Field precedence": stop:true wins over goto, AND wins
+        // before goto-target validation runs. T-PARSE-04 used a *valid*
+        // goto target; this test pins down that an *invalid* goto
+        // (multi-colon "a:b:c", per SPEC 4.1) triggers no validation
+        // error path when stop:true is set in the same Output.
+        project = await createTempProject();
+        const counterFile = join(project.dir, "iter-count");
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `n=0
+[ -f '${counterFile}' ] && n=$(cat '${counterFile}')
+echo $((n + 1)) > '${counterFile}'
+printf '{"stop":true,"goto":"a:b:c"}'`,
+        );
+
+        // (a) CLI surface: maxIterations 5 proves stop halts the loop, not the cap.
+        const cliResult = await runCLI(["run", "test", "-n", "5"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(cliResult.exitCode).toBe(0);
+        // (b) stderr contains no goto-validation error path.
+        expect(cliResult.stderr).not.toMatch(/Invalid goto/);
+        expect(cliResult.stderr).not.toMatch(/only one ':' delimiter/);
+        expect(cliResult.stderr).not.toMatch(/not found in workflow/);
+        expect(cliResult.stderr).not.toMatch(/not found in \.loopx/);
+        // (d) Counter file proves the script ran exactly once under CLI.
+        expect(existsSync(counterFile)).toBe(true);
+        expect((await readFile(counterFile, "utf-8")).trim()).toBe("1");
+
+        // (c) runPromise surface: resolves with one Output containing stop:true,
+        // does not reject. Counter goes from 1 → 2 (delta proves single execution).
+        const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("test", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5 });
+console.log(JSON.stringify(outputs));
+`;
+        const apiResult = await runAPIDriver(runtime, driverCode);
+        expect(apiResult.exitCode).toBe(0);
+        // No goto-validation error written by the API driver either.
+        expect(apiResult.stderr).not.toMatch(/Invalid goto/);
+        expect(apiResult.stderr).not.toMatch(/only one ':' delimiter/);
+        const outputs = JSON.parse(apiResult.stdout) as unknown[];
+        expect(outputs).toHaveLength(1);
+        const output = outputs[0] as Record<string, unknown>;
+        expect(output.stop).toBe(true);
+        // Counter delta from runPromise confirms a single iteration too.
+        expect((await readFile(counterFile, "utf-8")).trim()).toBe("2");
       });
 
       it('T-PARSE-05: {"result":"x","extra":"ignored"} drops unknown fields', async () => {
@@ -328,6 +383,24 @@ console.log(JSON.stringify(outputs));
         expect(outputs).toHaveLength(1);
         expect((outputs[0] as Record<string, unknown>).result).toBe("");
       });
+
+      it('T-PARSE-13a: whitespace-only stdout falls back to raw with bytes preserved', async () => {
+        // SPEC 2.3 raw-fallback rule: stdout that does not parse as a JSON
+        // object with at least one known field becomes `result` verbatim.
+        // Whitespace-only ("   ") is the boundary case between empty
+        // (T-PARSE-13 → result:"") and non-empty raw text (T-PARSE-12).
+        // A trim-before-fallback bug would collapse this to "".
+        project = await createTempProject();
+        // printf with a literal three-space format string (no escapes,
+        // no %), no trailing newline.
+        await createBashWorkflowScript(project, "test", "index", `printf '   '`);
+
+        const { outputs, exitCode } = await runParseTest(runtime, project);
+
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe("   ");
+      });
     });
 
     // -------------------------------------------------------------------------
@@ -398,6 +471,28 @@ console.log(JSON.stringify(outputs));
         expect(exitCode).toBe(0);
         expect(outputs).toHaveLength(1);
         expect((outputs[0] as Record<string, unknown>).result).toBe("null");
+      });
+
+      it('T-PARSE-17a: {"result":[1,2]} (array) coerces via String() to "1,2"', async () => {
+        // SPEC 2.3: "If `result` is present but not a string, it is
+        // coerced via `String(value)`." T-PARSE-14..17 cover number/
+        // boolean/object/null; the array case is distinct because
+        // `String([1,2])` joins with "," (no surrounding brackets),
+        // and a hand-rolled `JSON.stringify` shortcut would emit
+        // "[1,2]" instead.
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"result":[1,2]}'`,
+        );
+
+        const { outputs, exitCode } = await runParseTest(runtime, project);
+
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe("1,2");
       });
 
       it('T-PARSE-18: {"goto":42} invalid goto discarded, Output is {}', async () => {

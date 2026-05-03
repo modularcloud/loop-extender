@@ -4,6 +4,10 @@
 
 ## P0/P1 — RESOLVED
 
+### SPEC §2.3 / §4.1 (T-PARSE-04a / T-PARSE-13a / T-PARSE-17a — Output-parsing precedence + whitespace-only raw-fallback + array-coercion) — RESOLVED this iteration
+
+Test-only iteration; existing implementation in `packages/loop-extender/src/loop.ts` and `packages/loop-extender/src/parse-output.ts` already conformed across all three behaviors and no source changes were required. Tests added to `apps/tests/tests/e2e/output-parsing.test.ts` (parameterized via `forEachRuntime` for Node + Bun = 6 tests from 3 unique IDs). **T-PARSE-04a**: `stop:true` short-circuits BEFORE goto-validation per SPEC §2.3 — fixture emits `{"stop":true,"goto":"a:b:c"}` (multi-colon goto target invalid per SPEC §4.1); pins that `loop.ts:200-203` returns the stop-Output before the goto-validation block at `loop.ts:220+` ever runs. Asserts CLI exit 0, stderr free of any goto-validation diagnostic, `runPromise` resolves with a single Output `{stop:true}`, and a counter file proves exactly one execution per surface (CLI then runPromise). **T-PARSE-13a**: whitespace-only stdout (3 spaces, no JSON, no trailing newline) falls back to raw with bytes preserved — pins `parse-output.ts:22-26` catches `JSON.parse` failure and returns `{ result: stdout }` byte-for-byte rather than trimming/collapsing to `""` (the empty-stdout outcome covered by T-PARSE-13). **T-PARSE-17a**: `{"result":[1,2]}` (array `result`) coerces via `String()` to `"1,2"` — pins `parse-output.ts:50` uses `String(value)` (so `String([1,2]) === "1,2"`), distinct from `JSON.stringify` which would emit `"[1,2]"`. 3 unique IDs × 2 runtimes = 6 tests; build green, typecheck clean, all 68/68 tests in `output-parsing.test.ts` pass.
+
 ### SPEC §6.1 / §8.1 / §8.2 / §8.3 / §13 / §9.5 (T-PWD-01 / T-PWD-02 / T-PWD-03 / T-PWD-04a / T-PWD-04b / T-PWD-06 / T-PWD-07 / T-PWD-08 — PWD Non-Protocol Behavior: full four-tier passthrough × non-synthesis × CLI-project-root-ignores-PWD) — RESOLVED this iteration
 
 This iteration authors **16 tests** (8 unique IDs × 2 runtimes — Node 25.2.1 + Bun 1.3.11) closing the entire TEST-SPEC §4.7 "PWD Non-Protocol Behavior" block (T-PWD-01..08; T-PWD-05 is non-normative per the TEST-SPEC and is intentionally not implemented). SPEC §6.1 / §8.3 / §13 explicitly classify `PWD` as outside the script-protocol-protected tier — these tests pin down externally observable contracts that loopx (a) does not reserve / synthesize `PWD`, (b) passes user-supplied `PWD` through unchanged from every supply tier (inherited env, RunOptions.env, global env file, local `-e` env file), and (c) does not consult `$PWD` for CLI project-root derivation (uses `process.cwd()` instead per SPEC §3.2 / §6.1).
@@ -1295,7 +1299,7 @@ This sub-section is the authoritative TDD-gate audit and supersedes earlier per-
 - **§4.2 Subcommands** — output: T-SUB-05a, 06c, 06d, 06e, 06f. env set: T-SUB-11a..11e. env set Serialization: T-SUB-14l. env list: T-SUB-19a. env Grammar: T-SUB-24..28; T-SUB-29, 29a..29d. Broken `.loopx/` Tree: T-SUB-20..23.
 - **§4.3 Discovery** — Workflow Discovery: T-DISC-07b, 09a, 09b, 15c. Naming: T-DISC-30c, 30d, 30e. Symlinks: T-DISC-40j..40w (14 IDs). Caching: T-DISC-42d..42g. Project-root entry failures: T-DISC-49a..49k including 49c2/49c3.
 - **§4.4 Script Execution** — Workflow-Local Deps: T-EXEC-15a, 15b, 15c.
-- **§4.5 Output Parsing** — T-PARSE-04a, 13a, 17a.
+- **§4.5 Output Parsing** — ~~T-PARSE-04a, 13a, 17a~~ RESOLVED this iteration (3 unique IDs × 2 runtimes = 6 tests; test-only — see RESOLVED subsection above).
 - **§4.6 Loop State** — T-LOOP-13a, 15b, 24a, 44, 45, 46.
 - **§4.7 Env** — Global Env File: T-ENV-05f. Env File Parsing: T-ENV-08a, 15g..15n, 15i-single. Injection Precedence: T-ENV-21e..21h, 24a2..24a6, 24a5-run. Env-File NUL: T-ENV-26a..26g, T-ENV-27..27e. LOOPX_TMPDIR: T-TMP-30, 31, 43, 44, 45. ~~PWD Non-Protocol: T-PWD-01..08 (entire block missing).~~ RESOLVED this iteration (16 tests; 8 unique IDs × 2 runtimes; T-PWD-05 non-normative, intentionally not implemented; test-only — see RESOLVED subsection above). Symlink/Project-Root: T-SYM-01..09 including 02c/02d/04a..04d/06a/07a/07b (entire block missing).
 - **§4.9 Programmatic API** — T-API-07b, 07c, 09d, 09e, 10d..10j, 19a, 21e..21k, 24c..24j, 55a..55h, 59f, 59g, 61i..61t, 69g.
@@ -1305,7 +1309,9 @@ This sub-section is the authoritative TDD-gate audit and supersedes earlier per-
 - **§4.13 Workflow-Level Version Checking** — T-VER-09a, 11b2, 11d, 12c, 13b2, 13d, 14b..14d, 15b..15d, 26d, 27d, 28..28ai2 (entire non-regular package.json block).
 - **§4.14 Exit Codes** — T-EXIT-17.
 
-**CHOSEN-FOR-THIS-ITERATION**: T-PWD-01 / T-PWD-02 / T-PWD-03 / T-PWD-04a / T-PWD-04b / T-PWD-06 / T-PWD-07 / T-PWD-08 (PWD Non-Protocol Behavior — full four-tier passthrough × non-synthesis × CLI-project-root-ignores-PWD — SPEC §6.1, §8.1, §8.2, §8.3, §13, §9.5; T-PWD-05 non-normative, intentionally not implemented). — DELIVERED
+**CHOSEN-FOR-THIS-ITERATION**: T-PARSE-04a / T-PARSE-13a / T-PARSE-17a (Output-Parsing precedence + whitespace-only raw-fallback + array-coercion — SPEC §2.3, §4.1; test-only — existing implementation already conformed). — DELIVERED
+
+**PRIOR ITERATION**: T-PWD-01 / T-PWD-02 / T-PWD-03 / T-PWD-04a / T-PWD-04b / T-PWD-06 / T-PWD-07 / T-PWD-08 (PWD Non-Protocol Behavior — full four-tier passthrough × non-synthesis × CLI-project-root-ignores-PWD — SPEC §6.1, §8.1, §8.2, §8.3, §13, §9.5; T-PWD-05 non-normative, intentionally not implemented). — DELIVERED
 
 **PRIOR ITERATION**: T-INST-118a / T-INST-118b / T-INST-118c (Package-Manager Selection — Always npm: lockfiles + packageManager field do NOT cause loopx to select a non-npm tool — SPEC §10.10). — DELIVERED
 
@@ -1324,7 +1330,7 @@ This sub-section is the authoritative TDD-gate audit and supersedes earlier per-
 
 - **Loop state**: T-LOOP-13a, 15b, 24a, 44, 45, 46.
 - **Discovery**: T-DISC-07a, 07c, 09a, 09b, 24a, 24b, 42d-42g, 49a-49k, 40j-40w (project-root `.loopx` entry failures and symlink edges).
-- **Output parsing**: T-PARSE-04a, 13a, 17a; T-MOD-13q.
+- **Output parsing**: ~~T-PARSE-04a, 13a, 17a~~ RESOLVED this iteration; T-MOD-13q.
 - **Execution edge cases**: T-EXEC-15a/15b/15c (no auto-install at run time — needs fake-npm shim helper, deferred). RESOLVED this iteration: T-EXEC-03b/03c (cd cwd-isolation across goto + loop reset), T-EXEC-07a/07b (Bash invocation: no executable bit + absolute /bin/bash), T-EXEC-13c..13m (CJS-rejection matrix: 11 tests covering `require` / `module.exports` / `exports.foo` × `.js`/`.ts`/`.tsx`/`.jsx`), T-EXEC-16c/16d (`process.chdir()` cwd-isolation across goto + loop reset).
 - **Signals**: T-SIG-04a, 05a, 06a, 07a (SIGINT parity); T-SIG-20..31 (full pre-iteration signal-wins precedence).
 - **Types**: T-TYPE-08 (compile-time check for `output()`/`input()`).
