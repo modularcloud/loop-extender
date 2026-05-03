@@ -13634,6 +13634,507 @@ console.log(JSON.stringify({ errName, errMessage }));
     }, { timeout: 60_000, retry: 2 });
 
     // ------------------------------------------------------------------------
+    // T-TERM-02 / T-TERM-02c / T-TERM-02d: SPEC §7.2 first-observed-wins on
+    // the abort × consumer-cancellation race (run() surface), spanning the
+    // {.return(), .throw()} × {abort-first, consumer-first} matrix:
+    //
+    //   T-TERM-02 variant a — abort observed first, racing .return() during
+    //     `abort-listener` seam pause. Per SPEC §7.2 the surfaced outcome
+    //     is the abort error; .return() does NOT produce a clean settlement.
+    //   T-TERM-02 variant b — .return() observed first, racing abort during
+    //     `consumer-return-observed` seam pause. Per SPEC §9.1 (silent clean
+    //     completion for post-first-`next()` `.return()`) and §7.2 (abort
+    //     does not displace first-observed), settlement is `{ done: true,
+    //     value: undefined }` and the for-await loop exits without error.
+    //   T-TERM-02c — abort observed first, racing .throw() during
+    //     `abort-listener` seam pause. The consumer-thrown error neither
+    //     chains, wraps, nor replaces the abort outcome; for-await throws
+    //     the abort error.
+    //   T-TERM-02d — .throw() observed first, racing abort during
+    //     `consumer-throw-observed` seam pause. SPEC §9.1 leaves the exact
+    //     mid-loop `.throw()` settlement shape implementation-defined, so
+    //     this test asserts the negative (NOT abort error) plus the SPEC
+    //     §7.4 cleanup invariants (recorded LOOPX_TMPDIR removed exactly
+    //     once before settlement; ≤ 1 cleanup warning).
+    //
+    // Together with T-TMP-38a/38a2 (abort-vs-.return() at the cleanup-start
+    // seam, rule-3 cleanup branch with warning-cardinality assertion) and
+    // T-TMP-38c/38c2 (abort-vs-.throw() at the cleanup-start seam,
+    // warning-cardinality), the T-TERM-02 cluster pins the OUTCOME axis on
+    // the abort-listener / consumer-*-observed seams (which the cleanup-
+    // start-based T-TMP-38 cluster cannot reach without a fault). T-TERM-02
+    // shares fixtures (long-lived "ready" script) and driver shape with
+    // T-TMP-38a/38a2 / T-TMP-38c/38c2, but differs in its seam (abort-
+    // listener / consumer-*-observed instead of cleanup-start) and its
+    // outcome assertions.
+    // ------------------------------------------------------------------------
+    function buildLongLivedReadyFixture(): string {
+      // T-TERM-02 a/b/c: long-lived script that signals readiness and
+      // sleeps for 30 seconds. The harness uses the readiness file to
+      // synchronize "child is in the loop body" before driving the racing
+      // triggers. `sleep 30 & wait` lets the script forward signals
+      // (SIGTERM from execution.ts onAbort) cleanly to the sleep.
+      return `#!/bin/bash
+touch "$FIXTURE_READY_PATH"
+sleep 30 &
+wait
+`;
+    }
+
+    function buildTmpdirObservingReadyFixture(): string {
+      // T-TERM-02d: same as above plus LOOPX_TMPDIR observation into a
+      // marker external to the tmpdir, so the harness can assert that
+      // cleanup ran exactly once (the recorded path no longer exists on
+      // disk after settlement) per SPEC §7.4 settlement-precedes-rejection.
+      return `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "$TMPDIR_OBSERVATION_PATH"
+touch "$FIXTURE_READY_PATH"
+sleep 30 &
+wait
+`;
+    }
+
+    it("T-TERM-02 (variant a): SPEC §7.2 first-observed-wins under racing abort → .return() during abort-listener (run())", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const fixtureReady = join(project.dir, "fixture-ready.flag");
+      const pauseMarker = join(project.dir, "pause-marker.json");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildLongLivedReadyFixture(),
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync } from "node:fs";
+
+const fixtureReady = ${JSON.stringify(fixtureReady)};
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const ac = new AbortController();
+const gen = run("ralph", { signal: ac.signal });
+
+let errName = "";
+let errMessage = "";
+
+const iterPromise = (async () => {
+  try {
+    for await (const _ of gen) { /* drain */ }
+  } catch (e) {
+    const ex = e as { name?: string; message?: string };
+    errName = ex?.name ?? "";
+    errMessage = ex?.message ?? String(e);
+  }
+})();
+
+const fxReady = await waitForFile(fixtureReady, 15_000);
+if (!fxReady) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "fixture-ready never appeared" }));
+  process.exit(1);
+}
+
+// Abort observed FIRST. The user-signal listener pins firstObservedRef
+// to "abort" and (because LOOPX_TEST_TERMINAL_TRIGGER_PAUSE=abort-listener)
+// schedules the bounded §1.4 pause before dispatching internalAc.abort().
+ac.abort();
+
+const pauseSeen = await waitForFile(pauseMarker, 10_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared" }));
+  process.exit(1);
+}
+
+// Racing .return() (mid-loop, post-first-next()). wrapper.return sees
+// abortObservedFirst=true → SKIPS pin + consumer-return-observed seam,
+// runs internalAc.abort() (which terminates the active child) and
+// gen.return(undefined) on the inner generator. Per SPEC §7.2, the
+// surfaced outcome must be the abort error — the consumer .return() does
+// NOT produce a clean settlement here.
+await gen.return(undefined as never);
+
+await iterPromise;
+
+console.log(JSON.stringify({ errName, errMessage }));
+`;
+
+      const result = await runAPIDriver(runtime, driverCode, {
+        cwd: project.dir,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "abort-listener",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          FIXTURE_READY_PATH: fixtureReady,
+        },
+        timeout: 60_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const envelope = JSON.parse(result.stdout.trim());
+
+      // (a) For-await loop threw the abort error — first-observed (abort)
+      // wins over the racing post-pause .return(). Load-bearing: a buggy
+      // wrapper.return that pinned `returnCalled = true` regardless of
+      // abortObservedFirst would silence the abort and shift errName to "".
+      expect(envelope.errName).toBe("AbortError");
+    }, { timeout: 60_000, retry: 2 });
+
+    it("T-TERM-02 (variant b): SPEC §7.2 first-observed-wins under racing .return() → abort during consumer-return-observed (run())", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const fixtureReady = join(project.dir, "fixture-ready.flag");
+      const pauseMarker = join(project.dir, "pause-marker.json");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildLongLivedReadyFixture(),
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync } from "node:fs";
+
+const fixtureReady = ${JSON.stringify(fixtureReady)};
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const ac = new AbortController();
+const gen = run("ralph", { signal: ac.signal });
+
+let errName = "";
+let errMessage = "";
+
+const iterPromise = (async () => {
+  try {
+    for await (const _ of gen) { /* drain */ }
+  } catch (e) {
+    const ex = e as { name?: string; message?: string };
+    errName = ex?.name ?? "";
+    errMessage = ex?.message ?? String(e);
+  }
+})();
+
+const fxReady = await waitForFile(fixtureReady, 15_000);
+if (!fxReady) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "fixture-ready never appeared", returnDone: false, returnValue: null }));
+  process.exit(1);
+}
+
+// .return() observed FIRST (mid-loop, post-first-next()). wrapper.return
+// pins firstObservedRef = "consumer", sets returnCalled = true, then
+// pauses at consumer-return-observed BEFORE dispatching internalAc.abort()
+// + inner gen.return().
+const returnPromise = gen.return(undefined as never);
+
+const pauseSeen = await waitForFile(pauseMarker, 10_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared", returnDone: false, returnValue: null }));
+  process.exit(1);
+}
+
+// Racing abort: arrives during the consumer-return-observed pause. Per
+// SPEC §7.2 first-observed-wins, the .return() observed earlier wins as
+// the surfaced outcome — the abort here must NOT displace the silent-
+// clean-completion settlement (SPEC §9.1).
+ac.abort();
+
+const settled = await returnPromise;
+await iterPromise;
+
+console.log(JSON.stringify({
+  errName,
+  errMessage,
+  returnDone: settled.done === true,
+  returnValue: settled.value === undefined ? null : settled.value,
+}));
+`;
+
+      const result = await runAPIDriver(runtime, driverCode, {
+        cwd: project.dir,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "consumer-return-observed",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          FIXTURE_READY_PATH: fixtureReady,
+        },
+        timeout: 60_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const envelope = JSON.parse(result.stdout.trim());
+
+      // The .return() settles cleanly per standard async-generator
+      // semantics — first-observed (consumer .return()) wins; the racing
+      // post-pause abort does NOT displace the clean settlement.
+      expect(envelope.returnDone).toBe(true);
+      expect(envelope.returnValue).toBe(null);
+
+      // For-await loop exits silently — no error reaches the iter loop
+      // (silent clean completion contract from SPEC §9.1).
+      expect(envelope.errName).toBe("");
+      expect(envelope.errMessage).not.toMatch(/abort/i);
+    }, { timeout: 60_000, retry: 2 });
+
+    it("T-TERM-02c: SPEC §7.2 first-observed-wins under racing abort → .throw() during abort-listener (run())", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const fixtureReady = join(project.dir, "fixture-ready.flag");
+      const pauseMarker = join(project.dir, "pause-marker.json");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildLongLivedReadyFixture(),
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync } from "node:fs";
+
+const fixtureReady = ${JSON.stringify(fixtureReady)};
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const ac = new AbortController();
+const gen = run("ralph", { signal: ac.signal });
+
+let errName = "";
+let errMessage = "";
+
+const iterPromise = (async () => {
+  try {
+    for await (const _ of gen) { /* drain */ }
+  } catch (e) {
+    const ex = e as { name?: string; message?: string };
+    errName = ex?.name ?? "";
+    errMessage = ex?.message ?? String(e);
+  }
+})();
+
+const fxReady = await waitForFile(fixtureReady, 15_000);
+if (!fxReady) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "fixture-ready never appeared" }));
+  process.exit(1);
+}
+
+// Abort observed FIRST. The user-signal listener pins firstObservedRef
+// to "abort" and schedules the abort-listener seam pause before
+// dispatching internalAc.abort().
+ac.abort();
+
+const pauseSeen = await waitForFile(pauseMarker, 10_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared" }));
+  process.exit(1);
+}
+
+// Racing .throw() (mid-loop, post-first-next()). wrapper.throw sees
+// abortObservedFirst=true → SKIPS pin + consumer-throw-observed seam,
+// runs internalAc.abort() (terminates the active child) and inner
+// gen.return(undefined). Per SPEC §7.2, the surfaced outcome must be
+// the abort error — the consumer-thrown "test-throw" must NOT chain,
+// wrap, or replace the abort outcome.
+try {
+  await gen.throw(new Error("test-throw"));
+} catch {
+  // gen.throw may resolve { done: true } or reject; either way the
+  // for-await loop is the source of truth for the surfaced outcome.
+}
+
+await iterPromise;
+
+console.log(JSON.stringify({ errName, errMessage }));
+`;
+
+      const result = await runAPIDriver(runtime, driverCode, {
+        cwd: project.dir,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "abort-listener",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          FIXTURE_READY_PATH: fixtureReady,
+        },
+        timeout: 60_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const envelope = JSON.parse(result.stdout.trim());
+
+      // (a) For-await loop threw the abort error — first-observed (abort)
+      // wins over the racing post-pause .throw(). Load-bearing: a buggy
+      // wrapper.throw that surfaced the consumer-thrown error here would
+      // shift errName/errMessage.
+      expect(envelope.errName).toBe("AbortError");
+
+      // (b) The consumer-thrown "test-throw" error neither chains, wraps,
+      // nor replaces the abort outcome.
+      expect(envelope.errMessage).not.toMatch(/test-throw/);
+    }, { timeout: 60_000, retry: 2 });
+
+    it("T-TERM-02d: SPEC §7.2 first-observed-wins under racing .throw() → abort during consumer-throw-observed (run())", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const fixtureReady = join(project.dir, "fixture-ready.flag");
+      const pauseMarker = join(project.dir, "pause-marker.json");
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildTmpdirObservingReadyFixture(),
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+
+const fixtureReady = ${JSON.stringify(fixtureReady)};
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+const tmpdirObservation = ${JSON.stringify(tmpdirObservation)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const ac = new AbortController();
+const gen = run("ralph", { signal: ac.signal });
+
+let errName = "";
+let errMessage = "";
+
+const iterPromise = (async () => {
+  try {
+    for await (const _ of gen) { /* drain */ }
+  } catch (e) {
+    const ex = e as { name?: string; message?: string };
+    errName = ex?.name ?? "";
+    errMessage = ex?.message ?? String(e);
+  }
+})();
+
+const fxReady = await waitForFile(fixtureReady, 15_000);
+if (!fxReady) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "fixture-ready never appeared", recordedTmpdir: "", recordedTmpdirExists: false }));
+  process.exit(1);
+}
+
+// .throw() observed FIRST (mid-loop, post-first-next()). wrapper.throw
+// pins firstObservedRef = "consumer", sets returnCalled = true, then
+// pauses at consumer-throw-observed BEFORE dispatching internalAc.abort()
+// + inner gen.return().
+const throwPromise = gen.throw(new Error("test-throw"));
+
+const pauseSeen = await waitForFile(pauseMarker, 10_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared", recordedTmpdir: "", recordedTmpdirExists: false }));
+  process.exit(1);
+}
+
+// Racing abort: arrives during the consumer-throw-observed pause. Per
+// SPEC §7.2 first-observed-wins, the .throw() observed earlier wins as
+// the surfaced outcome — the abort must NOT displace the .throw()
+// settlement.
+ac.abort();
+
+try {
+  await throwPromise;
+} catch {
+  // gen.throw on the wrapper may resolve { done: true } or reject; the
+  // for-await loop captures whichever the implementation produces.
+}
+
+await iterPromise;
+
+const recordedTmpdir = existsSync(tmpdirObservation)
+  ? readFileSync(tmpdirObservation, "utf-8").trim()
+  : "";
+const recordedTmpdirExists = recordedTmpdir !== "" ? existsSync(recordedTmpdir) : false;
+
+console.log(JSON.stringify({ errName, errMessage, recordedTmpdir, recordedTmpdirExists }));
+`;
+
+      const result = await runAPIDriver(runtime, driverCode, {
+        cwd: project.dir,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "consumer-throw-observed",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          FIXTURE_READY_PATH: fixtureReady,
+          TMPDIR_OBSERVATION_PATH: tmpdirObservation,
+        },
+        timeout: 60_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const envelope = JSON.parse(result.stdout.trim());
+
+      // (a) Surfaced outcome is NOT the abort error. SPEC §9.1 leaves the
+      // exact mid-loop .throw() settlement shape implementation-defined
+      // (clean completion or consumer-thrown rejection); SPEC §7.2
+      // guarantees only that the post-pause abort does NOT displace it.
+      // Load-bearing: a buggy wrapper that surfaced the abort error here
+      // would shift errName to "AbortError".
+      expect(envelope.errName).not.toBe("AbortError");
+
+      // (b) Recorded LOOPX_TMPDIR no longer exists on disk — cleanup ran
+      // exactly once before settlement (SPEC §7.4 settlement-precedes-
+      // rejection contract). The fixture only observed LOOPX_TMPDIR (did
+      // not tamper with it), so vanilla cleanup removes the directory.
+      expect(envelope.recordedTmpdir).not.toBe("");
+      expect(envelope.recordedTmpdirExists).toBe(false);
+
+      // (c) ≤ 1 cleanup-related warning — vanilla cleanup is silent on
+      // success (zero warnings expected), so the SPEC §7.4 cardinality
+      // bound is trivially met. A buggy implementation that re-entered
+      // cleanup on the racing abort and triggered a fault on the second
+      // attempt would emit additional warnings.
+      const cleanupWarnings = result.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBeLessThanOrEqual(1);
+    }, { timeout: 60_000, retry: 2 });
+
+    // ------------------------------------------------------------------------
     // T-TERM-03: SPEC §7.2 surfaced-exit-code precedence under racing
     // signals during cleanup (CLI surface). SIGINT first → loopx forwards
     // to script, script dies, loopx enters cleanup → cleanup-start seam
@@ -13710,6 +14211,254 @@ while true; do sleep 1; done
         .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
       expect(cleanupWarnings.length).toBe(0);
     }, { timeout: 60_000, retry: 2 });
+
+    // ------------------------------------------------------------------------
+    // T-TERM-04 / T-TERM-04-run: SPEC §7.2 first-observed-wins on the
+    // child-spawn-failure × abort race, on both programmatic surfaces.
+    //
+    // Both variants use a NUL-in-RunOptions.env value (`MYVAR: "bad\0val"`),
+    // which causes the runtime to reject the spawn synchronously at child-
+    // launch time per SPEC §7.2 / §9.5 / T-API-57. Two seam windows wired in
+    // execution.ts gate the race:
+    //
+    //   variant a — `child-spawn-failure` seam: spawn-failure observed
+    //     FIRST, the seam pauses AFTER pinning iteration as first-observed
+    //     (firstObservedRef.trigger = "iteration"); the harness races
+    //     c.abort() during the bounded pause. Per SPEC §7.2 first-observed-
+    //     wins, the surfaced error must be the spawn-failure error — the
+    //     post-pause abort does NOT displace it.
+    //
+    //   variant b — `child-spawn-attempt` seam: seam fires BEFORE spawn() is
+    //     called and BEFORE the spawn outcome is observed; the harness races
+    //     c.abort() during the pause so the abort listener pins
+    //     firstObservedRef.trigger = "abort" BEFORE loopx observes the
+    //     spawn outcome. Per SPEC §7.2, the surfaced error must be the
+    //     abort error — the post-pause spawn-failure does NOT displace it.
+    //     The `child-spawn-attempt` seam is essential here: without it, an
+    //     abort delivered before the spawn attempt begins pre-empts the
+    //     spawn entirely under the explicit "abort wins over pre-iteration
+    //     failures" rule (T-API-65–65o), which is structurally distinct
+    //     from the residual first-observed-wins rule under test.
+    //
+    // T-TMP-38e / T-TMP-38e-run cover the cleanup-cardinality axis on the
+    // same seam matrix with a `recursive-remove-fail` cleanup-fault that
+    // forces a single warning to be emitted; these T-TERM-04 / T-TERM-04-run
+    // tests cover the OUTCOME axis on a vanilla cleanup path (no fault),
+    // pinning surfaced-error precedence independently from
+    // cleanup-cardinality. T-TERM-04 covers the runPromise() surface;
+    // T-TERM-04-run covers run(). Parameterized over both observation
+    // orders.
+    // ------------------------------------------------------------------------
+    const TERM_04_VARIANTS = [
+      {
+        variant: "a",
+        window: "child-spawn-failure",
+        expectAbort: false,
+        rationale: "spawn-failure observed first; abort during post-observation pause does NOT displace",
+      },
+      {
+        variant: "b",
+        window: "child-spawn-attempt",
+        expectAbort: true,
+        rationale: "abort observed first during pre-spawn pause; spawn-failure observed afterward does NOT displace",
+      },
+    ] as const;
+
+    for (const { variant, window, expectAbort } of TERM_04_VARIANTS) {
+      it(`T-TERM-04 (variant ${variant}): SPEC §7.2 first-observed-wins under racing spawn-failure × abort during ${window} (runPromise())`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const pauseMarker = join(project.dir, "pause-marker.json");
+
+        // Discovery requires at least one script; the script never runs
+        // because the runtime rejects the spawn before child launch (NUL in
+        // env value).
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash\nexit 0\n`,
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync } from "node:fs";
+
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const c = new AbortController();
+
+let errName = "";
+let errMessage = "";
+
+const promise = runPromise("ralph", {
+  signal: c.signal,
+  env: { MYVAR: "bad\\u0000val" },
+  maxIterations: 1,
+});
+
+const pauseSeen = await waitForFile(pauseMarker, 15_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared" }));
+  process.exit(1);
+}
+
+c.abort();
+
+try {
+  await promise;
+} catch (e) {
+  const ex = e as { name?: string; message?: string };
+  errName = ex?.name ?? "";
+  errMessage = ex?.message ?? String(e);
+}
+
+console.log(JSON.stringify({ errName, errMessage }));
+`;
+
+        const result = await runAPIDriver(runtime, driverCode, {
+          cwd: project.dir,
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: window,
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          },
+          timeout: 60_000,
+        });
+
+        expect(result.exitCode).toBe(0);
+        const envelope = JSON.parse(result.stdout.trim());
+
+        if (expectAbort) {
+          // Variant b: abort observed first → abort error wins. The post-
+          // pause spawn-failure must NOT displace it (not chained, not
+          // wrapped). Load-bearing: a buggy implementation that surfaced
+          // the spawn-failure error from runPromise's internal catch would
+          // shift errName here.
+          expect(envelope.errName).toBe("AbortError");
+          expect(envelope.errMessage).not.toMatch(/null bytes|invalid env|envp/i);
+        } else {
+          // Variant a: spawn-failure observed first → spawn-failure error
+          // wins. The post-pause abort must NOT displace it. Load-bearing:
+          // a buggy implementation that re-checked internalAc.signal.aborted
+          // in the runLoop / wrapper.next catch and surfaced an abort error
+          // when the slot was actually pinned to "iteration" would fail
+          // here.
+          expect(envelope.errName).not.toBe("AbortError");
+          expect(envelope.errMessage).not.toMatch(/^AbortError/);
+          expect(envelope.errMessage).not.toMatch(/aborted/i);
+        }
+
+        // Cleanup-fault is intentionally not configured here — vanilla
+        // cleanup ran on the spawn-failure path (LOOPX_TMPDIR was created
+        // before spawn was attempted; runLoop's finally removes it).
+        await rm(join(tmpdirParent), { recursive: true, force: true }).catch(() => {});
+      }, { timeout: 60_000, retry: 2 });
+
+      it(`T-TERM-04-run (variant ${variant}): SPEC §7.2 first-observed-wins under racing spawn-failure × abort during ${window} (run())`, async () => {
+        const { project, tmpdirParent } = await setupTmpdirTest();
+        const pauseMarker = join(project.dir, "pause-marker.json");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash\nexit 0\n`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync } from "node:fs";
+
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const c = new AbortController();
+const gen = run("ralph", {
+  signal: c.signal,
+  env: { MYVAR: "bad\\u0000val" },
+  maxIterations: 1,
+});
+
+let errName = "";
+let errMessage = "";
+
+const iterPromise = (async () => {
+  try {
+    for await (const _ of gen) { /* drain */ }
+  } catch (e) {
+    const ex = e as { name?: string; message?: string };
+    errName = ex?.name ?? "";
+    errMessage = ex?.message ?? String(e);
+  }
+})();
+
+const pauseSeen = await waitForFile(pauseMarker, 15_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared" }));
+  process.exit(1);
+}
+
+c.abort();
+
+await iterPromise;
+
+console.log(JSON.stringify({ errName, errMessage }));
+`;
+
+        const result = await runAPIDriver(runtime, driverCode, {
+          cwd: project.dir,
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: window,
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          },
+          timeout: 60_000,
+        });
+
+        expect(result.exitCode).toBe(0);
+        const envelope = JSON.parse(result.stdout.trim());
+
+        if (expectAbort) {
+          // Variant b: abort first → abort error wins on the run() surface
+          // via wrapper.next() catch's `firstObservedRef.trigger === "abort"`
+          // branch. A buggy run()-surface dispatcher that surfaced the
+          // spawn-failure error here would shift errName.
+          expect(envelope.errName).toBe("AbortError");
+          expect(envelope.errMessage).not.toMatch(/null bytes|invalid env|envp/i);
+        } else {
+          // Variant a: spawn-failure first → spawn-failure error wins on
+          // the run() surface. A buggy implementation that surfaced an
+          // abort error from a stale internalAc.signal.aborted check would
+          // fail here.
+          expect(envelope.errName).not.toBe("AbortError");
+          expect(envelope.errMessage).not.toMatch(/^AbortError/);
+          expect(envelope.errMessage).not.toMatch(/aborted/i);
+        }
+
+        await rm(join(tmpdirParent), { recursive: true, force: true }).catch(() => {});
+      }, { timeout: 60_000, retry: 2 });
+    }
 
     // ------------------------------------------------------------------------
     // T-TERM-05: SPEC §7.2 residual first-observed-wins on the CLI surface
