@@ -229,6 +229,73 @@ forEachRuntime((runtime) => {
       expect(result.exitCode).toBe(1);
     });
 
+    // T-SUB-05a — empty-string `--result ""` is a provided flag, not absent
+    it('T-SUB-05a: output --result "" → exit 0, JSON has result==="" (empty value still counts as provided flag)', async () => {
+      project = await createTempProject();
+      const result = await runCLI(["output", "--result", ""], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.result).toBe("");
+    });
+
+    // T-SUB-06c — missing operand for --result → usage error, no JSON stdout
+    it("T-SUB-06c: output --result (missing operand) → exit 1, stderr usage error, no JSON stdout", async () => {
+      project = await createTempProject();
+      const result = await runCLI(["output", "--result"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr.length).toBeGreaterThan(0);
+      // No JSON stdout — the usage error fired before the serialization path.
+      expect(result.stdout).toBe("");
+    });
+
+    // T-SUB-06d — missing operand for --goto → usage error, no JSON stdout
+    it("T-SUB-06d: output --goto (missing operand) → exit 1, stderr usage error, no JSON stdout", async () => {
+      project = await createTempProject();
+      const result = await runCLI(["output", "--goto"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr.length).toBeGreaterThan(0);
+      expect(result.stdout).toBe("");
+    });
+
+    // T-SUB-06e — unrecognized --unknown flag (bare) → usage error
+    it("T-SUB-06e: output --unknown → exit 1, stderr mentions '--unknown', no JSON stdout", async () => {
+      project = await createTempProject();
+      const result = await runCLI(["output", "--unknown"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("--unknown");
+      expect(result.stdout).toBe("");
+    });
+
+    // T-SUB-06f — unrecognized flag mixed with a recognized one → usage error
+    it("T-SUB-06f: output --unknown --result x → exit 1, stderr mentions '--unknown', no JSON stdout", async () => {
+      project = await createTempProject();
+      const result = await runCLI(["output", "--unknown", "--result", "x"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("--unknown");
+      // The recognized --result x must NOT slip through despite the unknown flag.
+      expect(result.stdout).toBe("");
+    });
+
     // T-SUB-06
     it("T-SUB-06: output --result 'x' works without .loopx/ directory", async () => {
       project = await createTempProject({ withLoopxDir: false });
@@ -329,6 +396,93 @@ forEachRuntime((runtime) => {
       await withIsolatedHome(async () => {
         const result = await runCLI(["env", "set", "-DASH", "val"], { runtime });
         expect(result.exitCode).toBe(1);
+      });
+    });
+
+    // T-SUB-11a — lowercase-first key accepted (regex explicitly allows lowercase)
+    it("T-SUB-11a: env set mykey myval → exit 0, env list shows mykey=myval", async () => {
+      await withIsolatedHome(async () => {
+        const setResult = await runCLI(["env", "set", "mykey", "myval"], {
+          runtime,
+        });
+        expect(setResult.exitCode).toBe(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).toContain("mykey=myval");
+      });
+    });
+
+    // T-SUB-11b — interior dash rejected, env file unchanged
+    it("T-SUB-11b: env set FOO-BAR val → exit 1, stderr error, env file not mutated", async () => {
+      await withIsolatedHome(async () => {
+        const result = await runCLI(["env", "set", "FOO-BAR", "val"], {
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).not.toContain("FOO-BAR");
+      });
+    });
+
+    // T-SUB-11c — interior dot rejected, env file unchanged
+    it("T-SUB-11c: env set FOO.BAR val → exit 1, stderr error, env file not mutated", async () => {
+      await withIsolatedHome(async () => {
+        const result = await runCLI(["env", "set", "FOO.BAR", "val"], {
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).not.toContain("FOO.BAR");
+      });
+    });
+
+    // T-SUB-11d — interior space rejected, env file unchanged
+    it("T-SUB-11d: env set 'FOO BAR' val → exit 1, stderr error, env file not mutated", async () => {
+      await withIsolatedHome(async () => {
+        const result = await runCLI(["env", "set", "FOO BAR", "val"], {
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).not.toContain("FOO BAR");
+        // Sanity: no zero-content key sneaking through either.
+        expect(listResult.stdout.split("\n").every((l) => !/^=/.test(l))).toBe(
+          true,
+        );
+      });
+    });
+
+    // T-SUB-11e — empty-string name rejected; pre-existing vars remain untouched
+    it('T-SUB-11e: env set "" val → exit 1, stderr error, env file not mutated and pre-existing vars untouched', async () => {
+      await withIsolatedHome(async () => {
+        // Pre-seed an unrelated variable to verify the failed set leaves it untouched.
+        const seedResult = await runCLI(["env", "set", "EXISTING", "v"], {
+          runtime,
+        });
+        expect(seedResult.exitCode).toBe(0);
+
+        const result = await runCLI(["env", "set", "", "val"], { runtime });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        // Pre-existing variable preserved.
+        expect(listResult.stdout).toContain("EXISTING=v");
+        // No zero-length-keyed entry written (no leading `=val` line).
+        expect(listResult.stdout.split("\n").every((l) => !/^=/.test(l))).toBe(
+          true,
+        );
       });
     });
 
