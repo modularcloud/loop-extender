@@ -13505,15 +13505,22 @@ console.log(JSON.stringify({ synchronousThrew, callSiteMessage, scriptReachedRea
 // Coverage in this block (foundational subset of T-API-65 series):
 //   T-API-65   runPromise + pre-aborted + missing envFile → abort error
 //   T-API-65a  runPromise + pre-aborted + invalid target  → abort error
+//   T-API-65a2 (param)    + non-string target argument matrix → abort error
 //   T-API-65b  runPromise + pre-aborted + missing .loopx/ → abort error
 //   T-API-65d  runPromise + pre-aborted + tmpdir creation fail → abort error
 //   T-API-65e  run        + invalid signal shape + missing envFile → NOT abort
 //   T-API-65f  run        + pre-aborted + throwing later-option getter → abort error
 //   T-API-65g  runPromise + pre-aborted + throwing later-option getter → abort error
+//   T-API-65h  runPromise + pre-aborted + missing workflow → abort error
+//   T-API-65i  runPromise + pre-aborted + missing script → abort error
+//   T-API-65j  runPromise + pre-aborted + missing default index → abort error
 //   T-API-65k  run        + pre-aborted + missing envFile → abort error
 //   T-API-65l  run        + pre-aborted + invalid target  → abort error
 //   T-API-65m  run        + pre-aborted + missing .loopx/ → abort error
 //   T-API-65n  run        + pre-aborted + tmpdir creation fail → abort error
+//   T-API-65o  run        + pre-aborted + target-resolution variants → abort error
+//   T-API-65v  runPromise + invalid options wrapper + aborted signal → NOT abort
+//   T-API-65w  run        + invalid options wrapper + aborted signal → NOT abort
 //
 // All abort-path tests additionally verify (per SPEC §7.4):
 //   (b) no child was spawned (marker file absent)
@@ -14617,5 +14624,156 @@ console.log(JSON.stringify({ threw, message, name }));
         expect(after.filter((e) => !before.includes(e))).toEqual([]);
       });
     }
+
+    // ------------------------------------------------------------------------
+    // T-API-65v: runPromise() — invalid `options` WRAPPER (array) does NOT
+    // enter the abort pathway, even when the wrapper carries an aborted
+    // AbortSignal. SPEC §9.3 carve-out (i): "An invalid options value …
+    // captures no signal and does not enter this pathway." T-API-65e covers
+    // carve-out (ii) (invalid signal shape on a valid options object); this
+    // test covers carve-out (i) on the runPromise() surface — array wrapper
+    // (excluded by SPEC §9.5 "non-array" clause) with an aborted signal
+    // attached as an own property. A buggy implementation that read
+    // `opts.signal` before validating wrapper shape, observed the aborted
+    // state, and routed through abort precedence would surface an abort
+    // error here instead of the invalid-options error (matching T-API-61e).
+    // SPEC §9.3, §9.5, §9.2.
+    // ------------------------------------------------------------------------
+    it("T-API-65v: runPromise() invalid options wrapper with aborted signal does not enter abort pathway", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65v-wrapper");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      // Build the invalid wrapper field-by-field (no `{...}` spread of an
+      // accessor-bearing object) so no harness-side accessor is invoked
+      // before the call. The wrapper is an array (SPEC §9.5 "non-array"
+      // violation) with `signal` attached as an own property.
+      const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const c = new AbortController();
+c.abort();
+const opts = [];
+opts.signal = c.signal;
+let synchronousThrew = false, callTimeMessage = "";
+let p;
+try {
+  p = runPromise("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e && e.message ? e.message : String(e);
+}
+let rejected = false, message = "", name = "", looksLikeAbort = false;
+if (!synchronousThrew) {
+  try {
+    await p;
+  } catch (e) {
+    rejected = true;
+    message = e && e.message ? e.message : String(e);
+    name = e && e.name ? e.name : "";
+    // Anchored "abort"/"aborted" word match — same predicate as T-API-65e.
+    looksLikeAbort = (name === "AbortError") || /\\babort(ed)?\\b/i.test(message);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, rejected, message, name, looksLikeAbort }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // SPEC §9.2: runPromise() always returns a promise; option-shape
+      // errors surface as promise rejections, never synchronous throws.
+      expect(parsed.synchronousThrew).toBe(false);
+      // (a) The promise rejected with the invalid-options error class
+      //     (matching T-API-61e) — NOT an abort error per SPEC §9.3
+      //     carve-out (i).
+      expect(parsed.rejected).toBe(true);
+      expect(parsed.looksLikeAbort).toBe(false);
+      expect(parsed.message).toMatch(/options|RunOptions/i);
+      // (b) No child was spawned.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65w: run() — invalid `options` WRAPPER (array) does NOT enter
+    // the abort pathway, even when the wrapper carries an aborted
+    // AbortSignal. Generator-surface counterpart to T-API-65v. Together
+    // with T-API-65v, closes SPEC §9.3 carve-out (i) ("invalid options
+    // value … captures no signal") across both API surfaces, complementing
+    // T-API-65e (carve-out (ii) on run()). The expected error class
+    // matches T-API-61a (run() with `options: []`). SPEC §9.3, §9.5, §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-65w: run() invalid options wrapper with aborted signal does not enter abort pathway", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65w-wrapper");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const c = new AbortController();
+c.abort();
+const opts = [];
+opts.signal = c.signal;
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e && e.message ? e.message : String(e);
+}
+let threw = false, message = "", name = "", looksLikeAbort = false;
+if (!synchronousThrew) {
+  try {
+    await gen.next();
+  } catch (e) {
+    threw = true;
+    message = e && e.message ? e.message : String(e);
+    name = e && e.name ? e.name : "";
+    looksLikeAbort = (name === "AbortError") || /\\babort(ed)?\\b/i.test(message);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message, name, looksLikeAbort }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // SPEC §9.1: option-shape errors do not throw at the call site;
+      // they surface lazily on first next().
+      expect(parsed.synchronousThrew).toBe(false);
+      // (a) First next() threw the invalid-options error class (matching
+      //     T-API-61a) — NOT an abort error per SPEC §9.3 carve-out (i).
+      expect(parsed.threw).toBe(true);
+      expect(parsed.looksLikeAbort).toBe(false);
+      expect(parsed.message).toMatch(/options|RunOptions/i);
+      // (b) No child was spawned.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
   });
 });
