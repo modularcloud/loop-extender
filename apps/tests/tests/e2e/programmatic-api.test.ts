@@ -11451,3 +11451,263 @@ console.log(JSON.stringify({ callTimeCounts, callTimeMessage, finalCounts, rejec
     }
   });
 });
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — Generator-Returns-Without-Throwing Invariants
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.1 / §9.2: run() always returns a generator and runPromise() always
+// returns a promise — neither call site ever throws synchronously. Errors
+// surface lazily on first next() (run) or as promise rejections (runPromise).
+// This contract is critical for consumer composition: any call-site throw
+// would break try/catch-around-iteration patterns and Promise.all-style
+// orchestration. T-API-63 and T-API-63a pin the "always-returns" contract
+// across the full enumeration of invalid inputs the SPEC defines, including
+// the throwing-getter pathway and the abort-precedence pathway.
+
+describe("SPEC: Generator-Returns-Without-Throwing Invariants", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  // Each variant exercises a distinct invalid-input branch in
+  // snapshotOptions / runInternal. The errorPattern matches the message
+  // surfaced on first next() / promise rejection. The variants are chosen
+  // so each one routes through a structurally different code path:
+  //   - invalid-target: target validation in runInternal
+  //   - invalid-options-shape: snapshotOptions outer shape gate
+  //   - throwing-option-getter: snapshotOptions per-field try/catch
+  //   - already-aborted-signal: SPEC §9.3 abort-precedence pathway
+  //   - invalid-cwd / invalid-envFile / invalid-env: per-field type gates
+  //   - invalid-maxIterations: integer-range gate
+  // A buggy implementation that broke the call-site contract on any single
+  // branch (e.g., letting a throwing getter escape, or doing eager target
+  // validation that threw at the call site) would fail the corresponding
+  // variant.
+  interface ApiInvalidVariant {
+    id: string;
+    desc: string;
+    setup: string;
+    argsExpr: string;
+    errorPattern: RegExp;
+  }
+
+  const apiInvalidVariants: ApiInvalidVariant[] = [
+    {
+      id: "invalid-target",
+      desc: "non-string target (null)",
+      setup: "",
+      argsExpr: "null, { maxIterations: 1 }",
+      errorPattern: /target/i,
+    },
+    {
+      id: "invalid-options-shape",
+      desc: "null options",
+      setup: "",
+      argsExpr: '"ralph", null',
+      errorPattern: /(options|RunOptions)/i,
+    },
+    {
+      id: "throwing-option-getter",
+      desc: "throwing options.cwd getter",
+      setup:
+        'const opts = {}; Object.defineProperty(opts, "cwd", { enumerable: true, configurable: true, get() { throw new Error("cwd-getter-boom"); } });',
+      argsExpr: '"ralph", opts',
+      errorPattern: /cwd-getter-boom/,
+    },
+    {
+      id: "already-aborted-signal",
+      desc: "pre-aborted AbortController",
+      setup: "const c = new AbortController(); c.abort();",
+      argsExpr: '"ralph", { signal: c.signal, maxIterations: 1 }',
+      errorPattern: /abort/i,
+    },
+    {
+      id: "invalid-cwd",
+      desc: "non-string cwd (number)",
+      setup: "",
+      argsExpr: '"ralph", { cwd: 42, maxIterations: 1 }',
+      errorPattern: /(cwd.*string|RunOptions\.cwd)/i,
+    },
+    {
+      id: "invalid-envFile",
+      desc: "non-string envFile (number)",
+      setup: "",
+      argsExpr: '"ralph", { envFile: 42, maxIterations: 1 }',
+      errorPattern: /(envFile.*string|RunOptions\.envFile)/i,
+    },
+    {
+      id: "invalid-maxIterations",
+      desc: "negative maxIterations (-1)",
+      setup: "",
+      argsExpr: '"ralph", { maxIterations: -1 }',
+      errorPattern: /(maxIterations.*integer|Invalid maxIterations)/i,
+    },
+    {
+      id: "invalid-env",
+      desc: "non-object env (string)",
+      setup: "",
+      argsExpr: '"ralph", { env: "not-an-object", maxIterations: 1 }',
+      errorPattern: /(env.*object|RunOptions\.env)/i,
+    },
+  ];
+
+  forEachRuntime((runtime) => {
+    // ----------------------------------------------------------------------
+    // T-API-63: run() returns a generator without throwing, even under
+    // every invalid-options scenario. Per SPEC §9.1: "run() ... still
+    // returns a generator without throwing" — errors surface on first
+    // next(). For each parameterized invalid input, assert (a) NO
+    // synchronous throw at the call site, (b) returned object honors the
+    // AsyncGenerator interface contract (.next, .return, .throw methods —
+    // critical because consumers may register cleanup via these methods
+    // before driving the generator), (c) the error surfaces on first
+    // next() with a message matching the variant-specific pattern, and
+    // (d) no child is spawned (pre-iteration failures fire before any
+    // spawn, and an abort displaces other pre-iteration failures).
+    //
+    // This is the gateway invariant for the entire T-API-63..69u block:
+    // every subsequent abort-precedence / generator-lifecycle test
+    // depends on this "always-returns-a-generator" contract holding.
+    // ----------------------------------------------------------------------
+    for (const v of apiInvalidVariants) {
+      it(`T-API-63: run() returns a generator without throwing — ${v.desc}`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+${v.setup}
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = run(${v.argsExpr});
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e.message || String(e);
+}
+const isObject = returned !== null && returned !== undefined && (typeof returned === "object" || typeof returned === "function");
+const hasNext = isObject && typeof returned.next === "function";
+const hasReturn = isObject && typeof returned.return === "function";
+const hasThrow = isObject && typeof returned.throw === "function";
+let nextThrew = false, nextMessage = "", nextErrName = "";
+if (!synchronousThrew && hasNext) {
+  try {
+    await returned.next();
+  } catch (e) {
+    nextThrew = true;
+    nextMessage = e.message || String(e);
+    nextErrName = (e && e.name) ? e.name : "";
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, isObject, hasNext, hasReturn, hasThrow, nextThrew, nextMessage, nextErrName }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at call site (SPEC §9.1).
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.callSiteMessage).toBe("");
+        // (b) Returned object honors the AsyncGenerator interface contract.
+        expect(parsed.isObject).toBe(true);
+        expect(parsed.hasNext).toBe(true);
+        expect(parsed.hasReturn).toBe(true);
+        expect(parsed.hasThrow).toBe(true);
+        // (c) Error surfaces on first next() with the expected pattern.
+        expect(parsed.nextThrew).toBe(true);
+        expect(parsed.nextMessage).toMatch(v.errorPattern);
+        // (d) No child spawned — pre-iteration failure fires before spawn
+        // (and SPEC §9.3 abort-precedence displaces other pre-iteration
+        // failures including target validation, env-file load, discovery).
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-63a: runPromise() returns a promise (not a thrown error) for
+    // every invalid input. Per SPEC §9.2: "the call itself always returns
+    // a promise" — even under invalid input the call must not throw
+    // synchronously. For each parameterized invalid input, assert (a) NO
+    // synchronous throw at the call site, (b) returned value is a thenable
+    // (typeof p.then === "function") — pinning the SPEC §9.2
+    // always-returns-promise contract on the surface, (c) the promise
+    // rejects with a message matching the variant-specific pattern, and
+    // (d) no child is spawned.
+    //
+    // The async-function-body-runs-synchronously-up-to-first-await
+    // semantics combined with runWithInternal being called BEFORE the
+    // first `await Promise.resolve()` (run.ts:761/776) mean the
+    // option-snapshot pass + signal capture fire before runPromise()
+    // returns the promise — but the surface contract requires the call
+    // not to throw, regardless of whether the snapshot itself records an
+    // error. A buggy implementation that let an option-shape exception
+    // escape past the async-function boundary would fail this test on
+    // the synchronousThrew assertion.
+    // ----------------------------------------------------------------------
+    for (const v of apiInvalidVariants) {
+      it(`T-API-63a: runPromise() returns a promise without throwing — ${v.desc}`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+${v.setup}
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = runPromise(${v.argsExpr});
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e.message || String(e);
+}
+const isObject = returned !== null && returned !== undefined && (typeof returned === "object" || typeof returned === "function");
+const isThenable = isObject && typeof returned.then === "function";
+let rejected = false, rejMessage = "", rejErrName = "";
+if (!synchronousThrew && isThenable) {
+  try {
+    await returned;
+  } catch (e) {
+    rejected = true;
+    rejMessage = e.message || String(e);
+    rejErrName = (e && e.name) ? e.name : "";
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, isObject, isThenable, rejected, rejMessage, rejErrName }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at call site (SPEC §9.2).
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.callSiteMessage).toBe("");
+        // (b) Returned value is a thenable — SPEC §9.2 always-returns-promise.
+        expect(parsed.isObject).toBe(true);
+        expect(parsed.isThenable).toBe(true);
+        // (c) Promise rejects with the expected pattern.
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.rejMessage).toMatch(v.errorPattern);
+        // (d) No child spawned.
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+  });
+});
