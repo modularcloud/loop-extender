@@ -8829,5 +8829,247 @@ console.log(JSON.stringify({ count, threw, message }));
         expect(existsSync(ranMarker)).toBe(true);
       });
     }
+
+    // ------------------------------------------------------------------------
+    // T-API-58g (i)–(v): runPromise() — global env file (§8.3 tier 4) supplying
+    //   a NUL-containing value for any of the five script-protocol-protected
+    //   names is silently overridden by protocol injection (tier 1).
+    //   Programmatic counterpart to CLI tests T-ENV-29 / T-ENV-29a (CLI global
+    //   env file); closes the global-env-file tier merge-order matrix on the
+    //   eager-snapshot programmatic surface. T-API-58b/c/d/d2/e/e2 pin the
+    //   contract on RunOptions.env (tier 2); T-API-58f / T-API-58f2 pin it on
+    //   the programmatic local-env-file (tier 3 via RunOptions.envFile). This
+    //   is the last uncovered tier on the programmatic surface.
+    //
+    //   A buggy implementation that wired the protocol-tier-overlay-after-
+    //   merge contract correctly on the CLI's global-env-file code path while
+    //   routing the programmatic global-env-file load through a separate,
+    //   merge-order-broken path would pass T-ENV-29 / T-ENV-29a (and T-API-58f
+    //   / T-API-58f2 for the local env-file tier) yet fail this test.
+    //
+    //   No `envFile` is supplied so the global env file is the highest-
+    //   precedence env-file tier — a buggy implementation cannot mask its
+    //   load by routing through the local-tier path.
+    //   SPEC §7.2 / §7.4 / §8.1 / §8.3 / §9.2 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      { name: "LOOPX_WORKFLOW", id: "i", marker: "loopx_workflow" },
+      { name: "LOOPX_TMPDIR", id: "ii", marker: "loopx_tmpdir" },
+      { name: "LOOPX_BIN", id: "iii", marker: "loopx_bin" },
+      { name: "LOOPX_PROJECT_ROOT", id: "iv", marker: "loopx_project_root" },
+      { name: "LOOPX_WORKFLOW_DIR", id: "v", marker: "loopx_workflow_dir" },
+    ]) {
+      it(`T-API-58g (${variant.id} ${variant.name}): runPromise() — NUL in global env file ${variant.name} silently overridden by protocol injection`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api58g-${variant.id}`);
+        const projectRoot = realpathSync(project.dir);
+        const obsMarker = join(project.dir, `${variant.marker}.txt`);
+        const tmpdirStatMarker = join(project.dir, "loopx_tmpdir_stat.txt");
+        const ranMarker = join(project.dir, "child-ran.txt");
+        // Provision a writable XDG_CONFIG_HOME with a global env file under
+        // <xdg>/loopx/env containing the NUL-bearing protocol-name line.
+        const xdgDir = await mkdtemp(join(osTmpdir(), `loopx-test-xdg-${variant.id}-`));
+        cleanups.push(async () => {
+          await rm(xdgDir, { recursive: true, force: true }).catch(() => {});
+        });
+        const loopxConfigDir = join(xdgDir, "loopx");
+        await mkdir(loopxConfigDir, { recursive: true });
+        const globalEnvFilePath = join(loopxConfigDir, "env");
+        // SPEC §8.1: env-file parser splits on '\n' and reads value from
+        // after the first '=' to end of line — NUL bytes within the value
+        // are preserved verbatim and reach mergeEnv unchanged.
+        await writeEnvFileRaw(
+          globalEnvFilePath,
+          `${variant.name}=bad\x00value\n`,
+        );
+        const tmpdirStatBlock =
+          variant.name === "LOOPX_TMPDIR"
+            ? `if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${tmpdirStatMarker}"
+else
+  printf 'not-dir' > "${tmpdirStatMarker}"
+fi
+`
+            : "";
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '%s' "\$${variant.name}" > "${obsMarker}"
+${tmpdirStatBlock}printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected, message }));
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  console.log(JSON.stringify({ count: 0, rejected, message }));
+}
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdgDir },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise resolved (no rejection — protocol-tier overlay replaced
+        //     the NUL value before the runtime saw it).
+        expect(parsed.rejected).toBe(false);
+        expect(parsed.count).toBe(1);
+        // (b) Marker records the real protocol value, not the NUL string.
+        const observed = readFileSync(obsMarker, "utf-8");
+        expect(observed).not.toBe("bad value");
+        if (variant.name === "LOOPX_WORKFLOW") {
+          expect(observed).toBe("ralph");
+        } else if (variant.name === "LOOPX_TMPDIR") {
+          // Real loopx-created tmpdir per SPEC §7.4 mkdtemp naming convention.
+          expect(observed).toMatch(/\/loopx-[^/]+$/);
+          const realTmpdirParent = realpathSync(tmpdirParent);
+          expect(observed.startsWith(realTmpdirParent)).toBe(true);
+          // (c) During-run stat marker proves real loopx-created directory
+          //     (not a substituted string). SPEC §7.4 cleanup removes the
+          //     dir AFTER the script exits, so a post-run stat would
+          //     observe absence even if the value were a real path.
+          expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+        } else if (variant.name === "LOOPX_BIN") {
+          // LOOPX_BIN is the resolved realpath of the loopx binary.
+          expect(existsSync(observed)).toBe(true);
+        } else if (variant.name === "LOOPX_PROJECT_ROOT") {
+          expect(observed).toBe(projectRoot);
+        } else if (variant.name === "LOOPX_WORKFLOW_DIR") {
+          expect(observed).toBe(join(projectRoot, ".loopx", "ralph"));
+        }
+        // (d) No spawn-failure error on stderr and no parser warning about NUL.
+        expect(result.stderr).not.toMatch(/exited with code/);
+        expect(result.stderr).not.toMatch(/spawn/i);
+        expect(result.stderr).not.toMatch(/nul|\\x00/i);
+        // (e) No override-warning on stderr (silent-override per §13 / §8.3).
+        const re = new RegExp(
+          `${variant.name.toLowerCase()}.*(override|overrid|ignored|warning|notice)`,
+          "i",
+        );
+        expect(result.stderr).not.toMatch(re);
+        // (f) Workflow script ran exactly once.
+        expect(existsSync(ranMarker)).toBe(true);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-58g2 (i)–(v): run() generator counterpart to T-API-58g. Same NUL-
+    //   merge-order contract on the global env-file tier on the lazy-snapshot
+    //   run() surface (SPEC §9.1). A buggy implementation that wired the
+    //   protocol-tier overlay correctly on the eager-snapshot runPromise()
+    //   global-env-file path while routing the lazy-snapshot run() global-env-
+    //   file path through a separate, merge-order-broken code path would pass
+    //   T-API-58g and fail T-API-58g2.
+    //   SPEC §7.2 / §7.4 / §8.1 / §8.3 / §9.1 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      { name: "LOOPX_WORKFLOW", id: "i", marker: "loopx_workflow" },
+      { name: "LOOPX_TMPDIR", id: "ii", marker: "loopx_tmpdir" },
+      { name: "LOOPX_BIN", id: "iii", marker: "loopx_bin" },
+      { name: "LOOPX_PROJECT_ROOT", id: "iv", marker: "loopx_project_root" },
+      { name: "LOOPX_WORKFLOW_DIR", id: "v", marker: "loopx_workflow_dir" },
+    ]) {
+      it(`T-API-58g2 (${variant.id} ${variant.name}): run() — NUL in global env file ${variant.name} silently overridden by protocol injection`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api58g2-${variant.id}`);
+        const projectRoot = realpathSync(project.dir);
+        const obsMarker = join(project.dir, `${variant.marker}.txt`);
+        const tmpdirStatMarker = join(project.dir, "loopx_tmpdir_stat.txt");
+        const ranMarker = join(project.dir, "child-ran.txt");
+        const xdgDir = await mkdtemp(join(osTmpdir(), `loopx-test-xdg-${variant.id}-`));
+        cleanups.push(async () => {
+          await rm(xdgDir, { recursive: true, force: true }).catch(() => {});
+        });
+        const loopxConfigDir = join(xdgDir, "loopx");
+        await mkdir(loopxConfigDir, { recursive: true });
+        const globalEnvFilePath = join(loopxConfigDir, "env");
+        await writeEnvFileRaw(
+          globalEnvFilePath,
+          `${variant.name}=bad\x00value\n`,
+        );
+        const tmpdirStatBlock =
+          variant.name === "LOOPX_TMPDIR"
+            ? `if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${tmpdirStatMarker}"
+else
+  printf 'not-dir' > "${tmpdirStatMarker}"
+fi
+`
+            : "";
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '%s' "\$${variant.name}" > "${obsMarker}"
+${tmpdirStatBlock}printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    maxIterations: 1,
+  })) {
+    count++;
+  }
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdgDir },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Generator settled cleanly.
+        expect(parsed.threw).toBe(false);
+        expect(parsed.count).toBe(1);
+        // (b) Marker records the real protocol value.
+        const observed = readFileSync(obsMarker, "utf-8");
+        expect(observed).not.toBe("bad value");
+        if (variant.name === "LOOPX_WORKFLOW") {
+          expect(observed).toBe("ralph");
+        } else if (variant.name === "LOOPX_TMPDIR") {
+          expect(observed).toMatch(/\/loopx-[^/]+$/);
+          const realTmpdirParent = realpathSync(tmpdirParent);
+          expect(observed.startsWith(realTmpdirParent)).toBe(true);
+          // During-run stat proves real loopx-created directory.
+          expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+        } else if (variant.name === "LOOPX_BIN") {
+          expect(existsSync(observed)).toBe(true);
+        } else if (variant.name === "LOOPX_PROJECT_ROOT") {
+          expect(observed).toBe(projectRoot);
+        } else if (variant.name === "LOOPX_WORKFLOW_DIR") {
+          expect(observed).toBe(join(projectRoot, ".loopx", "ralph"));
+        }
+        // (c) No spawn-failure error on stderr and no parser warning about NUL.
+        expect(result.stderr).not.toMatch(/exited with code/);
+        expect(result.stderr).not.toMatch(/spawn/i);
+        expect(result.stderr).not.toMatch(/nul|\\x00/i);
+        // (d) No override-warning on stderr.
+        const re = new RegExp(
+          `${variant.name.toLowerCase()}.*(override|overrid|ignored|warning|notice)`,
+          "i",
+        );
+        expect(result.stderr).not.toMatch(re);
+        // (e) Workflow script ran exactly once.
+        expect(existsSync(ranMarker)).toBe(true);
+      });
+    }
   });
 });
