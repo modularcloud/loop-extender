@@ -256,6 +256,27 @@ printf '%s' "\$${varname}" > "${markerPath}"
 }
 
 /**
+ * Create a shell script at `path` that records its argv (one arg per line) to
+ * `markerPath` and exits with `exitCode`. Used by T-DEL-26a / T-DEL-30 to
+ * prove that delegation forwarded the CLI argv byte-for-byte to the local
+ * binary.
+ */
+async function createArgvRecorderBinary(
+  path: string,
+  markerPath: string,
+  exitCode: number,
+): Promise<void> {
+  // `printf '%s\n' "$@"` writes one arg per line; if there are zero args, it
+  // writes a single empty line, which the test reads as "".
+  const content = `#!/bin/bash
+printf '%s\\n' "$@" > "${markerPath}"
+exit ${exitCode}
+`;
+  await writeFile(path, content, "utf-8");
+  await chmod(path, 0o755);
+}
+
+/**
  * Create a "global" loopx wrapper script at `path`. The wrapper uses
  * `exec node <realBinJs>` so it exercises the real delegation logic.
  */
@@ -490,6 +511,34 @@ describe("SPEC: CLI Delegation (T-DEL-* — §4.12)", () => {
     expect(existsSync(markerPath)).toBe(false);
   });
 
+  it("T-DEL-04a: LOOPX_DELEGATED=1 short-circuits before project-root package.json is read (broken JSON, no parse warning)", async () => {
+    fixture = await withDelegationSetup();
+    // Same broken-JSON shape as T-DEL-14 — without the recursion guard this
+    // would fire an invalid-JSON parse warning. With the guard set, the
+    // delegation code path must exit before reading the file at all.
+    await writeProjectPackageJson(fixture.projectDir, "{broken");
+    const markerPath = join(fixture.projectDir, "del-04a-marker.txt");
+    await createMarkerBinary(fixture.localBinPath, markerPath, "local-ran");
+
+    const result = await fixture.runGlobal(["version"], {
+      env: { LOOPX_DELEGATED: "1" },
+    });
+
+    // (a) Global runs (delegation skipped because LOOPX_DELEGATED is set).
+    expect(existsSync(markerPath)).toBe(false);
+    // (b) Exit 0 with the global version string.
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+    // (c) NO package.json parse warning — the recursion guard exited the
+    // delegation path before any package.json access happened. This pins
+    // down that the LOOPX_DELEGATED check runs before any file I/O on the
+    // project-root package.json. A buggy implementation that read and
+    // validated the project-root package.json before checking
+    // LOOPX_DELEGATED would emit an invalid-JSON warning here.
+    expect(hasInvalidJsonDelegationWarning(result.stderr)).toBe(false);
+    expect(/package\.json/i.test(result.stderr)).toBe(false);
+  });
+
   it("T-DEL-09: LOOPX_DELEGATED=\"\" (empty string) prevents delegation", async () => {
     fixture = await withDelegationSetup();
     await writeProjectPackageJson(fixture.projectDir, {
@@ -505,6 +554,30 @@ describe("SPEC: CLI Delegation (T-DEL-* — §4.12)", () => {
 
     expect(result.exitCode).toBe(0);
     expect(existsSync(markerPath)).toBe(false);
+  });
+
+  it("T-DEL-09a: LOOPX_DELEGATED=\"0\" (literal zero string) prevents delegation (presence-based, not boolean)", async () => {
+    fixture = await withDelegationSetup();
+    await writeProjectPackageJson(fixture.projectDir, {
+      name: "test",
+      dependencies: { loopx: "*" },
+    });
+    const markerPath = join(fixture.projectDir, "del-09a-marker.txt");
+    await createMarkerBinary(fixture.localBinPath, markerPath, "local-ran");
+
+    const result = await fixture.runGlobal(["version"], {
+      env: { LOOPX_DELEGATED: "0" },
+    });
+
+    // (a) Global runs — the literal "0" string is "set" per env-var
+    //     semantics, so the recursion guard suppresses delegation. A buggy
+    //     implementation that interpreted LOOPX_DELEGATED as a boolean
+    //     ("0"/"false"/"no" → not set) would delegate here and create the
+    //     marker file.
+    expect(existsSync(markerPath)).toBe(false);
+    // (b) Exit 0 with the global version string.
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
   });
 
   // ─────────────────────────────────────────────
@@ -824,6 +897,41 @@ echo "99.0.0-local"
     expect(hasMissingBinaryWarning(result.stderr)).toBe(true);
   });
 
+  it("T-DEL-15a: loopx declared in devDependencies (only) but binary missing → warning, delegation skipped", async () => {
+    fixture = await withDelegationSetup();
+    await writeProjectPackageJson(fixture.projectDir, {
+      name: "test",
+      // devDependencies only — NOT in dependencies or optionalDependencies.
+      devDependencies: { loopx: "*" },
+    });
+    await rm(fixture.localBinPath, { force: true });
+
+    const result = await fixture.runGlobal(["version"]);
+
+    // Global runs (delegation skipped, marker absent because we removed the bin).
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+    // Missing-binary warning fires for devDependencies declarations.
+    expect(hasMissingBinaryWarning(result.stderr)).toBe(true);
+  });
+
+  it("T-DEL-15b: loopx declared in optionalDependencies (only) but binary missing → warning, delegation skipped", async () => {
+    fixture = await withDelegationSetup();
+    await writeProjectPackageJson(fixture.projectDir, {
+      name: "test",
+      // optionalDependencies only — NOT in dependencies or devDependencies.
+      optionalDependencies: { loopx: "*" },
+    });
+    await rm(fixture.localBinPath, { force: true });
+
+    const result = await fixture.runGlobal(["version"]);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+    // Missing-binary warning fires for optionalDependencies declarations.
+    expect(hasMissingBinaryWarning(result.stderr)).toBe(true);
+  });
+
   it("T-DEL-16: node_modules/.bin/loopx exists but loopx not declared in any dependency field → no delegation, no warning", async () => {
     fixture = await withDelegationSetup();
     await writeProjectPackageJson(fixture.projectDir, {
@@ -895,6 +1003,115 @@ echo "99.0.0-local"
 
     expect(existsSync(markerPath)).toBe(true);
     expect(readFileSync(markerPath, "utf-8")).toBe("local-ran");
+  });
+
+  // ─────────────────────────────────────────────
+  // T-DEL-28 / T-DEL-28a..28e: Invalid semver range × {dependencies, devDependencies, optionalDependencies} × {binary present, binary missing}
+  // ─────────────────────────────────────────────
+
+  it("T-DEL-28: delegation is presence-based even with invalid semver range (dependencies, binary present)", async () => {
+    fixture = await withDelegationSetup();
+    await writeProjectPackageJson(fixture.projectDir, {
+      name: "test",
+      dependencies: { loopx: "not-a-range!!!" },
+    });
+    const markerPath = join(fixture.projectDir, "del-28-marker.txt");
+    await createMarkerBinary(fixture.localBinPath, markerPath, "local-ran");
+
+    const result = await fixture.runGlobal(["version"]);
+
+    // (a) Delegation occurs — the local marker file is created.
+    expect(existsSync(markerPath)).toBe(true);
+    expect(readFileSync(markerPath, "utf-8")).toBe("local-ran");
+    // (b) No invalid-semver warning — project-root delegation does not parse
+    //     or validate the declared range. A buggy implementation gating
+    //     delegation on `semver.validRange(range)` would skip and warn.
+    expect(/invalid.*semver|invalid.*range|semver.*range/i.test(result.stderr)).toBe(false);
+  });
+
+  it("T-DEL-28a: invalid-range × binary missing on dependencies → missing-binary warning, no invalid-semver warning", async () => {
+    fixture = await withDelegationSetup();
+    await writeProjectPackageJson(fixture.projectDir, {
+      name: "test",
+      dependencies: { loopx: "not-a-range!!!" },
+    });
+    // Remove the local bin to simulate "declared but binary missing".
+    await rm(fixture.localBinPath, { force: true });
+
+    const result = await fixture.runGlobal(["version"]);
+
+    // (a) Global runs (the binary was absent so delegation is skipped).
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+    // (b) Missing-binary warning fires.
+    expect(hasMissingBinaryWarning(result.stderr)).toBe(true);
+    // (c) NO invalid-semver warning — project-root delegation does not
+    //     consult or validate the range on either branch.
+    expect(/invalid.*semver|invalid.*range|semver.*range/i.test(result.stderr)).toBe(false);
+  });
+
+  it("T-DEL-28b: invalid-range × binary present on devDependencies → delegation, no invalid-semver warning", async () => {
+    fixture = await withDelegationSetup();
+    await writeProjectPackageJson(fixture.projectDir, {
+      name: "test",
+      devDependencies: { loopx: "not-a-range!!!" },
+    });
+    const markerPath = join(fixture.projectDir, "del-28b-marker.txt");
+    await createMarkerBinary(fixture.localBinPath, markerPath, "local-ran");
+
+    const result = await fixture.runGlobal(["version"]);
+
+    expect(existsSync(markerPath)).toBe(true);
+    expect(readFileSync(markerPath, "utf-8")).toBe("local-ran");
+    expect(/invalid.*semver|invalid.*range|semver.*range/i.test(result.stderr)).toBe(false);
+  });
+
+  it("T-DEL-28c: invalid-range × binary missing on devDependencies → missing-binary warning, no invalid-semver warning", async () => {
+    fixture = await withDelegationSetup();
+    await writeProjectPackageJson(fixture.projectDir, {
+      name: "test",
+      devDependencies: { loopx: "not-a-range!!!" },
+    });
+    await rm(fixture.localBinPath, { force: true });
+
+    const result = await fixture.runGlobal(["version"]);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+    expect(hasMissingBinaryWarning(result.stderr)).toBe(true);
+    expect(/invalid.*semver|invalid.*range|semver.*range/i.test(result.stderr)).toBe(false);
+  });
+
+  it("T-DEL-28d: invalid-range × binary present on optionalDependencies → delegation, no invalid-semver warning", async () => {
+    fixture = await withDelegationSetup();
+    await writeProjectPackageJson(fixture.projectDir, {
+      name: "test",
+      optionalDependencies: { loopx: "not-a-range!!!" },
+    });
+    const markerPath = join(fixture.projectDir, "del-28d-marker.txt");
+    await createMarkerBinary(fixture.localBinPath, markerPath, "local-ran");
+
+    const result = await fixture.runGlobal(["version"]);
+
+    expect(existsSync(markerPath)).toBe(true);
+    expect(readFileSync(markerPath, "utf-8")).toBe("local-ran");
+    expect(/invalid.*semver|invalid.*range|semver.*range/i.test(result.stderr)).toBe(false);
+  });
+
+  it("T-DEL-28e: invalid-range × binary missing on optionalDependencies → missing-binary warning, no invalid-semver warning", async () => {
+    fixture = await withDelegationSetup();
+    await writeProjectPackageJson(fixture.projectDir, {
+      name: "test",
+      optionalDependencies: { loopx: "not-a-range!!!" },
+    });
+    await rm(fixture.localBinPath, { force: true });
+
+    const result = await fixture.runGlobal(["version"]);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+    expect(hasMissingBinaryWarning(result.stderr)).toBe(true);
+    expect(/invalid.*semver|invalid.*range|semver.*range/i.test(result.stderr)).toBe(false);
   });
 
   // ─────────────────────────────────────────────
@@ -1008,6 +1225,33 @@ echo "99.0.0-local"
 
     expect(existsSync(markerPath)).toBe(true);
     expect(readFileSync(markerPath, "utf-8")).toBe("local-ran");
+  });
+
+  it("T-DEL-26a: delegation applies to `loopx output --result foo` (argv preserved byte-for-byte)", async () => {
+    fixture = await withDelegationSetup();
+    await writeProjectPackageJson(fixture.projectDir, {
+      name: "test",
+      dependencies: { loopx: "*" },
+    });
+    const markerPath = join(fixture.projectDir, "del-26a-marker.txt");
+    // Argv-recording shim: writes "$@" one-per-line, then exits 0.
+    await createArgvRecorderBinary(fixture.localBinPath, markerPath, 0);
+
+    const result = await fixture.runGlobal(["output", "--result", "foo"]);
+
+    // (a) Local binary handled the command (marker file created).
+    expect(existsSync(markerPath)).toBe(true);
+    // (b) Argv received byte-for-byte: ["output", "--result", "foo"].
+    //     `printf '%s\n' "$@"` writes one line per argv entry; trailing
+    //     newline is the implicit terminator after "foo".
+    const recorded = readFileSync(markerPath, "utf-8");
+    expect(recorded.split("\n").filter((l) => l.length > 0)).toEqual([
+      "output",
+      "--result",
+      "foo",
+    ]);
+    // (c) Shim's exit propagated.
+    expect(result.exitCode).toBe(0);
   });
 
   // ─────────────────────────────────────────────
@@ -1135,5 +1379,146 @@ echo "99.0.0-local"
     expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
     // peerDependencies is the "not declared in any checked field" path, not the "declared but missing binary" path.
     expect(/warn/i.test(result.stderr)).toBe(false);
+  });
+
+  // ─────────────────────────────────────────────
+  // T-DEL-29 / T-DEL-30: project-root derivation × pre-parsing semantics
+  // ─────────────────────────────────────────────
+
+  it("T-DEL-29: delegation project-root derivation ignores inherited $PWD and uses process.cwd()", async () => {
+    const baseDir = await mkdtemp(join(tmpdir(), "loopx-del29-"));
+    tempDirs.push(baseDir);
+
+    // (a) "no-deleg-cwd": real spawn cwd, no package.json, no local bin.
+    const noDelegCwd = join(baseDir, "no-deleg-cwd");
+    await mkdir(noDelegCwd, { recursive: true });
+
+    // (b) "has-deleg-pwd": separate dir with delegation setup that PWD points at.
+    const hasDelegPwd = join(baseDir, "has-deleg-pwd");
+    await mkdir(hasDelegPwd, { recursive: true });
+    await writeProjectPackageJson(hasDelegPwd, {
+      name: "test-pwd",
+      dependencies: { loopx: "*" },
+    });
+    const pwdLocalBinDir = join(hasDelegPwd, "node_modules", ".bin");
+    await mkdir(pwdLocalBinDir, { recursive: true });
+    const pwdLocalBin = join(pwdLocalBinDir, "loopx");
+    const markerPath = join(baseDir, "del-29-marker.txt");
+    await createMarkerBinary(pwdLocalBin, markerPath, "pwd-binary-invoked");
+
+    const globalBinPath = join(baseDir, "global", "bin", "loopx");
+    await createGlobalWrapper(globalBinPath);
+
+    const result = await spawnBinary(globalBinPath, ["version"], {
+      cwd: noDelegCwd,
+      env: { PWD: hasDelegPwd },
+    });
+
+    // (a) The PWD-pointed marker binary was NOT invoked — loopx's own
+    //     process.cwd() resolves to noDelegCwd (which has no package.json
+    //     and no local bin), so delegation does not occur. A buggy
+    //     implementation that consulted $PWD for the project-root
+    //     package.json lookup would find hasDelegPwd/package.json,
+    //     delegate to the marker shim, and create the marker file.
+    expect(existsSync(markerPath)).toBe(false);
+    // (b) Exit 0 with the global version string.
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+    // (c) No warning — this is the "no package.json at project root" path.
+    expect(/warn/i.test(result.stderr)).toBe(false);
+  });
+
+  it("T-DEL-30: delegation happens before command parsing, including for usage-error inputs", async () => {
+    fixture = await withDelegationSetup();
+    await writeProjectPackageJson(fixture.projectDir, {
+      name: "test",
+      dependencies: { loopx: "*" },
+    });
+    const markerPath = join(fixture.projectDir, "del-30-marker.txt");
+    // Shim records argv to marker file then exits 2 (usage-error-mimicking,
+    // distinct from success-path 0).
+    await createArgvRecorderBinary(fixture.localBinPath, markerPath, 2);
+
+    // Variant (a): unrecognized top-level flag.
+    const result1 = await fixture.runGlobal(["--unknown"]);
+    expect(existsSync(markerPath)).toBe(true);
+    expect(readFileSync(markerPath, "utf-8").split("\n").filter((l) => l.length > 0)).toEqual([
+      "--unknown",
+    ]);
+    // Local shim's exit propagated through delegation (proves global did
+    // not reject the input itself before delegation).
+    expect(result1.exitCode).toBe(2);
+
+    // Reset marker for variant (b).
+    await rm(markerPath, { force: true });
+
+    // Variant (b): unrecognized run-scoped flag.
+    const result2 = await fixture.runGlobal(["run", "--bogus", "ralph"]);
+    expect(existsSync(markerPath)).toBe(true);
+    expect(readFileSync(markerPath, "utf-8").split("\n").filter((l) => l.length > 0)).toEqual([
+      "run",
+      "--bogus",
+      "ralph",
+    ]);
+    expect(result2.exitCode).toBe(2);
+  });
+
+  // ─────────────────────────────────────────────
+  // T-DEL-07a: Delegated LOOPX_DELEGATED=1 reaches spawned scripts
+  // ─────────────────────────────────────────────
+
+  it("T-DEL-07a: after delegation fires, scripts spawned by the delegated loopx observe LOOPX_DELEGATED=1 in their env", async () => {
+    const baseDir = await mkdtemp(join(tmpdir(), "loopx-del07a-"));
+    tempDirs.push(baseDir);
+
+    const projectDir = join(baseDir, "project");
+    await mkdir(projectDir, { recursive: true });
+
+    await writeProjectPackageJson(projectDir, {
+      name: "test",
+      dependencies: { loopx: "*" },
+    });
+
+    // Real working local loopx so delegation actually executes loopx
+    // (which then spawns the script). The local binary is a wrapper that
+    // execs the real loopx bin.js — same pattern as T-DEL-10/11/24/25.
+    await installFunctionalLocalLoopx(projectDir, "2.0.0");
+
+    // Workflow with a script that observes LOOPX_DELEGATED and writes a
+    // JSON marker, then emits stop:true to terminate the loop.
+    const ralphDir = join(projectDir, ".loopx", "ralph");
+    await mkdir(ralphDir, { recursive: true });
+    const envMarker = join(baseDir, "del-07a-env-marker.json");
+    const scriptPath = join(ralphDir, "index.sh");
+    await writeFile(
+      scriptPath,
+      `#!/bin/bash
+if [ -z "\${LOOPX_DELEGATED+x}" ]; then
+  printf '%s' '{"present":false}' > "${envMarker}"
+else
+  printf '%s' '{"present":true,"value":"'"\$LOOPX_DELEGATED"'"}' > "${envMarker}"
+fi
+printf '%s' '{"stop":true}'
+`,
+      "utf-8",
+    );
+    await chmod(scriptPath, 0o755);
+
+    const globalBinPath = join(baseDir, "global", "bin", "loopx");
+    await createGlobalWrapper(globalBinPath);
+
+    // Run via global without LOOPX_DELEGATED in inherited env (so delegation
+    // actually fires). The delegated loopx receives LOOPX_DELEGATED=1
+    // (per T-DEL-07), and the script-spawn env-tier merge then propagates
+    // that into the script's environment unchanged (per T-ENV-24a's
+    // "not scrubbed before spawning" rule).
+    const result = await spawnBinary(globalBinPath, ["run", "-n", "1", "ralph"], {
+      cwd: projectDir,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(envMarker)).toBe(true);
+    const observed = JSON.parse(readFileSync(envMarker, "utf-8"));
+    expect(observed).toEqual({ present: true, value: "1" });
   });
 });
