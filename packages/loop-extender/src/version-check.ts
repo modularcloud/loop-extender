@@ -67,11 +67,16 @@ export function checkWorkflowVersion(
   }
 
   const obj = pkg as Record<string, unknown>;
-  const range = extractLoopxRange(obj);
-  if (range === null) {
+  const entry = extractLoopxValue(obj);
+  if (entry === null) {
     return { kind: "no-loopx-declared" };
   }
-
+  // Per SPEC §3.2: any value that is not a valid semver range — including
+  // non-string types — is treated as "invalid semver range".
+  if (typeof entry.value !== "string") {
+    return { kind: "invalid-semver", range: String(entry.value) };
+  }
+  const range = entry.value;
   if (!isValidRange(range)) {
     return { kind: "invalid-semver", range };
   }
@@ -83,20 +88,30 @@ export function checkWorkflowVersion(
 }
 
 /**
- * Workflow-level: extract loopx version range from dependencies (wins if
- * both) then devDependencies. Per SPEC §3.2, optionalDependencies is NOT
- * checked at the workflow level.
+ * Workflow-level: locate the `loopx` entry in `dependencies` (wins if both
+ * are present) then `devDependencies`. Returns the raw value (preserving
+ * type so the caller can distinguish a non-string value from a missing
+ * declaration). Per SPEC §3.2, `optionalDependencies` is NOT checked at
+ * the workflow level.
  */
-function extractLoopxRange(pkg: Record<string, unknown>): string | null {
+function extractLoopxValue(
+  pkg: Record<string, unknown>
+): { value: unknown } | null {
   const deps = pkg.dependencies;
   if (typeof deps === "object" && deps !== null && !Array.isArray(deps)) {
-    const v = (deps as Record<string, unknown>).loopx;
-    if (typeof v === "string") return v;
+    if (Object.prototype.hasOwnProperty.call(deps, "loopx")) {
+      return { value: (deps as Record<string, unknown>).loopx };
+    }
   }
   const devDeps = pkg.devDependencies;
-  if (typeof devDeps === "object" && devDeps !== null && !Array.isArray(devDeps)) {
-    const v = (devDeps as Record<string, unknown>).loopx;
-    if (typeof v === "string") return v;
+  if (
+    typeof devDeps === "object" &&
+    devDeps !== null &&
+    !Array.isArray(devDeps)
+  ) {
+    if (Object.prototype.hasOwnProperty.call(devDeps, "loopx")) {
+      return { value: (devDeps as Record<string, unknown>).loopx };
+    }
   }
   return null;
 }
