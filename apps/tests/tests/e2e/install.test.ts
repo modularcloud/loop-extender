@@ -5994,6 +5994,129 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         });
       });
 
+      it("T-INST-118a: bun.lockb does NOT cause loopx to select bun", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "my-workflow",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "my-workflow",
+                version: "1.0.0",
+              }),
+              // Zero-byte placeholder is sufficient for presence detection.
+              "bun.lockb": "",
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/my-workflow.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+          expect(result.exitCode).toBe(0);
+
+          // Exactly one invocation, against our fake `npm` shim.
+          // (If loopx selected bun based on bun.lockb presence, the npm shim
+          // would not have been invoked.)
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(1);
+          expect(invocations[0].argv).toEqual(["install"]);
+
+          // bun.lockb is preserved byte-for-byte in committed workflow.
+          expect(
+            existsSync(join(project!.loopxDir, "my-workflow", "bun.lockb")),
+          ).toBe(true);
+        });
+      });
+
+      it("T-INST-118b: yarn.lock does NOT cause loopx to select yarn", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "my-workflow",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "my-workflow",
+                version: "1.0.0",
+              }),
+              "yarn.lock": "",
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/my-workflow.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+          expect(result.exitCode).toBe(0);
+
+          // Exactly one invocation, against our fake `npm` shim.
+          // (If loopx selected yarn based on yarn.lock presence, the npm shim
+          // would not have been invoked.)
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(1);
+          expect(invocations[0].argv).toEqual(["install"]);
+
+          // yarn.lock preserved byte-for-byte in committed workflow.
+          expect(
+            existsSync(join(project!.loopxDir, "my-workflow", "yarn.lock")),
+          ).toBe(true);
+        });
+      });
+
+      it("T-INST-118c: multiple lockfiles + packageManager field still select npm", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "my-workflow",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "my-workflow",
+                version: "1.0.0",
+                packageManager: "yarn@3.6.1",
+              }),
+              "bun.lockb": "",
+              "pnpm-lock.yaml": "",
+              "yarn.lock": "",
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/my-workflow.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+          expect(result.exitCode).toBe(0);
+
+          // Exactly one invocation, against our fake `npm` shim.
+          // Per SPEC 10.10: none of these signals (lockfiles, packageManager)
+          // has any effect — `npm install` runs unconditionally.
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(1);
+          expect(invocations[0].argv).toEqual(["install"]);
+
+          // All lockfiles preserved byte-for-byte in committed workflow.
+          expect(
+            existsSync(join(project!.loopxDir, "my-workflow", "bun.lockb")),
+          ).toBe(true);
+          expect(
+            existsSync(
+              join(project!.loopxDir, "my-workflow", "pnpm-lock.yaml"),
+            ),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "my-workflow", "yarn.lock")),
+          ).toBe(true);
+        });
+      });
+
       it("T-INST-113: malformed package.json (invalid JSON) — warning once, auto-install skipped silently", async () => {
         project = await createTempProject();
         const logFile = join(project.dir, "fake-npm.log");
