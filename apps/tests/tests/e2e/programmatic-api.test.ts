@@ -9991,3 +9991,374 @@ console.log("done");
     });
   });
 });
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — Outer Options Shape Validation (SPEC §9.5)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.5: `options` must be omitted, `undefined`, or a non-null,
+// non-array, non-function object. T-API-61 series pins the primitive
+// matrix on both API surfaces:
+//   - run() rejects null / array / function / string / number / boolean /
+//     symbol / bigint (T-API-61, 61a, 61b, 61c, 61c2)
+//   - runPromise() rejects null / array / function / string / number /
+//     boolean / symbol / bigint (T-API-61d, 61e, 61e2)
+//   - run() / runPromise() accept explicit `undefined` outer options
+//     (T-API-61f / 61g)
+//   - runPromise() / run() accept explicit-`undefined` field values
+//     for cwd / envFile / maxIterations / signal / env (T-API-61h /
+//     61h2)
+//
+// All invalid-shape rejections surface lazily on first generator
+// next() under run(), or as promise rejection under runPromise(),
+// per SPEC §9.1 / §9.2 — never as a synchronous throw at the call
+// site.
+
+describe("SPEC: Outer Options Shape Validation", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-61, T-API-61a, T-API-61b, T-API-61c, T-API-61c2 —
+    // run() rejects null / array / function / string / number / boolean /
+    // symbol / bigint outer options. SPEC §9.5: options must be a
+    // non-null, non-array, non-function object. The contract is the union
+    // of three rejection rules — the symbol and bigint variants pin the
+    // structurally-distinct branches (typeof === "symbol", "bigint")
+    // that a buggy `typeof !== "object"`-only validator would already
+    // reject correctly, while string/number/boolean variants exercise
+    // primitives that ARE not "object" via typeof but a buggy validator
+    // gating on a different discriminator could miss.
+    // ------------------------------------------------------------------------
+    interface OuterShapeVariant {
+      id: string;
+      label: string;
+      // Inline literal spliced into the driver code. Symbols and BigInts
+      // cannot round-trip through JSON.
+      optionsExpr: string;
+    }
+
+    const runOuterShapeVariants: OuterShapeVariant[] = [
+      { id: "T-API-61", label: "null", optionsExpr: "null" },
+      { id: "T-API-61a", label: "array", optionsExpr: "[]" },
+      { id: "T-API-61b", label: "function", optionsExpr: "(() => {})" },
+      { id: "T-API-61c", label: "string", optionsExpr: '"string"' },
+      { id: "T-API-61c2 (number)", label: "number", optionsExpr: "42" },
+      { id: "T-API-61c2 (boolean true)", label: "boolean true", optionsExpr: "true" },
+      { id: "T-API-61c2 (boolean false)", label: "boolean false", optionsExpr: "false" },
+      { id: "T-API-61c2 (symbol)", label: "symbol", optionsExpr: 'Symbol("x")' },
+      { id: "T-API-61c2 (bigint)", label: "bigint", optionsExpr: "1n" },
+    ];
+
+    for (const v of runOuterShapeVariants) {
+      it(`${v.id}: run() with options: ${v.label} throws on first next() with no spawn`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", ${v.optionsExpr});
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let threw = false, message = "", name = "";
+if (!synchronousThrew) {
+  try {
+    await gen.next();
+  } catch (e) {
+    threw = true;
+    message = e.message || String(e);
+    name = e.name || "";
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // SPEC §9.1: option-shape errors do not throw at the call site;
+        // they surface lazily on first next().
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.threw).toBe(true);
+        // Error must reference the options context.
+        expect(parsed.message).toMatch(/options|RunOptions/i);
+        // No child was spawned (shape error fires pre-iteration).
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-61d, T-API-61e, T-API-61e2 — runPromise() counterpart.
+    // Closes the matrix on the eager-snapshot surface so a buggy
+    // implementation that wired up shape validation correctly on run()
+    // but used a different code path on runPromise() is caught.
+    // SPEC §9.2: runPromise() always returns a promise; option-shape
+    // errors surface as promise rejections, not synchronous throws.
+    // ------------------------------------------------------------------------
+    const runPromiseOuterShapeVariants: OuterShapeVariant[] = [
+      { id: "T-API-61d", label: "null", optionsExpr: "null" },
+      { id: "T-API-61e", label: "array", optionsExpr: "[]" },
+      { id: "T-API-61e2 (function)", label: "function", optionsExpr: "(() => {})" },
+      { id: "T-API-61e2 (string)", label: "string", optionsExpr: '"string"' },
+      { id: "T-API-61e2 (number)", label: "number", optionsExpr: "42" },
+      { id: "T-API-61e2 (boolean true)", label: "boolean true", optionsExpr: "true" },
+      { id: "T-API-61e2 (boolean false)", label: "boolean false", optionsExpr: "false" },
+      { id: "T-API-61e2 (symbol)", label: "symbol", optionsExpr: 'Symbol("x")' },
+      { id: "T-API-61e2 (bigint)", label: "bigint", optionsExpr: "1n" },
+    ];
+
+    for (const v of runPromiseOuterShapeVariants) {
+      it(`${v.id}: runPromise() with options: ${v.label} rejects with no spawn`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let synchronousThrew = false, callTimeMessage = "";
+let p;
+try {
+  p = runPromise("ralph", ${v.optionsExpr});
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let rejected = false, message = "", name = "";
+if (!synchronousThrew) {
+  try {
+    await p;
+  } catch (e) {
+    rejected = true;
+    message = e.message || String(e);
+    name = e.name || "";
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // SPEC §9.2: runPromise() always returns a promise; option-shape
+        // errors surface as promise rejections, never synchronous throws.
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.message).toMatch(/options|RunOptions/i);
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-61f: run("ralph", undefined) is equivalent to run("ralph") —
+    // explicit undefined is accepted as "no options supplied" per SPEC §9.5
+    // ("options must be omitted or undefined, or a non-null non-array
+    // non-function object"). Pins down the explicit-undefined positive
+    // case so a buggy validator cannot silently tighten acceptance to
+    // "omitted only".
+    // ------------------------------------------------------------------------
+    it("T-API-61f: run() with options: undefined is equivalent to options omitted", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'ran' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let threw = false, message = "";
+const outputs = [];
+try {
+  const gen = run("ralph", undefined);
+  for await (const out of gen) { outputs.push(out); }
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ threw, message, outputCount: outputs.length, lastStop: outputs[outputs.length - 1]?.stop ?? null }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.outputCount).toBe(1);
+      expect(parsed.lastStop).toBe(true);
+      // Script ran exactly once.
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, "utf-8")).toBe("ran");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-61g: runPromise("ralph", undefined) is equivalent to
+    // runPromise("ralph"). Companion to T-API-61f.
+    // ------------------------------------------------------------------------
+    it("T-API-61g: runPromise() with options: undefined is equivalent to options omitted", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'ran' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let rejected = false, message = "";
+let outputs = [];
+try {
+  outputs = await runPromise("ralph", undefined);
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ rejected, message, outputCount: outputs.length, lastStop: outputs[outputs.length - 1]?.stop ?? null }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.outputCount).toBe(1);
+      expect(parsed.lastStop).toBe(true);
+      expect(existsSync(marker)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-61h: runPromise() — every recognized option field explicitly
+    // `undefined` is treated as absent. SPEC §9.5: each option field's
+    // type is `T | undefined`; explicit undefined is equivalent to the
+    // field being omitted. Catches a buggy validator that rejected
+    // explicit-undefined fields as "not provided but defined", or a
+    // precedence layer that treated `undefined` as a distinct value in
+    // the spawn-environment builder.
+    // ------------------------------------------------------------------------
+    it("T-API-61h: runPromise() — every option field explicit undefined treated as absent", async () => {
+      project = await createTempProject();
+      const ranMarker = join(project.dir, "ran.txt");
+      const cwdMarker = join(project.dir, "cwd.txt");
+      const myvarMarker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'ran' > "${ranMarker}"
+/bin/pwd -P > "${cwdMarker}"
+if [ -z "\${MYVAR+x}" ]; then printf 'absent' > "${myvarMarker}"; else printf 'present\\t%s' "$MYVAR" > "${myvarMarker}"; fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+delete process.env.MYVAR;
+let rejected = false, message = "";
+let outputs = [];
+try {
+  outputs = await runPromise("ralph", { cwd: undefined, envFile: undefined, maxIterations: undefined, signal: undefined, env: undefined });
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ rejected, message, outputCount: outputs.length, lastStop: outputs[outputs.length - 1]?.stop ?? null }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // SPEC §9.5: explicit undefined is valid for every option field.
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.outputCount).toBe(1);
+      expect(parsed.lastStop).toBe(true);
+      // Script ran in the project dir (cwd: undefined → defaults to process.cwd()).
+      expect(existsSync(cwdMarker)).toBe(true);
+      const observedCwd = readFileSync(cwdMarker, "utf-8").trim();
+      expect(observedCwd).toBe(realpathSync(project.dir));
+      // env: undefined contributed no entries; envFile: undefined skipped
+      // local-env-file load. MYVAR was explicitly deleted from the
+      // spawned driver's process.env, so a buggy implementation that
+      // injected an `undefined`-valued MYVAR would surface "present" or
+      // a runtime-rejection failure.
+      expect(existsSync(myvarMarker)).toBe(true);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("absent");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-61h2: run() — every recognized option field explicitly
+    // `undefined` is treated as absent. Generator-surface counterpart to
+    // T-API-61h. Pins the same explicit-undefined acceptance contract on
+    // run()'s lazy first-next() snapshot path.
+    // ------------------------------------------------------------------------
+    it("T-API-61h2: run() — every option field explicit undefined treated as absent", async () => {
+      project = await createTempProject();
+      const ranMarker = join(project.dir, "ran.txt");
+      const cwdMarker = join(project.dir, "cwd.txt");
+      const myvarMarker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'ran' > "${ranMarker}"
+/bin/pwd -P > "${cwdMarker}"
+if [ -z "\${MYVAR+x}" ]; then printf 'absent' > "${myvarMarker}"; else printf 'present\\t%s' "$MYVAR" > "${myvarMarker}"; fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+delete process.env.MYVAR;
+let threw = false, message = "";
+const outputs = [];
+try {
+  const gen = run("ralph", { cwd: undefined, envFile: undefined, maxIterations: undefined, signal: undefined, env: undefined });
+  for await (const out of gen) { outputs.push(out); }
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ threw, message, outputCount: outputs.length, lastStop: outputs[outputs.length - 1]?.stop ?? null }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.outputCount).toBe(1);
+      expect(parsed.lastStop).toBe(true);
+      expect(existsSync(cwdMarker)).toBe(true);
+      const observedCwd = readFileSync(cwdMarker, "utf-8").trim();
+      expect(observedCwd).toBe(realpathSync(project.dir));
+      expect(existsSync(myvarMarker)).toBe(true);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("absent");
+    });
+  });
+});
