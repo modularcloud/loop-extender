@@ -16,7 +16,11 @@ import {
   realpathSync,
 } from "node:fs";
 import { join, basename, extname } from "node:path";
-import { execFileSync, spawn } from "node:child_process";
+import {
+  execFileSync,
+  spawn,
+  type ChildProcess,
+} from "node:child_process";
 import { tmpdir } from "node:os";
 import { classifySource } from "./parsers/classify-source.js";
 import {
@@ -26,6 +30,30 @@ import {
 } from "./discovery.js";
 import { checkWorkflowVersion } from "./version-check.js";
 
+/**
+ * Signal context for the install subcommand (SPEC §10.10 "Signals during
+ * `npm install`" and "Signals during the auto-install pass when no npm
+ * child is active").
+ *
+ * The CLI install entry point (bin.ts) installs SIGINT / SIGTERM handlers
+ * that consult `activeNpmChild` and forward the signal to the active npm
+ * child's process group when one is running. The auto-install loop in
+ * `runAutoInstall` checks `receivedSignal` between workflows, after each
+ * spawn outcome, and at the head of each iteration so a signal observed
+ * either while a child is active or while none is active causes the pass
+ * to abort cleanly without further `.gitignore` synthesis or `npm install`
+ * spawns. The aggregate failure report is suppressed when `receivedSignal`
+ * is non-null at end-of-pass (the SPEC §10.10 "unless it had already been
+ * emitted" carve-out — currently always falsy because the report is the
+ * very last side effect of the pass).
+ */
+export interface InstallSignalContext {
+  /** Returns the first signal observed by the install handlers (or null). */
+  receivedSignal(): NodeJS.Signals | null;
+  /** Records the active npm child so the signal handler can forward. */
+  setActiveNpmChild(child: ChildProcess | null): void;
+}
+
 export interface InstallOptions {
   source: string;
   cwd: string;
@@ -33,6 +61,12 @@ export interface InstallOptions {
   override: boolean; // -y
   noInstall: boolean; // --no-install (SPEC §10.10)
   runningVersion: string;
+  /**
+   * Optional signal context for SPEC §10.10. When omitted, the install
+   * runs without signal awareness (test paths that don't need to observe
+   * signal-driven termination).
+   */
+  signalContext?: InstallSignalContext;
 }
 
 interface WorkflowCandidate {
@@ -99,6 +133,7 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
     override,
     noInstall,
     runningVersion,
+    signalContext,
   } = opts;
 
   let classifyResult;
@@ -409,7 +444,8 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
       loopxDir,
       committed,
       runningVersion,
-      warnedWorkflows
+      warnedWorkflows,
+      signalContext
     );
     if (exitCode !== 0) {
       process.exit(exitCode);
@@ -448,7 +484,8 @@ async function runAutoInstall(
   loopxDir: string,
   committed: string[],
   runningVersion: string,
-  warnedFromPreflight: Set<string>
+  warnedFromPreflight: Set<string>,
+  signalContext?: InstallSignalContext
 ): Promise<number> {
   const failures: AutoInstallFailure[] = [];
   const fault = getAutoInstallFault();
@@ -458,6 +495,15 @@ async function runAutoInstall(
   const warnedAbout = new Set<string>(warnedFromPreflight);
 
   for (const workflowName of committed) {
+    // SPEC §10.10 "Signals during the auto-install pass when no npm child is
+    // active": at the head of each workflow iteration, check whether a signal
+    // has been observed since the last child exited. If so, abort the pass
+    // immediately — start no further `.gitignore` safeguards and no further
+    // `npm install` children. The aggregate failure report is suppressed at
+    // end-of-pass when receivedSignal is non-null.
+    if (signalContext && signalContext.receivedSignal() !== null) {
+      break;
+    }
     const workflowDir = join(loopxDir, workflowName);
     const pkgPath = join(workflowDir, "package.json");
 
@@ -542,18 +588,31 @@ async function runAutoInstall(
     }
 
     // 3. Spawn `npm install`.
+    //
+    // SPEC §10.10 "Signals during `npm install`": SIGINT / SIGTERM received
+    // while an `npm install` child is active propagates to the child's
+    // process group. We spawn detached so the child becomes its own process
+    // group leader; the CLI signal handlers (bin.ts) consult the
+    // signalContext's active-child slot and forward the signal via
+    // `process.kill(-pid, sig)` plus a SPEC §7.3 5-second grace + SIGKILL
+    // escalation. The child inherits stdin/stdout/stderr unchanged so the
+    // npm streaming-passthrough contract from T-INST-119 holds.
     try {
       await new Promise<void>((resolve, reject) => {
         const child = spawn("npm", ["install"], {
           cwd: workflowDir,
           stdio: "inherit",
           env: process.env,
+          detached: true,
         });
+        if (signalContext) signalContext.setActiveNpmChild(child);
         child.on("error", (err) => {
+          if (signalContext) signalContext.setActiveNpmChild(null);
           // Spawn failure (most commonly: npm not on PATH → ENOENT).
           reject(err);
         });
         child.on("exit", (code, signal) => {
+          if (signalContext) signalContext.setActiveNpmChild(null);
           if (signal) {
             reject(
               Object.assign(new Error(`npm install terminated by ${signal}`), {
@@ -581,7 +640,20 @@ async function runAutoInstall(
         exitCode?: number;
         signal?: NodeJS.Signals;
       };
-      if (e.code === "ENOENT") {
+      // SPEC §10.10 "Signals during `npm install`": when the npm child was
+      // terminated by a forwarded SIGINT / SIGTERM (originating from the CLI
+      // signal handler in bin.ts), the surfacing terminal outcome is the
+      // signal itself, not a per-workflow auto-install failure. Suppress the
+      // failure entry in that case so the aggregate report does not list a
+      // signal-induced exit as if it were an install error. The pass also
+      // breaks immediately after this iteration (the head-of-loop check on
+      // receivedSignal aborts further workflows).
+      const sigObserved =
+        signalContext !== undefined &&
+        signalContext.receivedSignal() !== null;
+      if (e.code === "NPM_SIGNAL" && sigObserved) {
+        // Skip recording — terminal outcome is the signal.
+      } else if (e.code === "ENOENT") {
         failures.push({
           workflow: workflowName,
           reason: "npm install spawn failed (npm not found on PATH)",
@@ -603,6 +675,16 @@ async function runAutoInstall(
         });
       }
     }
+  }
+
+  // SPEC §10.10 "Signals during the auto-install pass when no npm child is
+  // active": when receivedSignal is non-null at end-of-pass, suppress the
+  // final aggregate failure report. The "unless it had already been emitted"
+  // carve-out is structurally satisfied here because the report is the very
+  // last side effect of the pass — if we reached this point with the
+  // receivedSignal set, the report has not been emitted.
+  if (signalContext && signalContext.receivedSignal() !== null) {
+    return 0;
   }
 
   if (failures.length > 0) {

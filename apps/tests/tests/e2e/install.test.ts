@@ -5963,6 +5963,114 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         });
       });
 
+      // ─────────────────────────────────────────────────────────
+      // Signal During `npm install` (T-INST-116 / 116a)
+      // SPEC §10.10 / §7.3: SIGINT / SIGTERM received while an
+      // `npm install` child is active propagates to the child's
+      // process group; loopx waits for the child to exit and then
+      // exits with the signal's code. The npm child must be
+      // terminated (verified via `kill -0 <pid>` returning non-zero
+      // after loopx exits).
+      // ─────────────────────────────────────────────────────────
+
+      it("T-INST-116: SIGINT during npm install forwards to child process group, loopx exits 130", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        const pidFile = join(project.dir, "shim-pid");
+        gitServer = await startLocalGitServer([
+          {
+            name: "my-workflow",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "my-workflow",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          { sleepSeconds: 30, pidFile, logFile },
+          async (fake) => {
+            const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+              ["install", `${gitServer!.url}/my-workflow.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            await waitForStderr("ready", { timeoutMs: 30_000 });
+            const shimPid = Number(readFileSync(pidFile, "utf-8").trim());
+            expect(Number.isFinite(shimPid) && shimPid > 0).toBe(true);
+            sendSignal("SIGINT");
+            const r = await result;
+            expect(r.exitCode).toBe(130);
+
+            // The shim process group must have been terminated. After
+            // loopx exits, `kill -0 <shim-pid>` should fail with ESRCH.
+            let stillAlive = false;
+            try {
+              process.kill(shimPid, 0);
+              stillAlive = true;
+            } catch {
+              stillAlive = false;
+            }
+            expect(stillAlive).toBe(false);
+
+            // The shim recorded its run via the EXIT trap (so we know
+            // the spawn happened — invocation count = 1).
+            expect(fake.readInvocations().length).toBe(1);
+
+            // No aggregate failure report on the signal-termination path
+            // (SPEC §10.10 suppresses the not-yet-emitted aggregate report
+            // when receivedSignal is non-null at end-of-pass).
+            expect(r.stderr).not.toMatch(/auto-install failures/);
+          },
+        );
+      });
+
+      it("T-INST-116a: SIGTERM during npm install forwards to child process group, loopx exits 143", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        const pidFile = join(project.dir, "shim-pid");
+        gitServer = await startLocalGitServer([
+          {
+            name: "my-workflow",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "my-workflow",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          { sleepSeconds: 30, pidFile, logFile },
+          async (fake) => {
+            const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+              ["install", `${gitServer!.url}/my-workflow.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            await waitForStderr("ready", { timeoutMs: 30_000 });
+            const shimPid = Number(readFileSync(pidFile, "utf-8").trim());
+            expect(Number.isFinite(shimPid) && shimPid > 0).toBe(true);
+            sendSignal("SIGTERM");
+            const r = await result;
+            expect(r.exitCode).toBe(143);
+
+            let stillAlive = false;
+            try {
+              process.kill(shimPid, 0);
+              stillAlive = true;
+            } catch {
+              stillAlive = false;
+            }
+            expect(stillAlive).toBe(false);
+
+            expect(fake.readInvocations().length).toBe(1);
+            expect(r.stderr).not.toMatch(/auto-install failures/);
+          },
+        );
+      });
+
       it("T-INST-118: packageManager field does NOT cause loopx to select a different manager", async () => {
         project = await createTempProject();
         const logFile = join(project.dir, "fake-npm.log");

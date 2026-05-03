@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawnSync, type ChildProcess } from "node:child_process";
 import { constants } from "node:os";
 import { discoverScripts } from "./discovery.js";
 import {
@@ -25,7 +25,10 @@ import {
   envRemove,
   envList,
 } from "./env.js";
-import { installCommand } from "./install.js";
+import {
+  installCommand,
+  type InstallSignalContext,
+} from "./install.js";
 import { parseTarget } from "./target-validation.js";
 import { getLoopxBin, ensureLoopxPackageJson } from "./bin-path.js";
 
@@ -575,14 +578,95 @@ async function main(): Promise<void> {
       );
       process.exit(1);
     }
-    await installCommand({
-      source: installArgs.source,
-      cwd,
-      selectedWorkflow: installArgs.selectedWorkflow ?? null,
-      override: installArgs.override,
-      noInstall: installArgs.noInstall,
-      runningVersion: getVersion(),
-    });
+
+    // SPEC §10.10 "Signals during `npm install`" / "Signals during the
+    // auto-install pass when no npm child is active": install SIGINT /
+    // SIGTERM handlers BEFORE entering the install pipeline. When a signal
+    // arrives:
+    //   - If an `npm install` child is currently active, forward the same
+    //     signal to its process group via `process.kill(-pid, sig)` and
+    //     start a SPEC §7.3 5-second grace timer that escalates to SIGKILL
+    //     on the process group if the child has not exited.
+    //   - Whether or not a child is active, pin `installReceivedSignal` so
+    //     the auto-install loop aborts at the next safe checkpoint and
+    //     suppresses the aggregate failure report.
+    // After `installCommand` returns, if a signal was received, exit with
+    // `128 + sigNum` per SPEC §12.
+    let installReceivedSignal: NodeJS.Signals | null = null;
+    let installActiveNpmChild: ChildProcess | null = null;
+    let installSigKillTimer: ReturnType<typeof setTimeout> | null = null;
+    const installSignalHandler = (sig: NodeJS.Signals) => {
+      if (installReceivedSignal === null) {
+        installReceivedSignal = sig;
+      }
+      const child = installActiveNpmChild;
+      if (child && child.pid && installSigKillTimer === null) {
+        try {
+          process.kill(-child.pid, sig);
+        } catch {
+          try {
+            child.kill(sig);
+          } catch {
+            // already exited
+          }
+        }
+        installSigKillTimer = setTimeout(() => {
+          const stillActive = installActiveNpmChild;
+          if (stillActive && stillActive.pid) {
+            try {
+              process.kill(-stillActive.pid, "SIGKILL");
+            } catch {
+              try {
+                stillActive.kill("SIGKILL");
+              } catch {
+                // already exited
+              }
+            }
+          }
+        }, 5000);
+        installSigKillTimer.unref();
+      }
+    };
+    process.on("SIGINT", installSignalHandler);
+    process.on("SIGTERM", installSignalHandler);
+
+    const installSignalContext: InstallSignalContext = {
+      receivedSignal: () => installReceivedSignal,
+      setActiveNpmChild: (child) => {
+        installActiveNpmChild = child;
+        if (child === null && installSigKillTimer !== null) {
+          clearTimeout(installSigKillTimer);
+          installSigKillTimer = null;
+        }
+      },
+    };
+
+    try {
+      await installCommand({
+        source: installArgs.source,
+        cwd,
+        selectedWorkflow: installArgs.selectedWorkflow ?? null,
+        override: installArgs.override,
+        noInstall: installArgs.noInstall,
+        runningVersion: getVersion(),
+        signalContext: installSignalContext,
+      });
+    } finally {
+      process.removeListener("SIGINT", installSignalHandler);
+      process.removeListener("SIGTERM", installSignalHandler);
+      if (installSigKillTimer !== null) {
+        clearTimeout(installSigKillTimer);
+        installSigKillTimer = null;
+      }
+    }
+
+    if (installReceivedSignal !== null) {
+      const sigNum =
+        constants.signals[
+          installReceivedSignal as keyof typeof constants.signals
+        ] ?? 15;
+      process.exit(128 + sigNum);
+    }
     process.exit(0);
   }
 
