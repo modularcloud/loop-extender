@@ -323,26 +323,41 @@ function runWithInternal(
 
   // Wire user signal → internal abort propagation. SPEC §9.5: addEventListener
   // must return without throwing; if it throws, capture as a snapshot error.
+  // We always invoke addEventListener — even when aborted:true at capture —
+  // because per SPEC §9.3 / T-API-64p, the addEventListener-half of the
+  // §9.5 contract must be verified before the call enters the abort
+  // pathway. A duck signal whose addEventListener throws is non-compatible
+  // regardless of `aborted`, and must surface as an option-snapshot error
+  // rather than as an abort error.
   if (snap.error === undefined && snap.signal) {
-    if (snap.signal.aborted) {
-      // Already aborted at call-time — record first-observed and propagate
-      // synchronously (no `abort-listener` seam pause: the seam fires from
-      // the listener path, not the eager-aborted path).
+    try {
+      snap.signal.addEventListener("abort", onUserSignalAbort, {
+        once: true,
+      });
+    } catch (e) {
+      snap.error = e;
+      // SPEC §9.3 / T-API-64p: a signal whose addEventListener throws is
+      // NOT a usable AbortSignal — clear snap.signal so the abort-precedence
+      // pathway in runInternal does not mistake `aborted: true` on such a
+      // non-compatible signal as grounds to surface an abort error.
+      snap.signal = undefined;
+    }
+    const usableSignal = snap.error === undefined ? snap.signal : undefined;
+    if (usableSignal && usableSignal.aborted) {
+      // Already aborted at call-time (and addEventListener registered
+      // cleanly) — record first-observed and propagate synchronously. The
+      // `abort-listener` seam fires only from the listener path, not the
+      // eager-aborted path, so we dispatch directly. Real AbortSignals do
+      // not fire newly-registered listeners on already-aborted signals; the
+      // explicit `aborted` check is the only way to observe that case for
+      // both real and duck-typed signals.
       if (firstObservedRef.trigger === null) {
         firstObservedRef.trigger = "abort";
       }
       try {
-        internalAc.abort(snap.signal.reason);
+        internalAc.abort(usableSignal.reason);
       } catch {
         /* ignore */
-      }
-    } else {
-      try {
-        snap.signal.addEventListener("abort", onUserSignalAbort, {
-          once: true,
-        });
-      } catch (e) {
-        snap.error = e;
       }
     }
   }
@@ -602,6 +617,9 @@ async function* runInternal(
 ): AsyncGenerator<Output> {
   // SPEC §9.3 abort precedence: if a usable signal was captured and is
   // aborted (or aborts later), it displaces all other pre-iteration failures.
+  // "Usable" per SPEC §9.5 + T-API-64p: addEventListener must have been
+  // successfully registered. When registration throws, the call site clears
+  // `snap.signal` so a non-compatible signal cannot enter this pathway.
   if (snap.signal?.aborted) {
     throw makeAbortError(snap.signal);
   }

@@ -12799,5 +12799,687 @@ console.log(JSON.stringify({ synchronousThrew, callSiteMessage, orderAfterCall, 
         expect(parsed.orderAfterCall).toContain(v.field);
       });
     }
+
+    // ----------------------------------------------------------------------
+    // T-API-64m / T-API-64m2 — Throwing addEventListener getter on duck
+    // signal surfaces as option-snapshot error. SPEC §9.5: addEventListener
+    // "must be callable and returns without throwing" — the contract is also
+    // violated when the property *read itself* throws, before loopx can
+    // attempt to invoke the result. Distinguishes from T-API-64f / T-API-64g
+    // (function that throws when called); here loopx never observes any
+    // value because the read raises. A buggy implementation that read the
+    // property as a separate uncaught expression before wrapping the call
+    // site in try/catch would let the getter exception escape past the
+    // snapshot-capture boundary.
+    // ----------------------------------------------------------------------
+    for (const surface of ["run", "runPromise"] as const) {
+      const id = surface === "run" ? "T-API-64m" : "T-API-64m2";
+      it(`${id}: ${surface}() — throwing addEventListener getter surfaces as option-snapshot error`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64m-${surface}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run, runPromise } from "loopx";
+const duck = { aborted: false };
+Object.defineProperty(duck, "addEventListener", {
+  enumerable: true,
+  get() { throw new Error("ae-getter-boom"); }
+});
+let synchronousThrew = false, callSiteMessage = "";
+let observed = false, message = "", errName = "", looksLikeAbort = false;
+try {
+${surface === "run"
+  ? `  const gen = run("ralph", {
+       cwd: ${JSON.stringify(project.dir)},
+       signal: duck,
+       maxIterations: 1,
+     });
+     try { await gen.next(); }
+     catch (e) {
+       observed = true;
+       message = e?.message || String(e);
+       errName = e?.name || "";
+       looksLikeAbort = (errName === "AbortError") || /^abort(ed)?$/i.test(message);
+     }`
+  : `  const p = runPromise("ralph", {
+       cwd: ${JSON.stringify(project.dir)},
+       signal: duck,
+       maxIterations: 1,
+     });
+     try { await p; }
+     catch (e) {
+       observed = true;
+       message = e?.message || String(e);
+       errName = e?.name || "";
+       looksLikeAbort = (errName === "AbortError") || /^abort(ed)?$/i.test(message);
+     }`}
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, observed, message, errName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at call site.
+        expect(parsed.synchronousThrew).toBe(false);
+        // (b) Surface observed an option-snapshot error.
+        expect(parsed.observed).toBe(true);
+        // (c) Error references invalid signal or wraps the getter exception.
+        expect(parsed.message).toMatch(/(signal|ae-getter-boom|AbortSignal)/i);
+        // (d) NOT an abort error.
+        expect(parsed.looksLikeAbort).toBe(false);
+        // (e) No child spawned.
+        expect(existsSync(marker)).toBe(false);
+        // (f) No tmpdir created.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64n / T-API-64n2 — Prototype-inherited duck signal (aborted +
+    // addEventListener exposed via the prototype, not own properties) is
+    // accepted as AbortSignal-compatible. SPEC §9.5 uses "expose", not
+    // "has own"; an implementation that probed via Object.hasOwn(...) would
+    // reject this duck despite it satisfying the structural contract.
+    // ----------------------------------------------------------------------
+    for (const surface of ["run", "runPromise"] as const) {
+      const id = surface === "run" ? "T-API-64n" : "T-API-64n2";
+      it(`${id}: ${surface}() accepts prototype-inherited duck signal; abort fires correctly`, async () => {
+        project = await createTempProject();
+        const ready = join(project.dir, "ready.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `touch "${ready}"
+while true; do sleep 1; done`,
+        );
+        const driverCode = `
+import { run, runPromise } from "loopx";
+import { existsSync } from "node:fs";
+class DuckSignal {
+  addEventListener(type, fn) { if (type === "abort") this._listener = fn; }
+  _fire() { this.aborted = true; this._listener?.(); }
+}
+DuckSignal.prototype.aborted = false;
+const duck = new DuckSignal();
+// Sanity: confirm both contract halves are exposed via the prototype only.
+const ownHasAborted = Object.prototype.hasOwnProperty.call(duck, "aborted");
+const ownHasAEL = Object.prototype.hasOwnProperty.call(duck, "addEventListener");
+${surface === "run"
+  ? `const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+const nextP = gen.next();
+nextP.catch(() => {});
+while (!existsSync(${JSON.stringify(ready)})) {
+  await new Promise(r => setTimeout(r, 25));
+}
+duck._fire();
+let observed = false, message = "", errName = "", looksLikeAbort = false;
+try { await nextP; }
+catch (e) {
+  observed = true;
+  message = e?.message || String(e);
+  errName = e?.name || "";
+  looksLikeAbort = (errName === "AbortError") || /abort/i.test(message);
+}`
+  : `const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+while (!existsSync(${JSON.stringify(ready)})) {
+  await new Promise(r => setTimeout(r, 25));
+}
+duck._fire();
+let observed = false, message = "", errName = "", looksLikeAbort = false;
+try { await p; }
+catch (e) {
+  observed = true;
+  message = e?.message || String(e);
+  errName = e?.name || "";
+  looksLikeAbort = (errName === "AbortError") || /abort/i.test(message);
+}`}
+console.log(JSON.stringify({ ownHasAborted, ownHasAEL, observed, message, errName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, { timeout: 60_000 });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // Sanity: duck halves resolved through the prototype, not own props.
+        expect(parsed.ownHasAborted).toBe(false);
+        expect(parsed.ownHasAEL).toBe(false);
+        // (a) Abort surfaced via the inherited contract.
+        expect(parsed.observed).toBe(true);
+        expect(parsed.looksLikeAbort).toBe(true);
+        // (b) The error is an abort error, NOT an option-snapshot error
+        //     (no RunOptions.signal pre-iteration shape error).
+        expect(parsed.message).not.toMatch(/RunOptions\.signal/i);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64o / T-API-64o2 — Duck signal without `removeEventListener`
+    // accepted under normal (stop:true) completion. SPEC §9.5 explicitly
+    // states removeEventListener is NOT part of the AbortSignal-compatibility
+    // contract. A buggy implementation that called signal.removeEventListener
+    // unguarded on settlement would TypeError on a duck lacking it — but
+    // only on the normal-completion path (the abort path may early-return
+    // before reaching the unconditional remove). T-API-64a covers the
+    // abort-path acceptance; this closes the normal-completion-path cell.
+    // ----------------------------------------------------------------------
+    for (const surface of ["run", "runPromise"] as const) {
+      const id = surface === "run" ? "T-API-64o" : "T-API-64o2";
+      it(`${id}: ${surface}() accepts duck signal without removeEventListener under normal completion`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64o-${surface}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const driverCode = `
+import { run, runPromise } from "loopx";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) { if (type === "abort") this._listener = fn; }
+};
+// Sanity: removeEventListener must be entirely absent (own + prototype).
+const hasRemove = "removeEventListener" in duck;
+let observed = false, errMessage = "", errName = "";
+let outputs = [];
+let resolved = false;
+${surface === "run"
+  ? `try {
+  const gen = run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 5,
+  });
+  for await (const out of gen) { outputs.push(out); }
+  resolved = true;
+} catch (e) {
+  observed = true;
+  errMessage = e?.message || String(e);
+  errName = e?.name || "";
+}`
+  : `try {
+  outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 5,
+  });
+  resolved = true;
+} catch (e) {
+  observed = true;
+  errMessage = e?.message || String(e);
+  errName = e?.name || "";
+}`}
+console.log(JSON.stringify({ hasRemove, observed, errMessage, errName, outputs, resolved }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // Sanity: duck genuinely lacks removeEventListener.
+        expect(parsed.hasRemove).toBe(false);
+        // (a) Settled cleanly without throwing.
+        expect(parsed.observed).toBe(false);
+        expect(parsed.errMessage).toBe("");
+        expect(parsed.resolved).toBe(true);
+        // (b) Script ran exactly once and emitted stop:true (proves the loop
+        //     body was entered and reached a normal completion, not a
+        //     pre-iteration short-circuit).
+        expect(existsSync(marker)).toBe(true);
+        expect(parsed.outputs).toHaveLength(1);
+        expect(parsed.outputs[0]).toMatchObject({ stop: true });
+        // (c) No warning / error mentioning removeEventListener in stderr.
+        expect(result.stderr).not.toMatch(/removeEventListener/);
+        expect(result.stderr).not.toMatch(/TypeError/);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64p / T-API-64p2 / T-API-64p3 — `aborted: true` × non-compatible
+    // shape. SPEC §9.3: an `options.signal` that fails the SPEC §9.5
+    // compatibility contract captures no signal and does NOT enter the
+    // abort-precedence pathway, regardless of `aborted`'s value. A buggy
+    // implementation that read `aborted` first and routed `aborted: true`
+    // through abort precedence without first verifying full signal
+    // compatibility would surface an abort error here — instead the result
+    // must be an option-snapshot error. T-API-64p3 closes the maxIterations:0
+    // diagonal: option-shape validation is independent of iteration count
+    // (must NOT be skipped under `maxIterations: 0`, and must NOT route
+    // through abort precedence under any iteration count).
+    // ----------------------------------------------------------------------
+    interface AbortedTrueShapeVariant {
+      label: string;
+      duckExpr: string;
+    }
+    const abortedTrueShapeVariants: AbortedTrueShapeVariant[] = [
+      { label: "missing-AEL", duckExpr: `{ aborted: true }` },
+      {
+        label: "non-callable-AEL",
+        duckExpr: `{ aborted: true, addEventListener: 123 }`,
+      },
+      {
+        label: "throwing-AEL",
+        duckExpr: `{ aborted: true, addEventListener() { throw new Error("listener-register-failed"); } }`,
+      },
+    ];
+
+    for (const v of abortedTrueShapeVariants) {
+      it(`T-API-64p (${v.label}): run() — aborted:true × ${v.label} surfaces as option-snapshot error, not abort`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64p-${v.label}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const duck = ${v.duckExpr};
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let nextThrew = false, nextMessage = "", nextErrName = "", looksLikeAbort = false;
+if (!synchronousThrew && returned && typeof returned.next === "function") {
+  try {
+    await returned.next();
+  } catch (e) {
+    nextThrew = true;
+    nextMessage = e?.message || String(e);
+    nextErrName = e?.name || "";
+    looksLikeAbort = (nextErrName === "AbortError") || /^abort(ed)?$/i.test(nextMessage);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, nextThrew, nextMessage, nextErrName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at call site.
+        expect(parsed.synchronousThrew).toBe(false);
+        // (b) First next() throws.
+        expect(parsed.nextThrew).toBe(true);
+        // (c) Error references invalid signal or wraps the per-variant
+        //     exception (variant c).
+        expect(parsed.nextMessage).toMatch(/(signal|listener-register-failed|AbortSignal)/i);
+        // (d) NOT an abort error — even though aborted:true, the shape gate
+        //     fires first and routes through option-snapshot path.
+        expect(parsed.looksLikeAbort).toBe(false);
+        // (e) No child spawned.
+        expect(existsSync(marker)).toBe(false);
+        // (f) No tmpdir created.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+
+      it(`T-API-64p2 (${v.label}): runPromise() — aborted:true × ${v.label} rejects with option-snapshot error, not abort`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64p2-${v.label}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const duck = ${v.duckExpr};
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let rejected = false, rejMessage = "", rejErrName = "", looksLikeAbort = false;
+if (!synchronousThrew && returned && typeof returned.then === "function") {
+  try {
+    await returned;
+  } catch (e) {
+    rejected = true;
+    rejMessage = e?.message || String(e);
+    rejErrName = e?.name || "";
+    looksLikeAbort = (rejErrName === "AbortError") || /^abort(ed)?$/i.test(rejMessage);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, rejected, rejMessage, rejErrName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.rejMessage).toMatch(/(signal|listener-register-failed|AbortSignal)/i);
+        expect(parsed.looksLikeAbort).toBe(false);
+        expect(existsSync(marker)).toBe(false);
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+
+      // T-API-64p3 (run-surface variant): same shape variants under
+      // maxIterations:0 — option-shape validation is iteration-count-
+      // independent.
+      it(`T-API-64p3 (${v.label}, run): run() — aborted:true × ${v.label} × maxIterations:0 surfaces as option-snapshot error`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64p3-${v.label}-run`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const duck = ${v.duckExpr};
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 0,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let nextThrew = false, doneSilently = false, nextMessage = "", nextErrName = "", looksLikeAbort = false;
+if (!synchronousThrew && returned && typeof returned.next === "function") {
+  try {
+    const r = await returned.next();
+    if (r && r.done === true) { doneSilently = true; }
+  } catch (e) {
+    nextThrew = true;
+    nextMessage = e?.message || String(e);
+    nextErrName = e?.name || "";
+    looksLikeAbort = (nextErrName === "AbortError") || /^abort(ed)?$/i.test(nextMessage);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, nextThrew, doneSilently, nextMessage, nextErrName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw.
+        expect(parsed.synchronousThrew).toBe(false);
+        // (b) Did NOT silently complete with done:true (would mean
+        //     option-shape validation was skipped under maxIterations:0).
+        expect(parsed.doneSilently).toBe(false);
+        // (c) Threw an option-snapshot error.
+        expect(parsed.nextThrew).toBe(true);
+        expect(parsed.nextMessage).toMatch(/(signal|listener-register-failed|AbortSignal)/i);
+        // (d) NOT an abort error.
+        expect(parsed.looksLikeAbort).toBe(false);
+        // (e) No child spawned.
+        expect(existsSync(marker)).toBe(false);
+        // (f) No tmpdir created (option-shape errors fire before tmpdir
+        //     creation per SPEC §7.1 step-6 ordering).
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+
+      // T-API-64p3 (runPromise-surface variant): same shape variants under
+      // maxIterations:0 on the eager-promise surface.
+      it(`T-API-64p3 (${v.label}, runPromise): runPromise() — aborted:true × ${v.label} × maxIterations:0 rejects with option-snapshot error`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64p3-${v.label}-promise`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const duck = ${v.duckExpr};
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 0,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let rejected = false, resolvedSilently = false, rejMessage = "", rejErrName = "", looksLikeAbort = false;
+let resolvedValue;
+if (!synchronousThrew && returned && typeof returned.then === "function") {
+  try {
+    resolvedValue = await returned;
+    resolvedSilently = true;
+  } catch (e) {
+    rejected = true;
+    rejMessage = e?.message || String(e);
+    rejErrName = e?.name || "";
+    looksLikeAbort = (rejErrName === "AbortError") || /^abort(ed)?$/i.test(rejMessage);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, rejected, resolvedSilently, resolvedValue, rejMessage, rejErrName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.synchronousThrew).toBe(false);
+        // Did NOT silently resolve.
+        expect(parsed.resolvedSilently).toBe(false);
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.rejMessage).toMatch(/(signal|listener-register-failed|AbortSignal)/i);
+        expect(parsed.looksLikeAbort).toBe(false);
+        expect(existsSync(marker)).toBe(false);
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64q / T-API-64q2 — `addEventListener` returning a non-undefined
+    // value is accepted. SPEC §9.5 requires "callable and returns without
+    // throwing"; it does NOT require the return value to be `undefined`. A
+    // buggy implementation that asserted `result === undefined` after
+    // invoking addEventListener would reject conforming duck signals whose
+    // addEventListener happens to return a value (string, number, the
+    // listener fn itself, or any other non-undefined result).
+    // ----------------------------------------------------------------------
+    interface NonUndefinedReturnVariant {
+      label: string;
+      returnExpr: string;
+    }
+    const nonUndefinedReturnVariants: NonUndefinedReturnVariant[] = [
+      { label: "string", returnExpr: `"registered"` },
+      { label: "number", returnExpr: `123` },
+      { label: "self-listener", returnExpr: `fn` },
+      { label: "object", returnExpr: `{ ok: true }` },
+    ];
+
+    for (const v of nonUndefinedReturnVariants) {
+      it(`T-API-64q (${v.label}): run() accepts duck signal whose addEventListener returns ${v.label}`, async () => {
+        project = await createTempProject();
+        const ready = join(project.dir, "ready.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `touch "${ready}"
+while true; do sleep 1; done`,
+        );
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync } from "node:fs";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") { this._listener = fn; }
+    return ${v.returnExpr};
+  },
+  _fire() { this.aborted = true; this._listener?.(); }
+};
+let synchronousThrew = false, callSiteMessage = "";
+let gen;
+try {
+  gen = run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let observed = false, message = "", errName = "", looksLikeAbort = false, scriptReachedReady = false;
+if (gen) {
+  const nextP = gen.next();
+  nextP.catch(() => {});
+  while (!existsSync(${JSON.stringify(ready)})) {
+    await new Promise(r => setTimeout(r, 25));
+  }
+  scriptReachedReady = true;
+  duck._fire();
+  try { await nextP; }
+  catch (e) {
+    observed = true;
+    message = e?.message || String(e);
+    errName = e?.name || "";
+    looksLikeAbort = (errName === "AbortError") || /abort/i.test(message);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, scriptReachedReady, observed, message, errName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, { timeout: 60_000 });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw — duck signal accepted at call site.
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.callSiteMessage).toBe("");
+        // (b) Script reached "ready" before the abort fired.
+        expect(parsed.scriptReachedReady).toBe(true);
+        // (c) Generator threw an abort error (NOT an option-shape /
+        //     signal-validation error).
+        expect(parsed.observed).toBe(true);
+        expect(parsed.looksLikeAbort).toBe(true);
+        expect(parsed.message).not.toMatch(/RunOptions\.signal/i);
+      });
+
+      it(`T-API-64q2 (${v.label}): runPromise() accepts duck signal whose addEventListener returns ${v.label}`, async () => {
+        project = await createTempProject();
+        const ready = join(project.dir, "ready.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `touch "${ready}"
+while true; do sleep 1; done`,
+        );
+        const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync } from "node:fs";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") { this._listener = fn; }
+    return ${v.returnExpr};
+  },
+  _fire() { this.aborted = true; this._listener?.(); }
+};
+let synchronousThrew = false, callSiteMessage = "";
+let p;
+try {
+  p = runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let rejected = false, message = "", errName = "", looksLikeAbort = false, scriptReachedReady = false;
+if (p) {
+  while (!existsSync(${JSON.stringify(ready)})) {
+    await new Promise(r => setTimeout(r, 25));
+  }
+  scriptReachedReady = true;
+  duck._fire();
+  try { await p; }
+  catch (e) {
+    rejected = true;
+    message = e?.message || String(e);
+    errName = e?.name || "";
+    looksLikeAbort = (errName === "AbortError") || /abort/i.test(message);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, scriptReachedReady, rejected, message, errName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, { timeout: 60_000 });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.callSiteMessage).toBe("");
+        expect(parsed.scriptReachedReady).toBe(true);
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.looksLikeAbort).toBe(true);
+        expect(parsed.message).not.toMatch(/RunOptions\.signal/i);
+      });
+    }
   });
 });
