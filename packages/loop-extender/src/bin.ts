@@ -500,6 +500,20 @@ async function main(): Promise<void> {
   }
 
   if (firstArg === "version") {
+    // SPEC §4.3 defines `loopx version` as a no-argument subcommand; SPEC §11
+    // documents top-level / run / install help forms only — there is no
+    // version-scoped help. Per SPEC §12's non-exhaustive usage-error list and
+    // the consistent grammar pattern (`loopx run ralph bar` is a usage error),
+    // any extra positional after `version` — including `--help` / `-h` — is a
+    // usage error. The version short-circuit must not fire when extra args
+    // are present (covers T-CLI-01a / T-CLI-01b).
+    if (argv.length > 1) {
+      const extra = argv[1];
+      process.stderr.write(
+        `Error: loopx version takes no arguments (got '${extra}'). Run 'loopx -h' for usage.\n`
+      );
+      process.exit(1);
+    }
     console.log(getVersion());
     process.exit(0);
   }
