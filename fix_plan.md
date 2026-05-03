@@ -6,6 +6,31 @@
 
 ## P0/P1 — RESOLVED
 
+### SPEC §4.3 / §5.4 / §8.1 / §12 (T-SUB-14l / T-SUB-19a / T-SUB-20 / T-SUB-21 / T-SUB-22 / T-SUB-23 / T-SUB-24 / T-SUB-25 / T-SUB-26 / T-SUB-27 / T-SUB-28 / T-SUB-29 / T-SUB-29a / T-SUB-29b / T-SUB-29c / T-SUB-29d — env / output subcommand grammar + scope edges) — RESOLVED this iteration
+
+Mixed implementation + test-only iteration. 16 unique IDs × 2 runtimes (Node 25.2.1 + Bun 1.3.11) = 32 tests added to `apps/tests/tests/e2e/subcommands.test.ts`. Implementation iteration touched `envList` in `packages/loop-extender/src/env.ts` (parser-warning emission to stderr) and `handleEnvSubcommand` in `packages/loop-extender/src/bin.ts` (extra-positional rejection on `env set` / `remove` / `list`). New test helper `withGlobalEnvRawContent` added to `apps/tests/tests/helpers/env.ts` for raw-content global-env-file fixtures (parser-warning paths). All 138 tests in subcommands.test.ts pass; cli-grammar (57+1 skip) and env-vars (136) regressions clean; parse-env unit (53) clean.
+
+- **T-SUB-14l** (env-set backslash round-trip — write side + read side): SPEC §4.3 "value is written literally within double quotes" + SPEC §8.1 "no escape sequence interpretation". The 18-byte value `val\with\backslash` (containing two literal 0x5c bytes) must survive serialization (`KEY="val\with\backslash"\n` byte-for-byte) AND a subsequent `loopx run` that reads `$KEY` (identical 18 bytes in the marker file). Test-only — existing `envSet` writes value verbatim within quotes; `parseEnvFile` strips matching quotes literally without escape interpretation; round-trip survives.
+- **T-SUB-19a** (env list parses malformed global env file via SAME parser as `loopx run`): SPEC §8.1 "Non-blank, non-comment lines that do not contain a valid key … are ignored with a warning to stderr." Implementation iteration: `envList` previously called `parseEnvFile` but discarded the returned `warnings` array. Now emits `Warning: <msg>\n` per warning to stderr (matching the CLI `run` path at `bin.ts:606-608` which iterates `globalResult.warnings`). Asserts: exit 0 (warnings are non-fatal), stdout lists only the well-formed `GOOD=ok` entry, exactly one stderr warning line matching `/Warning:.*1BAD/`.
+- **T-SUB-20 / T-SUB-21 / T-SUB-22 / T-SUB-23** (`output --result` / `env list` / `env set` / `env remove` ignore `.loopx/` validation): SPEC §5.4 explicitly enumerates these commands as "No (validation)". A buggy impl that wired discovery into the env / output subcommands would emit collision warnings. Test fixture: `.loopx/ralph/` containing `check.sh` + `check.ts` (same-base-name collision — fatal under `loopx run`, ignored under env / output). Asserts: exit 0, no stderr matches `/collision|conflict|warn|validat|ralph/i`. Test-only — existing `handleOutputSubcommand` and `handleEnvSubcommand` in `bin.ts` never touch `.loopx/`.
+- **T-SUB-24** (`loopx env` no subcommand): SPEC §4.3 grammar requires a subcommand. Existing impl rejects at `handleEnvSubcommand` line 263-268.
+- **T-SUB-25** (`loopx env set` no operands): Existing impl rejects at line 273-276 (`subArgs.length < 3`).
+- **T-SUB-26** (`loopx env set FOO` no value): Same line 273-276 catch (subArgs.length=2 < 3). Pin: env file contains no `FOO=...` line (defends against a buggy impl that defaulted the missing value to `""`).
+- **T-SUB-27** (`loopx env remove` no name): Existing impl rejects at line 279-282 (`subArgs.length < 2`). Pin: pre-seeded `EXISTING=v` is not removed (defends against a buggy impl that defaulted `name=""` and silently no-op'd).
+- **T-SUB-28** (`loopx env unknown` subcommand): Existing impl rejects at line 286-291.
+- **T-SUB-29** (`loopx env list extra` extra positional): Implementation iteration added `subArgs.length > 1` check on the `list` branch — previously, `envList()` was called regardless of trailing positionals.
+- **T-SUB-29a** (`loopx env set FOO bar extra` extra positional): Implementation iteration added `subArgs.length > 3` check on the `set` branch — previously the 4th argv was silently ignored. Pin: env file does NOT contain `FOO=...` (defends against a buggy impl that committed `FOO=bar` despite the extra operand).
+- **T-SUB-29b** (`loopx env remove FOO extra` extra positional): Implementation iteration added `subArgs.length > 2` check on the `remove` branch. Pin: pre-seeded `FOO=bar` is preserved (defends against a buggy impl that ignored the extra operand and removed `FOO` anyway).
+- **T-SUB-29c** (`loopx output --result x extra` extra positional after value flag): Existing impl rejects via the unknown-flag fallthrough at `handleOutputSubcommand` line 251-254 ("unknown flag 'extra'"). The phrasing differs from "extra positional" but the SPEC permits "exact phrasing implementation-defined" — the test asserts exit 1 + non-empty stderr + empty stdout.
+- **T-SUB-29d** (`loopx output --stop extra` extra positional after boolean flag): Same unknown-flag fallthrough. Asserts exit 1 + stderr non-empty + empty stdout.
+
+**Implementation deltas:**
+1. `packages/loop-extender/src/env.ts` — `envList` now emits `Warning: <msg>\n` to stderr for each parser warning returned from `parseEnvFile`, mirroring the `loopx run` path.
+2. `packages/loop-extender/src/bin.ts` — `handleEnvSubcommand` now rejects extra positionals on `set` (>3 args), `remove` (>2 args), and `list` (>1 arg) with `process.exit(1)` and a stderr usage error mentioning the offending positional.
+
+**Test helpers:**
+- `apps/tests/tests/helpers/env.ts` — added `withGlobalEnvRawContent(rawContent, fn)` for raw verbatim global-env-file fixtures (T-SUB-19a). The existing `withGlobalEnv` requires a `Record<string, string>` and writes well-formed `KEY=VALUE` lines via `createEnvFile` — unsuitable for parser-warning paths.
+
 ### SPEC §4.1 / §4.2 / §4.3 / §7.1 / §7.2 / §11 / §12 / §2.3 (T-CLI-01a / T-CLI-01b / T-CLI-19b / T-CLI-23a / T-CLI-40b / T-CLI-70a / T-CLI-71a / T-CLI-71b / T-CLI-123 / T-CLI-123a / T-CLI-124 / T-CLI-124a / T-CLI-125 / T-CLI-126 — CLI parser and help-form / would-be-operand short-circuit edges) — RESOLVED this iteration
 
 Mixed implementation + test-only iteration: 14 unique IDs × 2 runtimes (Node 25.2.1 + Bun 1.3.11) = 28 tests added to `apps/tests/tests/e2e/cli-basics.test.ts` (T-CLI-01b parameterized over `--help` / `-h` so the it.each variant emits 2 sub-tests per runtime; total 30 vitest test invocations). Implementation iteration touched only the `version` subcommand arity check at `packages/loop-extender/src/bin.ts:502-520`.
@@ -1435,6 +1460,29 @@ This sub-section is the authoritative TDD-gate audit and supersedes earlier per-
 - **Exit codes**: T-EXIT-17 (invalid target string).
 - **Source detection**: T-INST-05a, 08g..08m.
 - **Other install**: T-INST-56f..56i, 60t/60u, 63f/63g, 64e, 70e, 76b, 79a, 80c2, 80f2, 83b, 92a..92c, 97a2, 97c.
+- **Subcommands**: ~~T-SUB-14l, 19a, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 29a, 29b, 29c, 29d~~ RESOLVED this iteration (env / output subcommand grammar + scope edges; see P0/P1 RESOLVED subsection above).
+
+## P3 — Test-suite gap inventory (unauthored TEST-SPEC IDs as of this iteration)
+
+After this iteration, **~455 TEST-SPEC test IDs remain unauthored** in the test suite (471 missing pre-iteration minus the 16 T-SUB IDs landed here). The gap is concentrated in:
+- T-INST-* (~146): mostly auto-install / SPEC §10.10 follow-on edges (T-INST-112a2..a5, 112g..o, 113a..n, 114b..d, 115a..d, 116*, 119*, 120*) and install-source symlink validation (T-INST-55f..55zj). Foundational subset already RESOLVED in earlier iterations.
+- T-API-* (~71): the bulk are AbortSignal × process-group / SIGKILL-escalation tests on the programmatic API surface (T-API-10d/10e/10f/10g/10h variants — both `run()` and `runPromise()` axes), plus parameterized variants of T-API-21*, 24*, and the broader option-snapshot validation matrix (T-API-61i..61t5).
+- T-VER-* (~46): runtime workflow `package.json` failure-mode edges and install-time version checking sub-paths.
+- T-TMP-* (~45): cleanup-safety and cleanup-failure surface-parity tests across the run() / runPromise() / CLI matrix.
+- T-DISC-* (~38): project-root `.loopx` entry failure modes and symlink edges (T-DISC-40j..40v, 49a..49k).
+- T-ENV-* (~32): NUL-byte handling, RunOptions.env tier interactions, env-vars edge cases.
+- T-SYM-* (~18): install-source symlink rules.
+- T-SIG-* (~14): pre-iteration signal-wins precedence (T-SIG-20..31), CLI signal parity (T-SIG-04a..07a).
+- T-MOD-* (~14): Bun-specific module-resolution variants (T-MOD-03d..03h-bun) and output() / input() helper tests.
+- T-DEL-* (~14): delegation edge cases.
+- T-CLI-* (~10): minor remaining CLI grammar edges.
+- T-TERM-* (~5): terminal-outcome precedence sub-paths.
+- T-TYPE-* (~1): T-TYPE-08 (compile-time output/input type-surface check).
+- T-EXIT-* (~1): T-EXIT-17 (invalid target string exit code 1).
+
+Excluded from this count: 15 known carve-outs (T-API-10i, T-API-10j, T-DISC-49-block-char-device, T-INST-79a / 112-block-char-device / 113-package-json-block-char-device / 116o-other-categories, T-PWD-05, T-SIG-26 / 29 / 30b, T-TMP-43 / 44 / 45, T-VER-28-block-char-device — explicit Known-Gap or Non-Normative entries in TEST-SPEC.md).
+
+Authoring strategy for future iterations: pick a small focused cluster (5-20 IDs) per iteration, prefer test-only iterations where the existing implementation already conforms, and surface implementation deltas only when the test reveals a real SPEC violation (as T-SUB-19a / 29 / 29a / 29b did this iteration).
 
 ## Pre-existing failures (not ADR-0004)
 

@@ -181,7 +181,11 @@ export function envList(): void {
   }
 
   const content = readFileSync(envPath, "utf-8");
-  const { vars } = parseEnvFile(content);
+  const { vars, warnings } = parseEnvFile(content);
+
+  for (const w of warnings) {
+    process.stderr.write(`Warning: ${w}\n`);
+  }
 
   const sorted = Object.entries(vars).sort(([a], [b]) =>
     a.localeCompare(b)

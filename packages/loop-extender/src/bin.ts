@@ -274,14 +274,32 @@ function handleEnvSubcommand(subArgs: string[]): void {
       process.stderr.write("Error: loopx env set requires <name> <value>\n");
       process.exit(1);
     }
+    if (subArgs.length > 3) {
+      process.stderr.write(
+        `Error: loopx env set: unexpected extra positional '${subArgs[3]}'\n`
+      );
+      process.exit(1);
+    }
     envSet(subArgs[1], subArgs[2]);
   } else if (action === "remove") {
     if (subArgs.length < 2) {
       process.stderr.write("Error: loopx env remove requires <name>\n");
       process.exit(1);
     }
+    if (subArgs.length > 2) {
+      process.stderr.write(
+        `Error: loopx env remove: unexpected extra positional '${subArgs[2]}'\n`
+      );
+      process.exit(1);
+    }
     envRemove(subArgs[1]);
   } else if (action === "list") {
+    if (subArgs.length > 1) {
+      process.stderr.write(
+        `Error: loopx env list: unexpected extra positional '${subArgs[1]}'\n`
+      );
+      process.exit(1);
+    }
     envList();
   } else {
     process.stderr.write(
