@@ -1092,9 +1092,12 @@ echo "99.0.0-local"
       const globalBinPath = join(baseDir, "global", "bin", "loopx");
       await createGlobalWrapper(globalBinPath);
 
+      // With --no-install per the §4.10 suite-wide auto-install-awareness rule
+      // (the SPEC §10.10 auto-install pass would invoke real `npm install`
+      // against the workflow, which fails in the sandboxed test environment).
       const result = await spawnBinary(
         globalBinPath,
-        ["install", `${gitServer.url}/ralph.git`],
+        ["install", "--no-install", `${gitServer.url}/ralph.git`],
         { cwd: projectDir },
       );
 

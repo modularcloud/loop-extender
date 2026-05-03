@@ -1799,6 +1799,10 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
 
     forEachRuntime((runtime) => {
       it("T-VER-12: install — dependencies wins over devDependencies (precedence)", async () => {
+        // With --no-install per the §4.10 suite-wide auto-install-awareness rule
+        // (the SPEC §10.10 auto-install pass would invoke real `npm install`
+        // against the workflow, which fails in the sandboxed test environment).
+        //
         // Case A: deps satisfied, devDeps unsatisfied → install succeeds
         {
           project = await createTempProject();
@@ -1816,7 +1820,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", `${gitServer.url}/ralph.git`],
+            ["install", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1847,7 +1851,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", `${gitServer.url}/ralph.git`],
+            ["install", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1882,6 +1886,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       });
 
       it("T-VER-12b: install — deps satisfied → devDeps fully ignored (no warning even if malformed)", async () => {
+        // With --no-install per the §4.10 suite-wide auto-install-awareness rule.
         project = await createTempProject();
         gitServer = await startLocalGitServer([
           {
@@ -1896,10 +1901,10 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
-          cwd: project.dir,
-          runtime,
-        });
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/ralph.git`],
+          { cwd: project.dir, runtime },
+        );
 
         expect(result.exitCode).toBe(0);
         expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
@@ -1985,6 +1990,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       });
 
       it("T-VER-13b: install — peerDependencies.loopx is ignored", async () => {
+        // With --no-install per the §4.10 suite-wide auto-install-awareness rule.
         project = await createTempProject();
         gitServer = await startLocalGitServer([
           {
@@ -1998,10 +2004,10 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
-          cwd: project.dir,
-          runtime,
-        });
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/ralph.git`],
+          { cwd: project.dir, runtime },
+        );
 
         expect(result.exitCode).toBe(0);
         expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
@@ -2148,6 +2154,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       });
 
       it("T-VER-15a: install — optionalDependencies does not rescue unsatisfied devDependencies; -y overrides", async () => {
+        // With --no-install per the §4.10 suite-wide auto-install-awareness rule.
         // Without -y
         {
           project = await createTempProject();
@@ -2165,7 +2172,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", `${gitServer.url}/ralph.git`],
+            ["install", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -2196,7 +2203,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", "-y", `${gitServer.url}/ralph.git`],
+            ["install", "--no-install", "-y", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
