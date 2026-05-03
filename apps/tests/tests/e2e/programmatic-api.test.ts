@@ -1,9 +1,10 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { chmod, mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
-import { execSync } from "node:child_process";
-import { join, resolve } from "node:path";
+import { execSync, spawnSync } from "node:child_process";
+import { dirname, join, resolve } from "node:path";
 import { tmpdir as osTmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 import {
   createTempProject,
   createWorkflowScript,
@@ -9509,6 +9510,304 @@ console.log(JSON.stringify({ count: results.length }));
       expect(readFileSync(homeMarker, "utf-8")).toBe(fakeHome);
       // (b) loopx loaded global env file using inherited HOME (real).
       expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// SPEC: RunOptions.env Does Not Affect Loopx's Tmpdir Parent
+//
+// SPEC §7.4: loopx selects its tmpdir parent from `os.tmpdir()`, which
+// itself reads `TMPDIR` / `TEMP` / `TMP` from the inherited environment
+// (timing per SPEC §9.1 / §9.2). User-supplied values for those names via
+// `RunOptions.env` (tier 2) reach the spawned child but do not redirect
+// the parent loopx selects for its own `mkdtemp(<parent>/loopx-)` call.
+//
+// T-API-60 / 60a / 60b / 60c close the contract on both API surfaces ×
+// {TMPDIR, TEMP, TMP}. For TEMP / TMP, the contract is runtime-aware: on
+// POSIX runtimes only TMPDIR redirects `os.tmpdir()`, so the test pins
+// the parent against `os.tmpdir()` evaluated in an identically-configured
+// child process via getRuntimeOsTmpdir. The complementary T-TMP-29 / 29b /
+// 29c family (in tmpdir.test.ts) covers the `runPromise()` surface; this
+// block adds the `run()` generator surface plus a redundant `runPromise()`
+// pin in the API test file for symmetry with T-API-59.
+// ═════════════════════════════════════════════════════════════
+
+/**
+ * Returns the value of `os.tmpdir()` inside an `envOverrides`-configured
+ * child process of the given runtime. POSIX runtimes only consult TMPDIR;
+ * Windows runtimes additionally consult TEMP / TMP. Mirrors the helper
+ * used in tmpdir.test.ts for T-TMP-25/29 runtime-aware assertions.
+ */
+function getRuntimeOsTmpdir(
+  runtime: "node" | "bun",
+  envOverrides: Record<string, string | undefined>,
+): string {
+  const effectiveEnv: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) effectiveEnv[key] = value;
+  }
+  for (const [key, value] of Object.entries(envOverrides)) {
+    if (value === undefined) {
+      delete effectiveEnv[key];
+    } else {
+      effectiveEnv[key] = value;
+    }
+  }
+  const command = runtime === "bun" ? "bun" : "node";
+  const result = spawnSync(
+    command,
+    ["-e", "process.stdout.write(require('os').tmpdir())"],
+    { env: effectiveEnv, encoding: "utf-8" },
+  );
+  if (result.status !== 0) {
+    throw new Error(
+      `getRuntimeOsTmpdir(${runtime}) probe failed: status=${result.status} stderr=${result.stderr}`,
+    );
+  }
+  return result.stdout.trim();
+}
+
+describe("SPEC: RunOptions.env Does Not Affect Loopx's Tmpdir Parent", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    for (const cleanup of cleanups.splice(0)) {
+      await cleanup().catch(() => {});
+    }
+  });
+
+  /**
+   * Allocate a writable test-isolated parent directory under the system
+   * tmpdir, registered for cleanup. Per TEST-SPEC §4.7, parallel CI workers
+   * must not race on a shared `/tmp/<name>` literal.
+   */
+  async function makeIsolatedTmpdirParent(label: string): Promise<string> {
+    const dir = await mkdtemp(
+      join(osTmpdir(), `loopx-test-${label}-parent-`),
+    );
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  /**
+   * A unique nonexistent path under the system tmpdir. Used as the wrong-
+   * parent value passed via `RunOptions.env` — loopx must not consult it,
+   * so it need not exist on disk.
+   */
+  function makeNonexistentParent(label: string): string {
+    return join(osTmpdir(), `loopx-test-${label}-fake-${randomUUID()}`);
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-60: runPromise() — RunOptions.env does NOT redirect tmpdir parent
+    //   selection (TMPDIR axis). Inherited TMPDIR points at realParent (a
+    //   writable mkdtemp directory loopx uses as its tmpdir parent).
+    //   RunOptions.env supplies a unique nonexistent fakeParent value. The
+    //   script observes both TMPDIR and LOOPX_TMPDIR. Assert (a) child's
+    //   TMPDIR == fakeParent (the RunOptions.env value reaches the child
+    //   per SPEC §8.3 tier-2 injection), (b) LOOPX_TMPDIR lives under
+    //   realParent (loopx's own tmpdir parent was captured from loopx's
+    //   own process.env, NOT from RunOptions.env). SPEC §7.4, §8.3, §9.5.
+    //
+    //   Companion to T-TMP-29 (runPromise + TMPDIR — same contract pinned in
+    //   tmpdir.test.ts). T-API-60 redundantly pins the same case in
+    //   programmatic-api.test.ts for symmetry with T-API-60a/60b/60c on the
+    //   run() surface, and to surface a regression as a programmatic-api
+    //   suite failure rather than only a tmpdir-suite failure.
+    // ------------------------------------------------------------------------
+    it("T-API-60: runPromise() — RunOptions.env TMPDIR does NOT redirect tmpdir parent", async () => {
+      project = await createTempProject();
+      const realParent = await makeIsolatedTmpdirParent("api60");
+      const fakeParent = makeNonexistentParent("api60");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpdirMarker = join(project.dir, "tmpdir-env.txt");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TMPDIR" > "${observedTmpdirMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, env: { TMPDIR: ${JSON.stringify(fakeParent)} } });
+console.log("done");
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: realParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      // (a) Child observed TMPDIR from RunOptions.env (the fake nonexistent path).
+      const observedTmpdir = readFileSync(observedTmpdirMarker, "utf-8");
+      expect(observedTmpdir).toBe(fakeParent);
+      // (b) loopx selected its own tmpdir parent from inherited process.env
+      //     (the real path) — LOOPX_TMPDIR is rooted under realParent.
+      const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(dirname(observedLoopxTmpdir)).toBe(realParent);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-60a: run() — generator-surface counterpart to T-API-60. The two
+    //   run surfaces have different snapshot timing for inherited env /
+    //   tmpdir parent (lazy on run() per SPEC §9.1 / §7.4; eager on
+    //   runPromise() per SPEC §9.2 / §7.4) but identical timing for
+    //   RunOptions.env (eager / call-site capture on both surfaces per
+    //   SPEC §9.5). A buggy implementation that special-cased the
+    //   tmpdir-parent / RunOptions.env interaction on the lazy-snapshot
+    //   run() surface — perhaps by re-reading RunOptions.env at first
+    //   next() and merging it into the lazy process.env snapshot before
+    //   computing os.tmpdir() — would pass T-API-60 / T-TMP-29 but fail
+    //   this test. SPEC §7.4, §8.3, §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-60a: run() — RunOptions.env TMPDIR does NOT redirect tmpdir parent", async () => {
+      project = await createTempProject();
+      const realParent = await makeIsolatedTmpdirParent("api60a");
+      const fakeParent = makeNonexistentParent("api60a");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpdirMarker = join(project.dir, "tmpdir-env.txt");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TMPDIR" > "${observedTmpdirMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, env: { TMPDIR: ${JSON.stringify(fakeParent)} } });
+for await (const _ of gen) {}
+console.log("done");
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: realParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const observedTmpdir = readFileSync(observedTmpdirMarker, "utf-8");
+      expect(observedTmpdir).toBe(fakeParent);
+      const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(dirname(observedLoopxTmpdir)).toBe(realParent);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-60b: run() — RunOptions.env does NOT redirect tmpdir parent
+    //   selection via TEMP. SPEC §7.4 / §9.5 apply the rule symmetrically
+    //   across TMPDIR / TEMP / TMP. T-API-60a covers TMPDIR on the run()
+    //   surface; T-TMP-29b covers TEMP on the runPromise() surface; this
+    //   test parameterizes the run() generator surface over TEMP. A buggy
+    //   implementation that special-cased the TEMP branch of os.tmpdir()
+    //   resolution on the lazy-snapshot run() surface would pass
+    //   T-API-60a / T-TMP-29b yet fail this test.
+    //
+    //   Apply T-TMP-25a's runtime-aware expected-parent logic: assert
+    //   LOOPX_TMPDIR lives under rightParent iff the active runtime's
+    //   os.tmpdir() consults TEMP in this configuration; otherwise assert
+    //   the parent matches os.tmpdir() evaluated in an identically-
+    //   configured child process. SPEC §7.4, §8.3, §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-60b: run() — RunOptions.env TEMP does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      project = await createTempProject();
+      const rightParent = await makeIsolatedTmpdirParent("api60b-right");
+      const wrongParent = makeNonexistentParent("api60b-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTempMarker = join(project.dir, "temp-env.txt");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TEMP" > "${observedTempMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TMP: undefined,
+        TEMP: rightParent,
+      });
+
+      const driverCode = `
+import { run } from "loopx";
+delete process.env.TMPDIR;
+delete process.env.TMP;
+process.env.TEMP = ${JSON.stringify(rightParent)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, env: { TEMP: ${JSON.stringify(wrongParent)} } });
+for await (const _ of gen) {}
+console.log("done");
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TEMP: rightParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const observedTemp = readFileSync(observedTempMarker, "utf-8");
+      expect(observedTemp).toBe(wrongParent);
+      const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(dirname(observedLoopxTmpdir)).toBe(expectedParent);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-60c: run() — RunOptions.env does NOT redirect tmpdir parent
+    //   selection via TMP. Same runtime-aware pattern as T-API-60b for the
+    //   TMP branch; together with T-API-60a (run() × TMPDIR), T-API-60b
+    //   (run() × TEMP), T-API-60 (runPromise() × TMPDIR), and T-TMP-29 /
+    //   29b / 29c (runPromise() × TMPDIR / TEMP / TMP), this closes the
+    //   RunOptions.env × tmpdir-parent contract across both run surfaces ×
+    //   all three variables. SPEC §7.4, §8.3, §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-60c: run() — RunOptions.env TMP does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      project = await createTempProject();
+      const rightParent = await makeIsolatedTmpdirParent("api60c-right");
+      const wrongParent = makeNonexistentParent("api60c-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpMarker = join(project.dir, "tmp-env.txt");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TMP" > "${observedTmpMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TEMP: undefined,
+        TMP: rightParent,
+      });
+
+      const driverCode = `
+import { run } from "loopx";
+delete process.env.TMPDIR;
+delete process.env.TEMP;
+process.env.TMP = ${JSON.stringify(rightParent)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, env: { TMP: ${JSON.stringify(wrongParent)} } });
+for await (const _ of gen) {}
+console.log("done");
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMP: rightParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const observedTmp = readFileSync(observedTmpMarker, "utf-8");
+      expect(observedTmp).toBe(wrongParent);
+      const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(dirname(observedLoopxTmpdir)).toBe(expectedParent);
     });
   });
 });
