@@ -7,6 +7,7 @@ import { parseOutput } from "./parsers/parse-output.js";
 import { parseGoto } from "./target-validation.js";
 import { checkWorkflowVersion, formatWarning } from "./version-check.js";
 import { makeAbortError } from "./abort.js";
+import { maybePauseAtTerminalTriggerWindow } from "./test-seams.js";
 import {
   createTmpdir,
   cleanupTmpdir,
@@ -189,6 +190,13 @@ export async function* runLoop(
 
       if (result.exitCode !== 0) {
         pinIterationFirstObserved();
+        // TEST-SPEC §1.4 `child-exit-handler` seam: pause AFTER recording the
+        // child-exit terminal trigger as first-observed but BEFORE dispatching
+        // the iteration-level error. Used by T-TERM-01 / T-TERM-05 to race a
+        // second terminal trigger (abort or signal) into the post-observation
+        // window; per SPEC §7.2, the child-exit outcome must remain surfaced
+        // because it was first-observed.
+        await maybePauseAtTerminalTriggerWindow("child-exit-handler");
         throw new Error(
           `Script '${currentWorkflow.name}:${currentScript.name}' exited with code ${result.exitCode}`
         );

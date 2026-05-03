@@ -12,7 +12,11 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { constants } from "node:os";
 import { discoverScripts } from "./discovery.js";
-import { runLoop, type LoopStartingTarget } from "./loop.js";
+import {
+  runLoop,
+  type LoopStartingTarget,
+  type FirstObservedRef,
+} from "./loop.js";
 import {
   loadGlobalEnv,
   loadLocalEnv,
@@ -610,6 +614,15 @@ async function main(): Promise<void> {
   const ac = new AbortController();
   let receivedSignal: NodeJS.Signals | null = null;
 
+  // SPEC §7.2 first-observed-wins: shared between the signal handlers,
+  // `runLoop`, and the post-loop dispatch logic. Pinned to "abort" by the
+  // signal handlers (only when null), pinned to "iteration" by `runLoop`
+  // before throwing iteration-level errors. The post-loop catch consults this
+  // slot to decide whether a late signal should displace an iteration error
+  // (T-TERM-05): if the iteration error was first-observed, surface it; only
+  // if the signal arrived first do we exit with the signal's code.
+  const firstObservedRef: FirstObservedRef = { trigger: null };
+
   function exitWithSignal(): never {
     const sigNum =
       constants.signals[receivedSignal as keyof typeof constants.signals] ?? 15;
@@ -620,10 +633,15 @@ async function main(): Promise<void> {
   // (e.g. SIGTERM during cleanup of a prior SIGINT) does not displace the
   // first signal's exit code. The AbortController is already aborted on the
   // second call (no-op), so we still propagate but leave `receivedSignal`
-  // anchored at the first observation.
+  // anchored at the first observation. We also pin `firstObservedRef.trigger`
+  // to "abort" so a downstream iteration-level error observed AFTER the
+  // signal cannot displace the signal's exit code at dispatch time.
   const signalHandler = (sig: NodeJS.Signals) => {
     if (receivedSignal === null) {
       receivedSignal = sig;
+    }
+    if (firstObservedRef.trigger === null) {
+      firstObservedRef.trigger = "abort";
     }
     ac.abort(sig);
   };
@@ -765,6 +783,7 @@ async function main(): Promise<void> {
       loopxBin,
       runningVersion: getVersion(),
       signal: ac.signal,
+      firstObservedRef,
     });
 
     for await (const _output of loop) {
@@ -775,7 +794,17 @@ async function main(): Promise<void> {
 
     process.exit(0);
   } catch (err: unknown) {
-    if (receivedSignal) exitWithSignal();
+    // SPEC §7.2 first-observed-wins. If an iteration-level error (script
+    // non-zero exit, invalid goto, etc.) was observed BEFORE any signal, the
+    // iteration outcome (Error: ... + exit 1) is the surfaced terminal
+    // outcome — a signal received during the post-observation
+    // `child-exit-handler` seam pause (T-TERM-05) or otherwise after
+    // `pinIterationFirstObserved` does not displace it. Only when the signal
+    // was first-observed (or no iteration error was pinned) do we exit with
+    // the signal's code.
+    if (receivedSignal && firstObservedRef.trigger !== "iteration") {
+      exitWithSignal();
+    }
     const msg = err instanceof Error ? err.message : String(err);
     process.stderr.write(`Error: ${msg}\n`);
     process.exit(1);

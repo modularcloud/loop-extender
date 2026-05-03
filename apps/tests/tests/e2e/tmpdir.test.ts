@@ -13207,5 +13207,604 @@ console.log(JSON.stringify({ errName, errMessage }));
         await rm(tmpdirPath, { recursive: true, force: true }).catch(() => {});
       }, { timeout: 60_000, retry: 2 });
     }
+
+    // ------------------------------------------------------------------------
+    // T-TERM-01 / T-TERM-01-run: SPEC §7.2 first-observed-wins on the
+    // active-child child-exit × abort race, on both programmatic surfaces.
+    //
+    // Variant a (child-exit observed first): seam = `child-exit-handler`.
+    // Script exits 1 immediately. Loopx observes the non-zero child-exit,
+    // pinIterationFirstObserved sets `firstObservedRef.trigger = "iteration"`,
+    // then loop.ts pauses at child-exit-handler. The harness polls for the
+    // parent-observable marker, then calls c.abort() during the bounded
+    // pause. Per SPEC §7.2, the surfaced terminal outcome must be the
+    // iteration error (first-observed wins; the racing abort does NOT
+    // displace it).
+    //
+    // Variant b (abort observed first): seam = `abort-listener`. Script
+    // installs a `trap 'exit 1' SIGUSR1` and sleeps long-lived. Harness
+    // calls c.abort() FIRST, which pins firstObservedRef.trigger = "abort"
+    // and schedules the abort-listener pause. During the pause the harness
+    // sends SIGUSR1 to the script's process group, the trap fires, the
+    // script exits 1. Loopx observes the non-zero child-exit during the
+    // still-paused abort dispatch — but pinIterationFirstObserved is a
+    // no-op (slot already occupied by abort), so wrapper.next() catch
+    // surfaces the abort error.
+    //
+    // Together the two variants pin SPEC §7.2's "first-observed wins"
+    // residual contract on the child-exit × abort race regardless of
+    // observation order. T-TERM-01 covers runPromise(); T-TERM-01-run
+    // covers run(). Both share the per-surface infrastructure already
+    // exercised by T-TMP-38b2 / T-TMP-38b2-run.
+    // ------------------------------------------------------------------------
+    function buildChildExitHandlerVariantAFixture(): string {
+      // Variant a: script exits 1 immediately. No coordination needed —
+      // loop.ts pauses at child-exit-handler AFTER observing the exit; the
+      // pause marker appears after the script has already exited, so the
+      // driver simply polls for the marker and then aborts.
+      return `#!/bin/bash
+exit 1
+`;
+    }
+
+    function buildAbortListenerVariantBFixture(): string {
+      // Variant b: long-lived script with SIGUSR1 → exit 1 trap. Records
+      // its PID via $$ to the PID marker so the driver can target the
+      // script's process group with process.kill(-pid, "SIGUSR1") AFTER
+      // the abort-listener pause has begun.
+      return `#!/bin/bash
+trap 'exit 1' USR1
+printf '%s' "$$" > "$PID_MARKER_PATH"
+touch "$FIXTURE_READY_PATH"
+sleep 30 &
+wait
+`;
+    }
+
+    it("T-TERM-01 (variant a): SPEC §7.2 first-observed-wins under racing child-exit → abort during child-exit-handler (runPromise())", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const pauseMarker = join(project.dir, "pause-marker.json");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildChildExitHandlerVariantAFixture(),
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync } from "node:fs";
+
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const c = new AbortController();
+
+let errName = "";
+let errMessage = "";
+
+const promise = runPromise("ralph", { signal: c.signal, maxIterations: 1 });
+
+// Child exits 1 immediately; loop.ts then pauses at child-exit-handler
+// AFTER pinning iteration as first-observed.
+const pauseSeen = await waitForFile(pauseMarker, 15_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared" }));
+  process.exit(1);
+}
+
+// Race the abort into the still-paused dispatch. Per SPEC §7.2, this
+// must NOT displace the iteration error (firstObservedRef.trigger is
+// already "iteration").
+c.abort();
+
+try {
+  await promise;
+} catch (e) {
+  const ex = e as { name?: string; message?: string };
+  errName = ex?.name ?? "";
+  errMessage = ex?.message ?? String(e);
+}
+
+console.log(JSON.stringify({ errName, errMessage }));
+`;
+
+      const result = await runAPIDriver(runtime, driverCode, {
+        cwd: project.dir,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "child-exit-handler",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+        },
+        timeout: 60_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const envelope = JSON.parse(result.stdout.trim());
+
+      // (a) Promise rejects with the iteration / script-failure error
+      // (first-observed wins; the racing abort during child-exit-handler
+      // does NOT displace it). Load-bearing: a buggy implementation that
+      // surfaced the abort error from the wrapper.next() catch (without
+      // consulting firstObservedRef) would show errName === "AbortError"
+      // here.
+      expect(envelope.errName).not.toBe("AbortError");
+      expect(envelope.errMessage).toMatch(/exited with code 1/);
+
+      // (b) No abort error chain or wrapper around the iteration error.
+      expect(envelope.errMessage).not.toMatch(/AbortError|aborted/i);
+    }, { timeout: 60_000, retry: 2 });
+
+    it("T-TERM-01 (variant b): SPEC §7.2 first-observed-wins under racing abort → child-exit during abort-listener (runPromise())", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const fixtureReady = join(project.dir, "fixture-ready.flag");
+      const pauseMarker = join(project.dir, "pause-marker.json");
+      const pidMarker = join(project.dir, "pid.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildAbortListenerVariantBFixture(),
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+
+const fixtureReady = ${JSON.stringify(fixtureReady)};
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+const pidMarker = ${JSON.stringify(pidMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const ac = new AbortController();
+
+let errName = "";
+let errMessage = "";
+
+const promise = runPromise("ralph", { signal: ac.signal, maxIterations: 1 });
+
+const fxReady = await waitForFile(fixtureReady, 15_000);
+if (!fxReady) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "fixture-ready never appeared" }));
+  process.exit(1);
+}
+
+// Abort observed FIRST. The user-signal listener pins firstObservedRef
+// to "abort" and (because LOOPX_TEST_TERMINAL_TRIGGER_PAUSE=abort-listener)
+// schedules the bounded §1.4 pause before dispatching internalAc.abort().
+// During the pause the child is still alive — execution.ts's onAbort has
+// not fired — so SIGUSR1 sent to its process group will reach the script.
+ac.abort();
+
+const pauseSeen = await waitForFile(pauseMarker, 10_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared" }));
+  process.exit(1);
+}
+
+const pidStr = readFileSync(pidMarker, "utf-8").trim();
+const pid = parseInt(pidStr, 10);
+if (Number.isNaN(pid) || pid <= 0) {
+  console.log(JSON.stringify({ errName: "RangeError", errMessage: "invalid pid in marker: " + pidStr }));
+  process.exit(1);
+}
+
+// Racing child-exit. SIGUSR1 → bash trap → exit 1 → runLoop observes
+// the iteration-level error during the still-paused abort dispatch. Per
+// SPEC §7.2, the abort error must remain the surfaced terminal outcome
+// (firstObservedRef.trigger === "abort" already pinned).
+try {
+  process.kill(-pid, "SIGUSR1");
+} catch {
+  // ESRCH is acceptable.
+}
+
+try {
+  await promise;
+} catch (e) {
+  const ex = e as { name?: string; message?: string };
+  errName = ex?.name ?? "";
+  errMessage = ex?.message ?? String(e);
+}
+
+console.log(JSON.stringify({ errName, errMessage }));
+`;
+
+      const result = await runAPIDriver(runtime, driverCode, {
+        cwd: project.dir,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "abort-listener",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          FIXTURE_READY_PATH: fixtureReady,
+          PID_MARKER_PATH: pidMarker,
+        },
+        timeout: 60_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const envelope = JSON.parse(result.stdout.trim());
+
+      // (a) Promise rejects with the abort error (first-observed wins;
+      // the racing non-zero exit during the abort-listener pause does
+      // NOT displace it).
+      expect(envelope.errName).toBe("AbortError");
+      expect(envelope.errMessage).not.toMatch(/exited with code/);
+    }, { timeout: 60_000, retry: 2 });
+
+    it("T-TERM-01-run (variant a): SPEC §7.2 first-observed-wins under racing child-exit → abort during child-exit-handler (run())", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const pauseMarker = join(project.dir, "pause-marker.json");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildChildExitHandlerVariantAFixture(),
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync } from "node:fs";
+
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const c = new AbortController();
+const gen = run("ralph", { signal: c.signal, maxIterations: 1 });
+
+let errName = "";
+let errMessage = "";
+
+const iterPromise = (async () => {
+  try {
+    for await (const _ of gen) { /* drain */ }
+  } catch (e) {
+    const ex = e as { name?: string; message?: string };
+    errName = ex?.name ?? "";
+    errMessage = ex?.message ?? String(e);
+  }
+})();
+
+const pauseSeen = await waitForFile(pauseMarker, 15_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared" }));
+  process.exit(1);
+}
+
+c.abort();
+
+await iterPromise;
+
+console.log(JSON.stringify({ errName, errMessage }));
+`;
+
+      const result = await runAPIDriver(runtime, driverCode, {
+        cwd: project.dir,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "child-exit-handler",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+        },
+        timeout: 60_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const envelope = JSON.parse(result.stdout.trim());
+
+      // (a) For-await loop threw the iteration error (first-observed wins;
+      // the racing abort during child-exit-handler does NOT displace it).
+      expect(envelope.errName).not.toBe("AbortError");
+      expect(envelope.errMessage).toMatch(/exited with code 1/);
+      expect(envelope.errMessage).not.toMatch(/AbortError|aborted/i);
+    }, { timeout: 60_000, retry: 2 });
+
+    it("T-TERM-01-run (variant b): SPEC §7.2 first-observed-wins under racing abort → child-exit during abort-listener (run())", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const fixtureReady = join(project.dir, "fixture-ready.flag");
+      const pauseMarker = join(project.dir, "pause-marker.json");
+      const pidMarker = join(project.dir, "pid.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        buildAbortListenerVariantBFixture(),
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, readFileSync } from "node:fs";
+
+const fixtureReady = ${JSON.stringify(fixtureReady)};
+const pauseMarker = ${JSON.stringify(pauseMarker)};
+const pidMarker = ${JSON.stringify(pidMarker)};
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+const ac = new AbortController();
+const gen = run("ralph", { signal: ac.signal, maxIterations: 1 });
+
+let errName = "";
+let errMessage = "";
+
+const iterPromise = (async () => {
+  try {
+    for await (const _ of gen) { /* drain */ }
+  } catch (e) {
+    const ex = e as { name?: string; message?: string };
+    errName = ex?.name ?? "";
+    errMessage = ex?.message ?? String(e);
+  }
+})();
+
+const fxReady = await waitForFile(fixtureReady, 15_000);
+if (!fxReady) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "fixture-ready never appeared" }));
+  process.exit(1);
+}
+
+ac.abort();
+
+const pauseSeen = await waitForFile(pauseMarker, 10_000);
+if (!pauseSeen) {
+  console.log(JSON.stringify({ errName: "TimeoutError", errMessage: "pause-marker never appeared" }));
+  process.exit(1);
+}
+
+const pidStr = readFileSync(pidMarker, "utf-8").trim();
+const pid = parseInt(pidStr, 10);
+if (Number.isNaN(pid) || pid <= 0) {
+  console.log(JSON.stringify({ errName: "RangeError", errMessage: "invalid pid in marker: " + pidStr }));
+  process.exit(1);
+}
+
+try {
+  process.kill(-pid, "SIGUSR1");
+} catch {
+  // ESRCH is acceptable.
+}
+
+await iterPromise;
+
+console.log(JSON.stringify({ errName, errMessage }));
+`;
+
+      const result = await runAPIDriver(runtime, driverCode, {
+        cwd: project.dir,
+        env: {
+          TMPDIR: tmpdirParent,
+          NODE_ENV: "test",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "abort-listener",
+          LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          FIXTURE_READY_PATH: fixtureReady,
+          PID_MARKER_PATH: pidMarker,
+        },
+        timeout: 60_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const envelope = JSON.parse(result.stdout.trim());
+
+      // (a) For-await loop threw the abort error (first-observed wins;
+      // the racing non-zero exit during the abort-listener pause does
+      // NOT displace it).
+      expect(envelope.errName).toBe("AbortError");
+      expect(envelope.errMessage).not.toMatch(/exited with code/);
+    }, { timeout: 60_000, retry: 2 });
+
+    // ------------------------------------------------------------------------
+    // T-TERM-03: SPEC §7.2 surfaced-exit-code precedence under racing
+    // signals during cleanup (CLI surface). SIGINT first → loopx forwards
+    // to script, script dies, loopx enters cleanup → cleanup-start seam
+    // pauses → harness sends SIGTERM during the bounded pause. The
+    // surfaced exit code must be 130 (SIGINT — first-observed signal),
+    // NOT 143 (SIGTERM — second signal received during the post-cleanup-
+    // start pause). T-TMP-38 covers the cleanup-idempotence angle (one
+    // attempt + one warning) under the same race; this test pins the
+    // surfaced-exit-code angle separately on a vanilla cleanup path
+    // (no warning expected, tmpdir cleanly removed).
+    // ------------------------------------------------------------------------
+    it("T-TERM-03: surfaced exit code reflects first-observed signal under SIGINT → SIGTERM during cleanup-start (CLI)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const pauseMarker = join(project.dir, "pause-marker.json");
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+echo "ready" >&2
+while true; do sleep 1; done
+`,
+      );
+
+      const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+        ["run", "-n", "1", "ralph"],
+        {
+          cwd: project.dir,
+          runtime,
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "cleanup-start",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+          },
+          timeout: 30_000,
+        },
+      );
+
+      await waitForStderr("ready");
+
+      // First-observed signal: SIGINT.
+      sendSignal("SIGINT");
+
+      const markerWritten = await waitForFile(pauseMarker, 10_000);
+      expect(markerWritten).toBe(true);
+      const marker = JSON.parse(readFileSync(pauseMarker, "utf-8"));
+      expect(marker.window).toBe("cleanup-start");
+
+      // Second-observed signal during cleanup-start pause: SIGTERM.
+      sendSignal("SIGTERM");
+
+      const outcome = await result;
+
+      // (a) SIGINT exit code (130) preserved; SIGTERM during the pause
+      // does NOT displace the first-observed signal's exit code.
+      expect(outcome.exitCode).toBe(130);
+
+      // (b) Cleanup completed successfully — the recorded LOOPX_TMPDIR
+      // path no longer exists on disk after loopx exits.
+      const recordedTmpdir = readFileSync(tmpdirObservation, "utf-8").trim();
+      expect(recordedTmpdir).not.toBe("");
+      expect(existsSync(recordedTmpdir)).toBe(false);
+
+      // (c) No cleanup-related warning on stderr (vanilla cleanup ran
+      // exactly once, success path — matches T-TMP-13 clean-cleanup
+      // contract).
+      const cleanupWarnings = outcome.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(0);
+    }, { timeout: 60_000, retry: 2 });
+
+    // ------------------------------------------------------------------------
+    // T-TERM-05: SPEC §7.2 residual first-observed-wins on the CLI surface
+    // for the child-exit-vs-signal race — child-exit observed first, signal
+    // arrives during the post-observation `child-exit-handler` pause.
+    // Surfaced exit code must be 1 (script-failure first-observed), NOT
+    // 143 (SIGTERM during the post-observation pause). Composes the
+    // existing `child-exit-handler` seam (used by T-TERM-01 / T-TERM-01-run
+    // on the API surface) with the `recursive-remove-fail` cleanup-fault
+    // (used by T-TMP-38e and the T-TMP-42 cleanup-warning suite) on the
+    // CLI surface. The cleanup-fault makes cleanup observably emit one
+    // SPEC §7.4 rule-4 warning so a buggy implementation that re-entered
+    // cleanup on the post-pause signal would emit two warnings and fail.
+    // ------------------------------------------------------------------------
+    it("T-TERM-05: surfaced exit code reflects first-observed child-exit under racing child-exit → SIGTERM during child-exit-handler (CLI)", async () => {
+      const { project, tmpdirParent } = await setupTmpdirTest();
+      const pauseMarker = join(project.dir, "pause-marker.json");
+      const tmpdirObservation = join(project.dir, "tmpdir.txt");
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirObservation}"
+printf 'content' > "$LOOPX_TMPDIR/file.txt"
+exit 1
+`,
+      );
+
+      const { result, sendSignal } = runCLIWithSignal(
+        ["run", "-n", "1", "ralph"],
+        {
+          cwd: project.dir,
+          runtime,
+          env: {
+            TMPDIR: tmpdirParent,
+            NODE_ENV: "test",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE: "child-exit-handler",
+            LOOPX_TEST_TERMINAL_TRIGGER_PAUSE_MARKER: pauseMarker,
+            LOOPX_TEST_CLEANUP_FAULT: "recursive-remove-fail",
+          },
+          timeout: 30_000,
+        },
+      );
+
+      // Child-exit observed FIRST: script exits 1, loop.ts pauses at
+      // child-exit-handler AFTER pinning iteration as first-observed.
+      const markerWritten = await waitForFile(pauseMarker, 15_000);
+      expect(markerWritten).toBe(true);
+      const marker = JSON.parse(readFileSync(pauseMarker, "utf-8"));
+      expect(marker.window).toBe("child-exit-handler");
+
+      // Race SIGTERM in during the child-exit-handler pause. Per SPEC
+      // §7.2, this must NOT displace the first-observed child-exit
+      // outcome (script-failure exit code 1). SIGTERM is preferred over
+      // SIGINT because the surfaced exit code (143) distinguishes more
+      // cleanly from cleanup-warning paths than SIGINT (130).
+      sendSignal("SIGTERM");
+
+      const outcome = await result;
+
+      // (a) Exit code 1 — script-failure outcome (first-observed). The
+      // post-pause SIGTERM does NOT shift the surfaced exit code to 143.
+      // Load-bearing assertion: a buggy CLI catch handler that surfaced
+      // the most-recent signal's exit code (rather than respecting
+      // firstObservedRef.trigger === "iteration") would fail here.
+      expect(outcome.exitCode).toBe(1);
+
+      // (a-stderr) The error message reflects the SPEC §12 script-
+      // failure mapping ("Error: ... exited with code N").
+      expect(outcome.stderr).toMatch(/Error: Script 'ralph:index' exited with code 1/);
+
+      // (b) Exactly one cleanup-related warning — single cleanup attempt,
+      // emitted once by the rule-4 recursive-remove-fail dispatch. A
+      // buggy implementation that re-entered cleanup on the post-pause
+      // SIGTERM would emit a second warning here.
+      const cleanupWarnings = outcome.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("LOOPX_TEST_CLEANUP_WARNING\t"));
+      expect(cleanupWarnings.length).toBe(1);
+
+      // (c) Recorded LOOPX_TMPDIR path persists after loopx exits per
+      // SPEC §7.4 "no further changes" after the rule-4 warning is
+      // emitted. The recursive-remove-fail seam halts cleanup at the
+      // simulated removal failure and leaves the partial directory on
+      // disk.
+      const recordedTmpdir = readFileSync(tmpdirObservation, "utf-8").trim();
+      expect(recordedTmpdir).not.toBe("");
+      expect(existsSync(recordedTmpdir)).toBe(true);
+      const st = statSync(recordedTmpdir);
+      expect(st.isDirectory()).toBe(true);
+
+      await rm(recordedTmpdir, { recursive: true, force: true }).catch(() => {});
+    }, { timeout: 60_000, retry: 2 });
   });
 });
