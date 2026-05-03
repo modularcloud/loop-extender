@@ -157,6 +157,13 @@ interface MakeTarballOpts {
   /** Make the archive body itself invalid (e.g., truncated). */
   corrupt?: boolean;
   empty?: boolean;
+  /**
+   * Symlinks to record in the archive, keyed by the symlink path (relative to
+   * the wrapperDir if set, else the archive root) with the value being the
+   * literal symlink-target string. Targets are recorded verbatim — relative
+   * paths resolve against the link's own parent directory at extraction time.
+   */
+  symlinks?: Record<string, string>;
 }
 
 async function makeTarball(
@@ -176,8 +183,10 @@ async function makeTarball(
     type Entry = {
       name: string;
       mode: number;
-      type: "file" | "dir";
+      type: "file" | "dir" | "symlink";
       content?: string;
+      /** Symlink target (literal). */
+      linkname?: string;
     };
     const entries: Entry[] = [];
     const pushDir = (dirPath: string) => {
@@ -217,6 +226,22 @@ async function makeTarball(
           content,
         });
       }
+      if (opts.symlinks) {
+        for (const [linkPath, target] of Object.entries(opts.symlinks)) {
+          const archivePathForEntry = prefix ? `${prefix}/${linkPath}` : linkPath;
+          const dirPart = archivePathForEntry
+            .split("/")
+            .slice(0, -1)
+            .join("/");
+          if (dirPart) pushDir(dirPart);
+          entries.push({
+            name: archivePathForEntry,
+            mode: 0o777,
+            type: "symlink",
+            linkname: target,
+          });
+        }
+      }
     }
 
     // Write manifest and payloads to disk for Python to read.
@@ -228,6 +253,7 @@ async function makeTarball(
       mode: number;
       type: string;
       payload?: string;
+      linkname?: string;
     }> = [];
     for (let i = 0; i < entries.length; i++) {
       const e = entries[i];
@@ -239,6 +265,13 @@ async function makeTarball(
           mode: e.mode,
           type: "file",
           payload: payloadFile,
+        });
+      } else if (e.type === "symlink") {
+        manifest.push({
+          name: e.name,
+          mode: e.mode,
+          type: "symlink",
+          linkname: e.linkname ?? "",
         });
       } else {
         manifest.push({ name: e.name, mode: e.mode, type: "dir" });
@@ -257,6 +290,10 @@ async function makeTarball(
       "        info.mode = e['mode']",
       "        if e['type'] == 'dir':",
       "            info.type = tarfile.DIRTYPE",
+      "            tf.addfile(info)",
+      "        elif e['type'] == 'symlink':",
+      "            info.type = tarfile.SYMTYPE",
+      "            info.linkname = e['linkname']",
       "            tf.addfile(info)",
       "        else:",
       "            with open(e['payload'], 'rb') as pf:",
@@ -4860,6 +4897,140 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           expect(readFileSync(gitignorePath, "utf-8").trim()).toBe(
             "node_modules",
           );
+        });
+      });
+
+      // T-INST-110h: Auto-install fires on a symlinked workflow directory that
+      // has a top-level package.json. Pins down the SPEC §10.10 × §10.11
+      // interaction: the source-side `alias -> internal/real-workflow` symlink
+      // must materialize as a real directory at `.loopx/alias/`, and the
+      // post-commit auto-install pass must invoke `npm install` once with
+      // cwd = `.loopx/alias/` (not `.loopx/internal/real-workflow/`).
+      // Parameterized across git and tarball sources per SPEC 10.2 / 10.11.
+      describe("T-INST-110h: symlinked workflow directory + auto-install", () => {
+        const SOURCE_INDEX = BASH_STOP;
+        const SOURCE_PKG = JSON.stringify({
+          name: "real-workflow",
+          version: "1.0.0",
+        });
+
+        async function assertMaterializedAndAutoInstalled(
+          aliasDir: string,
+          stderr: string,
+          fake: { readInvocations: () => Array<{ argv: string[]; cwd: string }> },
+          loopxDir: string,
+        ): Promise<void> {
+          // (b) `.loopx/alias/` is a real directory (not a symlink).
+          expect(existsSync(aliasDir)).toBe(true);
+          const aliasLstat = lstatSync(aliasDir);
+          expect(aliasLstat.isSymbolicLink()).toBe(false);
+          expect(aliasLstat.isDirectory()).toBe(true);
+
+          // (c) `.loopx/alias/index.sh` and `.loopx/alias/package.json` are
+          //     real files (not symlinks) with content byte-identical to the
+          //     symlink target's `index.sh` / `package.json`.
+          const indexPath = join(aliasDir, "index.sh");
+          const pkgPath = join(aliasDir, "package.json");
+          expect(existsSync(indexPath)).toBe(true);
+          expect(existsSync(pkgPath)).toBe(true);
+          const indexLstat = lstatSync(indexPath);
+          const pkgLstat = lstatSync(pkgPath);
+          expect(indexLstat.isSymbolicLink()).toBe(false);
+          expect(indexLstat.isFile()).toBe(true);
+          expect(pkgLstat.isSymbolicLink()).toBe(false);
+          expect(pkgLstat.isFile()).toBe(true);
+          expect(readFileSync(indexPath, "utf-8")).toBe(SOURCE_INDEX);
+          expect(readFileSync(pkgPath, "utf-8")).toBe(SOURCE_PKG);
+
+          // (d) Exactly one fake-npm invocation, cwd = .loopx/alias/, argv = ["install"].
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(1);
+          expect(invocations[0].argv).toEqual(["install"]);
+          expect(invocations[0].cwd).toBe(aliasDir);
+
+          // (e) `.loopx/alias/.gitignore` synthesized — single line `node_modules`.
+          const gitignorePath = join(aliasDir, ".gitignore");
+          expect(existsSync(gitignorePath)).toBe(true);
+          expect(lstatSync(gitignorePath).isFile()).toBe(true);
+          expect(readFileSync(gitignorePath, "utf-8").trim()).toBe(
+            "node_modules",
+          );
+
+          // (f) `.loopx/internal/` is NOT committed as a workflow (top-level
+          //     workflow detection is non-recursive).
+          expect(existsSync(join(loopxDir, "internal"))).toBe(false);
+
+          // (g) No aggregate failure report on stderr.
+          expect(stderr).not.toMatch(/auto-install|aggregate|failed/i);
+        }
+
+        it("git source: symlinked workflow → materialized real directory + auto-install", async () => {
+          project = await createTempProject();
+          const logFile = join(project.dir, "fake-npm.log");
+          gitServer = await startLocalGitServer([
+            {
+              name: "multi",
+              files: {
+                "internal/real-workflow/index.sh": SOURCE_INDEX,
+                "internal/real-workflow/package.json": SOURCE_PKG,
+              },
+              symlinks: {
+                alias: "internal/real-workflow",
+              },
+            },
+          ]);
+          await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/multi.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            // (a) Exit 0 — materialization succeeded and auto-install ran.
+            expect(result.exitCode).toBe(0);
+            await assertMaterializedAndAutoInstalled(
+              join(project!.loopxDir, "alias"),
+              result.stderr,
+              fake,
+              project!.loopxDir,
+            );
+          });
+        });
+
+        it("tarball source: symlinked workflow → materialized real directory + auto-install", async () => {
+          project = await createTempProject();
+          const logFile = join(project.dir, "fake-npm.log");
+          // Archive name and wrapper directory deliberately match so the
+          // SPEC §10.2 archive-name-derived workflow root is unambiguous when
+          // the source is unwrapped (the wrapper-dir contents become the
+          // source root).
+          const tarball = await makeTarball(
+            {
+              "internal/real-workflow/index.sh": SOURCE_INDEX,
+              "internal/real-workflow/package.json": SOURCE_PKG,
+            },
+            {
+              wrapperDir: "multi",
+              symlinks: {
+                alias: "internal/real-workflow",
+              },
+            },
+          );
+          httpServer = await startLocalHTTPServer([
+            tarballRoute("/multi.tar.gz", tarball),
+          ]);
+          await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+            const result = await runCLI(
+              ["install", `${httpServer!.url}/multi.tar.gz`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            // (a) Exit 0 — materialization succeeded and auto-install ran.
+            expect(result.exitCode).toBe(0);
+            await assertMaterializedAndAutoInstalled(
+              join(project!.loopxDir, "alias"),
+              result.stderr,
+              fake,
+              project!.loopxDir,
+            );
+          });
         });
       });
 

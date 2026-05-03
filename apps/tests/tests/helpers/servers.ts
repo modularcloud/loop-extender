@@ -71,6 +71,13 @@ export async function startLocalHTTPServer(
 export interface GitServerRepo {
   name: string;
   files: Record<string, string>;
+  /**
+   * Optional symlinks to add to the repo, keyed by symlink path (relative to
+   * the work tree root) with the value being the symlink target (a relative
+   * path string passed verbatim to `ln -s`). Useful for fixtures that exercise
+   * SPEC §10.11 install-source symlink materialization and similar cases.
+   */
+  symlinks?: Record<string, string>;
 }
 
 export interface GitServer {
@@ -102,6 +109,20 @@ export async function startLocalGitServer(
       const dir = join(fullPath, "..");
       await mkdir(dir, { recursive: true });
       await writeFile(fullPath, content, "utf-8");
+    }
+
+    if (repo.symlinks) {
+      for (const [linkPath, target] of Object.entries(repo.symlinks)) {
+        const fullLink = join(workDir, linkPath);
+        const linkDir = join(fullLink, "..");
+        await mkdir(linkDir, { recursive: true });
+        // Use ln -s so the symlink content is recorded literally and git
+        // commits it as a symbolic-link entry (mode 120000) rather than a
+        // regular file.
+        execSync(`ln -s "${target.replace(/"/g, '\\"')}" "${fullLink}"`, {
+          stdio: "pipe",
+        });
+      }
     }
 
     execSync(

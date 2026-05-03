@@ -4,6 +4,10 @@
 
 ## P0/P1 — RESOLVED
 
+### SPEC §10.11 / §10.10 (T-INST-110h — Auto-install fires on materialized symlinked workflow directory) — RESOLVED this iteration
+
+Tests added: T-INST-110h × 2 source variants (git, tarball) × 2 runtimes (node, bun) = 4 tests; parameterized via a nested `describe` block placed immediately after T-INST-110g in `apps/tests/tests/e2e/install.test.ts`. Helper extensions: `GitServerRepo.symlinks?: Record<string, string>` field added to `apps/tests/tests/helpers/servers.ts` (creates symlinks via `ln -s` before the initial commit so the bare-git source carries SYMTYPE entries); `MakeTarballOpts.symlinks?: Record<string, string>` field added to the inline `makeTarball` helper in `install.test.ts` (records SYMTYPE entries via Python `tarfile`). Implementation fix: `copyWorkflow` in `packages/loop-extender/src/install.ts` was throwing "Workflow source is not a directory" when the workflow root was itself a symlink; it now resolves a top-level symlink via `realpathSync(src)` and walks the resolved path, materializing as a real directory at the destination per SPEC §10.11. Evidence: full `install.test.ts` run shows 467 / 468 tests pass; the 1 failure is the pre-existing T-INST-GLOBAL-01a Bun-resolution gap (documented in this file under "Pre-existing failures").
+
 ### T-INST-112c / T-INST-112d (this iteration)
 
 `.gitignore` write-failure safeguard branch — first uses of the new `LOOPX_TEST_AUTOINSTALL_FAULT=gitignore-write-fail:<workflow>[,<workflow>...]` seam (TEST-SPEC §1.4). Implementation: added `getAutoInstallFault()` parser to `packages/loop-extender/src/install.ts` (semicolon-separated faults, comma-separated workflow lists) and threaded it into `runGitignoreSafeguard(workflowDir, workflowName, fault)`; when the workflow name appears in `gitignoreWriteFail`, the ENOENT-creation branch returns `{ ok: false, reason: "failed to synthesize .gitignore: EACCES: permission denied, open '<path>'" }` without touching disk, exercising the SPEC §10.10 safeguard-failure dispatch identically to a real EACCES write failure. Tests: T-INST-112c (3-workflow fixture, beta+gamma faulted, asserts only alpha reaches the npm shim and aggregate report lists both failed workflows but not alpha) and T-INST-112d (same fixture, asserts no rollback of committed `index.sh` / `package.json` for the failing workflows and no synthesized `.gitignore` for them). 4 tests total (2 unique IDs × 2 runtimes). Test-file edits: `apps/tests/tests/e2e/install.test.ts`. Source edits: `packages/loop-extender/src/install.ts`.
@@ -1252,7 +1256,25 @@ These T-TMP IDs are not yet implemented as test cases or are blocked by missing 
 
 ## P1 — Discovered open issues
 
-(none currently open)
+### TDD-Gate audit (this iteration) — comprehensive missing-test inventory
+
+This sub-section is the authoritative TDD-gate audit and supersedes earlier per-section enumerations. Below is a CONCISE bullet list of MISSING test IDs grouped by TEST-SPEC subsection (no test file under `/home/lzrs/Projects/loop-extender/apps/tests/tests/` covers these IDs):
+
+- **§4.1 CLI** — Basics (Help/Version): T-CLI-01a, 01b. Run Help: T-CLI-40b. Run Help Short-Circuit: T-CLI-70a, 123, 123a, 124, 124a, 125, 126. Bare Invocation: T-CLI-71a, 71b. Target via run: T-CLI-19b. End-of-Options `--`/name=value: T-CLI-TOP-DASHDASH-01; T-CLI-RUN-DASHDASH-01..13; T-CLI-RUN-INHERIT-01; T-CLI-RUN-NAMEVAL-01..07. Pre-iteration Ordering: T-CLI-RUN-ORDER-01..05. Stdout Silence: T-CLI-23a.
+- **§4.2 Subcommands** — output: T-SUB-05a, 06c, 06d, 06e, 06f. env set: T-SUB-11a..11e. env set Serialization: T-SUB-14l. env list: T-SUB-19a. env Grammar: T-SUB-24..28; T-SUB-29, 29a..29d. Broken `.loopx/` Tree: T-SUB-20..23.
+- **§4.3 Discovery** — Workflow Discovery: T-DISC-07b, 09a, 09b, 15c. Naming: T-DISC-30c, 30d, 30e. Symlinks: T-DISC-40j..40w (14 IDs). Caching: T-DISC-42d..42g. Project-root entry failures: T-DISC-49a..49k including 49c2/49c3.
+- **§4.4 Script Execution** — Workflow-Local Deps: T-EXEC-15a, 15b, 15c.
+- **§4.5 Output Parsing** — T-PARSE-04a, 13a, 17a.
+- **§4.6 Loop State** — T-LOOP-13a, 15b, 24a, 44, 45, 46.
+- **§4.7 Env** — Global Env File: T-ENV-05f. Env File Parsing: T-ENV-08a, 15g..15n, 15i-single. Injection Precedence: T-ENV-21e..21h, 24a2..24a6, 24a5-run. Env-File NUL: T-ENV-26a..26g, T-ENV-27..27e. LOOPX_TMPDIR: T-TMP-30, 31, 43, 44, 45. PWD Non-Protocol: T-PWD-01..08 (entire block missing). Symlink/Project-Root: T-SYM-01..09 including 02c/02d/04a..04d/06a/07a/07b (entire block missing).
+- **§4.9 Programmatic API** — T-API-07b, 07c, 09d, 09e, 10d..10j, 19a, 21e..21k, 24c..24j, 55a..55h, 59f, 59g, 61i..61t, 69g.
+- **§4.10 Install** — Source Detection: T-INST-05a, 08g, 08g2, 08h..08m. Source Symlinks: T-INST-55f..55zj (~39 IDs spanning 55f, 55f2, 55g, 55h, 55i, 55i2, 55i3, 55j, 55k, 55l, 55l2, 55l3, 55m, 55n, 55o, 55p, 55q, 55r, 55s, 55t, 55u, 55v, 55v2, 55v3, 55w, 55x, 55x2, 55y, 55z, 55za, 55zb, 55zc, 55zd, 55ze, 55zf, 55zg, 55zh, 55zi, 55zj). Zero-Workflow: T-INST-56f..56i. Selective: T-INST-60t, 60u. Validation: T-INST-63f, 63g, 64e. Collision: T-INST-70e, 97c. Version on Install: T-INST-76b. Atomicity: T-INST-79a (known gap), 80c2, 80f2, 83b, 92a..92c, 97a2. Gitignore Safeguard: T-INST-112a2..112a5, 112b, 112e..112o. Malformed package.json: T-INST-113a..113n. npm install Failures: T-INST-114b..114d. Env Purity: T-INST-115a..115d. Signal During npm install: T-INST-116..116g. Signal No-Active-Child: T-INST-116h..116k2. Signal-Symmetry: T-INST-116l..116o4. Aggregate-Report Already-Emitted: currently no IDs surfaced. Manager Selection: T-INST-118a, 118b, 118c. Stdout/Stderr Passthrough: T-INST-119..119d. -y Replacement Freshness: T-INST-120..120e.
+- **§4.11 Signals** — T-SIG-04a, 05a, 06a, 07a, 20, 20a, 20b, 21..25, 27, 28, 30, 31. Known gaps not authored: T-SIG-26, 29, 30b.
+- **§4.12 Delegation** — T-DEL-04a, 07a, 09a, 15a, 15b, 26a, 28..28e, 29, 30.
+- **§4.13 Workflow-Level Version Checking** — T-VER-09a, 11b2, 11d, 12c, 13b2, 13d, 14b..14d, 15b..15d, 26d, 27d, 28..28ai2 (entire non-regular package.json block).
+- **§4.14 Exit Codes** — T-EXIT-17.
+
+**CHOSEN-FOR-THIS-ITERATION**: T-INST-110h (Auto-install Trigger × symlinked workflow materialization — SPEC §10.10 × §10.11 interaction). — DELIVERED
 
 ## P1 — Other ADR-0004 test suites still missing
 

@@ -13,6 +13,7 @@ import {
   symlinkSync,
   readlinkSync,
   copyFileSync,
+  realpathSync,
 } from "node:fs";
 import { join, basename, extname } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
@@ -881,15 +882,30 @@ function copyWorkflow(src: string, dest: string): void {
   // `src` is the workflow root directory itself. We create `dest` then
   // iterate its children — children are "root-level" entries of the workflow;
   // grandchildren and deeper are not.
-  const rootStat = lstatSync(src);
+  let resolvedSrc = src;
+  let rootStat = lstatSync(resolvedSrc);
+  if (rootStat.isSymbolicLink()) {
+    // SPEC §10.11: a selected top-level workflow entry that is a symlink to
+    // a directory is installed as a real directory at the destination,
+    // containing a copy of the symlink target's workflow contents. Resolve
+    // the symlink and proceed against the target — the destination is
+    // created via mkdirSync below (no symlinkSync), so the materialized
+    // directory is real.
+    resolvedSrc = realpathSync(src);
+    rootStat = lstatSync(resolvedSrc);
+  }
   if (!rootStat.isDirectory()) {
     // Shouldn't happen for a workflow, but handle defensively.
     throw new Error(`Workflow source is not a directory: ${src}`);
   }
   mkdirSync(dest, { recursive: true, mode: rootStat.mode & 0o777 });
-  for (const entry of readdirSync(src)) {
+  for (const entry of readdirSync(resolvedSrc)) {
     if (entry === ".git") continue;
-    copyEntry(join(src, entry), join(dest, entry), /*isRootLevel*/ true);
+    copyEntry(
+      join(resolvedSrc, entry),
+      join(dest, entry),
+      /*isRootLevel*/ true,
+    );
   }
   try {
     chmodSync(dest, rootStat.mode & 0o777);
