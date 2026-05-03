@@ -13943,6 +13943,167 @@ console.log(JSON.stringify({ threw, message, name }));
     );
 
     // ------------------------------------------------------------------------
+    // T-API-65s-promise: runPromise() — pre-aborted signal beats sibling-
+    // validation discovery failure. SPEC §5.4 makes a same-base-name collision
+    // in any sibling workflow under `.loopx/` fatal for `loopx run <target>`,
+    // regardless of whether the target is the broken workflow. SPEC §9.3
+    // names `.loopx/` discovery failures as one of the displaced pre-iteration
+    // failure modes; T-API-65b / 65m close the missing-`.loopx/` existence
+    // sub-path on the abort-precedence surface, this closes the sibling-
+    // validation sub-path — the second SPEC §5.1 / §5.4 discovery-failure
+    // path — completing the abort-precedence × discovery × surface matrix.
+    // The counterparts on other surfaces are T-TMP-12-programmatic-discovery-
+    // validation (no-abort) and T-SIG-25 (CLI signal-wins).
+    //
+    // Fixture pairs a valid target workflow `ralph/index.sh` with a sibling
+    // `broken` workflow whose `check.sh` + `check.ts` pair is a SPEC §5.2
+    // base-name collision (fatal in run mode per SPEC §5.4). With a pre-
+    // aborted signal, abort precedence (SPEC §9.3) must displace the
+    // collision error; a buggy implementation that surfaced the collision
+    // anyway, or that spawned a child / created a tmpdir on the discovery-
+    // validation path before observing the abort, would fail one of (a)–(c).
+    // SPEC §9.3, §9.5, §9.1, §5.1, §5.2, §5.4.
+    // ------------------------------------------------------------------------
+    it("T-API-65s-promise: runPromise() pre-aborted signal beats sibling-validation discovery failure", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65s-promise");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+      // Sibling workflow with a base-name collision: broken/check.sh + broken/check.ts.
+      await createBashWorkflowScript(
+        project,
+        "broken",
+        "check",
+        `printf '{"stop":true}'`,
+      );
+      await createWorkflowScript(
+        project,
+        "broken",
+        "check",
+        ".ts",
+        `console.log('{"stop":true}');`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with the abort error, not the
+      //     sibling-validation collision error.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(
+        /collision|broken|check\.(sh|ts)|multiple files/i,
+      );
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65s-generator: run() — pre-aborted signal beats sibling-validation
+    // discovery failure. Generator-surface counterpart to T-API-65s-promise;
+    // first `next()` throws the abort error rather than the collision error.
+    // SPEC §9.3, §9.5, §9.1, §5.1, §5.2, §5.4.
+    // ------------------------------------------------------------------------
+    it("T-API-65s-generator: run() pre-aborted signal beats sibling-validation discovery failure", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65s-generator");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+      // Sibling workflow with a base-name collision: broken/check.sh + broken/check.ts.
+      await createBashWorkflowScript(
+        project,
+        "broken",
+        "check",
+        `printf '{"stop":true}'`,
+      );
+      await createWorkflowScript(
+        project,
+        "broken",
+        "check",
+        ".ts",
+        `console.log('{"stop":true}');`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() threw abort error, not the sibling-validation
+      //     collision error.
+      expect(parsed.threw).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(
+        /collision|broken|check\.(sh|ts)|multiple files/i,
+      );
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
     // T-API-65d: runPromise() — pre-aborted signal beats tmpdir-creation
     // failure. SPEC §9.3, §9.5, §7.4.
     //
