@@ -63,6 +63,33 @@ function getInstallFault(): { kind: "commit-fail-after"; n: number } | null {
   return null;
 }
 
+interface AutoInstallFault {
+  gitignoreWriteFail: Set<string>;
+}
+
+function getAutoInstallFault(): AutoInstallFault {
+  const empty: AutoInstallFault = { gitignoreWriteFail: new Set() };
+  if (process.env.NODE_ENV !== "test") return empty;
+  const raw = process.env.LOOPX_TEST_AUTOINSTALL_FAULT;
+  if (!raw) return empty;
+  const fault: AutoInstallFault = { gitignoreWriteFail: new Set() };
+  for (const segment of raw.split(";")) {
+    const trimmed = segment.trim();
+    if (!trimmed) continue;
+    const colon = trimmed.indexOf(":");
+    if (colon === -1) continue;
+    const kind = trimmed.slice(0, colon);
+    const value = trimmed.slice(colon + 1);
+    if (kind === "gitignore-write-fail") {
+      for (const name of value.split(",")) {
+        const n = name.trim();
+        if (n) fault.gitignoreWriteFail.add(n);
+      }
+    }
+  }
+  return fault;
+}
+
 export async function installCommand(opts: InstallOptions): Promise<void> {
   const {
     source,
@@ -423,6 +450,7 @@ async function runAutoInstall(
   warnedFromPreflight: Set<string>
 ): Promise<number> {
   const failures: AutoInstallFailure[] = [];
+  const fault = getAutoInstallFault();
   // Per SPEC §10.10: dedupe warnings across the whole install operation,
   // not just the auto-install pass. Seed with workflows already warned at
   // preflight time so we don't double-warn here.
@@ -506,7 +534,7 @@ async function runAutoInstall(
     if (malformed) continue;
 
     // 2. Run the .gitignore safeguard.
-    const gitignoreOk = runGitignoreSafeguard(workflowDir);
+    const gitignoreOk = runGitignoreSafeguard(workflowDir, workflowName, fault);
     if (!gitignoreOk.ok) {
       failures.push({ workflow: workflowName, reason: gitignoreOk.reason });
       continue;
@@ -593,7 +621,9 @@ async function runAutoInstall(
  * non-ENOENT lstat failure, or on a write failure when synthesizing.
  */
 function runGitignoreSafeguard(
-  workflowDir: string
+  workflowDir: string,
+  workflowName: string,
+  fault: AutoInstallFault
 ): { ok: true } | { ok: false; reason: string } {
   const gitignorePath = join(workflowDir, ".gitignore");
   let st;
@@ -602,7 +632,17 @@ function runGitignoreSafeguard(
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT") {
-      // Synthesize a .gitignore with `node_modules`.
+      // Synthesize a .gitignore with `node_modules`. The test-only
+      // `gitignore-write-fail:<workflow>` seam (TEST-SPEC §1.4) short-
+      // circuits this branch with a simulated EACCES write failure
+      // before any bytes touch disk; SPEC §10.10's safeguard-failure
+      // dispatch then runs identically to a real EACCES write failure.
+      if (fault.gitignoreWriteFail.has(workflowName)) {
+        return {
+          ok: false,
+          reason: `failed to synthesize .gitignore: EACCES: permission denied, open '${gitignorePath}'`,
+        };
+      }
       try {
         writeFileSync(gitignorePath, "node_modules\n", "utf-8");
         return { ok: true };

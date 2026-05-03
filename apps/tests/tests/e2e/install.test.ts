@@ -5285,6 +5285,158 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         );
       });
 
+      it("T-INST-112c: .gitignore write failure skips npm install for that workflow, contributes to aggregate failure, and does not abort the auto-install pass", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              timeout: 60_000,
+              env: {
+                NODE_ENV: "test",
+                LOOPX_TEST_AUTOINSTALL_FAULT:
+                  "gitignore-write-fail:beta,gamma",
+              },
+            },
+          );
+          // (a) exit code 1 — both safeguard write failures contribute.
+          expect(result.exitCode).toBe(1);
+
+          // (b) Only alpha reached the npm shim.
+          const invocations = fake.readInvocations();
+          const cwds = new Set(invocations.map((i) => i.cwd));
+          expect(cwds.has(join(project!.loopxDir, "alpha"))).toBe(true);
+          expect(cwds.has(join(project!.loopxDir, "beta"))).toBe(false);
+          expect(cwds.has(join(project!.loopxDir, "gamma"))).toBe(false);
+          expect(cwds.size).toBe(1);
+
+          // (c) Aggregate report lists BOTH beta and gamma — proves
+          // continuation past the first failure regardless of order.
+          expect(result.stderr).toMatch(/beta/);
+          expect(result.stderr).toMatch(/gamma/);
+          expect(result.stderr).toMatch(/\.gitignore/);
+
+          // (d) alpha is not listed in the aggregate report.
+          // The aggregate-report block starts with the SPEC §10.10
+          // "auto-install failures" header; only the failure entries
+          // following the header are scoped to the report (other stderr
+          // lines like progress / status messages are not in scope).
+          const reportStart = result.stderr.indexOf("auto-install failures");
+          expect(reportStart).toBeGreaterThanOrEqual(0);
+          const report = result.stderr.slice(reportStart);
+          expect(report).not.toMatch(/\[alpha\]/);
+        });
+      });
+
+      it("T-INST-112d: .gitignore write failure does not roll back committed workflow files", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async () => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              timeout: 60_000,
+              env: {
+                NODE_ENV: "test",
+                LOOPX_TEST_AUTOINSTALL_FAULT:
+                  "gitignore-write-fail:beta,gamma",
+              },
+            },
+          );
+          expect(result.exitCode).toBe(1);
+
+          // (a) alpha succeeded fully — its files + synthesized .gitignore.
+          expect(
+            existsSync(join(project!.loopxDir, "alpha", "index.sh")),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "alpha", "package.json")),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "alpha", ".gitignore")),
+          ).toBe(true);
+          expect(
+            readFileSync(
+              join(project!.loopxDir, "alpha", ".gitignore"),
+              "utf-8",
+            ).trim(),
+          ).toBe("node_modules");
+
+          // (b) beta committed files remain — no rollback.
+          expect(
+            existsSync(join(project!.loopxDir, "beta", "index.sh")),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "beta", "package.json")),
+          ).toBe(true);
+
+          // (c) beta has no .gitignore — write failed, no committed file.
+          expect(
+            existsSync(join(project!.loopxDir, "beta", ".gitignore")),
+          ).toBe(false);
+
+          // (d) gamma mirrors beta state — independent no-rollback per workflow.
+          expect(
+            existsSync(join(project!.loopxDir, "gamma", "index.sh")),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "gamma", "package.json")),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "gamma", ".gitignore")),
+          ).toBe(false);
+        });
+      });
+
       it("T-INST-114: npm install non-zero exit emits aggregate report and exits 1", async () => {
         project = await createTempProject();
         const logFile = join(project.dir, "fake-npm.log");
