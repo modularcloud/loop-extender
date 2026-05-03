@@ -13508,6 +13508,8 @@ console.log(JSON.stringify({ synchronousThrew, callSiteMessage, scriptReachedRea
 //   T-API-65b  runPromise + pre-aborted + missing .loopx/ → abort error
 //   T-API-65d  runPromise + pre-aborted + tmpdir creation fail → abort error
 //   T-API-65e  run        + invalid signal shape + missing envFile → NOT abort
+//   T-API-65f  run        + pre-aborted + throwing later-option getter → abort error
+//   T-API-65g  runPromise + pre-aborted + throwing later-option getter → abort error
 //   T-API-65k  run        + pre-aborted + missing envFile → abort error
 //   T-API-65l  run        + pre-aborted + invalid target  → abort error
 //   T-API-65m  run        + pre-aborted + missing .loopx/ → abort error
@@ -14043,5 +14045,130 @@ console.log(JSON.stringify({ threw, message, name }));
         expect(after.filter((e) => !before.includes(e))).toEqual([]);
       },
     );
+
+    // ------------------------------------------------------------------------
+    // T-API-65f: run() — pre-aborted signal beats a throwing later-option
+    // getter. SPEC §9.1 / §9.5 specify that `options.signal` is read FIRST
+    // before any other option field, so an already-aborted signal is captured
+    // before any subsequent option-field read can produce a snapshot
+    // exception. SPEC §9.3 then displaces the captured option-snapshot error
+    // (in this case, a throwing `env` getter) with the abort error.
+    //
+    // A buggy implementation that read `options.env` before `options.signal`
+    // would surface the env-getter exception ("env-getter-boom") instead and
+    // fail this test. This directly exercises the "signal first" rule rather
+    // than merely inferring it from the abort-vs-other-pre-iteration-failure
+    // precedence tests (T-API-65 / 65a / 65b / 65d / 65k / 65l / 65m / 65n).
+    // SPEC §9.1, §9.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-65f: run() pre-aborted signal beats throwing later-option getter", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65f");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const throwingOpts = {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  get env() { throw new Error("env-getter-boom"); },
+  maxIterations: 1,
+};
+const gen = run("ralph", throwingOpts);
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() throws abort error, not the env-getter-boom error.
+      expect(parsed.threw).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/env-getter-boom/);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65g: runPromise() — pre-aborted signal beats a throwing
+    // later-option getter. Promise-surface counterpart to T-API-65f.
+    // Per SPEC §9.2 "Option-snapshot timing" ("Identical to run(): each
+    // option field read at most once, options.signal first"), the same
+    // signal-first rule holds under runPromise(). SPEC §9.2, §9.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-65g: runPromise() pre-aborted signal beats throwing later-option getter", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65g");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+const throwingOpts = {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  get env() { throw new Error("env-getter-boom"); },
+  maxIterations: 1,
+};
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", throwingOpts);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with abort error, not the env-getter-boom error.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/env-getter-boom/);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
   });
 });
