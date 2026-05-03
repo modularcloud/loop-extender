@@ -5128,6 +5128,267 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           ).toBe(true);
         });
       });
+
+      // ─────────────────────────────────────────────────────────
+      // No Rollback on Auto-install Failure (T-INST-117 / 117a / 117b)
+      // SPEC §10.10 / §10.7 / §10.9: failures during the auto-install
+      // pass do NOT roll back committed workflow files; partial
+      // node_modules/ state from a failed npm install is left intact;
+      // `loopx install -y <source>` retries by removing the existing
+      // workflow directory (including stale node_modules/) and
+      // recommitting + re-running the auto-install pass.
+      // ─────────────────────────────────────────────────────────
+
+      it("T-INST-117: auto-install failures do not remove committed workflow files", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          {
+            exitCode: 0,
+            exitCodeByWorkflow: { beta: 1 },
+            logFile,
+          },
+          async () => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/multi.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            // Auto-install for `beta/` failed → exit 1 from the
+            // post-commit aggregate report; no rollback.
+            expect(result.exitCode).toBe(1);
+
+            // Both committed workflows remain on disk with their
+            // intended source files, plus the synthesized .gitignore
+            // each safeguard wrote before the npm spawn.
+            for (const wf of ["alpha", "beta"]) {
+              expect(
+                existsSync(join(project!.loopxDir, wf, "index.sh")),
+              ).toBe(true);
+              expect(
+                existsSync(join(project!.loopxDir, wf, "package.json")),
+              ).toBe(true);
+              expect(
+                existsSync(join(project!.loopxDir, wf, ".gitignore")),
+              ).toBe(true);
+              expect(
+                readFileSync(
+                  join(project!.loopxDir, wf, ".gitignore"),
+                  "utf-8",
+                ).trim(),
+              ).toBe("node_modules");
+            }
+          },
+        );
+      });
+
+      it("T-INST-117a: partial node_modules state from a failed npm install is not cleaned up", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "ralph",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          {
+            exitCode: 1,
+            createFiles: ["node_modules/partial-file"],
+            logFile,
+          },
+          async () => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/ralph.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            expect(result.exitCode).toBe(1);
+
+            // Partial node_modules/ left intact — loopx did not
+            // clean up the failing npm child's filesystem state.
+            expect(
+              existsSync(
+                join(
+                  project!.loopxDir,
+                  "ralph",
+                  "node_modules",
+                  "partial-file",
+                ),
+              ),
+            ).toBe(true);
+
+            // Workflow source files still committed despite npm failure.
+            expect(
+              existsSync(join(project!.loopxDir, "ralph", "index.sh")),
+            ).toBe(true);
+            expect(
+              existsSync(join(project!.loopxDir, "ralph", "package.json")),
+            ).toBe(true);
+          },
+        );
+      });
+
+      it("T-INST-117b: loopx install -y after a prior auto-install failure reinstalls cleanly", async () => {
+        project = await createTempProject();
+        const phase1Log = join(project.dir, "fake-npm-phase1.log");
+        const phase2Log = join(project.dir, "fake-npm-phase2.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "ralph",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        // ── Phase 1: failed install. ─────────────────────────────
+        await withFakeNpm(
+          {
+            exitCode: 1,
+            createFiles: ["node_modules/partial-file"],
+            logFile: phase1Log,
+          },
+          async (fake) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/ralph.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            // (a1) npm exited 1 → install exits 1 from aggregate report.
+            expect(result.exitCode).toBe(1);
+
+            // (b1) Workflow source files committed despite npm failure
+            //      (no rollback — T-INST-117 contract).
+            expect(
+              existsSync(join(project!.loopxDir, "ralph", "index.sh")),
+            ).toBe(true);
+            expect(
+              existsSync(join(project!.loopxDir, "ralph", "package.json")),
+            ).toBe(true);
+
+            // (c1) Partial node_modules/ left intact
+            //      (T-INST-117a contract).
+            expect(
+              existsSync(
+                join(
+                  project!.loopxDir,
+                  "ralph",
+                  "node_modules",
+                  "partial-file",
+                ),
+              ),
+            ).toBe(true);
+
+            // (d1) .gitignore synthesized by the safeguard before
+            //      npm spawn.
+            const gitignorePath = join(
+              project!.loopxDir,
+              "ralph",
+              ".gitignore",
+            );
+            expect(existsSync(gitignorePath)).toBe(true);
+            expect(readFileSync(gitignorePath, "utf-8").trim()).toBe(
+              "node_modules",
+            );
+
+            // (e1) Phase-1 fake-npm log records exactly one
+            //      invocation for .loopx/ralph/.
+            const invocations = fake.readInvocations();
+            expect(invocations.length).toBe(1);
+            expect(invocations[0].cwd).toBe(
+              join(project!.loopxDir, "ralph"),
+            );
+          },
+        );
+
+        // ── Phase 2: successful retry with -y. ───────────────────
+        await withFakeNpm(
+          { exitCode: 0, logFile: phase2Log },
+          async (fake) => {
+            const result = await runCLI(
+              ["install", "-y", `${gitServer!.url}/ralph.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            // (a2) Retry succeeds.
+            expect(result.exitCode).toBe(0);
+
+            // (b2) Workflow source files committed fresh —
+            //      `-y` removed the old workflow directory and
+            //      re-committed from the source.
+            expect(
+              existsSync(join(project!.loopxDir, "ralph", "index.sh")),
+            ).toBe(true);
+            expect(
+              existsSync(join(project!.loopxDir, "ralph", "package.json")),
+            ).toBe(true);
+
+            // (c2) Stale partial-file no longer exists — `-y`
+            //      file-level replacement removed the previous
+            //      workflow directory (including the leftover
+            //      node_modules/) before the new commit.
+            expect(
+              existsSync(
+                join(
+                  project!.loopxDir,
+                  "ralph",
+                  "node_modules",
+                  "partial-file",
+                ),
+              ),
+            ).toBe(false);
+
+            // (d2) .gitignore synthesized fresh against the
+            //      replacement workflow.
+            const gitignorePath = join(
+              project!.loopxDir,
+              "ralph",
+              ".gitignore",
+            );
+            expect(existsSync(gitignorePath)).toBe(true);
+            expect(readFileSync(gitignorePath, "utf-8").trim()).toBe(
+              "node_modules",
+            );
+
+            // (e2) Phase-2 fake-npm log records exactly one new
+            //      invocation — npm install was re-spawned for
+            //      the replaced workflow. This is the load-bearing
+            //      assertion: a buggy implementation that treated
+            //      the workflow as already-present-on-disk and
+            //      skipped the auto-install pass would pass
+            //      (a2)/(b2)/(c2)/(d2) but fail here.
+            const invocations = fake.readInvocations();
+            expect(invocations.length).toBe(1);
+            expect(invocations[0].cwd).toBe(
+              join(project!.loopxDir, "ralph"),
+            );
+          },
+        );
+      });
     });
   });
 
