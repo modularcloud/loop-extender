@@ -889,6 +889,52 @@ async function runAutoInstall(
     }
 
     processed.push(workflowName);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Between-workflows pause seam dispatch (TEST-SPEC §1.4).
+    // Fires AFTER the workflow's iteration body completes (and after the
+    // workflow name has been pushed onto `processed`), and BEFORE any
+    // subsequent workflow's iteration body begins — including its
+    // `.gitignore` safeguard `lstat`. The marker payload's `processed`
+    // field reports workflows whose iteration completed BEFORE the
+    // upcoming workflow (i.e., includes the just-completed one);
+    // `current` is the upcoming workflow name; `remaining` lists the
+    // workflows whose iteration has not started after `current`.
+    //
+    // The ordinal `between-workflows-after-first` fires only on the first
+    // workflow-to-workflow transition (after the first workflow's
+    // iteration completes — `processed.length === 1`). The named
+    // `between-workflows:<name>` fires after the named workflow's
+    // iteration completes regardless of its ordinal position. Neither
+    // fires when the just-completed workflow is the last one in
+    // `committed` (no upcoming workflow exists).
+    // ─────────────────────────────────────────────────────────────────────
+    if (pauseSpec && i + 1 < committed.length) {
+      const fireOrdinal =
+        pauseSpec.kind === "ordinal" &&
+        pauseSpec.window === "between-workflows-after-first" &&
+        processed.length === 1;
+      const fireNamed =
+        pauseSpec.kind === "named" &&
+        pauseSpec.window === "between-workflows" &&
+        pauseSpec.workflow === workflowName;
+      if (fireOrdinal || fireNamed) {
+        const next = committed[i + 1];
+        const resolvedWindow =
+          pauseSpec.kind === "ordinal"
+            ? "between-workflows-after-first"
+            : `between-workflows:${workflowName}`;
+        await pauseAutoInstallSeam(
+          resolvedWindow,
+          {
+            current: next,
+            processed: [...processed],
+            remaining: committed.slice(i + 2),
+          },
+          signalContext
+        );
+      }
+    }
   }
 
   // SPEC §10.10 "Signals during the auto-install pass when no npm child is
