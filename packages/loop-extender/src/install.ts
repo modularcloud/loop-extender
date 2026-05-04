@@ -112,12 +112,24 @@ interface AutoInstallFault {
   // T-INST-116k / 116k2 use this to deterministically force a safeguard
   // failure on whichever workflow the implementation processes first.
   gitignoreReplaceWithFifo: Set<string>;
+  // TEST-SPEC §1.4 `npm-spawn-fail:<name1,name2,...>`: causes the
+  // `spawn("npm", "install")` call for the named workflow to be intercepted
+  // and rejected with an ENOENT-shaped error before any real spawn occurs.
+  // The existing ENOENT catch branch in the auto-install loop then records
+  // a spawn-failure entry into `failures`, identical in shape to a real
+  // ENOENT from `spawn("npm", ...)` when npm is not on PATH. T-INST-116m /
+  // 116m2 use this to deterministically force a spawn failure on whichever
+  // workflow the implementation processes first, so the test can pin down
+  // the SPEC §10.10 aggregate-report-suppression contract on the
+  // spawn-failure-accumulator state.
+  npmSpawnFail: Set<string>;
 }
 
 function getAutoInstallFault(): AutoInstallFault {
   const empty: AutoInstallFault = {
     gitignoreWriteFail: new Set(),
     gitignoreReplaceWithFifo: new Set(),
+    npmSpawnFail: new Set(),
   };
   if (process.env.NODE_ENV !== "test") return empty;
   const raw = process.env.LOOPX_TEST_AUTOINSTALL_FAULT;
@@ -125,6 +137,7 @@ function getAutoInstallFault(): AutoInstallFault {
   const fault: AutoInstallFault = {
     gitignoreWriteFail: new Set(),
     gitignoreReplaceWithFifo: new Set(),
+    npmSpawnFail: new Set(),
   };
   for (const segment of raw.split(";")) {
     const trimmed = segment.trim();
@@ -142,6 +155,11 @@ function getAutoInstallFault(): AutoInstallFault {
       for (const name of value.split(",")) {
         const n = name.trim();
         if (n) fault.gitignoreReplaceWithFifo.add(n);
+      }
+    } else if (kind === "npm-spawn-fail") {
+      for (const name of value.split(",")) {
+        const n = name.trim();
+        if (n) fault.npmSpawnFail.add(n);
       }
     }
   }
@@ -709,10 +727,14 @@ async function runAutoInstall(
   // but NOT spawn failures where no child existed) so the `post-exit-first`
   // ordinal can fire on the first such observation; `safeguardFailureCount`
   // counts `.gitignore` safeguard failures recorded into `failures` so the
-  // `post-safeguard-failure-first` ordinal can fire on the first such record.
+  // `post-safeguard-failure-first` ordinal can fire on the first such record;
+  // `spawnFailureCount` counts npm `spawn` ENOENT-class failures recorded
+  // into `failures` so the `post-spawn-failure-first` ordinal can fire on
+  // the first such record.
   const processed: string[] = [];
   let npmChildExitCount = 0;
   let safeguardFailureCount = 0;
+  let spawnFailureCount = 0;
 
   for (let i = 0; i < committed.length; i++) {
     const workflowName = committed[i];
@@ -937,6 +959,23 @@ async function runAutoInstall(
       // npm streaming-passthrough contract from T-INST-119 holds.
       try {
         await new Promise<void>((resolve, reject) => {
+          // TEST-SPEC §1.4 `npm-spawn-fail` seam: synthesize an ENOENT
+          // spawn failure for the named workflow before any real spawn
+          // is attempted. The shape (`code: "ENOENT"`) matches what
+          // node's `child_process.spawn` produces when `npm` is not on
+          // PATH, so the existing ENOENT catch branch below records
+          // the failure identically to the production path. Production
+          // behavior is unaffected (NODE_ENV=test gating in
+          // getAutoInstallFault). T-INST-116m / 116m2 use this to
+          // deterministically reach the post-spawn-failure-first window.
+          if (fault.npmSpawnFail.has(workflowName)) {
+            reject(
+              Object.assign(new Error("spawn npm ENOENT"), {
+                code: "ENOENT",
+              })
+            );
+            return;
+          }
           const child = spawn("npm", ["install"], {
             cwd: workflowDir,
             stdio: "inherit",
@@ -999,6 +1038,55 @@ async function runAutoInstall(
             workflow: workflowName,
             reason: "npm install spawn failed (npm not found on PATH)",
           });
+          spawnFailureCount++;
+
+          // ───────────────────────────────────────────────────────────────────
+          // Post-spawn-failure pause seam dispatch (TEST-SPEC §1.4
+          // LOOPX_TEST_AUTOINSTALL_PAUSE). Fires AFTER the spawn-failure
+          // entry has been recorded into the `failures` accumulator and
+          // BEFORE the next workflow's iteration begins. The marker payload
+          // reports `processed` as the workflows whose iterations completed
+          // BEFORE this one (the failed workflow is NOT included), `current`
+          // as the failed workflow, and `remaining` as the workflows after
+          // this one.
+          //
+          // The ordinal `post-spawn-failure-first` fires on the first
+          // spawn-failure observation in the implementation's auto-install
+          // order (`spawnFailureCount === 1`). The named
+          // `post-spawn-failure:<name>` fires on the workflow whose name
+          // matches regardless of ordinal position.
+          //
+          // Per SPEC §10.10 "the aggregate failure report is suppressed
+          // when receivedSignal is non-null at end-of-pass": even though
+          // `failures` already has this workflow's spawn-failure entry, the
+          // end-of-pass guard at the bottom of `runAutoInstall` returns 0
+          // before emitting the aggregate report.
+          // ───────────────────────────────────────────────────────────────────
+          if (pauseSpec) {
+            const fireOrdinal =
+              pauseSpec.kind === "ordinal" &&
+              pauseSpec.window === "post-spawn-failure-first" &&
+              spawnFailureCount === 1;
+            const fireNamed =
+              pauseSpec.kind === "named" &&
+              pauseSpec.window === "post-spawn-failure" &&
+              pauseSpec.workflow === workflowName;
+            if (fireOrdinal || fireNamed) {
+              const resolvedWindow =
+                pauseSpec.kind === "ordinal"
+                  ? "post-spawn-failure-first"
+                  : `post-spawn-failure:${workflowName}`;
+              await pauseAutoInstallSeam(
+                resolvedWindow,
+                {
+                  current: workflowName,
+                  processed: [...processed],
+                  remaining: committed.slice(i + 1),
+                },
+                signalContext
+              );
+            }
+          }
         } else if (e.code === "NPM_NONZERO_EXIT") {
           failures.push({
             workflow: workflowName,
