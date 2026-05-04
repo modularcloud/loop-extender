@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { spawn } from "node:child_process";
-import { readFileSync, existsSync, unlinkSync, realpathSync } from "node:fs";
+import { readFileSync, existsSync, unlinkSync, realpathSync, readdirSync } from "node:fs";
 import { mkdir, chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -16,6 +16,7 @@ import {
   createEnvFile,
   writeEnvFileRaw,
   withGlobalEnv,
+  withGlobalEnvRawContent,
   withIsolatedHome,
 } from "../helpers/env.js";
 import {
@@ -1216,6 +1217,707 @@ fi
         }
         await rm(tempConfigHome, { recursive: true, force: true });
       }
+    });
+  });
+});
+
+// ============================================================================
+// SPEC: Env File NUL in Value -> Spawn Failure
+//   (T-ENV-26 / T-ENV-26a / T-ENV-26b / T-ENV-26c / T-ENV-26f / T-ENV-26g
+//    T-ENV-27 / T-ENV-27a / T-ENV-27b / T-ENV-27c / T-ENV-27d / T-ENV-27e)
+//
+// SPEC §7.2 / §9.5 — "the runtime does not distinguish tiers": runtime-level
+// rejections of env entries (most reliably an embedded NUL byte in a value)
+// surface as child launch / spawn failures at spawn time, regardless of which
+// env tier (RunOptions.env / local env-file / global env-file / inherited)
+// supplied the entry. T-API-57 series covers the RunOptions.env tier; this
+// block closes the gap for the local env-file (-e / envFile) and global env-
+// file tiers across all three run surfaces (CLI, runPromise(), run()).
+//
+// SPEC §8.1 / §8.2 — env-file parsers split content on '\n' and read the
+// value from after the first '=' to end of line; NUL bytes in values are
+// preserved verbatim (no parser-side validation). The parser-accepted entry
+// reaches mergeEnv unchanged, propagates through child_process.spawn, and
+// the Node runtime rejects it as ERR_INVALID_ARG_VALUE.
+//
+// SPEC §7.4 cleanup-trigger list ("Child launch / spawn failure after tmpdir
+// creation") + SPEC §9.3 ("Cleanup ordering is observable. When LOOPX_TMPDIR
+// cleanup runs as part of an error path ... it runs before the generator
+// throws or the promise rejects"): LOOPX_TMPDIR is created before spawn,
+// and best-effort cleanup runs in runLoop's finally block before the error
+// surfaces to the caller. The "no residue under TMPDIR parent" assertion
+// pins the cleanup-before-throw contract on the programmatic surfaces and
+// the cleanup-before-exit contract on the CLI surface.
+//
+// Coverage matrix (12 IDs):
+//   Tier         | maxIter | CLI         | runPromise()  | run() generator
+//   -------------|---------|-------------|---------------|-----------------
+//   local -e     | 1       | T-ENV-26    | T-ENV-26a     | T-ENV-26f
+//   local -e     | 0       | T-ENV-26b   | T-ENV-26c     | T-ENV-26g
+//   global       | 1       | T-ENV-27    | T-ENV-27a     | T-ENV-27d
+//   global       | 0       | T-ENV-27b   | T-ENV-27c     | T-ENV-27e
+//
+// All tests run under a test-isolated TMPDIR parent (TEST-SPEC §4.7 suite-
+// wide isolation guidance) so concurrent test workers do not race on
+// `/tmp`'s `loopx-*` entries.
+// ============================================================================
+
+describe("SPEC: Env File NUL in Value -> Spawn Failure", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    while (cleanups.length > 0) {
+      const cleanup = cleanups.shift();
+      if (cleanup) await cleanup().catch(() => {});
+    }
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  async function makeIsolatedTmpdirParent(label: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), `loopx-test-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  async function makeIsolatedXdgConfigHome(label: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), `loopx-test-xdg-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  // List `loopx-*` entries directly under `parent`, filtering implementation-
+  // internal helpers (per AGENT.md / SPEC §7.4 — nodepath-shim, bun-jsx, and
+  // install staging are NOT LOOPX_TMPDIR) and the test-isolation prefixes.
+  function listLoopxEntries(parent: string): string[] {
+    try {
+      return readdirSync(parent)
+        .filter((e) => e.startsWith("loopx-"))
+        .filter(
+          (e) =>
+            !e.startsWith("loopx-nodepath-shim-") &&
+            !e.startsWith("loopx-bun-jsx-") &&
+            !e.startsWith("loopx-install-") &&
+            !e.startsWith("loopx-test-"),
+        );
+    } catch {
+      return [];
+    }
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-ENV-26: CLI -e local env-file NUL byte in value -> spawn failure.
+    //   The parser preserves the NUL, mergeEnv passes it to spawn, and Node
+    //   rejects the env value (ERR_INVALID_ARG_VALUE). loopx exits 1 with a
+    //   child-launch / spawn-failure stderr (NOT a parser-shape warning).
+    //   LOOPX_TMPDIR cleanup ran before exit (no residue under the test-
+    //   isolated TMPDIR parent). SPEC §7.2 / §7.4 / §8.2.
+    // ------------------------------------------------------------------------
+    it("T-ENV-26: CLI -e — NUL in env-file value rejects with spawn failure and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("env26");
+      const marker = join(project.dir, "child-ran.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await writeEnvFileRaw(envFilePath, `MYVAR=bad\x00val\n`);
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const result = await runCLI(
+        ["run", "-e", envFilePath, "-n", "1", "ralph"],
+        {
+          cwd: project.dir,
+          runtime,
+          env: { TMPDIR: tmpdirParent },
+        },
+      );
+
+      // (a) Exit code 1 — child launch / spawn failure surfaces non-zero.
+      expect(result.exitCode).toBe(1);
+      // (b) Stderr contains a child-launch / spawn-failure error (not a
+      //     parser-shape warning about an invalid key).
+      expect(result.stderr.length).toBeGreaterThan(0);
+      expect(result.stderr).not.toMatch(/invalid key/i);
+      // (c) Workflow script did not run (spawn rejected before child started).
+      expect(existsSync(marker)).toBe(false);
+      // (d) Cleanup ran before exit — no loopx-* residue under TMPDIR parent.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-26a: runPromise() local envFile NUL -> rejection + cleanup.
+    //   Programmatic-API counterpart to T-ENV-26. SPEC §9.3's cleanup-before-
+    //   rejection ordering is asserted via the residue check.
+    //   SPEC §7.2 / §7.4 / §8.2 / §9.3 / §9.5.
+    // ------------------------------------------------------------------------
+    it("T-ENV-26a: runPromise() — NUL in local envFile value rejects with spawn failure and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env26a");
+      const marker = join(projectDir, "child-ran.txt");
+      const envFilePath = join(projectDir, "local.env");
+      await writeEnvFileRaw(envFilePath, `MYVAR=bad\x00val\n`);
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(projectDir)},
+    envFile: ${JSON.stringify(envFilePath)},
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ rejected, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with a spawn-failure error (not an envFile
+      //     shape-validation error — the file exists, is readable, and
+      //     the parser accepts the NUL value).
+      expect(parsed.rejected).toBe(true);
+      expect(parsed.message).not.toMatch(/envFile.*not.*found/i);
+      expect(parsed.message).not.toMatch(/options\.envFile/i);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) Cleanup ran before rejection — no loopx-* residue.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-26b: CLI -n 0 + local envFile NUL -> exit 0 (no spawn, no
+    //   spawn-failure surface). The env-file is read and parsed (validating
+    //   readability + key shape), but the runtime's environment-building
+    //   step never executes, so the NUL value silently survives.
+    //   SPEC §4.2 / §7.1 / §7.4 / §8.1 / §8.2.
+    // ------------------------------------------------------------------------
+    it("T-ENV-26b: CLI -e -n 0 — NUL in env-file value silently survives (no spawn)", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("env26b");
+      const marker = join(project.dir, "child-ran.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await writeEnvFileRaw(envFilePath, `MYVAR=bad\x00val\n`);
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const result = await runCLI(
+        ["run", "-e", envFilePath, "-n", "0", "ralph"],
+        {
+          cwd: project.dir,
+          runtime,
+          env: { TMPDIR: tmpdirParent },
+        },
+      );
+
+      // (a) Exit code 0 (per SPEC §4.2 -n 0 exits 0 on success).
+      expect(result.exitCode).toBe(0);
+      // (b) No spawn-failure error and no parser warning about NUL.
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      expect(result.stderr).not.toMatch(/invalid key/i);
+      // (c) Workflow script did not run (no spawn under -n 0).
+      expect(existsSync(marker)).toBe(false);
+      // (d) No LOOPX_TMPDIR was created (per SPEC §7.4 — tmpdir creation
+      //     is skipped under -n 0).
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-26c: runPromise() maxIterations:0 + local envFile NUL ->
+    //   resolves []. Programmatic-API counterpart to T-ENV-26b.
+    //   SPEC §9.2 / §9.5 / §7.1 / §7.4 / §8.2.
+    // ------------------------------------------------------------------------
+    it("T-ENV-26c: runPromise() — maxIterations:0 + NUL in local envFile silently survives (no spawn)", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env26c");
+      const marker = join(projectDir, "child-ran.txt");
+      const envFilePath = join(projectDir, "local.env");
+      await writeEnvFileRaw(envFilePath, `MYVAR=bad\x00val\n`);
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "", value = "<not-set>";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(projectDir)},
+    envFile: ${JSON.stringify(envFilePath)},
+    maxIterations: 0,
+  });
+  value = JSON.stringify(outputs);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ rejected, message, value }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise resolved (no rejection).
+      expect(parsed.rejected).toBe(false);
+      // (b) Resolved value is [].
+      expect(parsed.value).toBe("[]");
+      // (c) No spawn-failure error.
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      // (d) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (e) No LOOPX_TMPDIR was created.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-26f: run() generator local envFile NUL -> throws on first next()
+    //   + cleanup. Generator-surface counterpart to T-ENV-26a.
+    //   SPEC §7.2 / §7.4 / §8.2 / §9.1 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-ENV-26f: run() — NUL in local envFile value throws on first next() and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env26f");
+      const marker = join(projectDir, "child-ran.txt");
+      const envFilePath = join(projectDir, "local.env");
+      await writeEnvFileRaw(envFilePath, `MYVAR=bad\x00val\n`);
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(projectDir)},
+  envFile: ${JSON.stringify(envFilePath)},
+  maxIterations: 1,
+});
+let threw = false, message = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() rejected with a spawn-failure error.
+      expect(parsed.threw).toBe(true);
+      expect(parsed.message).not.toMatch(/envFile.*not.*found/i);
+      expect(parsed.message).not.toMatch(/options\.envFile/i);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) Cleanup ran before throw — no loopx-* residue.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-26g: run() maxIterations:0 + local envFile NUL -> first next()
+    //   returns { done: true, value: undefined }. Generator-surface
+    //   counterpart to T-ENV-26c.
+    //   SPEC §9.1 / §9.5 / §7.1 / §7.4 / §8.2.
+    // ------------------------------------------------------------------------
+    it("T-ENV-26g: run() — maxIterations:0 + NUL in local envFile completes immediately (no spawn)", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env26g");
+      const marker = join(projectDir, "child-ran.txt");
+      const envFilePath = join(projectDir, "local.env");
+      await writeEnvFileRaw(envFilePath, `MYVAR=bad\x00val\n`);
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(projectDir)},
+  envFile: ${JSON.stringify(envFilePath)},
+  maxIterations: 0,
+});
+let threw = false, message = "", firstDone = null, firstValue = "<not-set>";
+try {
+  const first = await gen.next();
+  firstDone = first.done;
+  firstValue = first.value === undefined ? "undefined" : JSON.stringify(first.value);
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message, firstDone, firstValue }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() returned { done: true, value: undefined }.
+      expect(parsed.threw).toBe(false);
+      expect(parsed.firstDone).toBe(true);
+      expect(parsed.firstValue).toBe("undefined");
+      // (b) No spawn-failure error.
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      // (c) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (d) No LOOPX_TMPDIR was created.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-27: CLI global env-file NUL byte in value -> spawn failure.
+    //   Global-env-file tier counterpart to T-ENV-26 (local -e). The
+    //   isolated XDG_CONFIG_HOME is provisioned via runCLI's `env` option;
+    //   the global env file at <xdg>/loopx/env contains `MYVAR=bad\x00val`,
+    //   which the parser preserves verbatim. SPEC §7.2 / §8.1 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-ENV-27: CLI — NUL in global env-file value rejects with spawn failure and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("env27");
+      const xdgDir = await makeIsolatedXdgConfigHome("env27");
+      const loopxConfigDir = join(xdgDir, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const globalEnvFilePath = join(loopxConfigDir, "env");
+      await writeEnvFileRaw(globalEnvFilePath, `MYVAR=bad\x00val\n`);
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdgDir },
+      });
+
+      // (a) Exit code 1 — child launch / spawn failure.
+      expect(result.exitCode).toBe(1);
+      // (b) Stderr contains a child-launch / spawn-failure error (not a
+      //     parser-shape warning).
+      expect(result.stderr.length).toBeGreaterThan(0);
+      expect(result.stderr).not.toMatch(/invalid key/i);
+      // (c) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (d) Cleanup ran before exit — no loopx-* residue under TMPDIR parent.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-27a: runPromise() global env-file NUL -> rejection + cleanup.
+    //   Programmatic-API counterpart to T-ENV-27. Uses
+    //   `withGlobalEnvRawContent` to set XDG_CONFIG_HOME on process.env so
+    //   the api-driver subprocess inherits it via the standard env merge.
+    //   SPEC §7.2 / §7.4 / §8.1 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-ENV-27a: runPromise() — NUL in global env-file value rejects with spawn failure and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env27a");
+      const marker = join(projectDir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      await withGlobalEnvRawContent(`MYVAR=bad\x00val\n`, async () => {
+        const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(projectDir)},
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ rejected, message }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected.
+        expect(parsed.rejected).toBe(true);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) Cleanup ran before rejection — no loopx-* residue.
+        const after = listLoopxEntries(tmpdirParent);
+        const newEntries = after.filter((e) => !before.includes(e));
+        expect(newEntries).toEqual([]);
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-27b: CLI -n 0 + global env-file NUL -> exit 0.
+    //   SPEC §4.2 / §7.1 / §7.4 / §8.1.
+    // ------------------------------------------------------------------------
+    it("T-ENV-27b: CLI -n 0 — NUL in global env-file value silently survives (no spawn)", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("env27b");
+      const xdgDir = await makeIsolatedXdgConfigHome("env27b");
+      const loopxConfigDir = join(xdgDir, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const globalEnvFilePath = join(loopxConfigDir, "env");
+      await writeEnvFileRaw(globalEnvFilePath, `MYVAR=bad\x00val\n`);
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const result = await runCLI(["run", "-n", "0", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdgDir },
+      });
+
+      // (a) Exit code 0.
+      expect(result.exitCode).toBe(0);
+      // (b) No spawn-failure error and no parser warning about NUL.
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      expect(result.stderr).not.toMatch(/invalid key/i);
+      // (c) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (d) No LOOPX_TMPDIR was created.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-27c: runPromise() maxIterations:0 + global env-file NUL ->
+    //   resolves []. SPEC §9.2 / §9.5 / §7.1 / §7.4 / §8.1.
+    // ------------------------------------------------------------------------
+    it("T-ENV-27c: runPromise() — maxIterations:0 + NUL in global env-file silently survives (no spawn)", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env27c");
+      const marker = join(projectDir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      await withGlobalEnvRawContent(`MYVAR=bad\x00val\n`, async () => {
+        const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "", value = "<not-set>";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(projectDir)},
+    maxIterations: 0,
+  });
+  value = JSON.stringify(outputs);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ rejected, message, value }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.rejected).toBe(false);
+        expect(parsed.value).toBe("[]");
+        expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+        expect(existsSync(marker)).toBe(false);
+        const after = listLoopxEntries(tmpdirParent);
+        const newEntries = after.filter((e) => !before.includes(e));
+        expect(newEntries).toEqual([]);
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-27d: run() generator global env-file NUL -> throws + cleanup.
+    //   Generator-surface counterpart to T-ENV-27a.
+    //   SPEC §7.2 / §7.4 / §8.1 / §9.1 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-ENV-27d: run() — NUL in global env-file value throws on first next() and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env27d");
+      const marker = join(projectDir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      await withGlobalEnvRawContent(`MYVAR=bad\x00val\n`, async () => {
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(projectDir)},
+  maxIterations: 1,
+});
+let threw = false, message = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First next() rejected.
+        expect(parsed.threw).toBe(true);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) Cleanup ran before throw — no loopx-* residue.
+        const after = listLoopxEntries(tmpdirParent);
+        const newEntries = after.filter((e) => !before.includes(e));
+        expect(newEntries).toEqual([]);
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-27e: run() generator maxIterations:0 + global env-file NUL ->
+    //   first next() returns { done: true }. Generator-surface counterpart
+    //   to T-ENV-27c. SPEC §9.1 / §9.5 / §7.1 / §7.4 / §8.1.
+    // ------------------------------------------------------------------------
+    it("T-ENV-27e: run() — maxIterations:0 + NUL in global env-file completes immediately (no spawn)", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env27e");
+      const marker = join(projectDir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      await withGlobalEnvRawContent(`MYVAR=bad\x00val\n`, async () => {
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(projectDir)},
+  maxIterations: 0,
+});
+let threw = false, message = "", firstDone = null, firstValue = "<not-set>";
+try {
+  const first = await gen.next();
+  firstDone = first.done;
+  firstValue = first.value === undefined ? "undefined" : JSON.stringify(first.value);
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message, firstDone, firstValue }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.threw).toBe(false);
+        expect(parsed.firstDone).toBe(true);
+        expect(parsed.firstValue).toBe("undefined");
+        expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+        expect(existsSync(marker)).toBe(false);
+        const after = listLoopxEntries(tmpdirParent);
+        const newEntries = after.filter((e) => !before.includes(e));
+        expect(newEntries).toEqual([]);
+      });
     });
   });
 });
