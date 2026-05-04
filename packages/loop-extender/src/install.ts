@@ -104,14 +104,28 @@ function getInstallFault(): { kind: "commit-fail-after"; n: number } | null {
 
 interface AutoInstallFault {
   gitignoreWriteFail: Set<string>;
+  // TEST-SPEC §1.4 `gitignore-replace-with-fifo:<name1,name2,...>`: places a
+  // FIFO at the named workflow's `.gitignore` path immediately before the
+  // safeguard `lstat`. The existing non-regular-file branch in
+  // `runGitignoreSafeguard` then naturally records a safeguard failure with
+  // a "non-regular" reason, identical in shape to a real FIFO at that path.
+  // T-INST-116k / 116k2 use this to deterministically force a safeguard
+  // failure on whichever workflow the implementation processes first.
+  gitignoreReplaceWithFifo: Set<string>;
 }
 
 function getAutoInstallFault(): AutoInstallFault {
-  const empty: AutoInstallFault = { gitignoreWriteFail: new Set() };
+  const empty: AutoInstallFault = {
+    gitignoreWriteFail: new Set(),
+    gitignoreReplaceWithFifo: new Set(),
+  };
   if (process.env.NODE_ENV !== "test") return empty;
   const raw = process.env.LOOPX_TEST_AUTOINSTALL_FAULT;
   if (!raw) return empty;
-  const fault: AutoInstallFault = { gitignoreWriteFail: new Set() };
+  const fault: AutoInstallFault = {
+    gitignoreWriteFail: new Set(),
+    gitignoreReplaceWithFifo: new Set(),
+  };
   for (const segment of raw.split(";")) {
     const trimmed = segment.trim();
     if (!trimmed) continue;
@@ -123,6 +137,11 @@ function getAutoInstallFault(): AutoInstallFault {
       for (const name of value.split(",")) {
         const n = name.trim();
         if (n) fault.gitignoreWriteFail.add(n);
+      }
+    } else if (kind === "gitignore-replace-with-fifo") {
+      for (const name of value.split(",")) {
+        const n = name.trim();
+        if (n) fault.gitignoreReplaceWithFifo.add(n);
       }
     }
   }
@@ -688,9 +707,12 @@ async function runAutoInstall(
   // the auto-install order; `npmChildExitCount` counts npm `child.on("exit")`
   // observations (success and non-zero-exit and signal-terminated alike,
   // but NOT spawn failures where no child existed) so the `post-exit-first`
-  // ordinal can fire on the first such observation.
+  // ordinal can fire on the first such observation; `safeguardFailureCount`
+  // counts `.gitignore` safeguard failures recorded into `failures` so the
+  // `post-safeguard-failure-first` ordinal can fire on the first such record.
   const processed: string[] = [];
   let npmChildExitCount = 0;
+  let safeguardFailureCount = 0;
 
   for (let i = 0; i < committed.length; i++) {
     const workflowName = committed[i];
@@ -790,6 +812,64 @@ async function runAutoInstall(
       const gitignoreOk = runGitignoreSafeguard(workflowDir, workflowName, fault);
       if (!gitignoreOk.ok) {
         failures.push({ workflow: workflowName, reason: gitignoreOk.reason });
+        safeguardFailureCount++;
+
+        // ───────────────────────────────────────────────────────────────────
+        // Post-safeguard-failure pause seam dispatch (TEST-SPEC §1.4
+        // LOOPX_TEST_AUTOINSTALL_PAUSE). Fires AFTER the safeguard failure
+        // has been recorded into the `failures` accumulator and BEFORE the
+        // next workflow's iteration begins (the IIFE is about to return,
+        // and the post-IIFE between-workflows dispatch is gated on a
+        // different window value). The marker payload reports `processed`
+        // as the workflows whose iterations completed BEFORE this one (i.e.,
+        // the failed workflow is NOT included), `current` as the failed
+        // workflow, and `remaining` as the workflows after this one.
+        //
+        // The ordinal `post-safeguard-failure-first` fires on the first
+        // safeguard-failure observation in the implementation's auto-install
+        // order (`safeguardFailureCount === 1`). The named
+        // `post-safeguard-failure:<name>` fires on the workflow whose name
+        // matches regardless of ordinal position.
+        //
+        // After resuming from the pause, the IIFE returns. The post-IIFE
+        // code path then runs through `processed.push(workflowName)` and
+        // checks the between-workflows dispatch (which won't fire because
+        // the active window is different). The next iteration's
+        // head-of-loop check observes the signal and breaks the outer
+        // loop, satisfying SPEC §10.10's "no further `.gitignore`
+        // safeguards or `npm install` children" guarantee.
+        //
+        // Per SPEC §10.10 "the aggregate failure report is suppressed when
+        // receivedSignal is non-null at end-of-pass": even though `failures`
+        // already has this workflow's safeguard-failure entry, the
+        // end-of-pass guard at the bottom of `runAutoInstall` returns 0
+        // before emitting the aggregate report.
+        // ───────────────────────────────────────────────────────────────────
+        if (pauseSpec) {
+          const fireOrdinal =
+            pauseSpec.kind === "ordinal" &&
+            pauseSpec.window === "post-safeguard-failure-first" &&
+            safeguardFailureCount === 1;
+          const fireNamed =
+            pauseSpec.kind === "named" &&
+            pauseSpec.window === "post-safeguard-failure" &&
+            pauseSpec.workflow === workflowName;
+          if (fireOrdinal || fireNamed) {
+            const resolvedWindow =
+              pauseSpec.kind === "ordinal"
+                ? "post-safeguard-failure-first"
+                : `post-safeguard-failure:${workflowName}`;
+            await pauseAutoInstallSeam(
+              resolvedWindow,
+              {
+                current: workflowName,
+                processed: [...processed],
+                remaining: committed.slice(i + 1),
+              },
+              signalContext
+            );
+          }
+        }
         return;
       }
 
@@ -1064,6 +1144,20 @@ function runGitignoreSafeguard(
   fault: AutoInstallFault
 ): { ok: true } | { ok: false; reason: string } {
   const gitignorePath = join(workflowDir, ".gitignore");
+  // TEST-SPEC §1.4 `gitignore-replace-with-fifo` seam: place a FIFO at the
+  // workflow's `.gitignore` path immediately before this safeguard's `lstat`.
+  // The existing non-regular-file branch below will then record a safeguard
+  // failure organically, exactly as it would for a real FIFO. Production
+  // behavior is unaffected (NODE_ENV=test gating in getAutoInstallFault).
+  if (fault.gitignoreReplaceWithFifo.has(workflowName)) {
+    try {
+      execFileSync("mkfifo", [gitignorePath], { stdio: "pipe" });
+    } catch {
+      // If mkfifo is unavailable or the path already has a non-empty entry,
+      // fall through; the test will surface the deviation. Production code
+      // never reaches this branch (gated on NODE_ENV=test).
+    }
+  }
   let st;
   try {
     st = lstatSync(gitignorePath);
