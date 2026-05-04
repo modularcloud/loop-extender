@@ -539,6 +539,12 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
     // Version check (SPEC §10.6, workflow-level only)
     const versionResult = checkWorkflowVersion(wf.sourceDir, runningVersion);
     switch (versionResult.kind) {
+      case "non-regular":
+        pkgWarnings.push(
+          `Warning: workflow '${wf.name}' package.json is not a regular file; skipping check`
+        );
+        warnedWorkflows.add(wf.name);
+        break;
       case "unreadable":
         pkgWarnings.push(
           `Warning: workflow '${wf.name}' package.json is unreadable (permission denied); skipping check`

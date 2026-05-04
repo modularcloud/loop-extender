@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
-import { chmod, readFile } from "node:fs/promises";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { execSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import {
@@ -142,6 +142,27 @@ function countUnreadableWarnings(
     ).length;
 }
 
+/** True iff stderr has a non-regular-path warning mentioning the workflow. */
+function hasNonRegularWarning(stderr: string, workflowName: string): boolean {
+  return (
+    stderr.includes(workflowName) &&
+    /not.*regular.*file/i.test(stderr)
+  );
+}
+
+function countNonRegularWarnings(
+  stderr: string,
+  workflowName: string,
+): number {
+  return stderr
+    .split("\n")
+    .filter(
+      (line) =>
+        line.includes(workflowName) &&
+        /not.*regular.*file/i.test(line),
+    ).length;
+}
+
 /** True iff stderr has any package.json-related warning mentioning the workflow. */
 function hasAnyPackageJsonWarning(
   stderr: string,
@@ -150,7 +171,8 @@ function hasAnyPackageJsonWarning(
   return (
     hasInvalidJsonWarning(stderr, workflowName) ||
     hasInvalidSemverWarning(stderr, workflowName) ||
-    hasUnreadableWarning(stderr, workflowName)
+    hasUnreadableWarning(stderr, workflowName) ||
+    hasNonRegularWarning(stderr, workflowName)
   );
 }
 
@@ -1788,6 +1810,46 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       expect(existsSync(brokenMarker)).toBe(true);
       expect(countInvalidSemverWarnings(result.stderr, "broken")).toBe(1);
       expect(hasAnyPackageJsonWarning(result.stderr, "clean")).toBe(false);
+    });
+
+    // ─────────────────────────────────────────────
+    // Non-Regular Workflow `package.json` Path (SPEC §3.2)
+    // ─────────────────────────────────────────────
+
+    it("T-VER-28: workflow package.json is a directory → one non-regular warning, version check skipped, execution continues", async () => {
+      project = await createTempProject();
+      const markerFile = join(project.dir, "ran.marker");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        bashMarker(markerFile),
+      );
+      // Replace the (default-absent) package.json with a directory containing
+      // a placeholder file. The directory must be non-empty so its identity
+      // is stable for assertion (d).
+      const pkgPath = join(project.loopxDir, "ralph", "package.json");
+      await mkdir(pkgPath, { recursive: true });
+      const placeholderPath = join(pkgPath, "README");
+      const placeholderContent = "placeholder content";
+      await writeFile(placeholderPath, placeholderContent, "utf-8");
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      // (a) exit code 0 — non-regular path is non-fatal per SPEC §3.2.
+      expect(result.exitCode).toBe(0);
+      // (b) stderr contains exactly one package.json warning for ralph.
+      expect(countNonRegularWarnings(result.stderr, "ralph")).toBe(1);
+      // (c) script ran.
+      expect(existsSync(markerFile)).toBe(true);
+      // (d) directory entry preserved unchanged with placeholder file intact.
+      const pkgStat = lstatSync(pkgPath);
+      expect(pkgStat.isDirectory()).toBe(true);
+      expect(existsSync(placeholderPath)).toBe(true);
+      expect(readFileSync(placeholderPath, "utf-8")).toBe(placeholderContent);
     });
   });
 
