@@ -6249,6 +6249,491 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
       });
 
       // ─────────────────────────────────────────────────────────
+      // SIGKILL Escalation when npm child traps the forwarded signal
+      // (T-INST-116c / T-INST-116f)
+      // SPEC §10.10 "Signals during `npm install`": "the section 7.3
+      // grace period and SIGKILL escalation rules apply by analogy" —
+      // after loopx forwards the signal to the npm child's process
+      // group, it waits 5 seconds for the group to exit and then
+      // sends SIGKILL. Configure the fake-npm shim with
+      // `trapSignals: ["TERM", "INT"]` (no-op trap on each) and use
+      // the survival-loop pattern (`while true; do sleep 1; done`)
+      // so bash genuinely ignores the forwarded signal until SIGKILL
+      // tears down the process group. The 4–10s elapsed window is
+      // wider than the spec's 4–7s "tolerance" guideline to absorb
+      // CI scheduling jitter on top of the {retry: 2} flaky-retry
+      // budget; the load-bearing claim is "elapsed is roughly 5s,
+      // not <4s (no grace) and not the full 30s sleep ceiling
+      // (escalation never fired)".
+      // T-INST-116c: SIGTERM axis.
+      // T-INST-116f: SIGINT axis.
+      // ─────────────────────────────────────────────────────────
+
+      it(
+        "T-INST-116c: SIGKILL escalation when npm install child ignores SIGTERM beyond the 5-second grace period",
+        async () => {
+          project = await createTempProject();
+          const logFile = join(project.dir, "fake-npm.log");
+          const pidFile = join(project.dir, "shim-pid");
+          gitServer = await startLocalGitServer([
+            {
+              name: "multi",
+              files: {
+                "alpha/index.sh": BASH_STOP,
+                "alpha/package.json": JSON.stringify({
+                  name: "alpha",
+                  version: "1.0.0",
+                }),
+                "beta/index.sh": BASH_STOP,
+                "beta/package.json": JSON.stringify({
+                  name: "beta",
+                  version: "1.0.0",
+                }),
+              },
+            },
+          ]);
+          await withFakeNpm(
+            {
+              sleepSeconds: 30,
+              trapSignals: ["TERM", "INT"],
+              pidFile,
+              logFile,
+            },
+            async (fake) => {
+              const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+                ["install", `${gitServer!.url}/multi.git`],
+                { cwd: project!.dir, runtime, timeout: 60_000 },
+              );
+              await waitForStderr("ready", { timeoutMs: 30_000 });
+              const shimPid = Number(readFileSync(pidFile, "utf-8").trim());
+              expect(Number.isFinite(shimPid) && shimPid > 0).toBe(true);
+
+              const start = Date.now();
+              sendSignal("SIGTERM");
+              const r = await result;
+              const elapsed = Date.now() - start;
+
+              // (a) Grace window: shim survived past the immediate
+              // SIGTERM forwarding (>=4s) but was torn down well
+              // before the 30s sleep ceiling. The lower bound is
+              // load-bearing — a buggy implementation that bypassed
+              // the grace timer (immediate SIGKILL) or whose
+              // escalation never fired (waiting for the natural
+              // sleep exit) would fall outside this window.
+              expect(elapsed).toBeGreaterThanOrEqual(4_000);
+              expect(elapsed).toBeLessThanOrEqual(10_000);
+
+              // (b) Shim no longer in the process table — SIGKILL
+              // escalation succeeded (the no-op TERM/INT trap could
+              // not block it).
+              let stillAlive = false;
+              try {
+                process.kill(shimPid, 0);
+                stillAlive = true;
+              } catch {
+                stillAlive = false;
+              }
+              expect(stillAlive).toBe(false);
+
+              // (c) loopx surfaces the originally-forwarded signal,
+              // not the SIGKILL escalation.
+              expect(r.exitCode).toBe(143);
+
+              // (d) No aggregate-failure-report — interrupted by
+              // signal, not by a non-zero npm exit (SPEC §10.10
+              // suppression-on-receivedSignal rule).
+              expect(r.stderr).not.toMatch(/auto-install failures/);
+
+              // The shim's EXIT trap is bypassed by SIGKILL, so the
+              // invocation log is empty even though the shim
+              // certainly ran (we read its PID from `pidFile` and
+              // observed `ready` on stderr above). Don't assert on
+              // the log count here — it would conflict with the
+              // SIGKILL escalation contract this test is pinning.
+              // The fake-npm shim must still be unreferenced
+              // (`fake` parameter prevents an unused-variable
+              // lint).
+              void fake;
+            },
+          );
+        },
+        { timeout: 60_000, retry: 2 },
+      );
+
+      it(
+        "T-INST-116f: SIGKILL escalation when npm install child ignores SIGINT beyond the 5-second grace period",
+        async () => {
+          project = await createTempProject();
+          const logFile = join(project.dir, "fake-npm.log");
+          const pidFile = join(project.dir, "shim-pid");
+          gitServer = await startLocalGitServer([
+            {
+              name: "multi",
+              files: {
+                "alpha/index.sh": BASH_STOP,
+                "alpha/package.json": JSON.stringify({
+                  name: "alpha",
+                  version: "1.0.0",
+                }),
+                "beta/index.sh": BASH_STOP,
+                "beta/package.json": JSON.stringify({
+                  name: "beta",
+                  version: "1.0.0",
+                }),
+              },
+            },
+          ]);
+          await withFakeNpm(
+            {
+              sleepSeconds: 30,
+              trapSignals: ["INT", "TERM"],
+              pidFile,
+              logFile,
+            },
+            async (fake) => {
+              const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+                ["install", `${gitServer!.url}/multi.git`],
+                { cwd: project!.dir, runtime, timeout: 60_000 },
+              );
+              await waitForStderr("ready", { timeoutMs: 30_000 });
+              const shimPid = Number(readFileSync(pidFile, "utf-8").trim());
+              expect(Number.isFinite(shimPid) && shimPid > 0).toBe(true);
+
+              const start = Date.now();
+              sendSignal("SIGINT");
+              const r = await result;
+              const elapsed = Date.now() - start;
+
+              // (a) Grace window before SIGKILL escalation —
+              // mirrors T-INST-116c's bound. SIGINT must hit the
+              // same 5-second timer; a buggy implementation that
+              // short-circuited the grace timer for SIGINT (e.g.,
+              // dispatched escalation only on SIGTERM) would
+              // bypass this window.
+              expect(elapsed).toBeGreaterThanOrEqual(4_000);
+              expect(elapsed).toBeLessThanOrEqual(10_000);
+
+              let stillAlive = false;
+              try {
+                process.kill(shimPid, 0);
+                stillAlive = true;
+              } catch {
+                stillAlive = false;
+              }
+              expect(stillAlive).toBe(false);
+
+              // (c) loopx surfaces SIGINT (130), not the SIGKILL
+              // escalation (137).
+              expect(r.exitCode).toBe(130);
+
+              expect(r.stderr).not.toMatch(/auto-install failures/);
+
+              // SIGKILL bypasses the shim's EXIT trap, so the
+              // invocation log is empty — see T-INST-116c for
+              // rationale.
+              void fake;
+            },
+          );
+        },
+        { timeout: 60_000, retry: 2 },
+      );
+
+      // ─────────────────────────────────────────────────────────
+      // Partial node_modules/ Preservation Under Signal Termination
+      // (T-INST-116d / T-INST-116d2)
+      // SPEC §10.10 "Signals during `npm install`": "Partial
+      // `node_modules/` state produced before interruption is not
+      // cleaned up by loopx." The shim creates `node_modules/
+      // partial-file` immediately on entry (before `ready`) so the
+      // partial state exists by the time the harness signals; after
+      // the signal-induced exit, the file must remain on disk.
+      // T-INST-116d: SIGINT axis.
+      // T-INST-116d2: SIGTERM axis (parity).
+      // ─────────────────────────────────────────────────────────
+
+      it("T-INST-116d: SIGINT during npm install does not clean partial node_modules/ state", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "my-workflow",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "my-workflow",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          {
+            sleepSeconds: 30,
+            createFiles: ["node_modules/partial-file"],
+            logFile,
+          },
+          async (fake) => {
+            const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+              ["install", `${gitServer!.url}/my-workflow.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            await waitForStderr("ready", { timeoutMs: 30_000 });
+            sendSignal("SIGINT");
+            const r = await result;
+
+            // (a) Exit 130 (128 + SIGINT).
+            expect(r.exitCode).toBe(130);
+
+            // (b) Partial node_modules/ state preserved on disk —
+            // loopx does not clean up after signal-induced exit.
+            const partialPath = join(
+              project!.loopxDir,
+              "my-workflow",
+              "node_modules",
+              "partial-file",
+            );
+            expect(existsSync(partialPath)).toBe(true);
+
+            // Sanity: shim ran exactly once and committed workflow
+            // is still on disk.
+            expect(fake.readInvocations().length).toBe(1);
+            expect(
+              existsSync(
+                join(project!.loopxDir, "my-workflow", "index.sh"),
+              ),
+            ).toBe(true);
+            expect(r.stderr).not.toMatch(/auto-install failures/);
+          },
+        );
+      });
+
+      it("T-INST-116d2: SIGTERM during npm install does not clean partial node_modules/ state (SIGTERM-axis parity)", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "my-workflow",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "my-workflow",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          {
+            sleepSeconds: 30,
+            createFiles: ["node_modules/partial-file"],
+            logFile,
+          },
+          async (fake) => {
+            const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+              ["install", `${gitServer!.url}/my-workflow.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            await waitForStderr("ready", { timeoutMs: 30_000 });
+            sendSignal("SIGTERM");
+            const r = await result;
+
+            // (a) Exit 143 (128 + SIGTERM).
+            expect(r.exitCode).toBe(143);
+
+            // (b) Partial node_modules/ state preserved on disk
+            // under SIGTERM — same no-cleanup rule as SIGINT. A
+            // buggy implementation that left partial state alone
+            // on SIGINT (passing T-INST-116d) but cleaned it on a
+            // SIGTERM-handler dispatch path would fail here.
+            const partialPath = join(
+              project!.loopxDir,
+              "my-workflow",
+              "node_modules",
+              "partial-file",
+            );
+            expect(existsSync(partialPath)).toBe(true);
+
+            expect(fake.readInvocations().length).toBe(1);
+            expect(
+              existsSync(
+                join(project!.loopxDir, "my-workflow", "index.sh"),
+              ),
+            ).toBe(true);
+            expect(r.stderr).not.toMatch(/auto-install failures/);
+          },
+        );
+      });
+
+      // ─────────────────────────────────────────────────────────
+      // Process-Group Forwarding (T-INST-116e / T-INST-116g)
+      // SPEC §10.10 "Signals during `npm install`": SIGINT / SIGTERM
+      // "propagates to the child's process group" — not just the
+      // direct npm child. The shim spawns a long-lived background
+      // grandchild (`sleep 3600 &`) which inherits the npm child's
+      // process group. After loopx forwards the signal, both the
+      // shim and the grandchild must be terminated; an
+      // implementation that delivered the signal only to the direct
+      // npm child PID (not the group) would leave the grandchild
+      // orphaned. Auto-install/process-group counterpart to T-SIG-06
+      // / T-SIG-06a.
+      // T-INST-116e: SIGTERM axis.
+      // T-INST-116g: SIGINT axis (parity).
+      // ─────────────────────────────────────────────────────────
+
+      it("T-INST-116e: SIGTERM during npm install is forwarded to the npm child's process group (grandchild also killed)", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        const pidFile = join(project.dir, "shim-pid");
+        const grandchildPidFile = join(project.dir, "grandchild-pid");
+        gitServer = await startLocalGitServer([
+          {
+            name: "my-workflow",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "my-workflow",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          {
+            sleepSeconds: 30,
+            spawnGrandchild: true,
+            grandchildPidFile,
+            pidFile,
+            logFile,
+          },
+          async (fake) => {
+            const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+              ["install", `${gitServer!.url}/my-workflow.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            await waitForStderr("ready", { timeoutMs: 30_000 });
+
+            const shimPid = Number(readFileSync(pidFile, "utf-8").trim());
+            const gcPid = Number(
+              readFileSync(grandchildPidFile, "utf-8").trim(),
+            );
+            expect(Number.isFinite(shimPid) && shimPid > 0).toBe(true);
+            expect(Number.isFinite(gcPid) && gcPid > 0).toBe(true);
+            expect(shimPid).not.toBe(gcPid);
+
+            sendSignal("SIGTERM");
+            const r = await result;
+
+            // (a) Exit 143.
+            expect(r.exitCode).toBe(143);
+
+            // (b) Shim PID terminated (forwarded signal landed on
+            // the direct child).
+            let shimAlive = false;
+            try {
+              process.kill(shimPid, 0);
+              shimAlive = true;
+            } catch {
+              shimAlive = false;
+            }
+            expect(shimAlive).toBe(false);
+
+            // (c) Grandchild PID terminated — the load-bearing
+            // assertion. Without process-group forwarding the
+            // grandchild would still be alive (its parent died but
+            // it was reparented to init / the test process and
+            // continues sleeping). `kill -0` returning ESRCH
+            // confirms the grandchild was actually torn down.
+            let gcAlive = false;
+            try {
+              process.kill(gcPid, 0);
+              gcAlive = true;
+            } catch {
+              gcAlive = false;
+            }
+            expect(gcAlive).toBe(false);
+
+            expect(fake.readInvocations().length).toBe(1);
+            expect(r.stderr).not.toMatch(/auto-install failures/);
+          },
+        );
+      });
+
+      it("T-INST-116g: SIGINT during npm install is forwarded to the npm child's process group (grandchild also killed)", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        const pidFile = join(project.dir, "shim-pid");
+        const grandchildPidFile = join(project.dir, "grandchild-pid");
+        gitServer = await startLocalGitServer([
+          {
+            name: "my-workflow",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "my-workflow",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          {
+            sleepSeconds: 30,
+            spawnGrandchild: true,
+            grandchildPidFile,
+            pidFile,
+            logFile,
+          },
+          async (fake) => {
+            const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+              ["install", `${gitServer!.url}/my-workflow.git`],
+              { cwd: project!.dir, runtime, timeout: 60_000 },
+            );
+            await waitForStderr("ready", { timeoutMs: 30_000 });
+
+            const shimPid = Number(readFileSync(pidFile, "utf-8").trim());
+            const gcPid = Number(
+              readFileSync(grandchildPidFile, "utf-8").trim(),
+            );
+            expect(Number.isFinite(shimPid) && shimPid > 0).toBe(true);
+            expect(Number.isFinite(gcPid) && gcPid > 0).toBe(true);
+            expect(shimPid).not.toBe(gcPid);
+
+            sendSignal("SIGINT");
+            const r = await result;
+
+            // (a) Exit 130.
+            expect(r.exitCode).toBe(130);
+
+            let shimAlive = false;
+            try {
+              process.kill(shimPid, 0);
+              shimAlive = true;
+            } catch {
+              shimAlive = false;
+            }
+            expect(shimAlive).toBe(false);
+
+            // (c) Grandchild terminated under SIGINT — SIGINT-axis
+            // parity for the process-group-forwarding contract. A
+            // buggy implementation that forwarded SIGINT only to
+            // the direct npm PID (not the group) would leave the
+            // grandchild alive and pass T-INST-116e but fail here.
+            let gcAlive = false;
+            try {
+              process.kill(gcPid, 0);
+              gcAlive = true;
+            } catch {
+              gcAlive = false;
+            }
+            expect(gcAlive).toBe(false);
+
+            expect(fake.readInvocations().length).toBe(1);
+            expect(r.stderr).not.toMatch(/auto-install failures/);
+          },
+        );
+      });
+
+      // ─────────────────────────────────────────────────────────
       // No-Active-Child Auto-install Pause: between-workflows-after-first
       // window (T-INST-116h / T-INST-116h2)
       // SPEC §10.10 "Signals during the auto-install pass when no

@@ -231,7 +231,18 @@ ${
 
 ${
   spawnGrandchild
-    ? `sleep 3600 &
+    ? `# Spawn a long-lived background process inside the shim's process
+# group so process-group signal forwarding can be observed (T-INST-116e
+# / 116g). When non-interactive bash forks an asynchronous (\`&\`)
+# command, it explicitly sets SIGINT and SIGQUIT to SIG_IGN on the
+# child (bash man page: "asynchronous commands ignore SIGINT and SIGQUIT
+# in addition to these inherited dispositions"). That auto-ignore would
+# make SIGINT to the process group a no-op for the grandchild, masking
+# a faulty implementation that forwarded SIGINT only to the direct npm
+# child. Wrap in a subshell that resets the SIGINT/SIGQUIT trap to
+# default *before* \`exec\`, so the resulting \`sleep\` process has
+# default disposition and dies on a process-group SIGINT/SIGTERM.
+( trap - INT QUIT; exec sleep 3600 ) &
 GRANDCHILD_PID=$!
 ${grandchildPidFile ? `printf '%s' "$GRANDCHILD_PID" > ${grandchildPidFile}` : ""}`
     : ""
@@ -254,9 +265,23 @@ echo "ready" >&2
 ${stdoutFile ? `cat ${stdoutFile}` : ""}
 ${stderrFile ? `cat ${stderrFile} >&2` : ""}
 
-if [ "$SLEEP_FOR" != "0" ]; then
+${
+  trapSignals.length > 0
+    ? `# Survival loop: when trapSignals is set, the shim must genuinely
+# ignore the configured signal(s) for the 5-second SPEC §7.3 grace
+# window so SIGKILL escalation can be observed (T-INST-116c / 116f).
+# A single \`sleep $SLEEP_FOR\` would die from a process-group signal
+# (sleep itself does not trap), letting bash fall through to \`exit\`
+# and short-circuiting the grace window. The while-true loop spawns a
+# fresh \`sleep 1\` per iteration, so each individual sleep dies on
+# signal but bash itself (with \`trap ''\`) keeps looping until SIGKILL
+# tears it down. Same pattern as the runtime-script signal-trap-ignore
+# tests (T-TMP-18a/18b, T-SIG-05/05a).
+while true; do sleep 1; done`
+    : `if [ "$SLEEP_FOR" != "0" ]; then
   sleep "$SLEEP_FOR"
-fi
+fi`
+}
 
 exit "$EXIT_CODE_FOR"
 `;
