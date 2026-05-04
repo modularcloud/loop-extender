@@ -219,7 +219,50 @@ interface AutoInstallPausePayload {
   processed: string[];
   remaining: string[];
   activeChildPid?: number;
-  gitignoreStateAtPause?: unknown;
+  gitignoreStateAtPause?: GitignoreStateAtPause;
+}
+
+// Deterministic on-disk state of `.loopx/<current>/.gitignore` captured at
+// `pre-spawn-first` / `pre-spawn:<name>` pause-entry. Per TEST-SPEC §1.4 and
+// T-INST-116i / T-INST-116i2, the harness uses this field to pin SPEC §10.10's
+// "side effects completed before the signal observation remain on disk" rule
+// byte-for-byte without a race: post-signal `lstat` of the same path must
+// match this snapshot exactly (absent → ENOENT; regular with content C →
+// regular with content C; any other type → that exact type).
+type GitignoreStateAtPause =
+  | { exists: false }
+  | { exists: true; type: "regular"; content: string }
+  | {
+      exists: true;
+      type: "symlink" | "directory" | "fifo" | "socket" | "other";
+    };
+
+function captureGitignoreStateAtPause(workflowDir: string): GitignoreStateAtPause {
+  const gitignorePath = join(workflowDir, ".gitignore");
+  let st;
+  try {
+    st = lstatSync(gitignorePath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { exists: false };
+    return { exists: true, type: "other" };
+  }
+  if (st.isFile()) {
+    let content = "";
+    try {
+      content = readFileSync(gitignorePath, "utf-8");
+    } catch {
+      // Unreadable regular file — surface as "other" so a buggy implementation
+      // that mutated permissions during cleanup is detectable.
+      return { exists: true, type: "other" };
+    }
+    return { exists: true, type: "regular", content };
+  }
+  if (st.isSymbolicLink()) return { exists: true, type: "symlink" };
+  if (st.isDirectory()) return { exists: true, type: "directory" };
+  if (st.isFIFO()) return { exists: true, type: "fifo" };
+  if (st.isSocket()) return { exists: true, type: "socket" };
+  return { exists: true, type: "other" };
 }
 
 async function pauseAutoInstallSeam(
@@ -748,6 +791,58 @@ async function runAutoInstall(
       if (!gitignoreOk.ok) {
         failures.push({ workflow: workflowName, reason: gitignoreOk.reason });
         return;
+      }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // Pre-spawn pause seam dispatch (TEST-SPEC §1.4 LOOPX_TEST_AUTOINSTALL_PAUSE).
+      // Fires AFTER the .gitignore safeguard's `lstat` dispatch + (sync) write
+      // for this workflow, BEFORE the `spawn("npm", "install")` call. The
+      // marker payload's `gitignoreStateAtPause` records the deterministic
+      // post-safeguard on-disk state of `.loopx/<current>/.gitignore` so the
+      // harness can pin SPEC §10.10's "side effects completed before the
+      // signal observation remain on disk" rule byte-for-byte across both
+      // sub-cases (existing-state preservation AND the absent → absent
+      // negative-form "side effects that had not begun do not start after
+      // the signal observation").
+      //
+      // The ordinal `pre-spawn-first` fires on the first workflow processed
+      // in the implementation's auto-install order (`processed.length === 0`).
+      // The named `pre-spawn:<name>` fires on the workflow whose name
+      // matches regardless of ordinal position.
+      //
+      // After resuming from the pause, the IIFE returns without spawning npm
+      // when a signal has been observed; the head-of-iteration check on the
+      // next iteration then breaks the outer loop, satisfying the SPEC §10.10
+      // "no further `npm install` children are started" guarantee.
+      // ─────────────────────────────────────────────────────────────────────
+      if (pauseSpec) {
+        const fireOrdinal =
+          pauseSpec.kind === "ordinal" &&
+          pauseSpec.window === "pre-spawn-first" &&
+          processed.length === 0;
+        const fireNamed =
+          pauseSpec.kind === "named" &&
+          pauseSpec.window === "pre-spawn" &&
+          pauseSpec.workflow === workflowName;
+        if (fireOrdinal || fireNamed) {
+          const resolvedWindow =
+            pauseSpec.kind === "ordinal"
+              ? "pre-spawn-first"
+              : `pre-spawn:${workflowName}`;
+          await pauseAutoInstallSeam(
+            resolvedWindow,
+            {
+              current: workflowName,
+              processed: [...processed],
+              remaining: committed.slice(i + 1),
+              gitignoreStateAtPause: captureGitignoreStateAtPause(workflowDir),
+            },
+            signalContext
+          );
+          if (signalContext && signalContext.receivedSignal() !== null) {
+            return;
+          }
+        }
       }
 
       // 3. Spawn `npm install`.

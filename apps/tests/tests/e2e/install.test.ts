@@ -6488,6 +6488,310 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
       });
 
       // ─────────────────────────────────────────────────────────
+      // No-Active-Child Auto-install Pause: pre-spawn-first window
+      // (T-INST-116i / T-INST-116i2)
+      // SPEC §10.10 "Signals during the auto-install pass when no
+      // npm child is active": the no-active-child contract must
+      // hold for the gap between the .gitignore safeguard's lstat
+      // dispatch decision and the spawn("npm", ...) call. Uses the
+      // test-only LOOPX_TEST_AUTOINSTALL_PAUSE=pre-spawn-first seam
+      // (TEST-SPEC §1.4) to deterministically deliver the signal in
+      // that window. The marker payload's `gitignoreStateAtPause`
+      // field captures the deterministic on-disk state of
+      // `.loopx/<current>/.gitignore` at pause-entry, so the harness
+      // can pin both halves of SPEC §10.10's "side effects completed
+      // before the signal observation remain on disk" rule
+      // byte-for-byte without a race — including the load-bearing
+      // negative form "side effects that had not begun do not start
+      // after the signal observation" in the absent → absent case.
+      // T-INST-116i: SIGINT axis.
+      // T-INST-116i2: SIGTERM axis (parity).
+      // ─────────────────────────────────────────────────────────
+
+      it("T-INST-116i: SIGINT during pre-spawn-first window — no spawn, no further processing, gitignore state preserved byte-for-byte", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        const markerPath = join(project.dir, "autoinstall-pause-marker.json");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const { result, sendSignal } = runCLIWithSignal(
+            ["install", `${gitServer!.url}/multi.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              timeout: 60_000,
+              env: {
+                NODE_ENV: "test",
+                LOOPX_TEST_AUTOINSTALL_PAUSE: "pre-spawn-first",
+                LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+              },
+            },
+          );
+
+          // Poll for the marker file (the seam writes + fsyncs it
+          // before the bounded delay begins, so polling is race-free).
+          const pauseDeadline = Date.now() + 30_000;
+          while (!existsSync(markerPath)) {
+            if (Date.now() > pauseDeadline) {
+              sendSignal("SIGINT");
+              await result;
+              throw new Error("Timed out waiting for pause marker");
+            }
+            await new Promise((r) => setTimeout(r, 50));
+          }
+          const marker = JSON.parse(readFileSync(markerPath, "utf-8"));
+          expect(marker.window).toBe("pre-spawn-first");
+          expect(marker.processed).toEqual([]);
+          const first = marker.current as string;
+          expect(["alpha", "beta", "gamma"]).toContain(first);
+          const remaining = marker.remaining as string[];
+          expect(remaining.length).toBe(2);
+          for (const w of remaining) {
+            expect(["alpha", "beta", "gamma"]).toContain(w);
+            expect(w).not.toBe(first);
+          }
+          const untouched = remaining;
+          // gitignoreStateAtPause MUST be present per the section 1.4
+          // marker contract for the pre-spawn-first window.
+          expect(marker.gitignoreStateAtPause).toBeDefined();
+          const stateAtPause = marker.gitignoreStateAtPause as
+            | { exists: false }
+            | { exists: true; type: "regular"; content: string }
+            | {
+                exists: true;
+                type: "symlink" | "directory" | "fifo" | "socket" | "other";
+              };
+
+          sendSignal("SIGINT");
+          const r = await result;
+
+          // (a) Exit 130 (128 + SIGINT).
+          expect(r.exitCode).toBe(130);
+
+          // (b) Zero shim invocations — the spawn for `first` was preempted
+          // by the signal observation during the pre-spawn pause; workflows
+          // in `untouched` were never reached.
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(0);
+
+          // (c) Workflows in untouched do NOT have a synthesized .gitignore
+          // (no safeguard write reached either of them).
+          for (const w of untouched) {
+            expect(existsSync(join(project!.loopxDir, w, ".gitignore"))).toBe(
+              false,
+            );
+          }
+
+          // (d) All three committed workflow directories preserved
+          // byte-for-byte from the source — committed workflow files
+          // are not rolled back.
+          for (const w of ["alpha", "beta", "gamma"]) {
+            const indexPath = join(project!.loopxDir, w, "index.sh");
+            const pkgPath = join(project!.loopxDir, w, "package.json");
+            expect(existsSync(indexPath)).toBe(true);
+            expect(readFileSync(indexPath, "utf-8")).toBe(BASH_STOP);
+            const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+            expect(pkg.name).toBe(w);
+            expect(pkg.version).toBe("1.0.0");
+          }
+
+          // (e) No aggregate failure report on signal-termination — the
+          // only "failure" would have been `first`'s preempted spawn,
+          // which is not recorded as an auto-install failure.
+          expect(r.stderr).not.toMatch(/auto-install failures/);
+
+          // (f) Post-exit state of `.loopx/<first>/.gitignore` matches
+          // gitignoreStateAtPause byte-for-byte across all sub-cases,
+          // including the absent → absent case. This pins both halves
+          // of SPEC §10.10's "side effects completed before the signal
+          // observation remain on disk" rule deterministically.
+          const firstGitignore = join(project!.loopxDir, first, ".gitignore");
+          if (stateAtPause.exists === false) {
+            // Absent → absent: a buggy implementation that started or
+            // completed a safeguard write AFTER observing the signal
+            // would create the file post-pause and fail this assertion.
+            expect(existsSync(firstGitignore)).toBe(false);
+          } else if (stateAtPause.type === "regular") {
+            expect(existsSync(firstGitignore)).toBe(true);
+            const st = lstatSync(firstGitignore);
+            expect(st.isFile()).toBe(true);
+            expect(readFileSync(firstGitignore, "utf-8")).toBe(
+              stateAtPause.content,
+            );
+          } else {
+            expect(existsSync(firstGitignore)).toBe(true);
+            const st = lstatSync(firstGitignore);
+            if (stateAtPause.type === "symlink") {
+              expect(st.isSymbolicLink()).toBe(true);
+            } else if (stateAtPause.type === "directory") {
+              expect(st.isDirectory()).toBe(true);
+            } else if (stateAtPause.type === "fifo") {
+              expect(st.isFIFO()).toBe(true);
+            } else if (stateAtPause.type === "socket") {
+              expect(st.isSocket()).toBe(true);
+            } else {
+              // type === "other" — accept any non-regular entry.
+              expect(st.isFile()).toBe(false);
+            }
+          }
+        });
+      });
+
+      it("T-INST-116i2: SIGTERM during pre-spawn-first window — SIGTERM-axis parity", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        const markerPath = join(project.dir, "autoinstall-pause-marker.json");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const { result, sendSignal } = runCLIWithSignal(
+            ["install", `${gitServer!.url}/multi.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              timeout: 60_000,
+              env: {
+                NODE_ENV: "test",
+                LOOPX_TEST_AUTOINSTALL_PAUSE: "pre-spawn-first",
+                LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+              },
+            },
+          );
+
+          const pauseDeadline = Date.now() + 30_000;
+          while (!existsSync(markerPath)) {
+            if (Date.now() > pauseDeadline) {
+              sendSignal("SIGTERM");
+              await result;
+              throw new Error("Timed out waiting for pause marker");
+            }
+            await new Promise((r) => setTimeout(r, 50));
+          }
+          const marker = JSON.parse(readFileSync(markerPath, "utf-8"));
+          expect(marker.window).toBe("pre-spawn-first");
+          expect(marker.processed).toEqual([]);
+          const first = marker.current as string;
+          expect(["alpha", "beta", "gamma"]).toContain(first);
+          const remaining = marker.remaining as string[];
+          expect(remaining.length).toBe(2);
+          const untouched = remaining;
+          expect(marker.gitignoreStateAtPause).toBeDefined();
+          const stateAtPause = marker.gitignoreStateAtPause as
+            | { exists: false }
+            | { exists: true; type: "regular"; content: string }
+            | {
+                exists: true;
+                type: "symlink" | "directory" | "fifo" | "socket" | "other";
+              };
+
+          sendSignal("SIGTERM");
+          const r = await result;
+
+          // (a) Exit 143 (128 + SIGTERM).
+          expect(r.exitCode).toBe(143);
+
+          // (b) Zero shim invocations — SIGTERM-axis parity for the
+          // no-spawn guarantee.
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(0);
+
+          // (c) Workflows in untouched do NOT have a synthesized .gitignore.
+          for (const w of untouched) {
+            expect(existsSync(join(project!.loopxDir, w, ".gitignore"))).toBe(
+              false,
+            );
+          }
+
+          // (d) All three committed workflow directories preserved
+          // byte-for-byte (no rollback under SIGTERM either).
+          for (const w of ["alpha", "beta", "gamma"]) {
+            const indexPath = join(project!.loopxDir, w, "index.sh");
+            const pkgPath = join(project!.loopxDir, w, "package.json");
+            expect(existsSync(indexPath)).toBe(true);
+            expect(readFileSync(indexPath, "utf-8")).toBe(BASH_STOP);
+            const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+            expect(pkg.name).toBe(w);
+            expect(pkg.version).toBe("1.0.0");
+          }
+
+          // (e) No aggregate failure report on SIGTERM-termination.
+          expect(r.stderr).not.toMatch(/auto-install failures/);
+
+          // (f) Post-exit state of `.loopx/<first>/.gitignore` matches
+          // gitignoreStateAtPause byte-for-byte across all sub-cases.
+          // SIGTERM-axis parity for both halves of the SPEC §10.10
+          // "side effects completed before the signal observation remain
+          // on disk" rule.
+          const firstGitignore = join(project!.loopxDir, first, ".gitignore");
+          if (stateAtPause.exists === false) {
+            expect(existsSync(firstGitignore)).toBe(false);
+          } else if (stateAtPause.type === "regular") {
+            expect(existsSync(firstGitignore)).toBe(true);
+            const st = lstatSync(firstGitignore);
+            expect(st.isFile()).toBe(true);
+            expect(readFileSync(firstGitignore, "utf-8")).toBe(
+              stateAtPause.content,
+            );
+          } else {
+            expect(existsSync(firstGitignore)).toBe(true);
+            const st = lstatSync(firstGitignore);
+            if (stateAtPause.type === "symlink") {
+              expect(st.isSymbolicLink()).toBe(true);
+            } else if (stateAtPause.type === "directory") {
+              expect(st.isDirectory()).toBe(true);
+            } else if (stateAtPause.type === "fifo") {
+              expect(st.isFIFO()).toBe(true);
+            } else if (stateAtPause.type === "socket") {
+              expect(st.isSocket()).toBe(true);
+            } else {
+              expect(st.isFile()).toBe(false);
+            }
+          }
+        });
+      });
+
+      // ─────────────────────────────────────────────────────────
       // No-Active-Child Auto-install Pause: post-exit-first window
       // (T-INST-116j / T-INST-116j2 / T-INST-116j3)
       // SPEC §10.10 "Signals during the auto-install pass when no
