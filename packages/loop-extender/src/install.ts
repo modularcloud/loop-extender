@@ -47,9 +47,13 @@ import { checkWorkflowVersion } from "./version-check.js";
  * either while a child is active or while none is active causes the pass
  * to abort cleanly without further `.gitignore` synthesis or `npm install`
  * spawns. The aggregate failure report is suppressed when `receivedSignal`
- * is non-null at end-of-pass (the SPEC §10.10 "unless it had already been
- * emitted" carve-out — currently always falsy because the report is the
- * very last side effect of the pass).
+ * is non-null at end-of-pass and BEFORE the report is written; the
+ * SPEC §10.10 "unless it had already been emitted" carve-out is handled
+ * by the post-aggregate-report pause seam (TEST-SPEC §1.4) which fires
+ * AFTER the report has been emitted to stderr — when a signal arrives
+ * during that seam's pause, the already-emitted report is preserved on
+ * stderr and `runAutoInstall` returns 0 so `installCommand` defers the
+ * exit code to bin.ts's outer signal handler (`128 + signum`).
  */
 export interface InstallSignalContext {
   /** Returns the first signal observed by the install handlers (or null). */
@@ -1248,20 +1252,78 @@ async function runAutoInstall(
   }
 
   // SPEC §10.10 "Signals during the auto-install pass when no npm child is
-  // active": when receivedSignal is non-null at end-of-pass, suppress the
-  // final aggregate failure report. The "unless it had already been emitted"
-  // carve-out is structurally satisfied here because the report is the very
-  // last side effect of the pass — if we reached this point with the
-  // receivedSignal set, the report has not been emitted.
+  // active": when receivedSignal is non-null at end-of-pass and BEFORE the
+  // aggregate failure report is emitted, suppress the report ("report not
+  // yet emitted" half of the SPEC §10.10 signal-termination clause). The
+  // complementary "unless it had already been emitted" carve-out is handled
+  // below by the post-aggregate-report pause seam.
   if (signalContext && signalContext.receivedSignal() !== null) {
     return 0;
   }
 
   if (failures.length > 0) {
-    process.stderr.write("Error: auto-install failures:\n");
+    // Use synchronous fd-2 writes so the report bytes reach the kernel pipe
+    // before the post-aggregate-report seam below writes (and fsync's) its
+    // marker file. On POSIX, `process.stderr.write` for a pipe is async and
+    // can leave data in libuv's user-space buffer past the fsync. The
+    // harness polls for the marker and then signals; if the report were
+    // still in the user-space buffer at signal time and the subsequent
+    // `process.exit(128+sig)` truncated the buffer, the test's stderr
+    // capture would miss the report bytes. `writeSync(2, …)` avoids that
+    // race by going directly to the fd.
+    writeSync(2, "Error: auto-install failures:\n");
     for (const f of failures) {
-      process.stderr.write(`  [${f.workflow}] ${f.reason}\n`);
+      writeSync(2, `  [${f.workflow}] ${f.reason}\n`);
     }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Post-aggregate-report pause seam dispatch (TEST-SPEC §1.4
+    // LOOPX_TEST_AUTOINSTALL_PAUSE). Fires AFTER the aggregate failure
+    // report has been emitted to stderr and BEFORE this function returns
+    // (and therefore before bin.ts's outer install signal handler observes
+    // process exit). The seam fires only when an aggregate report is
+    // actually emitted (failures.length > 0); it is a no-op on a clean /
+    // no-failure auto-install pass per TEST-SPEC §1.4.
+    //
+    // Marker payload: `current = null` (no per-workflow focal position
+    // applies — all per-workflow processing has reached terminal state by
+    // the time the report is emitted), `processed = [...processed]`
+    // (workflow names whose iteration body ran to terminal state during
+    // the pass — for the T-INST-116l fixture with FIFO-replacement FAULT
+    // applied to all three workflows, all three are present), `remaining
+    // = []` (no further workflows pending). Ordinal-only — no named form.
+    //
+    // After resuming from the pause, if a signal was observed during the
+    // pause, return 0 so installCommand does NOT call process.exit(1) —
+    // bin.ts's outer install signal handler sees `installReceivedSignal`
+    // and exits with `128 + signum` per SPEC §10.10's signal-exit-code
+    // clause. The aggregate report was written to stderr above and is
+    // preserved on disk / in the kernel pipe (the SPEC §10.10 "unless it
+    // had already been emitted" carve-out half).
+    //
+    // No second emission of the report after the pause: this branch
+    // returns 1 only on the no-signal path (timeout/no-trigger case),
+    // and the writeSync calls above ran exactly once.
+    // ───────────────────────────────────────────────────────────────────
+    if (
+      pauseSpec &&
+      pauseSpec.kind === "ordinal" &&
+      pauseSpec.window === "post-aggregate-report"
+    ) {
+      await pauseAutoInstallSeam(
+        "post-aggregate-report",
+        {
+          current: null,
+          processed: [...processed],
+          remaining: [],
+        },
+        signalContext
+      );
+      if (signalContext && signalContext.receivedSignal() !== null) {
+        return 0;
+      }
+    }
+
     return 1;
   }
   return 0;
