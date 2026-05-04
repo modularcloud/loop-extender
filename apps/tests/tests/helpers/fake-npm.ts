@@ -120,9 +120,41 @@ function buildShimScript(
 # Records invocation argv, cwd, env, and timing to a log file.
 set -u
 
+# Initialize ALL trap-referenced variables to safe defaults BEFORE
+# installing the EXIT trap, so a signal that interrupts the slow
+# per-invocation setup below (printenv loop, python3 calls) still
+# produces a log entry. The trap re-reads variables at __finalize-time,
+# so subsequent populating updates ARE visible — the defaults are only
+# used when the trap fires before setup completes (e.g., SIGINT
+# delivered to the bash process group during the python3 startup
+# window). Without this restructuring, the trap was installed AFTER
+# the python3 calls (~200-400ms), and a SIGINT during that window
+# would terminate bash before the trap was set, producing no log
+# entry — load-bearing for T-INST-116o / T-INST-116o2 which rely on
+# both workflows' shim invocations being recorded.
 START_MS=$(($(date +%s%N) / 1000000))
 SHIM_PID=$$
 SHIM_CWD="$(pwd -P)"
+ARGV_JSON="[]"
+ENV_JSON="{}"
+CWD_JSON="\\"\\""
+GITIGNORE_AT_START_JSON=""
+
+# Write log entry on exit (covers both normal exit and signal termination).
+__finalize() {
+  local end_ms=$(($(date +%s%N) / 1000000))
+  local entry="{"
+  entry+="\\"argv\\":$ARGV_JSON"
+  entry+=",\\"cwd\\":$CWD_JSON"
+  entry+=",\\"env\\":$ENV_JSON"
+  entry+=",\\"pid\\":$SHIM_PID"
+  entry+=",\\"startedAtMs\\":$START_MS"
+  entry+=",\\"endedAtMs\\":$end_ms"
+  entry+="$GITIGNORE_AT_START_JSON"
+  entry+="}"
+  printf '%s\\n' "$entry" >> ${logFile}
+}
+trap __finalize EXIT
 
 # Snapshot recorded env vars BEFORE bash mutates them further.
 declare -A RECORDED_ENV
@@ -139,7 +171,6 @@ sys.stdout.write(json.dumps(sys.argv[1]))' "$1"
 }
 
 # Snapshot .gitignore at the moment of spawn (BEFORE any other side effect).
-GITIGNORE_AT_START_JSON=""
 ${
   recordGitignoreAtStart
     ? `if [ -e ".gitignore" ] || [ -L ".gitignore" ]; then
@@ -162,25 +193,31 @@ fi`
     : ""
 }
 
-# Capture argv as a JSON array.
-ARGV_JSON="["
+# Capture argv as a JSON array. Build into a local-scope variable
+# atomically so an interrupting SIGINT during the python3 calls below
+# doesn't leave the trap-referenced ARGV_JSON in a partial state — the
+# default value ("[]") set above remains in place until the build
+# completes and assigns the final result in a single bash statement.
+__argv_local="["
 for i in "$@"; do
-  if [ "$ARGV_JSON" != "[" ]; then ARGV_JSON+=","; fi
-  ARGV_JSON+=$(__json_string "$i")
+  if [ "$__argv_local" != "[" ]; then __argv_local+=","; fi
+  __argv_local+=$(__json_string "$i")
 done
-ARGV_JSON+="]"
+__argv_local+="]"
+ARGV_JSON="$__argv_local"
 
-# Capture env as a JSON object.
-ENV_JSON="{"
+# Capture env as a JSON object. Same atomic-update pattern as ARGV_JSON.
+__env_local="{"
 __first=1
 for name in "\${!RECORDED_ENV[@]}"; do
-  if [ "$__first" = "0" ]; then ENV_JSON+=","; fi
+  if [ "$__first" = "0" ]; then __env_local+=","; fi
   __first=0
-  ENV_JSON+=$(__json_string "$name")
-  ENV_JSON+=":"
-  ENV_JSON+=$(__json_string "\${RECORDED_ENV[$name]}")
+  __env_local+=$(__json_string "$name")
+  __env_local+=":"
+  __env_local+=$(__json_string "\${RECORDED_ENV[$name]}")
 done
-ENV_JSON+="}"
+__env_local+="}"
+ENV_JSON="$__env_local"
 
 CWD_JSON=$(__json_string "$SHIM_CWD")
 
@@ -204,22 +241,6 @@ default = ${exitCode}
 wf = sys.argv[2]
 print(overrides.get(wf, default))
 ' '${exitCodeByWorkflowJson.replace(/'/g, "'\\''")}' "$WORKFLOW")
-
-# Write log entry on exit (covers both normal exit and signal termination).
-__finalize() {
-  local end_ms=$(($(date +%s%N) / 1000000))
-  local entry="{"
-  entry+="\\"argv\\":$ARGV_JSON"
-  entry+=",\\"cwd\\":$CWD_JSON"
-  entry+=",\\"env\\":$ENV_JSON"
-  entry+=",\\"pid\\":$SHIM_PID"
-  entry+=",\\"startedAtMs\\":$START_MS"
-  entry+=",\\"endedAtMs\\":$end_ms"
-  entry+="$GITIGNORE_AT_START_JSON"
-  entry+="}"
-  printf '%s\\n' "$entry" >> ${logFile}
-}
-trap __finalize EXIT
 
 ${trapLines}
 

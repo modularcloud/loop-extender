@@ -1008,32 +1008,38 @@ async function runAutoInstall(
       // `process.kill(-pid, sig)` plus a SPEC §7.3 5-second grace + SIGKILL
       // escalation. The child inherits stdin/stdout/stderr unchanged so the
       // npm streaming-passthrough contract from T-INST-119 holds.
+      //
+      // The spawn-and-wait is split across two awaits so the
+      // `child-active-after-failure` pause seam (TEST-SPEC §1.4) can fire
+      // AFTER spawn but BEFORE child exit. The first phase (synchronous)
+      // sets up the spawn and prepares an exit-promise; the optional seam
+      // pause then runs (early-returning when the harness delivers a
+      // signal); the second phase awaits the exit promise to learn the
+      // child's terminal outcome.
       try {
-        await new Promise<void>((resolve, reject) => {
-          // TEST-SPEC §1.4 `npm-spawn-fail` seam: synthesize an ENOENT
-          // spawn failure for the named workflow before any real spawn
-          // is attempted. The shape (`code: "ENOENT"`) matches what
-          // node's `child_process.spawn` produces when `npm` is not on
-          // PATH, so the existing ENOENT catch branch below records
-          // the failure identically to the production path. Production
-          // behavior is unaffected (NODE_ENV=test gating in
-          // getAutoInstallFault). T-INST-116m / 116m2 use this to
-          // deterministically reach the post-spawn-failure-first window.
-          if (fault.npmSpawnFail.has(workflowName)) {
-            reject(
-              Object.assign(new Error("spawn npm ENOENT"), {
-                code: "ENOENT",
-              })
-            );
-            return;
-          }
-          const child = spawn("npm", ["install"], {
-            cwd: workflowDir,
-            stdio: "inherit",
-            env: process.env,
-            detached: true,
+        // TEST-SPEC §1.4 `npm-spawn-fail` seam: synthesize an ENOENT
+        // spawn failure for the named workflow before any real spawn
+        // is attempted. The shape (`code: "ENOENT"`) matches what
+        // node's `child_process.spawn` produces when `npm` is not on
+        // PATH, so the existing ENOENT catch branch below records
+        // the failure identically to the production path. Production
+        // behavior is unaffected (NODE_ENV=test gating in
+        // getAutoInstallFault). T-INST-116m / 116m2 use this to
+        // deterministically reach the post-spawn-failure-first window.
+        if (fault.npmSpawnFail.has(workflowName)) {
+          throw Object.assign(new Error("spawn npm ENOENT"), {
+            code: "ENOENT",
           });
-          if (signalContext) signalContext.setActiveNpmChild(child);
+        }
+        const child = spawn("npm", ["install"], {
+          cwd: workflowDir,
+          stdio: "inherit",
+          env: process.env,
+          detached: true,
+        });
+        if (signalContext) signalContext.setActiveNpmChild(child);
+        const activeChildPid = child.pid;
+        const spawnExitPromise = new Promise<void>((resolve, reject) => {
           child.on("error", (err) => {
             if (signalContext) signalContext.setActiveNpmChild(null);
             // Spawn failure (most commonly: npm not on PATH → ENOENT).
@@ -1062,6 +1068,74 @@ async function runAutoInstall(
             }
           });
         });
+        // Attach a noop catch immediately so Node doesn't flag the
+        // rejection as unhandled when the child exits during the
+        // optional seam pause (await pauseAutoInstallSeam) below —
+        // Node 25's default unhandled-rejection-is-fatal behavior
+        // would crash the process between the rejection landing and
+        // our `await spawnExitPromise` attaching its own handler.
+        // The original `spawnExitPromise` retains its rejection state
+        // and our await still throws normally.
+        spawnExitPromise.catch(() => {});
+
+        // ─────────────────────────────────────────────────────────────────
+        // Child-active-after-failure pause seam dispatch (TEST-SPEC §1.4
+        // LOOPX_TEST_AUTOINSTALL_PAUSE). Fires AFTER the `spawn("npm",
+        // "install")` call has produced a live child for THIS workflow
+        // AND at least one prior workflow's auto-install failure has
+        // been recorded into the `failures` accumulator, BEFORE the
+        // child-exit promise is awaited. The marker payload reports
+        // `current` as the active-child workflow, `processed` as the
+        // workflows whose iterations completed BEFORE this one (i.e.,
+        // includes the workflow whose failure put `failures.length >=
+        // 1`), `remaining` as the workflows after this one, and
+        // `activeChildPid` as the just-spawned npm child PID (the
+        // process-group leader for `detached: true` spawns) so the
+        // harness can verify post-exit termination via `kill -0 <pid>`
+        // without depending on the shim log (unobservable while the
+        // shim is alive) or the shim's `pidFile` write (which races
+        // against the marker write).
+        //
+        // Pins SPEC §10.10's active-child × prior-failure-suppression
+        // sentence (resolving P-0004-05): when a signal arrives during
+        // the pause, the existing CLI signal handler in bin.ts forwards
+        // the signal to `activeChildPid`'s process group, the child
+        // dies, the spawn-exit promise rejects with NPM_SIGNAL,
+        // sigObserved is true → the catch branch suppresses the
+        // per-workflow failure entry, the head-of-iteration check on
+        // the next iteration aborts the pass, and the end-of-pass
+        // signal-suppression guard at the bottom of `runAutoInstall`
+        // returns 0 BEFORE the aggregate failure report is written
+        // — preserving the prior failures from the accumulator without
+        // emitting the report.
+        //
+        // Ordinal-only (`child-active-after-failure`); no named form
+        // declared. Skipped when no failure has been recorded
+        // (`failures.length === 0`) so a fresh active-child window for
+        // the FIRST workflow does not match — that window is covered by
+        // the existing `pre-spawn-first` seam and the T-INST-116/116a
+        // single-workflow signal-during-npm-install tests instead.
+        // ─────────────────────────────────────────────────────────────────
+        if (
+          pauseSpec &&
+          pauseSpec.kind === "ordinal" &&
+          pauseSpec.window === "child-active-after-failure" &&
+          failures.length >= 1 &&
+          activeChildPid !== undefined
+        ) {
+          await pauseAutoInstallSeam(
+            "child-active-after-failure",
+            {
+              current: workflowName,
+              processed: [...processed],
+              remaining: committed.slice(i + 1),
+              activeChildPid,
+            },
+            signalContext
+          );
+        }
+
+        await spawnExitPromise;
         // Resolved: child exited successfully (code 0).
         npmExitObserved = true;
       } catch (err) {

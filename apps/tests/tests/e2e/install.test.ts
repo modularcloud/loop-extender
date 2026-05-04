@@ -8723,6 +8723,311 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         });
       }, { timeout: 60_000, retry: 2 });
 
+      // ─────────────────────────────────────────────────────────
+      // SIGINT/SIGTERM during npm install — active-child ×
+      // prior-failure-suppression window
+      // (T-INST-116o / T-INST-116o2)
+      // SPEC §10.10's active-child-signal × prior-failure-suppression
+      // sentence (added this cycle resolving P-0004-05): when SIGINT /
+      // SIGTERM arrives while an `npm install` child is active for a
+      // workflow whose processing began AFTER a prior workflow's
+      // auto-install failure has been recorded into the aggregate
+      // accumulator, the not-yet-emitted aggregate failure report is
+      // suppressed under the same rule as the no-active-child signal
+      // case.
+      //
+      // Fixture: 2 workflows, each fails with `npm install` non-zero
+      // exit after a 30-second sleep — both fail under any
+      // implementation-defined auto-install order. By the time the
+      // second-processed workflow's npm child has been spawned, the
+      // first-processed workflow's NPM_NONZERO_EXIT failure has
+      // already been recorded into `failures`. The seam fires AFTER
+      // the second workflow's `spawn("npm", "install")` produces a
+      // live child AND `failures.length >= 1`, BEFORE the spawn-exit
+      // promise is awaited. The marker carries `activeChildPid` from
+      // loopx's own `child.pid` (the process-group leader for
+      // `detached: true` spawns) so the harness can verify
+      // post-exit termination via `kill -0 <pid>` without depending
+      // on the shim log (unobservable while the shim is alive) or
+      // the shim's `pidFile` write (which races against the marker
+      // write).
+      //
+      // The load-bearing assertion (c) — aggregate-report suppression
+      // on the active-child × prior-failure observation — pins the
+      // new SPEC §10.10 clause; a buggy implementation that emitted
+      // the aggregate report in this case (the alternate
+      // "preservation" reading rejected by SPEC) would surface the
+      // first-processed workflow's failure entry on stderr after the
+      // signal observation and fail (c).
+      //
+      // Representative coverage: covers `npm install` non-zero exit
+      // as the prior-failure category. Other prior-failure categories
+      // (`.gitignore` safeguard failure, `npm install` spawn failure)
+      // require additional ordinal-targeted FAULT seams to
+      // deterministically observe — see TEST-SPEC §3
+      // T-INST-116o-other-categories for the explicit known-gap
+      // documentation.
+      //
+      // T-INST-116o: SIGINT axis.
+      // T-INST-116o2: SIGTERM axis (parity).
+      // ─────────────────────────────────────────────────────────
+
+      it("T-INST-116o: SIGINT during child-active-after-failure window — aggregate report suppressed despite prior failure entry", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        const markerPath = join(project.dir, "autoinstall-pause-marker.json");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          {
+            exitCodeByWorkflow: { alpha: 1, beta: 1 },
+            sleepByWorkflow: { alpha: 30, beta: 30 },
+            logFile,
+          },
+          async (fake) => {
+            const { result, sendSignal } = runCLIWithSignal(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                timeout: 90_000,
+                env: {
+                  NODE_ENV: "test",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE: "child-active-after-failure",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+                },
+              },
+            );
+
+            // Poll for the marker file. Per TEST-SPEC §1.4, loopx
+            // writes + fsyncs the marker BEFORE the bounded-delay
+            // timer starts, so polling is race-free. The seam fires
+            // AFTER the second-processed workflow's npm child is
+            // spawned AND the first-processed workflow's failure has
+            // been recorded into `failures` — i.e., after roughly
+            // 30 s of sleep for the first-processed workflow.
+            const pauseDeadline = Date.now() + 60_000;
+            while (!existsSync(markerPath)) {
+              if (Date.now() > pauseDeadline) {
+                sendSignal("SIGINT");
+                await result;
+                throw new Error("Timed out waiting for pause marker");
+              }
+              await new Promise((r) => setTimeout(r, 50));
+            }
+            const marker = JSON.parse(readFileSync(markerPath, "utf-8"));
+            expect(marker.window).toBe("child-active-after-failure");
+
+            // marker.processed contains exactly one workflow name (the
+            // first-processed one whose failure put `failures.length >= 1`).
+            const processed = marker.processed as string[];
+            expect(processed.length).toBe(1);
+            expect(["alpha", "beta"]).toContain(processed[0]);
+            // marker.current is the OTHER workflow (the active-child one
+            // whose npm child was just spawned).
+            const currentWorkflow = marker.current as string;
+            expect(["alpha", "beta"]).toContain(currentWorkflow);
+            expect(currentWorkflow).not.toBe(processed[0]);
+            // marker.remaining is empty (no further workflows).
+            expect(marker.remaining).toEqual([]);
+            // marker.activeChildPid is loopx's own knowledge of the
+            // just-spawned npm child PID (the process-group leader for
+            // `detached: true` spawns).
+            const activeChildPid = marker.activeChildPid as number;
+            expect(typeof activeChildPid).toBe("number");
+            expect(Number.isFinite(activeChildPid)).toBe(true);
+            expect(activeChildPid).toBeGreaterThan(0);
+
+            sendSignal("SIGINT");
+            const r = await result;
+
+            // (a) Exit 130 (128 + SIGINT) — the signal supersedes
+            // the would-be exit code 1 from the recorded failure
+            // per SPEC §10.10's "128 + signal number" clause.
+            expect(r.exitCode).toBe(130);
+
+            // (b) The active npm child (whose PID is the marker's
+            // activeChildPid) is no longer in the process table —
+            // verify via `kill -0 <pid>` returning non-zero. The
+            // bin.ts signal handler forwarded SIGINT to the child's
+            // process group via `process.kill(-pid, "SIGINT")`, the
+            // shim's bash process died (SIGINT default disposition),
+            // and the EXIT trap recorded the invocation before bash
+            // truly terminated.
+            let stillAlive = false;
+            try {
+              process.kill(activeChildPid, 0);
+              stillAlive = true;
+            } catch {
+              stillAlive = false;
+            }
+            expect(stillAlive).toBe(false);
+
+            // (c) NO aggregate failure report on stderr — load-bearing
+            // suppression assertion. The first-processed workflow's
+            // NPM_NONZERO_EXIT failure was recorded into `failures`
+            // BEFORE the signal arrived, but the end-of-pass
+            // signal-suppression guard at the bottom of `runAutoInstall`
+            // returns 0 BEFORE emitting the report. A buggy
+            // implementation that emitted the aggregate report in this
+            // case would surface the first-processed workflow's failure
+            // entry on stderr after the signal observation and fail
+            // here.
+            expect(r.stderr).not.toMatch(/auto-install failures/);
+
+            // (d) Both committed workflow directories preserved
+            // byte-for-byte from the source. SPEC §10.10's "Committed
+            // workflow files are not rolled back" / SPEC §10.9's
+            // narrowed install-failure-cleanup scope: signal
+            // termination at this stage does not roll back the
+            // file-level install. Any `.gitignore` synthesized for
+            // either workflow before its `npm install` child was
+            // spawned remains on disk.
+            for (const w of ["alpha", "beta"]) {
+              const indexPath = join(project!.loopxDir, w, "index.sh");
+              const pkgPath = join(project!.loopxDir, w, "package.json");
+              expect(existsSync(indexPath)).toBe(true);
+              expect(readFileSync(indexPath, "utf-8")).toBe(BASH_STOP);
+              const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+              expect(pkg.name).toBe(w);
+              expect(pkg.version).toBe("1.0.0");
+            }
+
+            // (e) The shim log records exactly two invocations — the
+            // first-processed workflow's full sleep-and-exit cycle
+            // (~30 s, exit code 1) and the second-processed
+            // workflow's spawn that was interrupted by the signal
+            // (EXIT trap fires from signal-induced bash termination).
+            // Guards against any over-eager spawn after the signal
+            // observation.
+            const invocations = fake.readInvocations();
+            expect(invocations.length).toBe(2);
+          },
+        );
+      }, { timeout: 90_000, retry: 2 });
+
+      it("T-INST-116o2: SIGTERM during child-active-after-failure window — SIGTERM-axis parity", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        const markerPath = join(project.dir, "autoinstall-pause-marker.json");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm(
+          {
+            exitCodeByWorkflow: { alpha: 1, beta: 1 },
+            sleepByWorkflow: { alpha: 30, beta: 30 },
+            logFile,
+          },
+          async (fake) => {
+            const { result, sendSignal } = runCLIWithSignal(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                timeout: 90_000,
+                env: {
+                  NODE_ENV: "test",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE: "child-active-after-failure",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+                },
+              },
+            );
+
+            const pauseDeadline = Date.now() + 60_000;
+            while (!existsSync(markerPath)) {
+              if (Date.now() > pauseDeadline) {
+                sendSignal("SIGTERM");
+                await result;
+                throw new Error("Timed out waiting for pause marker");
+              }
+              await new Promise((r) => setTimeout(r, 50));
+            }
+            const marker = JSON.parse(readFileSync(markerPath, "utf-8"));
+            expect(marker.window).toBe("child-active-after-failure");
+            const processed = marker.processed as string[];
+            expect(processed.length).toBe(1);
+            expect(["alpha", "beta"]).toContain(processed[0]);
+            const currentWorkflow = marker.current as string;
+            expect(["alpha", "beta"]).toContain(currentWorkflow);
+            expect(currentWorkflow).not.toBe(processed[0]);
+            expect(marker.remaining).toEqual([]);
+            const activeChildPid = marker.activeChildPid as number;
+            expect(typeof activeChildPid).toBe("number");
+            expect(Number.isFinite(activeChildPid)).toBe(true);
+            expect(activeChildPid).toBeGreaterThan(0);
+
+            sendSignal("SIGTERM");
+            const r = await result;
+
+            // (a) Exit 143 (128 + SIGTERM).
+            expect(r.exitCode).toBe(143);
+
+            // (b) Active npm child terminated.
+            let stillAlive = false;
+            try {
+              process.kill(activeChildPid, 0);
+              stillAlive = true;
+            } catch {
+              stillAlive = false;
+            }
+            expect(stillAlive).toBe(false);
+
+            // (c) Aggregate report suppressed under SIGTERM — pins
+            // SPEC §10.10's SIGINT / SIGTERM parity for the new
+            // active-child × prior-failure-suppression clause. A
+            // buggy implementation that handled SIGINT correctly but
+            // mishandled SIGTERM via a separate signal-handler
+            // dispatch path would pass T-INST-116o and fail here.
+            expect(r.stderr).not.toMatch(/auto-install failures/);
+
+            // (d) Committed workflow files preserved byte-for-byte.
+            for (const w of ["alpha", "beta"]) {
+              const indexPath = join(project!.loopxDir, w, "index.sh");
+              const pkgPath = join(project!.loopxDir, w, "package.json");
+              expect(existsSync(indexPath)).toBe(true);
+              expect(readFileSync(indexPath, "utf-8")).toBe(BASH_STOP);
+              const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+              expect(pkg.name).toBe(w);
+              expect(pkg.version).toBe("1.0.0");
+            }
+
+            // (e) Two shim invocations recorded.
+            const invocations = fake.readInvocations();
+            expect(invocations.length).toBe(2);
+          },
+        );
+      }, { timeout: 90_000, retry: 2 });
+
       it("T-INST-118: packageManager field does NOT cause loopx to select a different manager", async () => {
         project = await createTempProject();
         const logFile = join(project.dir, "fake-npm.log");
