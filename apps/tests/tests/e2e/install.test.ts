@@ -6071,6 +6071,183 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         );
       });
 
+      // ─────────────────────────────────────────────────────────
+      // Multi-workflow no-further-processing guarantee
+      // (T-INST-116b / T-INST-116b2)
+      // SPEC §10.10: "Signals during `npm install`" — remaining
+      // committed workflows are not processed (no further `.gitignore`
+      // synthesis or `npm install` invocations). Multi-workflow source
+      // alpha/beta/gamma, each with index.sh + package.json and no
+      // pre-existing .gitignore, with `withFakeNpm({ sleepSeconds: 30 })`
+      // so every invocation sleeps; the signal arrives during whichever
+      // workflow was processed first. Order-independent assertions key
+      // on "exactly one invocation, exactly one synthesized .gitignore"
+      // rather than hard-coding the auto-install order.
+      // ─────────────────────────────────────────────────────────
+
+      it("T-INST-116b: SIGINT during npm install — remaining workflows are not processed (no further npm or .gitignore)", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ sleepSeconds: 30, logFile }, async (fake) => {
+          const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+            ["install", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+          await waitForStderr("ready", { timeoutMs: 30_000 });
+          sendSignal("SIGINT");
+          const r = await result;
+
+          // (a) Exit 130 (128 + SIGINT).
+          expect(r.exitCode).toBe(130);
+
+          // (b) Exactly one shim invocation, against one of the three
+          // workflow names. Order is implementation-defined; we key on
+          // count and derive the first-processed workflow name from the
+          // log entry's cwd basename.
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(1);
+          const firstWorkflow = invocations[0].cwd.split("/").pop();
+          expect(["alpha", "beta", "gamma"]).toContain(firstWorkflow);
+
+          // (c) Only the first-processed workflow's directory contains
+          // a synthesized .gitignore.
+          const firstGitignore = join(
+            project!.loopxDir,
+            firstWorkflow!,
+            ".gitignore",
+          );
+          expect(existsSync(firstGitignore)).toBe(true);
+          expect(readFileSync(firstGitignore, "utf-8")).toBe("node_modules\n");
+
+          // (d) The other two workflow directories do NOT have a
+          // synthesized .gitignore — the auto-install pass was
+          // interrupted before it reached them, and .gitignore
+          // synthesis is gated by the same per-workflow trigger as
+          // `npm install`.
+          for (const wf of ["alpha", "beta", "gamma"]) {
+            if (wf === firstWorkflow) continue;
+            const gitignorePath = join(project!.loopxDir, wf, ".gitignore");
+            expect(existsSync(gitignorePath)).toBe(false);
+          }
+
+          // (e) All three committed workflow directories still exist
+          // with their committed files byte-for-byte from the source —
+          // committed workflow files are not rolled back under SPEC
+          // 10.10's signal-termination clause.
+          for (const wf of ["alpha", "beta", "gamma"]) {
+            const indexPath = join(project!.loopxDir, wf, "index.sh");
+            const pkgPath = join(project!.loopxDir, wf, "package.json");
+            expect(existsSync(indexPath)).toBe(true);
+            expect(readFileSync(indexPath, "utf-8")).toBe(BASH_STOP);
+            const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+            expect(pkg.name).toBe(wf);
+            expect(pkg.version).toBe("1.0.0");
+          }
+
+          // No aggregate failure report on the signal-termination path.
+          expect(r.stderr).not.toMatch(/auto-install failures/);
+        });
+      });
+
+      it("T-INST-116b2: SIGTERM during npm install — remaining workflows are not processed (SIGTERM-axis parity)", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ sleepSeconds: 30, logFile }, async (fake) => {
+          const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+            ["install", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+          await waitForStderr("ready", { timeoutMs: 30_000 });
+          sendSignal("SIGTERM");
+          const r = await result;
+
+          // (a) Exit 143 (128 + SIGTERM).
+          expect(r.exitCode).toBe(143);
+
+          // (b) Exactly one shim invocation.
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(1);
+          const firstWorkflow = invocations[0].cwd.split("/").pop();
+          expect(["alpha", "beta", "gamma"]).toContain(firstWorkflow);
+
+          // (c) Only the first-processed workflow has a synthesized
+          // .gitignore.
+          const firstGitignore = join(
+            project!.loopxDir,
+            firstWorkflow!,
+            ".gitignore",
+          );
+          expect(existsSync(firstGitignore)).toBe(true);
+          expect(readFileSync(firstGitignore, "utf-8")).toBe("node_modules\n");
+
+          // (d) The other two workflow directories do NOT have a
+          // synthesized .gitignore.
+          for (const wf of ["alpha", "beta", "gamma"]) {
+            if (wf === firstWorkflow) continue;
+            const gitignorePath = join(project!.loopxDir, wf, ".gitignore");
+            expect(existsSync(gitignorePath)).toBe(false);
+          }
+
+          // (e) All three committed workflow directories still exist
+          // byte-for-byte from the source.
+          for (const wf of ["alpha", "beta", "gamma"]) {
+            const indexPath = join(project!.loopxDir, wf, "index.sh");
+            const pkgPath = join(project!.loopxDir, wf, "package.json");
+            expect(existsSync(indexPath)).toBe(true);
+            expect(readFileSync(indexPath, "utf-8")).toBe(BASH_STOP);
+            const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+            expect(pkg.name).toBe(wf);
+            expect(pkg.version).toBe("1.0.0");
+          }
+
+          expect(r.stderr).not.toMatch(/auto-install failures/);
+        });
+      });
+
       it("T-INST-118: packageManager field does NOT cause loopx to select a different manager", async () => {
         project = await createTempProject();
         const logFile = join(project.dir, "fake-npm.log");
