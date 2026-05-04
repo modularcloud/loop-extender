@@ -8157,6 +8157,255 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         });
       });
 
+      // ─────────────────────────────────────────────────────────
+      // SIGINT/SIGTERM during the auto-install pass — no-active-child
+      // before-first-workflow ordinal window
+      // (T-INST-116n / T-INST-116n2)
+      // SPEC §10.10 "Signals during the auto-install pass when no
+      // npm child is active": the no-active-child contract must
+      // hold even at the very top of the auto-install pass — BEFORE
+      // the first workflow's iteration body begins. The marker
+      // payload reports `processed = []` (no workflow's iteration
+      // has started), `current = committed[0]` (upcoming first
+      // workflow), and `remaining = committed.slice(1)` (the others).
+      // The load-bearing observation: an implementation that wires
+      // its no-active-child signal handling only into the
+      // per-workflow loop body (e.g., one that checks for
+      // `receivedSignal` before each workflow's safeguard but skips
+      // the check on the very first iteration's pre-pass setup)
+      // would pass T-INST-116h/116i/116j/116k/116m and fail this
+      // test. With ZERO workflows processed and an EMPTY `failures`
+      // accumulator, the aggregate report is structurally
+      // unreachable and the suppression guard is the only thing
+      // standing between the seam-injected pause and a clean exit.
+      // T-INST-116n: SIGINT axis.
+      // T-INST-116n2: SIGTERM axis (parity).
+      // ─────────────────────────────────────────────────────────
+
+      it("T-INST-116n: SIGINT during before-first-workflow window — zero workflows processed, no .gitignore on disk anywhere", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        const markerPath = join(project.dir, "autoinstall-pause-marker.json");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const { result, sendSignal } = runCLIWithSignal(
+            ["install", `${gitServer!.url}/multi.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              timeout: 60_000,
+              env: {
+                NODE_ENV: "test",
+                LOOPX_TEST_AUTOINSTALL_PAUSE: "before-first-workflow",
+                LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+              },
+            },
+          );
+
+          // Poll for the marker file (the seam writes + fsyncs it
+          // before the bounded delay begins, so polling is race-free).
+          const pauseDeadline = Date.now() + 30_000;
+          while (!existsSync(markerPath)) {
+            if (Date.now() > pauseDeadline) {
+              sendSignal("SIGINT");
+              await result;
+              throw new Error("Timed out waiting for pause marker");
+            }
+            await new Promise((r) => setTimeout(r, 50));
+          }
+          const marker = JSON.parse(readFileSync(markerPath, "utf-8"));
+          expect(marker.window).toBe("before-first-workflow");
+          // `processed` is empty: no workflow's iteration has started
+          // when the seam fires.
+          expect(marker.processed).toEqual([]);
+          const upcoming = marker.current as string;
+          expect(["alpha", "beta", "gamma"]).toContain(upcoming);
+          const remaining = marker.remaining as string[];
+          expect(remaining.length).toBe(2);
+          for (const w of remaining) {
+            expect(["alpha", "beta", "gamma"]).toContain(w);
+            expect(w).not.toBe(upcoming);
+          }
+          const allWorkflows = [upcoming, ...remaining];
+          expect(new Set(allWorkflows)).toEqual(
+            new Set(["alpha", "beta", "gamma"]),
+          );
+
+          sendSignal("SIGINT");
+          const r = await result;
+
+          // (a) Exit 130 (128 + SIGINT).
+          expect(r.exitCode).toBe(130);
+
+          // (b) Zero shim invocations — the head-of-loop signal-check
+          // guard at the top of the per-workflow loop short-circuits
+          // ALL workflows the moment SIGINT is observed, so npm
+          // install is never spawned.
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(0);
+
+          // (c) NO `.gitignore` exists on disk for any workflow —
+          // the safeguard's synthesis side effect never ran for
+          // any workflow because no per-workflow body executed.
+          for (const w of ["alpha", "beta", "gamma"]) {
+            expect(existsSync(join(project!.loopxDir, w, ".gitignore"))).toBe(
+              false,
+            );
+          }
+
+          // (d) All three committed workflow directories preserved
+          // byte-for-byte from the source — committed workflow
+          // files are not rolled back under SPEC §10.10's
+          // signal-termination clause.
+          for (const w of ["alpha", "beta", "gamma"]) {
+            const indexPath = join(project!.loopxDir, w, "index.sh");
+            const pkgPath = join(project!.loopxDir, w, "package.json");
+            expect(existsSync(indexPath)).toBe(true);
+            expect(readFileSync(indexPath, "utf-8")).toBe(BASH_STOP);
+            const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+            expect(pkg.name).toBe(w);
+            expect(pkg.version).toBe("1.0.0");
+          }
+
+          // (e) No aggregate failure report on stderr. With
+          // `failures` empty (no workflow's iteration ran), the
+          // aggregate-report block is structurally unreachable; the
+          // suppression guard at end-of-pass returns 0 before the
+          // report could be emitted. A buggy implementation that
+          // wired the dispatch into the loop body but skipped the
+          // pre-loop check would still produce no aggregate report
+          // here (because no failures were recorded), so this
+          // assertion is necessary but not sufficient — the
+          // load-bearing assertions are (b) zero shim invocations
+          // and (c) no `.gitignore` on disk anywhere.
+          expect(r.stderr).not.toMatch(/auto-install failures/);
+        });
+      });
+
+      it("T-INST-116n2: SIGTERM during before-first-workflow window — SIGTERM-axis parity", async () => {
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        const markerPath = join(project.dir, "autoinstall-pause-marker.json");
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const { result, sendSignal } = runCLIWithSignal(
+            ["install", `${gitServer!.url}/multi.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              timeout: 60_000,
+              env: {
+                NODE_ENV: "test",
+                LOOPX_TEST_AUTOINSTALL_PAUSE: "before-first-workflow",
+                LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+              },
+            },
+          );
+
+          const pauseDeadline = Date.now() + 30_000;
+          while (!existsSync(markerPath)) {
+            if (Date.now() > pauseDeadline) {
+              sendSignal("SIGTERM");
+              await result;
+              throw new Error("Timed out waiting for pause marker");
+            }
+            await new Promise((r) => setTimeout(r, 50));
+          }
+          const marker = JSON.parse(readFileSync(markerPath, "utf-8"));
+          expect(marker.window).toBe("before-first-workflow");
+          expect(marker.processed).toEqual([]);
+          const upcoming = marker.current as string;
+          expect(["alpha", "beta", "gamma"]).toContain(upcoming);
+          const remaining = marker.remaining as string[];
+          expect(remaining.length).toBe(2);
+          const allWorkflows = [upcoming, ...remaining];
+          expect(new Set(allWorkflows)).toEqual(
+            new Set(["alpha", "beta", "gamma"]),
+          );
+
+          sendSignal("SIGTERM");
+          const r = await result;
+
+          // (a) Exit 143 (128 + SIGTERM).
+          expect(r.exitCode).toBe(143);
+
+          // (b) Zero shim invocations — SIGTERM-axis parity for
+          // the no-spawn guarantee at the before-first-workflow
+          // window.
+          const invocations = fake.readInvocations();
+          expect(invocations.length).toBe(0);
+
+          // (c) No `.gitignore` on disk anywhere.
+          for (const w of ["alpha", "beta", "gamma"]) {
+            expect(existsSync(join(project!.loopxDir, w, ".gitignore"))).toBe(
+              false,
+            );
+          }
+
+          // (d) All three committed workflow directories preserved
+          // byte-for-byte.
+          for (const w of ["alpha", "beta", "gamma"]) {
+            const indexPath = join(project!.loopxDir, w, "index.sh");
+            const pkgPath = join(project!.loopxDir, w, "package.json");
+            expect(existsSync(indexPath)).toBe(true);
+            expect(readFileSync(indexPath, "utf-8")).toBe(BASH_STOP);
+            const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+            expect(pkg.name).toBe(w);
+            expect(pkg.version).toBe("1.0.0");
+          }
+
+          // (e) No aggregate failure report on stderr — SIGTERM-axis
+          // parity for the no-aggregate-report guarantee. A buggy
+          // implementation whose suppression rule was conditioned on
+          // SIGINT specifically (rather than the SPEC's SIGINT-or-SIGTERM
+          // normative pair) would pass T-INST-116n and fail this
+          // assertion.
+          expect(r.stderr).not.toMatch(/auto-install failures/);
+        });
+      });
+
       it("T-INST-118: packageManager field does NOT cause loopx to select a different manager", async () => {
         project = await createTempProject();
         const logFile = join(project.dir, "fake-npm.log");

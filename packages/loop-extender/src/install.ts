@@ -736,6 +736,53 @@ async function runAutoInstall(
   let safeguardFailureCount = 0;
   let spawnFailureCount = 0;
 
+  // ─────────────────────────────────────────────────────────────────────
+  // Before-first-workflow pause seam dispatch (TEST-SPEC §1.4
+  // LOOPX_TEST_AUTOINSTALL_PAUSE). Fires at the top of the auto-install
+  // pass, BEFORE the first workflow's iteration body begins — i.e.,
+  // before `committed[0]`'s package.json lstat / version check /
+  // `.gitignore` safeguard / `npm install` spawn. Marker payload reports
+  // `processed = []` (no workflow's iteration has started), `current =
+  // committed[0]` (upcoming first workflow), and `remaining =
+  // committed.slice(1)` (the other workflows). No `gitignoreStateAtPause`
+  // or `activeChildPid` field — neither concept applies in this window.
+  //
+  // Structurally distinct from `between-workflows-after-first` (which
+  // fires AFTER the first workflow's iteration completes) and
+  // `pre-spawn-first` (which fires DURING the first workflow's
+  // iteration, after its safeguard). Catches a buggy implementation
+  // that wires its no-active-child signal handling only into the
+  // per-workflow loop body (e.g., one that checks for `receivedSignal`
+  // before each workflow's safeguard but skips the check on the
+  // very first iteration's pre-pass setup).
+  //
+  // Ordinal-only — no named form. Skipped when `committed` is empty
+  // (no first workflow exists; the per-workflow loop is a no-op and
+  // the seam would have nothing meaningful to mark).
+  //
+  // After resuming from the pause, the head-of-loop signal-check
+  // guard at the top of the `for` loop observes the signal and
+  // `break`s, satisfying SPEC §10.10's "no further `.gitignore`
+  // safeguards or `npm install` children" guarantee with ZERO
+  // workflows processed.
+  // ─────────────────────────────────────────────────────────────────────
+  if (
+    pauseSpec &&
+    pauseSpec.kind === "ordinal" &&
+    pauseSpec.window === "before-first-workflow" &&
+    committed.length > 0
+  ) {
+    await pauseAutoInstallSeam(
+      "before-first-workflow",
+      {
+        current: committed[0],
+        processed: [],
+        remaining: committed.slice(1),
+      },
+      signalContext
+    );
+  }
+
   for (let i = 0; i < committed.length; i++) {
     const workflowName = committed[i];
     // SPEC §10.10 "Signals during the auto-install pass when no npm child is
