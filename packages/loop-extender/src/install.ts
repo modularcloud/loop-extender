@@ -14,6 +14,10 @@ import {
   readlinkSync,
   copyFileSync,
   realpathSync,
+  openSync,
+  writeSync,
+  closeSync,
+  fsyncSync,
 } from "node:fs";
 import { join, basename, extname } from "node:path";
 import {
@@ -123,6 +127,147 @@ function getAutoInstallFault(): AutoInstallFault {
     }
   }
   return fault;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Auto-install pause seam (TEST-SPEC §1.4 LOOPX_TEST_AUTOINSTALL_PAUSE).
+// Non-public, gated on NODE_ENV=test. Recognized window values pause the
+// auto-install pass at the named focal point for a bounded interval so
+// the test harness can deliver a signal during the otherwise sub-millisecond
+// window. The companion env var LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER names
+// an absolute path; loopx writes a parent-observable JSON marker to that
+// path (fsync'd, closed) before the bounded delay begins.
+// ─────────────────────────────────────────────────────────────────────
+
+type AutoInstallPauseSpec =
+  | {
+      kind: "ordinal";
+      window:
+        | "before-first-workflow"
+        | "between-workflows-after-first"
+        | "pre-spawn-first"
+        | "post-exit-first"
+        | "post-safeguard-failure-first"
+        | "post-spawn-failure-first"
+        | "child-active-after-failure"
+        | "post-aggregate-report";
+    }
+  | {
+      kind: "named";
+      window:
+        | "between-workflows"
+        | "pre-spawn"
+        | "post-exit"
+        | "post-safeguard-failure"
+        | "post-spawn-failure";
+      workflow: string;
+    };
+
+const AUTOINSTALL_PAUSE_ORDINALS = new Set<string>([
+  "before-first-workflow",
+  "between-workflows-after-first",
+  "pre-spawn-first",
+  "post-exit-first",
+  "post-safeguard-failure-first",
+  "post-spawn-failure-first",
+  "child-active-after-failure",
+  "post-aggregate-report",
+]);
+
+const AUTOINSTALL_PAUSE_NAMED = new Set<string>([
+  "between-workflows",
+  "pre-spawn",
+  "post-exit",
+  "post-safeguard-failure",
+  "post-spawn-failure",
+]);
+
+function getAutoInstallPause(): AutoInstallPauseSpec | null {
+  if (process.env.NODE_ENV !== "test") return null;
+  const raw = process.env.LOOPX_TEST_AUTOINSTALL_PAUSE;
+  if (!raw) return null;
+  if (AUTOINSTALL_PAUSE_ORDINALS.has(raw)) {
+    return {
+      kind: "ordinal",
+      window: raw as Extract<AutoInstallPauseSpec, { kind: "ordinal" }>["window"],
+    };
+  }
+  const colonIdx = raw.indexOf(":");
+  if (colonIdx > 0) {
+    const window = raw.slice(0, colonIdx);
+    const workflow = raw.slice(colonIdx + 1);
+    if (AUTOINSTALL_PAUSE_NAMED.has(window) && workflow) {
+      return {
+        kind: "named",
+        window: window as Extract<AutoInstallPauseSpec, { kind: "named" }>["window"],
+        workflow,
+      };
+    }
+  }
+  return null; // unknown / malformed → no-op
+}
+
+// Bounded pause interval per TEST-SPEC §1.4: ≥ 2 seconds, ≤ 10 seconds.
+// Long enough for the harness to deliver a signal, short enough to bound
+// test runtime if the harness fails to deliver one.
+const AUTOINSTALL_PAUSE_MS = 5000;
+// Polling resolution for early-resume on signal observation.
+const AUTOINSTALL_PAUSE_POLL_MS = 50;
+
+interface AutoInstallPausePayload {
+  current: string | null;
+  processed: string[];
+  remaining: string[];
+  activeChildPid?: number;
+  gitignoreStateAtPause?: unknown;
+}
+
+async function pauseAutoInstallSeam(
+  resolvedWindow: string,
+  payload: AutoInstallPausePayload,
+  signalContext?: InstallSignalContext
+): Promise<void> {
+  const markerPath = process.env.LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER;
+  if (markerPath) {
+    const marker: Record<string, unknown> = {
+      window: resolvedWindow,
+      current: payload.current,
+      processed: payload.processed,
+      remaining: payload.remaining,
+    };
+    if (payload.activeChildPid !== undefined) {
+      marker.activeChildPid = payload.activeChildPid;
+    }
+    if (payload.gitignoreStateAtPause !== undefined) {
+      marker.gitignoreStateAtPause = payload.gitignoreStateAtPause;
+    }
+    try {
+      const fd = openSync(markerPath, "w");
+      try {
+        writeSync(fd, JSON.stringify(marker));
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      // Per TEST-SPEC §1.4: "If LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER is unset
+      // or names a non-writable path, the seam still pauses for the bounded
+      // interval but the marker is not written."
+    }
+  }
+
+  // Bounded sleep with periodic signal polling so we can resume early when
+  // the harness delivers a signal during the pause; the head-of-iteration
+  // check then aborts the pass without waiting the full interval.
+  const start = Date.now();
+  while (Date.now() - start < AUTOINSTALL_PAUSE_MS) {
+    if (signalContext && signalContext.receivedSignal() !== null) {
+      return;
+    }
+    await new Promise<void>((resolve) =>
+      setTimeout(resolve, AUTOINSTALL_PAUSE_POLL_MS)
+    );
+  }
 }
 
 export async function installCommand(opts: InstallOptions): Promise<void> {
@@ -489,12 +634,23 @@ async function runAutoInstall(
 ): Promise<number> {
   const failures: AutoInstallFailure[] = [];
   const fault = getAutoInstallFault();
+  const pauseSpec = getAutoInstallPause();
   // Per SPEC §10.10: dedupe warnings across the whole install operation,
   // not just the auto-install pass. Seed with workflows already warned at
   // preflight time so we don't double-warn here.
   const warnedAbout = new Set<string>(warnedFromPreflight);
+  // Track per-workflow processing terminal state for the pause-seam marker
+  // payload (TEST-SPEC §1.4 LOOPX_TEST_AUTOINSTALL_PAUSE). `processed`
+  // accumulates workflow names whose iteration body ran to completion in
+  // the auto-install order; `npmChildExitCount` counts npm `child.on("exit")`
+  // observations (success and non-zero-exit and signal-terminated alike,
+  // but NOT spawn failures where no child existed) so the `post-exit-first`
+  // ordinal can fire on the first such observation.
+  const processed: string[] = [];
+  let npmChildExitCount = 0;
 
-  for (const workflowName of committed) {
+  for (let i = 0; i < committed.length; i++) {
+    const workflowName = committed[i];
     // SPEC §10.10 "Signals during the auto-install pass when no npm child is
     // active": at the head of each workflow iteration, check whether a signal
     // has been observed since the last child exited. If so, abort the pass
@@ -507,174 +663,232 @@ async function runAutoInstall(
     const workflowDir = join(loopxDir, workflowName);
     const pkgPath = join(workflowDir, "package.json");
 
-    // 1. Re-validate the committed package.json. SPEC §10.10:
-    //   - Absent → silent skip (no auto-install).
-    //   - Unreadable / invalid JSON / invalid semver / non-regular path
-    //     → emit at-most-one workflow-level warning (matching SPEC §3.2)
-    //       if not already emitted for this workflow during this install,
-    //       then silent skip auto-install (and the .gitignore safeguard).
-    let pkgLstat;
-    try {
-      pkgLstat = lstatSync(pkgPath);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "ENOENT") {
-        continue; // Silent skip: no top-level package.json.
-      }
-      // Other lstat failure → treat as malformed.
-      if (!warnedAbout.has(workflowName)) {
-        process.stderr.write(
-          `Warning: workflow '${workflowName}' package.json could not be read; skipping auto-install\n`
-        );
-        warnedAbout.add(workflowName);
-      }
-      continue;
-    }
-    // SPEC §3.2 / §10.10: a non-regular package.json (directory, symlink,
-    // FIFO, socket, etc.) is treated as malformed → warn + skip.
-    if (!pkgLstat.isFile()) {
-      if (!warnedAbout.has(workflowName)) {
-        process.stderr.write(
-          `Warning: workflow '${workflowName}' package.json is not a regular file; skipping auto-install\n`
-        );
-        warnedAbout.add(workflowName);
-      }
-      continue;
-    }
-    // Validate JSON / semver via checkWorkflowVersion.
-    const versionResult = checkWorkflowVersion(workflowDir, runningVersion);
-    let malformed = false;
-    switch (versionResult.kind) {
-      case "unreadable":
-        if (!warnedAbout.has(workflowName)) {
-          process.stderr.write(
-            `Warning: workflow '${workflowName}' package.json is unreadable (permission denied); skipping auto-install\n`
-          );
-          warnedAbout.add(workflowName);
-        }
-        malformed = true;
-        break;
-      case "invalid-json":
-        if (!warnedAbout.has(workflowName)) {
-          process.stderr.write(
-            `Warning: workflow '${workflowName}' package.json contains invalid JSON; skipping auto-install\n`
-          );
-          warnedAbout.add(workflowName);
-        }
-        malformed = true;
-        break;
-      case "invalid-semver":
-        if (!warnedAbout.has(workflowName)) {
-          process.stderr.write(
-            `Warning: workflow '${workflowName}' has an invalid semver specifier for loopx in package.json; skipping auto-install\n`
-          );
-          warnedAbout.add(workflowName);
-        }
-        malformed = true;
-        break;
-      // satisfied / mismatched / no-loopx-declared / no-package-json:
-      // none of these block auto-install (mismatched is a §10.6 preflight
-      // concern that already gated commit).
-      default:
-        break;
-    }
-    if (malformed) continue;
+    // Per-iteration tracking for the auto-install pause seam.
+    let npmExitObserved = false;
 
-    // 2. Run the .gitignore safeguard.
-    const gitignoreOk = runGitignoreSafeguard(workflowDir, workflowName, fault);
-    if (!gitignoreOk.ok) {
-      failures.push({ workflow: workflowName, reason: gitignoreOk.reason });
-      continue;
-    }
+    // Use IIFE to allow early-return semantics for skip / malformed / etc.
+    // without losing the end-of-iteration `processed.push` and pause-seam
+    // dispatch below.
+    await (async () => {
+      // 1. Re-validate the committed package.json. SPEC §10.10:
+      //   - Absent → silent skip (no auto-install).
+      //   - Unreadable / invalid JSON / invalid semver / non-regular path
+      //     → emit at-most-one workflow-level warning (matching SPEC §3.2)
+      //       if not already emitted for this workflow during this install,
+      //       then silent skip auto-install (and the .gitignore safeguard).
+      let pkgLstat;
+      try {
+        pkgLstat = lstatSync(pkgPath);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") {
+          return; // Silent skip: no top-level package.json.
+        }
+        // Other lstat failure → treat as malformed.
+        if (!warnedAbout.has(workflowName)) {
+          process.stderr.write(
+            `Warning: workflow '${workflowName}' package.json could not be read; skipping auto-install\n`
+          );
+          warnedAbout.add(workflowName);
+        }
+        return;
+      }
+      // SPEC §3.2 / §10.10: a non-regular package.json (directory, symlink,
+      // FIFO, socket, etc.) is treated as malformed → warn + skip.
+      if (!pkgLstat.isFile()) {
+        if (!warnedAbout.has(workflowName)) {
+          process.stderr.write(
+            `Warning: workflow '${workflowName}' package.json is not a regular file; skipping auto-install\n`
+          );
+          warnedAbout.add(workflowName);
+        }
+        return;
+      }
+      // Validate JSON / semver via checkWorkflowVersion.
+      const versionResult = checkWorkflowVersion(workflowDir, runningVersion);
+      let malformed = false;
+      switch (versionResult.kind) {
+        case "unreadable":
+          if (!warnedAbout.has(workflowName)) {
+            process.stderr.write(
+              `Warning: workflow '${workflowName}' package.json is unreadable (permission denied); skipping auto-install\n`
+            );
+            warnedAbout.add(workflowName);
+          }
+          malformed = true;
+          break;
+        case "invalid-json":
+          if (!warnedAbout.has(workflowName)) {
+            process.stderr.write(
+              `Warning: workflow '${workflowName}' package.json contains invalid JSON; skipping auto-install\n`
+            );
+            warnedAbout.add(workflowName);
+          }
+          malformed = true;
+          break;
+        case "invalid-semver":
+          if (!warnedAbout.has(workflowName)) {
+            process.stderr.write(
+              `Warning: workflow '${workflowName}' has an invalid semver specifier for loopx in package.json; skipping auto-install\n`
+            );
+            warnedAbout.add(workflowName);
+          }
+          malformed = true;
+          break;
+        // satisfied / mismatched / no-loopx-declared / no-package-json:
+        // none of these block auto-install (mismatched is a §10.6 preflight
+        // concern that already gated commit).
+        default:
+          break;
+      }
+      if (malformed) return;
 
-    // 3. Spawn `npm install`.
-    //
-    // SPEC §10.10 "Signals during `npm install`": SIGINT / SIGTERM received
-    // while an `npm install` child is active propagates to the child's
-    // process group. We spawn detached so the child becomes its own process
-    // group leader; the CLI signal handlers (bin.ts) consult the
-    // signalContext's active-child slot and forward the signal via
-    // `process.kill(-pid, sig)` plus a SPEC §7.3 5-second grace + SIGKILL
-    // escalation. The child inherits stdin/stdout/stderr unchanged so the
-    // npm streaming-passthrough contract from T-INST-119 holds.
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const child = spawn("npm", ["install"], {
-          cwd: workflowDir,
-          stdio: "inherit",
-          env: process.env,
-          detached: true,
+      // 2. Run the .gitignore safeguard.
+      const gitignoreOk = runGitignoreSafeguard(workflowDir, workflowName, fault);
+      if (!gitignoreOk.ok) {
+        failures.push({ workflow: workflowName, reason: gitignoreOk.reason });
+        return;
+      }
+
+      // 3. Spawn `npm install`.
+      //
+      // SPEC §10.10 "Signals during `npm install`": SIGINT / SIGTERM received
+      // while an `npm install` child is active propagates to the child's
+      // process group. We spawn detached so the child becomes its own process
+      // group leader; the CLI signal handlers (bin.ts) consult the
+      // signalContext's active-child slot and forward the signal via
+      // `process.kill(-pid, sig)` plus a SPEC §7.3 5-second grace + SIGKILL
+      // escalation. The child inherits stdin/stdout/stderr unchanged so the
+      // npm streaming-passthrough contract from T-INST-119 holds.
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const child = spawn("npm", ["install"], {
+            cwd: workflowDir,
+            stdio: "inherit",
+            env: process.env,
+            detached: true,
+          });
+          if (signalContext) signalContext.setActiveNpmChild(child);
+          child.on("error", (err) => {
+            if (signalContext) signalContext.setActiveNpmChild(null);
+            // Spawn failure (most commonly: npm not on PATH → ENOENT).
+            reject(err);
+          });
+          child.on("exit", (code, signal) => {
+            if (signalContext) signalContext.setActiveNpmChild(null);
+            if (signal) {
+              reject(
+                Object.assign(new Error(`npm install terminated by ${signal}`), {
+                  code: "NPM_SIGNAL",
+                  signal,
+                })
+              );
+              return;
+            }
+            if (code === 0) {
+              resolve();
+            } else {
+              reject(
+                Object.assign(
+                  new Error(`npm install exited with code ${code}`),
+                  { code: "NPM_NONZERO_EXIT", exitCode: code }
+                )
+              );
+            }
+          });
         });
-        if (signalContext) signalContext.setActiveNpmChild(child);
-        child.on("error", (err) => {
-          if (signalContext) signalContext.setActiveNpmChild(null);
-          // Spawn failure (most commonly: npm not on PATH → ENOENT).
-          reject(err);
-        });
-        child.on("exit", (code, signal) => {
-          if (signalContext) signalContext.setActiveNpmChild(null);
-          if (signal) {
-            reject(
-              Object.assign(new Error(`npm install terminated by ${signal}`), {
-                code: "NPM_SIGNAL",
-                signal,
-              })
-            );
-            return;
-          }
-          if (code === 0) {
-            resolve();
-          } else {
-            reject(
-              Object.assign(
-                new Error(`npm install exited with code ${code}`),
-                { code: "NPM_NONZERO_EXIT", exitCode: code }
-              )
-            );
-          }
-        });
-      });
-    } catch (err) {
-      const e = err as NodeJS.ErrnoException & {
-        code?: string;
-        exitCode?: number;
-        signal?: NodeJS.Signals;
-      };
-      // SPEC §10.10 "Signals during `npm install`": when the npm child was
-      // terminated by a forwarded SIGINT / SIGTERM (originating from the CLI
-      // signal handler in bin.ts), the surfacing terminal outcome is the
-      // signal itself, not a per-workflow auto-install failure. Suppress the
-      // failure entry in that case so the aggregate report does not list a
-      // signal-induced exit as if it were an install error. The pass also
-      // breaks immediately after this iteration (the head-of-loop check on
-      // receivedSignal aborts further workflows).
-      const sigObserved =
-        signalContext !== undefined &&
-        signalContext.receivedSignal() !== null;
-      if (e.code === "NPM_SIGNAL" && sigObserved) {
-        // Skip recording — terminal outcome is the signal.
-      } else if (e.code === "ENOENT") {
-        failures.push({
-          workflow: workflowName,
-          reason: "npm install spawn failed (npm not found on PATH)",
-        });
-      } else if (e.code === "NPM_NONZERO_EXIT") {
-        failures.push({
-          workflow: workflowName,
-          reason: `npm install exited with code ${e.exitCode}`,
-        });
-      } else if (e.code === "NPM_SIGNAL") {
-        failures.push({
-          workflow: workflowName,
-          reason: `npm install terminated by signal ${e.signal}`,
-        });
-      } else {
-        failures.push({
-          workflow: workflowName,
-          reason: `npm install failed: ${e.message}`,
-        });
+        // Resolved: child exited successfully (code 0).
+        npmExitObserved = true;
+      } catch (err) {
+        const e = err as NodeJS.ErrnoException & {
+          code?: string;
+          exitCode?: number;
+          signal?: NodeJS.Signals;
+        };
+        // SPEC §10.10 "Signals during `npm install`": when the npm child was
+        // terminated by a forwarded SIGINT / SIGTERM (originating from the CLI
+        // signal handler in bin.ts), the surfacing terminal outcome is the
+        // signal itself, not a per-workflow auto-install failure. Suppress the
+        // failure entry in that case so the aggregate report does not list a
+        // signal-induced exit as if it were an install error. The pass also
+        // breaks immediately after this iteration (the head-of-loop check on
+        // receivedSignal aborts further workflows).
+        const sigObserved =
+          signalContext !== undefined &&
+          signalContext.receivedSignal() !== null;
+        if (e.code === "NPM_SIGNAL" && sigObserved) {
+          // Skip recording — terminal outcome is the signal.
+          npmExitObserved = true;
+        } else if (e.code === "ENOENT") {
+          failures.push({
+            workflow: workflowName,
+            reason: "npm install spawn failed (npm not found on PATH)",
+          });
+        } else if (e.code === "NPM_NONZERO_EXIT") {
+          failures.push({
+            workflow: workflowName,
+            reason: `npm install exited with code ${e.exitCode}`,
+          });
+          npmExitObserved = true;
+        } else if (e.code === "NPM_SIGNAL") {
+          failures.push({
+            workflow: workflowName,
+            reason: `npm install terminated by signal ${e.signal}`,
+          });
+          npmExitObserved = true;
+        } else {
+          failures.push({
+            workflow: workflowName,
+            reason: `npm install failed: ${e.message}`,
+          });
+        }
+      }
+    })();
+
+    if (npmExitObserved) npmChildExitCount++;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Auto-install pause seam dispatch (TEST-SPEC §1.4).
+    // Fires AFTER the workflow's terminal outcome has been recorded into
+    // the failures accumulator (per SPEC §10.10 "AND recorded that
+    // workflow's auto-install terminal outcome, including any non-zero-exit
+    // aggregate failure entry"), and BEFORE any further per-workflow
+    // processing begins. The marker payload's `processed` field reports
+    // workflows whose iteration completed BEFORE this one's focal point;
+    // `current` is the workflow at the focal point; `remaining` lists the
+    // workflows whose iteration has not started.
+    // ─────────────────────────────────────────────────────────────────────
+    if (pauseSpec) {
+      const remaining = committed.slice(i + 1);
+      // post-exit-first / post-exit:<name>
+      if (npmExitObserved) {
+        const fireOrdinal =
+          pauseSpec.kind === "ordinal" &&
+          pauseSpec.window === "post-exit-first" &&
+          npmChildExitCount === 1;
+        const fireNamed =
+          pauseSpec.kind === "named" &&
+          pauseSpec.window === "post-exit" &&
+          pauseSpec.workflow === workflowName;
+        if (fireOrdinal || fireNamed) {
+          const resolvedWindow =
+            pauseSpec.kind === "ordinal"
+              ? "post-exit-first"
+              : `post-exit:${workflowName}`;
+          await pauseAutoInstallSeam(
+            resolvedWindow,
+            {
+              current: workflowName,
+              processed: [...processed],
+              remaining,
+            },
+            signalContext
+          );
+        }
       }
     }
+
+    processed.push(workflowName);
   }
 
   // SPEC §10.10 "Signals during the auto-install pass when no npm child is
