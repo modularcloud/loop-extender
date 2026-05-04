@@ -370,6 +370,59 @@ console.log(JSON.stringify(outputs));
         expect(outputs[1].result).toBe("");
       });
 
+      it("T-LOOP-13a: cross-workflow loop reset clears stdin even when the cross-workflow chain produced a result", async () => {
+        project = await createTempProject();
+        const counterFile = join(project.dir, "alpha-counter.txt");
+
+        // alpha:index — first invocation emits goto:beta:step;
+        // subsequent invocations read stdin and echo the bytes back as result.
+        // The counter increments AFTER the dispatch so iteration 1 sees count=1
+        // (goto branch) and iteration 3 sees count=2 (cat-stdin branch).
+        await createBashWorkflowScript(
+          project,
+          "alpha",
+          "index",
+          `printf '1' >> "${counterFile}"
+COUNT=$(wc -c < "${counterFile}" | tr -d ' ')
+if [ "$COUNT" -eq 1 ]; then
+  printf '{"goto":"beta:step"}'
+else
+  INPUT=$(cat)
+  printf '{"result":"%s"}' "$INPUT"
+fi`,
+        );
+        // beta:step emits {"result":"payload"} with NO goto — triggers loop
+        // reset back to alpha:index. Per SPEC §6.6 the reset target gets empty
+        // stdin regardless of any result in the previous (cross-workflow) output.
+        await createBashWorkflowScript(
+          project,
+          "beta",
+          "step",
+          `printf '{"result":"payload"}'`,
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("alpha", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 3 });
+console.log(JSON.stringify(outputs));
+`;
+
+        const result = await runAPIDriver(runtime, driverCode, {
+          cwd: project.dir,
+        });
+
+        const outputs = JSON.parse(result.stdout);
+        expect(outputs).toHaveLength(3);
+        // iter 1 — alpha:index #1: goto trigger, no result observed
+        expect(outputs[0].goto).toBe("beta:step");
+        expect(outputs[0].result).toBeUndefined();
+        // iter 2 — beta:step: produces result=payload but no goto (drives reset)
+        expect(outputs[1].result).toBe("payload");
+        expect(outputs[1].goto).toBeUndefined();
+        // iter 3 — alpha:index #2: stdin was empty on reset, NOT "payload"
+        expect(outputs[2].result).toBe("");
+      });
+
       it("T-LOOP-14: first iteration receives empty stdin", async () => {
         project = await createTempProject();
 
@@ -446,6 +499,39 @@ console.log(JSON.stringify(outputs));
         const outputs = JSON.parse(result.stdout);
         expect(outputs).toHaveLength(2);
         expect(outputs[1].result).toBe("cross-payload");
+      });
+
+      it("T-LOOP-15b: coerced non-string result piped via stdin uses String(value) bytes, not JSON form", async () => {
+        project = await createTempProject();
+
+        // Non-string `result` (a JSON object) — chosen because String({x:1})
+        // === "[object Object]" differs byte-for-byte from JSON.stringify({x:1})
+        // === '{"x":1}'. Distinguishes "coerced then piped" from "piped as JSON".
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"result":{"x":1},"goto":"reader"}'`,
+        );
+        await createWorkflowScript(project, "ralph", "reader", ".sh", catStdin());
+
+        const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+console.log(JSON.stringify(outputs));
+`;
+
+        const result = await runAPIDriver(runtime, driverCode, {
+          cwd: project.dir,
+        });
+
+        const outputs = JSON.parse(result.stdout);
+        expect(outputs).toHaveLength(2);
+        // index — parser coerced {x:1} via String() to "[object Object]"
+        expect(outputs[0].result).toBe("[object Object]");
+        expect(outputs[0].goto).toBe("reader");
+        // reader — stdin was the coerced "[object Object]" bytes, not '{"x":1}'
+        expect(outputs[1].result).toBe("[object Object]");
       });
     });
   });
@@ -1254,6 +1340,40 @@ console.log(JSON.stringify({ outputs, threwError }));
           expect(output.result).not.toBe("should-not-appear");
         }
       });
+
+      it("T-LOOP-24a: CLI — failed script's stdout is neither parsed nor leaked to CLI stdout; stderr marker still surfaces", async () => {
+        project = await createTempProject();
+
+        // Script writes structured-looking JSON to stdout (would be a `stop:true`
+        // clean exit if parsed), writes a distinctive marker to stderr, then
+        // exits 1. Per SPEC §6.2/§6.3/§7.2: stdout is captured (not pass-through)
+        // and on non-zero exit is not parsed; stderr passes through. Per SPEC
+        // §7.1 the CLI never prints `result` to its own stdout.
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '%s\\n' '{"stop":true}'
+printf 'STDERR-MARKER-T-LOOP-24A: script about to fail with exit 1\\n' >&2
+exit 1`,
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        // (a) script-failure exit, NOT the would-be `stop:true` clean exit
+        expect(result.exitCode).toBe(1);
+        // (b) CLI stdout is empty byte-for-byte — no leaked structured-looking
+        // content. In particular the literal '{"stop":true}' must not appear.
+        expect(result.stdout).toBe("");
+        expect(result.stdout).not.toContain('{"stop":true}');
+        // (c) stderr passes the script's marker through to the user
+        expect(result.stderr).toContain(
+          "STDERR-MARKER-T-LOOP-24A: script about to fail with exit 1",
+        );
+      });
     });
   });
 
@@ -1289,6 +1409,144 @@ console.log(JSON.stringify(outputs));
         expect(outputs).toHaveLength(2);
         expect(outputs[0].result).toBe("iter-1");
         expect(outputs[1].result).toBe("iter-2");
+      });
+    });
+  });
+
+  // =========================================================================
+  // Max-Iteration-Before-Goto Validation (T-LOOP-44 – T-LOOP-46)
+  // SPEC §7.1 step-order: increment counter (9) → stop (10) → maxIter (11)
+  // → goto-validate (12). On the iteration that hits the limit, an invalid
+  // goto value must NOT surface a goto-validation error — the loop terminates
+  // at step 11 before step 12 runs. These tests pin that ordering across all
+  // three run surfaces (CLI / runPromise / run() generator).
+  // =========================================================================
+  describe("SPEC: Max-iteration-before-goto validation", () => {
+    forEachRuntime((runtime) => {
+      it("T-LOOP-44: CLI — invalid `goto` on the final counted iteration does not surface a goto-validation error", async () => {
+        project = await createTempProject();
+        const markerFile = join(project.dir, "ran.txt");
+
+        // ralph:index outputs an invalid three-colon goto target. Marker
+        // increment proves actual execution.
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '1' >> "${markerFile}"
+printf '{"goto":"a:b:c"}'`,
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        // (a) exit code 0 — limit reached at step 11, goto-validate never runs
+        expect(result.exitCode).toBe(0);
+        // (b) stderr contains no goto-validation error mentioning a:b:c
+        expect(result.stderr).not.toContain("a:b:c");
+        // (c) ralph:index actually ran (and ran exactly once)
+        expect(existsSync(markerFile)).toBe(true);
+        expect(readFileSync(markerFile, "utf-8")).toBe("1");
+      });
+
+      it("T-LOOP-45: runPromise — invalid `goto` on the final counted iteration resolves, does not reject", async () => {
+        project = await createTempProject();
+        const markerFile = join(project.dir, "ran.txt");
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '1' >> "${markerFile}"
+printf '{"goto":"a:b:c"}'`,
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+let resolved = false;
+let rejected = false;
+let outputs = null;
+let errMsg = null;
+try {
+  outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+  resolved = true;
+} catch (e) {
+  rejected = true;
+  errMsg = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ resolved, rejected, errMsg, outputs }));
+`;
+
+        const result = await runAPIDriver(runtime, driverCode, {
+          cwd: project.dir,
+        });
+
+        const parsed = JSON.parse(result.stdout);
+        // (a) promise resolved — no goto-validation rejection
+        expect(parsed.resolved).toBe(true);
+        expect(parsed.rejected).toBe(false);
+        // (b) sole Output has goto:"a:b:c" — value parsed and yielded as-is
+        expect(parsed.outputs).toHaveLength(1);
+        expect(parsed.outputs[0].goto).toBe("a:b:c");
+        // (c) ralph:index actually ran exactly once
+        expect(existsSync(markerFile)).toBe(true);
+        expect(readFileSync(markerFile, "utf-8")).toBe("1");
+      });
+
+      it("T-LOOP-46: run() — invalid `goto` on the final counted iteration yields, then settles done without throwing", async () => {
+        project = await createTempProject();
+        const markerFile = join(project.dir, "ran.txt");
+
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '1' >> "${markerFile}"
+printf '{"goto":"a:b:c"}'`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+const first = await gen.next();
+let secondDone = null;
+let secondValue = null;
+let threwError = false;
+let errMsg = null;
+try {
+  const second = await gen.next();
+  secondDone = second.done;
+  secondValue = second.value;
+} catch (e) {
+  threwError = true;
+  errMsg = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({
+  firstDone: first.done,
+  firstValue: first.value,
+  secondDone,
+  secondValue,
+  threwError,
+  errMsg,
+}));
+`;
+
+        const result = await runAPIDriver(runtime, driverCode, {
+          cwd: project.dir,
+        });
+
+        const parsed = JSON.parse(result.stdout);
+        // (a) first .next() yielded the final iteration's Output, not done yet
+        expect(parsed.firstDone).toBe(false);
+        expect(parsed.firstValue.goto).toBe("a:b:c");
+        // (b) second .next() settles done WITHOUT throwing
+        expect(parsed.threwError).toBe(false);
+        expect(parsed.secondDone).toBe(true);
+        // (c) ralph:index actually ran exactly once
+        expect(existsSync(markerFile)).toBe(true);
+        expect(readFileSync(markerFile, "utf-8")).toBe("1");
       });
     });
   });

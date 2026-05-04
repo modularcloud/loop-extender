@@ -1,10 +1,16 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { createTempProject, type TempProject } from "../helpers/fixtures.js";
+import {
+  createTempProject,
+  createWorkflowScript,
+  createBashWorkflowScript,
+  type TempProject,
+} from "../helpers/fixtures.js";
 import { runCLI } from "../helpers/cli.js";
-import { withIsolatedHome } from "../helpers/env.js";
+import { withIsolatedHome, withGlobalEnvRawContent } from "../helpers/env.js";
 import { forEachRuntime } from "../helpers/runtime.js";
+import { writeEnvToFile } from "../helpers/fixture-scripts.js";
 
 forEachRuntime((runtime) => {
   // ---------------------------------------------------------------------------
@@ -229,6 +235,73 @@ forEachRuntime((runtime) => {
       expect(result.exitCode).toBe(1);
     });
 
+    // T-SUB-05a — empty-string `--result ""` is a provided flag, not absent
+    it('T-SUB-05a: output --result "" → exit 0, JSON has result==="" (empty value still counts as provided flag)', async () => {
+      project = await createTempProject();
+      const result = await runCLI(["output", "--result", ""], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.result).toBe("");
+    });
+
+    // T-SUB-06c — missing operand for --result → usage error, no JSON stdout
+    it("T-SUB-06c: output --result (missing operand) → exit 1, stderr usage error, no JSON stdout", async () => {
+      project = await createTempProject();
+      const result = await runCLI(["output", "--result"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr.length).toBeGreaterThan(0);
+      // No JSON stdout — the usage error fired before the serialization path.
+      expect(result.stdout).toBe("");
+    });
+
+    // T-SUB-06d — missing operand for --goto → usage error, no JSON stdout
+    it("T-SUB-06d: output --goto (missing operand) → exit 1, stderr usage error, no JSON stdout", async () => {
+      project = await createTempProject();
+      const result = await runCLI(["output", "--goto"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr.length).toBeGreaterThan(0);
+      expect(result.stdout).toBe("");
+    });
+
+    // T-SUB-06e — unrecognized --unknown flag (bare) → usage error
+    it("T-SUB-06e: output --unknown → exit 1, stderr mentions '--unknown', no JSON stdout", async () => {
+      project = await createTempProject();
+      const result = await runCLI(["output", "--unknown"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("--unknown");
+      expect(result.stdout).toBe("");
+    });
+
+    // T-SUB-06f — unrecognized flag mixed with a recognized one → usage error
+    it("T-SUB-06f: output --unknown --result x → exit 1, stderr mentions '--unknown', no JSON stdout", async () => {
+      project = await createTempProject();
+      const result = await runCLI(["output", "--unknown", "--result", "x"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("--unknown");
+      // The recognized --result x must NOT slip through despite the unknown flag.
+      expect(result.stdout).toBe("");
+    });
+
     // T-SUB-06
     it("T-SUB-06: output --result 'x' works without .loopx/ directory", async () => {
       project = await createTempProject({ withLoopxDir: false });
@@ -329,6 +402,93 @@ forEachRuntime((runtime) => {
       await withIsolatedHome(async () => {
         const result = await runCLI(["env", "set", "-DASH", "val"], { runtime });
         expect(result.exitCode).toBe(1);
+      });
+    });
+
+    // T-SUB-11a — lowercase-first key accepted (regex explicitly allows lowercase)
+    it("T-SUB-11a: env set mykey myval → exit 0, env list shows mykey=myval", async () => {
+      await withIsolatedHome(async () => {
+        const setResult = await runCLI(["env", "set", "mykey", "myval"], {
+          runtime,
+        });
+        expect(setResult.exitCode).toBe(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).toContain("mykey=myval");
+      });
+    });
+
+    // T-SUB-11b — interior dash rejected, env file unchanged
+    it("T-SUB-11b: env set FOO-BAR val → exit 1, stderr error, env file not mutated", async () => {
+      await withIsolatedHome(async () => {
+        const result = await runCLI(["env", "set", "FOO-BAR", "val"], {
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).not.toContain("FOO-BAR");
+      });
+    });
+
+    // T-SUB-11c — interior dot rejected, env file unchanged
+    it("T-SUB-11c: env set FOO.BAR val → exit 1, stderr error, env file not mutated", async () => {
+      await withIsolatedHome(async () => {
+        const result = await runCLI(["env", "set", "FOO.BAR", "val"], {
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).not.toContain("FOO.BAR");
+      });
+    });
+
+    // T-SUB-11d — interior space rejected, env file unchanged
+    it("T-SUB-11d: env set 'FOO BAR' val → exit 1, stderr error, env file not mutated", async () => {
+      await withIsolatedHome(async () => {
+        const result = await runCLI(["env", "set", "FOO BAR", "val"], {
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).not.toContain("FOO BAR");
+        // Sanity: no zero-content key sneaking through either.
+        expect(listResult.stdout.split("\n").every((l) => !/^=/.test(l))).toBe(
+          true,
+        );
+      });
+    });
+
+    // T-SUB-11e — empty-string name rejected; pre-existing vars remain untouched
+    it('T-SUB-11e: env set "" val → exit 1, stderr error, env file not mutated and pre-existing vars untouched', async () => {
+      await withIsolatedHome(async () => {
+        // Pre-seed an unrelated variable to verify the failed set leaves it untouched.
+        const seedResult = await runCLI(["env", "set", "EXISTING", "v"], {
+          runtime,
+        });
+        expect(seedResult.exitCode).toBe(0);
+
+        const result = await runCLI(["env", "set", "", "val"], { runtime });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        // Pre-existing variable preserved.
+        expect(listResult.stdout).toContain("EXISTING=v");
+        // No zero-length-keyed entry written (no leading `=val` line).
+        expect(listResult.stdout.split("\n").every((l) => !/^=/.test(l))).toBe(
+          true,
+        );
       });
     });
 
@@ -545,6 +705,61 @@ forEachRuntime((runtime) => {
         expect(content).toContain('FOO=""\n');
       });
     });
+
+    // T-SUB-14l — backslash round-trip: literal backslashes preserved on
+    // serialization (SPEC §4.3 "value is written literally within double
+    // quotes") and on read (SPEC §8.1 "no escape sequence interpretation").
+    // The 18-byte value `val\with\backslash` contains exactly two literal
+    // 0x5c bytes; both must survive (write side: bytes appear inside the
+    // quoted env-file form unchanged; read side: a workflow that reads $KEY
+    // sees the same byte sequence).
+    it("T-SUB-14l: env set FOO 'val\\with\\backslash' → literal backslashes preserved through write+read", async () => {
+      await withIsolatedHome(async () => {
+        const value = "val\\with\\backslash"; // 18 bytes incl. two 0x5c
+        expect(value.length).toBe(18); // sanity-check the source-level escape
+
+        const setResult = await runCLI(["env", "set", "KEY", value], {
+          runtime,
+        });
+        expect(setResult.exitCode).toBe(0);
+
+        // (a) On-disk byte sequence is exactly KEY="val\with\backslash"\n
+        const envFile = getGlobalEnvFilePath();
+        const onDisk = readFileSync(envFile, "utf-8");
+        expect(onDisk).toContain(`KEY="${value}"\n`);
+
+        // (b) A workflow that observes $KEY records the identical 18-byte
+        //     value (no escape interpretation at read time).
+        const project = await createTempProject();
+        try {
+          const markerPath = join(project.dir, "key-value.txt");
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            // Write $KEY then exit non-zero so the loop terminates after
+            // exactly one iteration without us needing to author a stop:true
+            // emitter (and so the test doesn't depend on goto/loop semantics).
+            // The marker is what we assert on.
+            `${writeEnvToFile("KEY", markerPath)}exit 1\n`,
+          );
+
+          const runResult = await runCLI(["run", "ralph"], {
+            cwd: project.dir,
+            runtime,
+          });
+          // Script exits 1 by design — we only care that the marker was
+          // written before exit.
+          expect(runResult.exitCode).toBe(1);
+
+          const readBack = readFileSync(markerPath, "utf-8");
+          expect(readBack).toBe(value); // identical 18-byte value
+        } finally {
+          await project.cleanup();
+        }
+      });
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -622,6 +837,330 @@ forEachRuntime((runtime) => {
           await project.cleanup();
         }
       });
+    });
+
+    // T-SUB-19a — env list parses a malformed global env file via the SAME
+    // parser used for `loopx run`, emitting one parser warning to stderr per
+    // invalid line and silently dropping malformed keys from the listing.
+    // Closes the gap between the `run` and `env list` env-file parse paths
+    // (SPEC §8.1 invalid-key warning rule + §4.3 / §5.4 env-list scope).
+    it("T-SUB-19a: env list with malformed global env file → parser warning to stderr, only well-formed entries listed", async () => {
+      // 1BAD starts with a digit and so violates SPEC §8.1's
+      // [A-Za-z_][A-Za-z0-9_]* key pattern; GOOD is well-formed.
+      await withGlobalEnvRawContent("1BAD=val\nGOOD=ok\n", async () => {
+        const result = await runCLI(["env", "list"], { runtime });
+
+        // (a) malformed line does not fail env list (warning, not error)
+        expect(result.exitCode).toBe(0);
+
+        // (b) stdout lists only the well-formed entry
+        const lines = result.stdout.trimEnd().split("\n");
+        expect(lines).toEqual(["GOOD=ok"]);
+        // (c) stdout does not contain the malformed key
+        expect(result.stdout).not.toContain("1BAD");
+
+        // (d) stderr contains exactly one parser warning for the 1BAD=val
+        //     line (same warning class as `loopx run` emits when loading the
+        //     global env file via loadGlobalEnv → parseEnvFile)
+        const warnLines = result.stderr
+          .split("\n")
+          .filter((l) => /Warning:.*1BAD/.test(l));
+        expect(warnLines.length).toBe(1);
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // TEST-SPEC §4.2 / SPEC §4.3 / §5.4 — Subcommands ignore .loopx/ validation
+  //
+  // SPEC §5.4 enumerates the commands that do NOT require .loopx/ to exist or
+  // be valid: `loopx output`, `loopx env *`. These tests pin down that those
+  // commands continue to exit 0 (and emit no discovery / validation warnings)
+  // even when `.loopx/` is present and is "broken" — here, structurally
+  // invalid in a way that would be fatal under `loopx run <target>` (a
+  // workflow with a same-base-name script collision per SPEC §5.2). A buggy
+  // implementation that wired discovery/validation into these subcommands
+  // would emit warnings or fail; this cluster catches that.
+  // ---------------------------------------------------------------------------
+
+  describe("SPEC: Subcommands ignore .loopx/ validation (§5.4)", () => {
+    let project: TempProject | null = null;
+
+    afterEach(async () => {
+      if (project) {
+        await project.cleanup();
+        project = null;
+      }
+    });
+
+    /**
+     * Builds a project with a `.loopx/` whose `ralph` workflow contains a
+     * same-base-name collision (`check.sh` and `check.ts`). SPEC §5.2 makes
+     * this fatal for `loopx run <target>` but not for `loopx output` or
+     * `loopx env *` (per SPEC §5.4).
+     */
+    async function projectWithBrokenLoopx(): Promise<TempProject> {
+      const p = await createTempProject();
+      await createWorkflowScript(p, "ralph", "check", ".sh", "#!/bin/bash\necho stop\n");
+      await createWorkflowScript(p, "ralph", "check", ".ts", "console.log('x');\n");
+      return p;
+    }
+
+    // T-SUB-20 — `loopx output` works (and emits no validation warnings)
+    // even when `.loopx/` contains a fatal-for-run collision.
+    it("T-SUB-20: output --result with broken .loopx/ tree → exit 0, valid JSON, no validation warnings", async () => {
+      project = await projectWithBrokenLoopx();
+      const result = await runCLI(["output", "--result", "x"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.result).toBe("x");
+      // No discovery or validation warnings about ralph/check collision.
+      expect(result.stderr).not.toMatch(/collision|conflict|warn|validat|ralph/i);
+    });
+
+    // T-SUB-21 — `loopx env list` does not validate `.loopx/`.
+    it("T-SUB-21: env list with broken .loopx/ tree (no env vars) → exit 0, empty stdout, no validation warnings", async () => {
+      project = await projectWithBrokenLoopx();
+      await withIsolatedHome(async () => {
+        const result = await runCLI(["env", "list"], {
+          cwd: project!.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toBe("");
+        expect(result.stderr).not.toMatch(
+          /collision|conflict|warn|validat|ralph/i,
+        );
+      });
+    });
+
+    // T-SUB-22 — `loopx env set` does not validate `.loopx/`.
+    it("T-SUB-22: env set FOO bar with broken .loopx/ tree → exit 0, no validation warnings, value reachable via env list", async () => {
+      project = await projectWithBrokenLoopx();
+      await withIsolatedHome(async () => {
+        const setResult = await runCLI(["env", "set", "FOO", "bar"], {
+          cwd: project!.dir,
+          runtime,
+        });
+        expect(setResult.exitCode).toBe(0);
+        expect(setResult.stderr).not.toMatch(
+          /collision|conflict|warn|validat|ralph/i,
+        );
+
+        const listResult = await runCLI(["env", "list"], {
+          cwd: project!.dir,
+          runtime,
+        });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).toContain("FOO=bar");
+      });
+    });
+
+    // T-SUB-23 — `loopx env remove` does not validate `.loopx/`.
+    it("T-SUB-23: env remove FOO with broken .loopx/ tree → exit 0, no validation warnings, FOO absent from list", async () => {
+      project = await projectWithBrokenLoopx();
+      await withIsolatedHome(async () => {
+        // Pre-seed FOO=bar so there's something to remove.
+        const setResult = await runCLI(["env", "set", "FOO", "bar"], {
+          cwd: project!.dir,
+          runtime,
+        });
+        expect(setResult.exitCode).toBe(0);
+
+        const removeResult = await runCLI(["env", "remove", "FOO"], {
+          cwd: project!.dir,
+          runtime,
+        });
+        expect(removeResult.exitCode).toBe(0);
+        expect(removeResult.stderr).not.toMatch(
+          /collision|conflict|warn|validat|ralph/i,
+        );
+
+        const listResult = await runCLI(["env", "list"], {
+          cwd: project!.dir,
+          runtime,
+        });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).not.toContain("FOO");
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // TEST-SPEC §4.2 / SPEC §4.3 / §12 — env / output usage errors
+  //
+  // SPEC §4.3 enumerates the env subcommands as exactly `set`, `remove`,
+  // `list` (no others, no defaults, no extra positionals); `output`'s grammar
+  // is the named-flag form only. SPEC §12's usage-error contract requires
+  // exit 1 + a usage-error category on stderr for parser-level surface
+  // failures. The tests below pin down each violating shape across the env
+  // and output subcommands.
+  // ---------------------------------------------------------------------------
+
+  describe("SPEC: env / output subcommand usage errors (§4.3, §12)", () => {
+    // T-SUB-24 — bare `env` (no subcommand)
+    it("T-SUB-24: env (no subcommand) → exit 1, usage error, no env mutation", async () => {
+      await withIsolatedHome(async () => {
+        const result = await runCLI(["env"], { runtime });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        // Sanity: nothing was committed under the isolated HOME.
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).toBe("");
+      });
+    });
+
+    // T-SUB-25 — `env set` (no name, no value)
+    it("T-SUB-25: env set (no operands) → exit 1, usage error, no env mutation", async () => {
+      await withIsolatedHome(async () => {
+        const result = await runCLI(["env", "set"], { runtime });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).toBe("");
+      });
+    });
+
+    // T-SUB-26 — `env set FOO` (name only, missing value)
+    it("T-SUB-26: env set FOO (missing value) → exit 1, usage error, FOO not committed", async () => {
+      await withIsolatedHome(async () => {
+        const result = await runCLI(["env", "set", "FOO"], { runtime });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        // FOO must NOT have been committed (no FOO=... line, including
+        // FOO="" — a buggy impl that defaulted the missing value to "" would
+        // fail this assertion).
+        expect(listResult.stdout).not.toMatch(/^FOO=/m);
+      });
+    });
+
+    // T-SUB-27 — `env remove` (no name)
+    it("T-SUB-27: env remove (no name) → exit 1, usage error, env file not mutated", async () => {
+      await withIsolatedHome(async () => {
+        // Pre-seed an entry to verify the failed remove leaves it untouched
+        // and to verify a buggy impl that defaulted name="" and silently
+        // no-op'd (matching T-SUB-16 nonexistent-name silence) still fails.
+        await runCLI(["env", "set", "EXISTING", "v"], { runtime });
+
+        const result = await runCLI(["env", "remove"], { runtime });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).toContain("EXISTING=v");
+      });
+    });
+
+    // T-SUB-28 — `env unknown` (unrecognized env subcommand)
+    it("T-SUB-28: env unknown → exit 1, usage error, no env mutation", async () => {
+      await withIsolatedHome(async () => {
+        const result = await runCLI(["env", "unknown"], { runtime });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).toBe("");
+      });
+    });
+
+    // T-SUB-29 — `env list extra` (extra positional after `list`)
+    it("T-SUB-29: env list extra → exit 1, usage error, no stdout listing", async () => {
+      await withIsolatedHome(async () => {
+        // Pre-seed an entry so a buggy impl that ignored the extra operand
+        // and ran `list` regardless would emit visible stdout (which we
+        // assert is absent).
+        await runCLI(["env", "set", "FOO", "bar"], { runtime });
+
+        const result = await runCLI(["env", "list", "extra"], { runtime });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stdout).toBe("");
+      });
+    });
+
+    // T-SUB-29a — `env set FOO bar extra` (extra positional after set <name> <value>)
+    it("T-SUB-29a: env set FOO bar extra → exit 1, usage error, FOO not committed", async () => {
+      await withIsolatedHome(async () => {
+        const result = await runCLI(
+          ["env", "set", "FOO", "bar", "extra"],
+          { runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        // No FOO entry was committed despite the leading well-formed
+        // `set FOO bar`.
+        expect(listResult.stdout).not.toMatch(/^FOO=/m);
+      });
+    });
+
+    // T-SUB-29b — `env remove FOO extra` (extra positional after remove <name>)
+    it("T-SUB-29b: env remove FOO extra → exit 1, usage error, env file not mutated", async () => {
+      await withIsolatedHome(async () => {
+        // Pre-seed FOO so a buggy impl that ignored the extra operand and
+        // proceeded with the remove would wipe it (failing the assertion).
+        await runCLI(["env", "set", "FOO", "bar"], { runtime });
+
+        const result = await runCLI(
+          ["env", "remove", "FOO", "extra"],
+          { runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).toContain("FOO=bar");
+      });
+    });
+
+    // T-SUB-29c — `output --result x extra` (extra positional after a value flag)
+    it("T-SUB-29c: output --result x extra → exit 1, usage error, no JSON stdout", async () => {
+      const project = await createTempProject();
+      try {
+        const result = await runCLI(
+          ["output", "--result", "x", "extra"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+        // No structured JSON was serialized despite the well-formed
+        // `--result x` prefix.
+        expect(result.stdout).toBe("");
+      } finally {
+        await project.cleanup();
+      }
+    });
+
+    // T-SUB-29d — `output --stop extra` (extra positional after a boolean flag)
+    it("T-SUB-29d: output --stop extra → exit 1, usage error, no JSON stdout", async () => {
+      const project = await createTempProject();
+      try {
+        const result = await runCLI(
+          ["output", "--stop", "extra"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        await project.cleanup();
+      }
     });
   });
 });

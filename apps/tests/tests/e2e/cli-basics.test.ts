@@ -62,7 +62,7 @@ describe("SPEC: CLI Basics (ADR-0003 workflow model, T-CLI-* §4.1)", () => {
   });
 
   // ========================================================================
-  // Help & Version (T-CLI-01)
+  // Help & Version (T-CLI-01, 01a, 01b)
   // ========================================================================
   describe("SPEC: Help & Version", () => {
     forEachRuntime((runtime) => {
@@ -74,6 +74,57 @@ describe("SPEC: CLI Basics (ADR-0003 workflow model, T-CLI-* §4.1)", () => {
         const expectedVersion = getExpectedVersion();
         expect(result.stdout).toBe(`${expectedVersion}\n`);
       });
+
+      it("T-CLI-01a: `loopx version extra` (extra positional after version) → usage error, exit 1", async () => {
+        // SPEC §4.3 specifies `loopx version` as a no-argument subcommand;
+        // SPEC §12's usage-error enumeration is non-exhaustive and the
+        // consistent grammar pattern is that extra positionals to fixed-grammar
+        // subcommands are usage errors. The version-print short-circuit must
+        // not fire when the parser rejects the invocation.
+        project = await createTempProject({ withLoopxDir: false });
+        const result = await runCLI(["version", "extra"], {
+          cwd: project.dir,
+          runtime,
+        });
+        const expectedVersion = getExpectedVersion();
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.length).toBeGreaterThan(0);
+        // (c) stdout does NOT contain the version string — the print
+        // short-circuit must not fire when args are rejected. We assert the
+        // exact version literal is absent from stdout.
+        expect(result.stdout).not.toContain(expectedVersion);
+      });
+
+      it.each(["--help", "-h"])(
+        "T-CLI-01b: `loopx version %s` → usage error, exit 1, no version, no version-scoped help block",
+        async (helpFlag) => {
+          // SPEC §11 defines exactly three help forms — top-level, run, install
+          // — with no "Version Help" section. SPEC §4.3 does not document a
+          // help form for `version`. The deliberate omission combined with
+          // SPEC §12's non-exhaustive usage-error enumeration makes the
+          // consistent reading "extra arguments to a no-argument subcommand
+          // are usage errors", which subsumes `--help` / `-h` as unrecognized
+          // arguments at the version-subcommand parser level.
+          project = await createTempProject({ withLoopxDir: false });
+          const result = await runCLI(["version", helpFlag], {
+            cwd: project.dir,
+            runtime,
+          });
+          const expectedVersion = getExpectedVersion();
+
+          // (i) exit code 1
+          expect(result.exitCode).toBe(1);
+          // (ii) stderr surfaces a usage / unrecognized-argument error
+          expect(result.stderr.length).toBeGreaterThan(0);
+          // (iii) stdout does NOT contain the version string
+          expect(result.stdout).not.toContain(expectedVersion);
+          // (iv) stdout does NOT contain a version-scoped help block — no
+          //      "Usage: loopx version ..." synopsis text, since the version
+          //      subcommand has no help form per SPEC §11.
+          expect(result.stdout).not.toMatch(/usage:\s*loopx\s+version/i);
+        },
+      );
     });
   });
 
@@ -272,6 +323,54 @@ describe("SPEC: CLI Basics (ADR-0003 workflow model, T-CLI-* §4.1)", () => {
         // Negative: must NOT advertise the legacy bare-<script> top-level positional grammar.
         expect(result.stdout).not.toMatch(/run\s+\[options?\]\s+<script[-_]?name>/);
         expect(result.stdout).not.toMatch(/run\s+\[options?\]\s+<script>(?!\b\s*[:>])/);
+      });
+
+      it("T-CLI-40b: run help usage grammar reflects SPEC 11.2 / 12 limits (no `--`, no name=value tail)", async () => {
+        // SPEC 11.2: "The printed usage reflects these limits." Parser-level
+        // rejection of `--` and `name=value` is covered by
+        // T-CLI-RUN-DASHDASH-01..05 / T-CLI-RUN-NAMEVAL-01..03; this test
+        // covers the help-text reflection of those limits. Scope assertions
+        // to the contiguous Usage / Synopsis block to distinguish synopsis
+        // grammar from explanatory prose (SPEC 11.2's shell-env-prefix
+        // example `key=value loopx run <target>` legitimately appears in
+        // example/prose blocks but must not appear in the synopsis grammar).
+        project = await createTempProject();
+        await createBashWorkflowScript(project, "ralph", "index", "printf '{\"stop\":true}'");
+
+        const result = await runCLI(["run", "-h"], { cwd: project.dir, runtime });
+
+        expect(result.exitCode).toBe(0);
+
+        // Extract the usage / synopsis block(s): the contiguous lines from
+        // the first "Usage:" line up until the first blank line or
+        // structured section header (Options:/Examples:/Available...).
+        const lines = result.stdout.split("\n");
+        const usageStart = lines.findIndex((line) => /^\s*usage:/i.test(line));
+        expect(usageStart).toBeGreaterThanOrEqual(0);
+        const usageBlockLines: string[] = [];
+        for (let i = usageStart; i < lines.length; i++) {
+          const line = lines[i];
+          if (i > usageStart) {
+            // Stop at blank line or section header (indented Options/Examples/etc.)
+            if (line.trim() === "") break;
+            if (/^\s*(options|examples|available|commands|sources|arguments)\s*:/i.test(line)) break;
+          }
+          usageBlockLines.push(line);
+        }
+        const usageBlock = usageBlockLines.join("\n");
+
+        // (a) Usage line does NOT contain `[--]` / `[-- ...]` / a trailing
+        //     `--` placeholder.
+        expect(usageBlock).not.toMatch(/\[\s*--\s*(\.{3}|\]|\s)/);
+        expect(usageBlock).not.toMatch(/\[\s*--\s*[^\]]*\]/);
+
+        // (b) Usage line does NOT show a `name=value` named-argument tail —
+        //     no `[name=value...]`, `[<var>=<value>...]`, `[KEY=VALUE...]`,
+        //     etc., appearing AFTER the target argument or after `--`.
+        expect(usageBlock).not.toMatch(/\[[^\]]*=\s*[^\]]*\.{3}\]/);
+        expect(usageBlock).not.toMatch(/\[\s*name\s*=\s*value/i);
+        expect(usageBlock).not.toMatch(/\[\s*<\s*var\s*>\s*=\s*<\s*value/i);
+        expect(usageBlock).not.toMatch(/\[\s*KEY\s*=\s*VALUE/);
       });
 
       it("T-CLI-41: `loopx run --help` byte-identical to `loopx run -h` (including non-fatal warnings)", async () => {
@@ -711,6 +810,19 @@ describe("SPEC: CLI Basics (ADR-0003 workflow model, T-CLI-* §4.1)", () => {
         assertRunHelp(result);
       });
 
+      it("T-CLI-70a: `loopx run --help ralph adr=0003` shows run help (long-form suppresses extra-positional / name=value)", async () => {
+        // Long-form counterpart to T-CLI-RUN-DASHDASH-05 / T-CLI-RUN-NAMEVAL-*:
+        // verifies that `--help` after the `run` subcommand suppresses
+        // extra-positional and `name=value` tail rejection identically to
+        // `-h`.
+        project = await createTempProject();
+        const result = await runCLI(["run", "--help", "ralph", "adr=0003"], {
+          cwd: project.dir,
+          runtime,
+        });
+        assertRunHelp(result);
+      });
+
       it("T-CLI-92: `loopx run -h -n` shows run help (missing -n operand ignored)", async () => {
         project = await createTempProject();
         const result = await runCLI(["run", "-h", "-n"], { cwd: project.dir, runtime });
@@ -732,6 +844,55 @@ describe("SPEC: CLI Basics (ADR-0003 workflow model, T-CLI-* §4.1)", () => {
       it("T-CLI-95: `loopx run --help -e` shows run help (long form, missing -e operand ignored)", async () => {
         project = await createTempProject();
         const result = await runCLI(["run", "--help", "-e"], { cwd: project.dir, runtime });
+        assertRunHelp(result);
+      });
+
+      // Would-be-operand variants: a naive parser would consume `-h` /
+      // `--help` as the operand of `-n` / `-e`, but the help short-circuit
+      // fires unconditionally. Mirrors install-side T-INST-49f. Together with
+      // T-CLI-92..95 (operand missing → -h after) and T-CLI-68 (target then
+      // help-first) these close the run-help-after-target × would-be-operand
+      // coverage.
+
+      it("T-CLI-123: `loopx run -n -h` shows run help (would-be -n operand)", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["run", "-n", "-h"], { cwd: project.dir, runtime });
+        assertRunHelp(result);
+      });
+
+      it("T-CLI-123a: `loopx run ralph -n -h` shows run help (target-position would-be -n operand)", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["run", "ralph", "-n", "-h"], {
+          cwd: project.dir,
+          runtime,
+        });
+        assertRunHelp(result);
+      });
+
+      it("T-CLI-124: `loopx run -e -h` shows run help (would-be -e operand)", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["run", "-e", "-h"], { cwd: project.dir, runtime });
+        assertRunHelp(result);
+      });
+
+      it("T-CLI-124a: `loopx run ralph -e -h` shows run help (target-position would-be -e operand)", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["run", "ralph", "-e", "-h"], {
+          cwd: project.dir,
+          runtime,
+        });
+        assertRunHelp(result);
+      });
+
+      it("T-CLI-125: `loopx run -n --help` shows run help (long-form would-be -n operand)", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["run", "-n", "--help"], { cwd: project.dir, runtime });
+        assertRunHelp(result);
+      });
+
+      it("T-CLI-126: `loopx run -e --help` shows run help (long-form would-be -e operand)", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["run", "-e", "--help"], { cwd: project.dir, runtime });
         assertRunHelp(result);
       });
     });
@@ -890,6 +1051,22 @@ describe("SPEC: CLI Basics (ADR-0003 workflow model, T-CLI-* §4.1)", () => {
       it("T-CLI-71: `loopx -x` is a usage error (unknown short flag)", async () => {
         project = await createTempProject();
         const result = await runCLI(["-x"], { cwd: project.dir, runtime });
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-CLI-71a: `loopx --unknown -h` is a usage error (top-level parsing fails before -h)", async () => {
+        // The first argument is an unrecognized top-level flag, so the
+        // top-level help short-circuit does not apply.
+        project = await createTempProject();
+        const result = await runCLI(["--unknown", "-h"], { cwd: project.dir, runtime });
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-CLI-71b: `loopx --unknown --help` is a usage error (top-level parsing fails before --help)", async () => {
+        // The first argument is an unrecognized top-level flag, so the
+        // top-level help short-circuit does not apply.
+        project = await createTempProject();
+        const result = await runCLI(["--unknown", "--help"], { cwd: project.dir, runtime });
         expect(result.exitCode).toBe(1);
       });
 
@@ -1542,6 +1719,30 @@ describe("SPEC: CLI Basics (ADR-0003 workflow model, T-CLI-* §4.1)", () => {
         expect(result.exitCode).toBe(1);
       });
 
+      it("T-CLI-19b: `loopx run ralph` without `.loopx/` emits remediation guidance per SPEC 7.2", async () => {
+        // SPEC 7.2: "When executing via `loopx run <target>`, if `.loopx/` does
+        // not exist, loopx exits with an error instructing the user to create
+        // it." Existing tests pin (a) exit 1 + (b) `.loopx/` mention, but not
+        // the *creation-guidance* part of the SPEC 7.2 error contract.
+        project = await createTempProject({ withLoopxDir: false });
+        const result = await runCLI(["run", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        // (a) exit code 1
+        expect(result.exitCode).toBe(1);
+        // (b) stderr mentions `.loopx/` (or `.loopx`)
+        expect(result.stderr).toMatch(/\.loopx\/?/);
+        // (c) stderr contains actionable creation guidance — structurally
+        //     distinct from a bare "directory not found" error. Accept any
+        //     of the canonical remediation signals: literal mention of
+        //     creating / initializing / making `.loopx/`, a suggested
+        //     command (`mkdir`, `loopx install`), or a "create it" hint.
+        const remediation = /\b(create|creat\w*|init\w*|mak(?:e|ing)|mkdir|loopx\s+install|set\s*up|setup|add\s+workflows?)\b/i;
+        expect(result.stderr).toMatch(remediation);
+      });
+
       it("T-CLI-20: `-n 1 ralph` runs exactly 1 iteration even without stop", async () => {
         project = await createTempProject();
         const counterFile = join(project.dir, "counter-20.txt");
@@ -2037,6 +2238,40 @@ describe("SPEC: CLI Basics (ADR-0003 workflow model, T-CLI-* §4.1)", () => {
         expect(result.exitCode).toBe(0);
         expect(result.stdout).toBe("");
         expect(readFileSync(marker, "utf-8")).toBe("ran-23");
+      });
+
+      it("T-CLI-23a: CLI stdout silence on raw (non-JSON) successful output", async () => {
+        // SPEC §7.1: "The CLI does not print `result` to its own stdout at any
+        // point." SPEC §2.3: "If stdout is not valid JSON, is not an object,
+        // or is a valid JSON object but contains none of the known fields,
+        // the entire stdout content is treated as `{ result: <raw output> }`."
+        // T-CLI-23 covers structured JSON success; T-LOOP-24a covers the
+        // failure path. This test covers raw-stdout success — a buggy impl
+        // could route raw stdout through to the CLI's own stdout while
+        // correctly suppressing structured JSON ("if I parsed it as
+        // structured output, suppress; otherwise pass through").
+        project = await createTempProject();
+        const marker = join(project.dir, "marker-23a.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'ran-23a' > "${marker}"\nprintf 'hello raw\\n'\nexit 0`,
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        // (a) clean exit 0 — loop reset and `-n 1` capped iterations
+        expect(result.exitCode).toBe(0);
+        // (b) CLI's captured stdout is byte-empty — raw script output never
+        //     appears on the CLI's own stdout
+        expect(result.stdout).toBe("");
+        expect(result.stdout).not.toContain("hello raw");
+        // (c) marker file exists, proving the script actually ran
+        expect(readFileSync(marker, "utf-8")).toBe("ran-23a");
       });
 
       it("T-CLI-27: `loopx run ralph beta` (two positionals) → exit 1", async () => {

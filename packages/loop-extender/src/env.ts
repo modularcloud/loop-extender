@@ -10,30 +10,43 @@ import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { parseEnvFile, KEY_PATTERN } from "./parsers/parse-env.js";
 
-export function getGlobalEnvPath(): string {
-  const xdg =
-    process.env.XDG_CONFIG_HOME ||
-    join(process.env.HOME || homedir(), ".config");
+/**
+ * Resolve the global loopx env file path from `XDG_CONFIG_HOME` (with `HOME`
+ * fallback). Reads `process.env` by default. When `envSnapshot` is provided
+ * (the eager `runPromise()` path per SPEC §9.2), the snapshot's
+ * `XDG_CONFIG_HOME` / `HOME` are consulted instead so the path is pinned to
+ * the values present at the call site rather than reflecting later mutations.
+ */
+export function getGlobalEnvPath(
+  envSnapshot?: Record<string, string>
+): string {
+  const env = envSnapshot ?? (process.env as Record<string, string>);
+  const xdg = env.XDG_CONFIG_HOME || join(env.HOME || homedir(), ".config");
   return join(xdg, "loopx", "env");
 }
 
-export function loadGlobalEnv(): {
+/**
+ * Load and parse the global loopx env file. When `envPath` is supplied
+ * (the eager `runPromise()` path per SPEC §9.2) it is used verbatim; otherwise
+ * the path is resolved lazily from the live `process.env`.
+ */
+export function loadGlobalEnv(envPath?: string): {
   vars: Record<string, string>;
   warnings: string[];
 } {
-  const envPath = getGlobalEnvPath();
+  const path = envPath ?? getGlobalEnvPath();
 
-  if (!existsSync(envPath)) {
+  if (!existsSync(path)) {
     return { vars: {}, warnings: [] };
   }
 
   try {
-    accessSync(envPath, constants.R_OK);
+    accessSync(path, constants.R_OK);
   } catch {
-    throw new Error(`Global env file is unreadable: ${envPath}`);
+    throw new Error(`Global env file is unreadable: ${path}`);
   }
 
-  const content = readFileSync(envPath, "utf-8");
+  const content = readFileSync(path, "utf-8");
   return parseEnvFile(content);
 }
 
@@ -57,7 +70,8 @@ export function loadLocalEnv(path: string): {
 
 export function mergeEnv(
   globalEnv: Record<string, string>,
-  localEnv: Record<string, string>
+  localEnv: Record<string, string>,
+  inheritedEnv?: Record<string, string>
 ): Record<string, string> {
   // Per SPEC §8.3 precedence (highest wins):
   //   loopx-injected (LOOPX_BIN / LOOPX_PROJECT_ROOT / LOOPX_WORKFLOW)
@@ -70,8 +84,12 @@ export function mergeEnv(
   // LOOPX_DELEGATED is *not* scrubbed — if it was inherited from a parent
   // loopx invocation, it passes through unchanged (SPEC §4.7 / TEST-SPEC
   // T-ENV-24a).
+  //
+  // When `inheritedEnv` is supplied (eager runPromise path per SPEC §9.2) we
+  // use that snapshot in place of the live `process.env`. Otherwise we read
+  // `process.env` lazily (SPEC §9.1 contract for run() / CLI).
   return {
-    ...(process.env as Record<string, string>),
+    ...(inheritedEnv ?? (process.env as Record<string, string>)),
     ...globalEnv,
     ...localEnv,
   };
@@ -163,7 +181,11 @@ export function envList(): void {
   }
 
   const content = readFileSync(envPath, "utf-8");
-  const { vars } = parseEnvFile(content);
+  const { vars, warnings } = parseEnvFile(content);
+
+  for (const w of warnings) {
+    process.stderr.write(`Warning: ${w}\n`);
+  }
 
   const sorted = Object.entries(vars).sort(([a], [b]) =>
     a.localeCompare(b)

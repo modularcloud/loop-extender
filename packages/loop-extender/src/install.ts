@@ -13,9 +13,18 @@ import {
   symlinkSync,
   readlinkSync,
   copyFileSync,
+  realpathSync,
+  openSync,
+  writeSync,
+  closeSync,
+  fsyncSync,
 } from "node:fs";
 import { join, basename, extname } from "node:path";
-import { execFileSync } from "node:child_process";
+import {
+  execFileSync,
+  spawn,
+  type ChildProcess,
+} from "node:child_process";
 import { tmpdir } from "node:os";
 import { classifySource } from "./parsers/classify-source.js";
 import {
@@ -25,12 +34,47 @@ import {
 } from "./discovery.js";
 import { checkWorkflowVersion } from "./version-check.js";
 
+/**
+ * Signal context for the install subcommand (SPEC §10.10 "Signals during
+ * `npm install`" and "Signals during the auto-install pass when no npm
+ * child is active").
+ *
+ * The CLI install entry point (bin.ts) installs SIGINT / SIGTERM handlers
+ * that consult `activeNpmChild` and forward the signal to the active npm
+ * child's process group when one is running. The auto-install loop in
+ * `runAutoInstall` checks `receivedSignal` between workflows, after each
+ * spawn outcome, and at the head of each iteration so a signal observed
+ * either while a child is active or while none is active causes the pass
+ * to abort cleanly without further `.gitignore` synthesis or `npm install`
+ * spawns. The aggregate failure report is suppressed when `receivedSignal`
+ * is non-null at end-of-pass and BEFORE the report is written; the
+ * SPEC §10.10 "unless it had already been emitted" carve-out is handled
+ * by the post-aggregate-report pause seam (TEST-SPEC §1.4) which fires
+ * AFTER the report has been emitted to stderr — when a signal arrives
+ * during that seam's pause, the already-emitted report is preserved on
+ * stderr and `runAutoInstall` returns 0 so `installCommand` defers the
+ * exit code to bin.ts's outer signal handler (`128 + signum`).
+ */
+export interface InstallSignalContext {
+  /** Returns the first signal observed by the install handlers (or null). */
+  receivedSignal(): NodeJS.Signals | null;
+  /** Records the active npm child so the signal handler can forward. */
+  setActiveNpmChild(child: ChildProcess | null): void;
+}
+
 export interface InstallOptions {
   source: string;
   cwd: string;
   selectedWorkflow?: string | null; // -w <name>
   override: boolean; // -y
+  noInstall: boolean; // --no-install (SPEC §10.10)
   runningVersion: string;
+  /**
+   * Optional signal context for SPEC §10.10. When omitted, the install
+   * runs without signal awareness (test paths that don't need to observe
+   * signal-driven termination).
+   */
+  signalContext?: InstallSignalContext;
 }
 
 interface WorkflowCandidate {
@@ -62,13 +106,263 @@ function getInstallFault(): { kind: "commit-fail-after"; n: number } | null {
   return null;
 }
 
+interface AutoInstallFault {
+  gitignoreWriteFail: Set<string>;
+  // TEST-SPEC §1.4 `gitignore-replace-with-fifo:<name1,name2,...>`: places a
+  // FIFO at the named workflow's `.gitignore` path immediately before the
+  // safeguard `lstat`. The existing non-regular-file branch in
+  // `runGitignoreSafeguard` then naturally records a safeguard failure with
+  // a "non-regular" reason, identical in shape to a real FIFO at that path.
+  // T-INST-116k / 116k2 use this to deterministically force a safeguard
+  // failure on whichever workflow the implementation processes first.
+  gitignoreReplaceWithFifo: Set<string>;
+  // TEST-SPEC §1.4 `npm-spawn-fail:<name1,name2,...>`: causes the
+  // `spawn("npm", "install")` call for the named workflow to be intercepted
+  // and rejected with an ENOENT-shaped error before any real spawn occurs.
+  // The existing ENOENT catch branch in the auto-install loop then records
+  // a spawn-failure entry into `failures`, identical in shape to a real
+  // ENOENT from `spawn("npm", ...)` when npm is not on PATH. T-INST-116m /
+  // 116m2 use this to deterministically force a spawn failure on whichever
+  // workflow the implementation processes first, so the test can pin down
+  // the SPEC §10.10 aggregate-report-suppression contract on the
+  // spawn-failure-accumulator state.
+  npmSpawnFail: Set<string>;
+}
+
+function getAutoInstallFault(): AutoInstallFault {
+  const empty: AutoInstallFault = {
+    gitignoreWriteFail: new Set(),
+    gitignoreReplaceWithFifo: new Set(),
+    npmSpawnFail: new Set(),
+  };
+  if (process.env.NODE_ENV !== "test") return empty;
+  const raw = process.env.LOOPX_TEST_AUTOINSTALL_FAULT;
+  if (!raw) return empty;
+  const fault: AutoInstallFault = {
+    gitignoreWriteFail: new Set(),
+    gitignoreReplaceWithFifo: new Set(),
+    npmSpawnFail: new Set(),
+  };
+  for (const segment of raw.split(";")) {
+    const trimmed = segment.trim();
+    if (!trimmed) continue;
+    const colon = trimmed.indexOf(":");
+    if (colon === -1) continue;
+    const kind = trimmed.slice(0, colon);
+    const value = trimmed.slice(colon + 1);
+    if (kind === "gitignore-write-fail") {
+      for (const name of value.split(",")) {
+        const n = name.trim();
+        if (n) fault.gitignoreWriteFail.add(n);
+      }
+    } else if (kind === "gitignore-replace-with-fifo") {
+      for (const name of value.split(",")) {
+        const n = name.trim();
+        if (n) fault.gitignoreReplaceWithFifo.add(n);
+      }
+    } else if (kind === "npm-spawn-fail") {
+      for (const name of value.split(",")) {
+        const n = name.trim();
+        if (n) fault.npmSpawnFail.add(n);
+      }
+    }
+  }
+  return fault;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Auto-install pause seam (TEST-SPEC §1.4 LOOPX_TEST_AUTOINSTALL_PAUSE).
+// Non-public, gated on NODE_ENV=test. Recognized window values pause the
+// auto-install pass at the named focal point for a bounded interval so
+// the test harness can deliver a signal during the otherwise sub-millisecond
+// window. The companion env var LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER names
+// an absolute path; loopx writes a parent-observable JSON marker to that
+// path (fsync'd, closed) before the bounded delay begins.
+// ─────────────────────────────────────────────────────────────────────
+
+type AutoInstallPauseSpec =
+  | {
+      kind: "ordinal";
+      window:
+        | "before-first-workflow"
+        | "between-workflows-after-first"
+        | "pre-spawn-first"
+        | "post-exit-first"
+        | "post-safeguard-failure-first"
+        | "post-spawn-failure-first"
+        | "child-active-after-failure"
+        | "post-aggregate-report";
+    }
+  | {
+      kind: "named";
+      window:
+        | "between-workflows"
+        | "pre-spawn"
+        | "post-exit"
+        | "post-safeguard-failure"
+        | "post-spawn-failure";
+      workflow: string;
+    };
+
+const AUTOINSTALL_PAUSE_ORDINALS = new Set<string>([
+  "before-first-workflow",
+  "between-workflows-after-first",
+  "pre-spawn-first",
+  "post-exit-first",
+  "post-safeguard-failure-first",
+  "post-spawn-failure-first",
+  "child-active-after-failure",
+  "post-aggregate-report",
+]);
+
+const AUTOINSTALL_PAUSE_NAMED = new Set<string>([
+  "between-workflows",
+  "pre-spawn",
+  "post-exit",
+  "post-safeguard-failure",
+  "post-spawn-failure",
+]);
+
+function getAutoInstallPause(): AutoInstallPauseSpec | null {
+  if (process.env.NODE_ENV !== "test") return null;
+  const raw = process.env.LOOPX_TEST_AUTOINSTALL_PAUSE;
+  if (!raw) return null;
+  if (AUTOINSTALL_PAUSE_ORDINALS.has(raw)) {
+    return {
+      kind: "ordinal",
+      window: raw as Extract<AutoInstallPauseSpec, { kind: "ordinal" }>["window"],
+    };
+  }
+  const colonIdx = raw.indexOf(":");
+  if (colonIdx > 0) {
+    const window = raw.slice(0, colonIdx);
+    const workflow = raw.slice(colonIdx + 1);
+    if (AUTOINSTALL_PAUSE_NAMED.has(window) && workflow) {
+      return {
+        kind: "named",
+        window: window as Extract<AutoInstallPauseSpec, { kind: "named" }>["window"],
+        workflow,
+      };
+    }
+  }
+  return null; // unknown / malformed → no-op
+}
+
+// Bounded pause interval per TEST-SPEC §1.4: ≥ 2 seconds, ≤ 10 seconds.
+// Long enough for the harness to deliver a signal, short enough to bound
+// test runtime if the harness fails to deliver one.
+const AUTOINSTALL_PAUSE_MS = 5000;
+// Polling resolution for early-resume on signal observation.
+const AUTOINSTALL_PAUSE_POLL_MS = 50;
+
+interface AutoInstallPausePayload {
+  current: string | null;
+  processed: string[];
+  remaining: string[];
+  activeChildPid?: number;
+  gitignoreStateAtPause?: GitignoreStateAtPause;
+}
+
+// Deterministic on-disk state of `.loopx/<current>/.gitignore` captured at
+// `pre-spawn-first` / `pre-spawn:<name>` pause-entry. Per TEST-SPEC §1.4 and
+// T-INST-116i / T-INST-116i2, the harness uses this field to pin SPEC §10.10's
+// "side effects completed before the signal observation remain on disk" rule
+// byte-for-byte without a race: post-signal `lstat` of the same path must
+// match this snapshot exactly (absent → ENOENT; regular with content C →
+// regular with content C; any other type → that exact type).
+type GitignoreStateAtPause =
+  | { exists: false }
+  | { exists: true; type: "regular"; content: string }
+  | {
+      exists: true;
+      type: "symlink" | "directory" | "fifo" | "socket" | "other";
+    };
+
+function captureGitignoreStateAtPause(workflowDir: string): GitignoreStateAtPause {
+  const gitignorePath = join(workflowDir, ".gitignore");
+  let st;
+  try {
+    st = lstatSync(gitignorePath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { exists: false };
+    return { exists: true, type: "other" };
+  }
+  if (st.isFile()) {
+    let content = "";
+    try {
+      content = readFileSync(gitignorePath, "utf-8");
+    } catch {
+      // Unreadable regular file — surface as "other" so a buggy implementation
+      // that mutated permissions during cleanup is detectable.
+      return { exists: true, type: "other" };
+    }
+    return { exists: true, type: "regular", content };
+  }
+  if (st.isSymbolicLink()) return { exists: true, type: "symlink" };
+  if (st.isDirectory()) return { exists: true, type: "directory" };
+  if (st.isFIFO()) return { exists: true, type: "fifo" };
+  if (st.isSocket()) return { exists: true, type: "socket" };
+  return { exists: true, type: "other" };
+}
+
+async function pauseAutoInstallSeam(
+  resolvedWindow: string,
+  payload: AutoInstallPausePayload,
+  signalContext?: InstallSignalContext
+): Promise<void> {
+  const markerPath = process.env.LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER;
+  if (markerPath) {
+    const marker: Record<string, unknown> = {
+      window: resolvedWindow,
+      current: payload.current,
+      processed: payload.processed,
+      remaining: payload.remaining,
+    };
+    if (payload.activeChildPid !== undefined) {
+      marker.activeChildPid = payload.activeChildPid;
+    }
+    if (payload.gitignoreStateAtPause !== undefined) {
+      marker.gitignoreStateAtPause = payload.gitignoreStateAtPause;
+    }
+    try {
+      const fd = openSync(markerPath, "w");
+      try {
+        writeSync(fd, JSON.stringify(marker));
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      // Per TEST-SPEC §1.4: "If LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER is unset
+      // or names a non-writable path, the seam still pauses for the bounded
+      // interval but the marker is not written."
+    }
+  }
+
+  // Bounded sleep with periodic signal polling so we can resume early when
+  // the harness delivers a signal during the pause; the head-of-iteration
+  // check then aborts the pass without waiting the full interval.
+  const start = Date.now();
+  while (Date.now() - start < AUTOINSTALL_PAUSE_MS) {
+    if (signalContext && signalContext.receivedSignal() !== null) {
+      return;
+    }
+    await new Promise<void>((resolve) =>
+      setTimeout(resolve, AUTOINSTALL_PAUSE_POLL_MS)
+    );
+  }
+}
+
 export async function installCommand(opts: InstallOptions): Promise<void> {
   const {
     source,
     cwd,
     selectedWorkflow,
     override,
+    noInstall,
     runningVersion,
+    signalContext,
   } = opts;
 
   let classifyResult;
@@ -149,6 +443,7 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
   // Preflight
   const failures: PreflightFailure[] = [];
   const pkgWarnings: string[] = []; // non-blocking package.json warnings
+  const warnedWorkflows = new Set<string>(); // workflows already warned about during preflight (SPEC §10.10 once-per-install dedup)
   const replacements = new Set<string>(); // workflow names to replace at commit time
 
   for (const wf of selected) {
@@ -244,20 +539,29 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
     // Version check (SPEC §10.6, workflow-level only)
     const versionResult = checkWorkflowVersion(wf.sourceDir, runningVersion);
     switch (versionResult.kind) {
+      case "non-regular":
+        pkgWarnings.push(
+          `Warning: workflow '${wf.name}' package.json is not a regular file; skipping check`
+        );
+        warnedWorkflows.add(wf.name);
+        break;
       case "unreadable":
         pkgWarnings.push(
           `Warning: workflow '${wf.name}' package.json is unreadable (permission denied); skipping check`
         );
+        warnedWorkflows.add(wf.name);
         break;
       case "invalid-json":
         pkgWarnings.push(
           `Warning: workflow '${wf.name}' package.json contains invalid JSON; skipping check`
         );
+        warnedWorkflows.add(wf.name);
         break;
       case "invalid-semver":
         pkgWarnings.push(
           `Warning: workflow '${wf.name}' has an invalid semver specifier for loopx in package.json; skipping check`
         );
+        warnedWorkflows.add(wf.name);
         break;
       case "mismatched":
         if (!override) {
@@ -366,6 +670,821 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
     }
     process.exit(1);
   }
+
+  // ─────────────────────────────────────────────────────────────
+  // Post-commit auto-install pass (SPEC §10.10)
+  // ─────────────────────────────────────────────────────────────
+  if (!noInstall) {
+    const exitCode = await runAutoInstall(
+      loopxDir,
+      committed,
+      runningVersion,
+      warnedWorkflows,
+      signalContext
+    );
+    if (exitCode !== 0) {
+      process.exit(exitCode);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SPEC §10.10 auto-install pass.
+// ─────────────────────────────────────────────────────────────────────
+
+interface AutoInstallFailure {
+  workflow: string;
+  reason: string;
+}
+
+/**
+ * Runs the post-commit auto-install pass over each committed workflow that has
+ * a top-level `package.json`. Returns the exit code (0 on success, 1 if any
+ * workflow's auto-install failed).
+ *
+ * Per SPEC §10.10:
+ * - Iterates committed workflows in the order returned by the commit phase.
+ * - For each workflow with a top-level `package.json`:
+ *     1. Re-validate the committed `package.json` (skip silently if absent;
+ *        warn + skip if malformed, with at-most-one warning per install).
+ *     2. Run the `.gitignore` safeguard (synthesize on ENOENT, leave regular,
+ *        treat any non-regular entry as a safeguard failure).
+ *     3. Spawn `npm install` with cwd = workflow directory, env inherited
+ *        unchanged, stdio inherited (streaming passthrough).
+ * - Workflows without a top-level `package.json` are skipped silently.
+ * - Failures are aggregated and an aggregate failure report is emitted
+ *   on stderr at the end if any failures occurred.
+ */
+async function runAutoInstall(
+  loopxDir: string,
+  committed: string[],
+  runningVersion: string,
+  warnedFromPreflight: Set<string>,
+  signalContext?: InstallSignalContext
+): Promise<number> {
+  const failures: AutoInstallFailure[] = [];
+  const fault = getAutoInstallFault();
+  const pauseSpec = getAutoInstallPause();
+  // Per SPEC §10.10: dedupe warnings across the whole install operation,
+  // not just the auto-install pass. Seed with workflows already warned at
+  // preflight time so we don't double-warn here.
+  const warnedAbout = new Set<string>(warnedFromPreflight);
+  // Track per-workflow processing terminal state for the pause-seam marker
+  // payload (TEST-SPEC §1.4 LOOPX_TEST_AUTOINSTALL_PAUSE). `processed`
+  // accumulates workflow names whose iteration body ran to completion in
+  // the auto-install order; `npmChildExitCount` counts npm `child.on("exit")`
+  // observations (success and non-zero-exit and signal-terminated alike,
+  // but NOT spawn failures where no child existed) so the `post-exit-first`
+  // ordinal can fire on the first such observation; `safeguardFailureCount`
+  // counts `.gitignore` safeguard failures recorded into `failures` so the
+  // `post-safeguard-failure-first` ordinal can fire on the first such record;
+  // `spawnFailureCount` counts npm `spawn` ENOENT-class failures recorded
+  // into `failures` so the `post-spawn-failure-first` ordinal can fire on
+  // the first such record.
+  const processed: string[] = [];
+  let npmChildExitCount = 0;
+  let safeguardFailureCount = 0;
+  let spawnFailureCount = 0;
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Before-first-workflow pause seam dispatch (TEST-SPEC §1.4
+  // LOOPX_TEST_AUTOINSTALL_PAUSE). Fires at the top of the auto-install
+  // pass, BEFORE the first workflow's iteration body begins — i.e.,
+  // before `committed[0]`'s package.json lstat / version check /
+  // `.gitignore` safeguard / `npm install` spawn. Marker payload reports
+  // `processed = []` (no workflow's iteration has started), `current =
+  // committed[0]` (upcoming first workflow), and `remaining =
+  // committed.slice(1)` (the other workflows). No `gitignoreStateAtPause`
+  // or `activeChildPid` field — neither concept applies in this window.
+  //
+  // Structurally distinct from `between-workflows-after-first` (which
+  // fires AFTER the first workflow's iteration completes) and
+  // `pre-spawn-first` (which fires DURING the first workflow's
+  // iteration, after its safeguard). Catches a buggy implementation
+  // that wires its no-active-child signal handling only into the
+  // per-workflow loop body (e.g., one that checks for `receivedSignal`
+  // before each workflow's safeguard but skips the check on the
+  // very first iteration's pre-pass setup).
+  //
+  // Ordinal-only — no named form. Skipped when `committed` is empty
+  // (no first workflow exists; the per-workflow loop is a no-op and
+  // the seam would have nothing meaningful to mark).
+  //
+  // After resuming from the pause, the head-of-loop signal-check
+  // guard at the top of the `for` loop observes the signal and
+  // `break`s, satisfying SPEC §10.10's "no further `.gitignore`
+  // safeguards or `npm install` children" guarantee with ZERO
+  // workflows processed.
+  // ─────────────────────────────────────────────────────────────────────
+  if (
+    pauseSpec &&
+    pauseSpec.kind === "ordinal" &&
+    pauseSpec.window === "before-first-workflow" &&
+    committed.length > 0
+  ) {
+    await pauseAutoInstallSeam(
+      "before-first-workflow",
+      {
+        current: committed[0],
+        processed: [],
+        remaining: committed.slice(1),
+      },
+      signalContext
+    );
+  }
+
+  for (let i = 0; i < committed.length; i++) {
+    const workflowName = committed[i];
+    // SPEC §10.10 "Signals during the auto-install pass when no npm child is
+    // active": at the head of each workflow iteration, check whether a signal
+    // has been observed since the last child exited. If so, abort the pass
+    // immediately — start no further `.gitignore` safeguards and no further
+    // `npm install` children. The aggregate failure report is suppressed at
+    // end-of-pass when receivedSignal is non-null.
+    if (signalContext && signalContext.receivedSignal() !== null) {
+      break;
+    }
+    const workflowDir = join(loopxDir, workflowName);
+    const pkgPath = join(workflowDir, "package.json");
+
+    // Per-iteration tracking for the auto-install pause seam.
+    let npmExitObserved = false;
+
+    // Use IIFE to allow early-return semantics for skip / malformed / etc.
+    // without losing the end-of-iteration `processed.push` and pause-seam
+    // dispatch below.
+    await (async () => {
+      // 1. Re-validate the committed package.json. SPEC §10.10:
+      //   - Absent → silent skip (no auto-install).
+      //   - Unreadable / invalid JSON / invalid semver / non-regular path
+      //     → emit at-most-one workflow-level warning (matching SPEC §3.2)
+      //       if not already emitted for this workflow during this install,
+      //       then silent skip auto-install (and the .gitignore safeguard).
+      let pkgLstat;
+      try {
+        pkgLstat = lstatSync(pkgPath);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") {
+          return; // Silent skip: no top-level package.json.
+        }
+        // Other lstat failure → treat as malformed.
+        if (!warnedAbout.has(workflowName)) {
+          process.stderr.write(
+            `Warning: workflow '${workflowName}' package.json could not be read; skipping auto-install\n`
+          );
+          warnedAbout.add(workflowName);
+        }
+        return;
+      }
+      // SPEC §3.2 / §10.10: a non-regular package.json (directory, symlink,
+      // FIFO, socket, etc.) is treated as malformed → warn + skip.
+      if (!pkgLstat.isFile()) {
+        if (!warnedAbout.has(workflowName)) {
+          process.stderr.write(
+            `Warning: workflow '${workflowName}' package.json is not a regular file; skipping auto-install\n`
+          );
+          warnedAbout.add(workflowName);
+        }
+        return;
+      }
+      // Validate JSON / semver via checkWorkflowVersion.
+      const versionResult = checkWorkflowVersion(workflowDir, runningVersion);
+      let malformed = false;
+      switch (versionResult.kind) {
+        case "unreadable":
+          if (!warnedAbout.has(workflowName)) {
+            process.stderr.write(
+              `Warning: workflow '${workflowName}' package.json is unreadable (permission denied); skipping auto-install\n`
+            );
+            warnedAbout.add(workflowName);
+          }
+          malformed = true;
+          break;
+        case "invalid-json":
+          if (!warnedAbout.has(workflowName)) {
+            process.stderr.write(
+              `Warning: workflow '${workflowName}' package.json contains invalid JSON; skipping auto-install\n`
+            );
+            warnedAbout.add(workflowName);
+          }
+          malformed = true;
+          break;
+        case "invalid-semver":
+          if (!warnedAbout.has(workflowName)) {
+            process.stderr.write(
+              `Warning: workflow '${workflowName}' has an invalid semver specifier for loopx in package.json; skipping auto-install\n`
+            );
+            warnedAbout.add(workflowName);
+          }
+          malformed = true;
+          break;
+        // satisfied / mismatched / no-loopx-declared / no-package-json:
+        // none of these block auto-install (mismatched is a §10.6 preflight
+        // concern that already gated commit).
+        default:
+          break;
+      }
+      if (malformed) return;
+
+      // 2. Run the .gitignore safeguard.
+      const gitignoreOk = runGitignoreSafeguard(workflowDir, workflowName, fault);
+      if (!gitignoreOk.ok) {
+        failures.push({ workflow: workflowName, reason: gitignoreOk.reason });
+        safeguardFailureCount++;
+
+        // ───────────────────────────────────────────────────────────────────
+        // Post-safeguard-failure pause seam dispatch (TEST-SPEC §1.4
+        // LOOPX_TEST_AUTOINSTALL_PAUSE). Fires AFTER the safeguard failure
+        // has been recorded into the `failures` accumulator and BEFORE the
+        // next workflow's iteration begins (the IIFE is about to return,
+        // and the post-IIFE between-workflows dispatch is gated on a
+        // different window value). The marker payload reports `processed`
+        // as the workflows whose iterations completed BEFORE this one (i.e.,
+        // the failed workflow is NOT included), `current` as the failed
+        // workflow, and `remaining` as the workflows after this one.
+        //
+        // The ordinal `post-safeguard-failure-first` fires on the first
+        // safeguard-failure observation in the implementation's auto-install
+        // order (`safeguardFailureCount === 1`). The named
+        // `post-safeguard-failure:<name>` fires on the workflow whose name
+        // matches regardless of ordinal position.
+        //
+        // After resuming from the pause, the IIFE returns. The post-IIFE
+        // code path then runs through `processed.push(workflowName)` and
+        // checks the between-workflows dispatch (which won't fire because
+        // the active window is different). The next iteration's
+        // head-of-loop check observes the signal and breaks the outer
+        // loop, satisfying SPEC §10.10's "no further `.gitignore`
+        // safeguards or `npm install` children" guarantee.
+        //
+        // Per SPEC §10.10 "the aggregate failure report is suppressed when
+        // receivedSignal is non-null at end-of-pass": even though `failures`
+        // already has this workflow's safeguard-failure entry, the
+        // end-of-pass guard at the bottom of `runAutoInstall` returns 0
+        // before emitting the aggregate report.
+        // ───────────────────────────────────────────────────────────────────
+        if (pauseSpec) {
+          const fireOrdinal =
+            pauseSpec.kind === "ordinal" &&
+            pauseSpec.window === "post-safeguard-failure-first" &&
+            safeguardFailureCount === 1;
+          const fireNamed =
+            pauseSpec.kind === "named" &&
+            pauseSpec.window === "post-safeguard-failure" &&
+            pauseSpec.workflow === workflowName;
+          if (fireOrdinal || fireNamed) {
+            const resolvedWindow =
+              pauseSpec.kind === "ordinal"
+                ? "post-safeguard-failure-first"
+                : `post-safeguard-failure:${workflowName}`;
+            await pauseAutoInstallSeam(
+              resolvedWindow,
+              {
+                current: workflowName,
+                processed: [...processed],
+                remaining: committed.slice(i + 1),
+              },
+              signalContext
+            );
+          }
+        }
+        return;
+      }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // Pre-spawn pause seam dispatch (TEST-SPEC §1.4 LOOPX_TEST_AUTOINSTALL_PAUSE).
+      // Fires AFTER the .gitignore safeguard's `lstat` dispatch + (sync) write
+      // for this workflow, BEFORE the `spawn("npm", "install")` call. The
+      // marker payload's `gitignoreStateAtPause` records the deterministic
+      // post-safeguard on-disk state of `.loopx/<current>/.gitignore` so the
+      // harness can pin SPEC §10.10's "side effects completed before the
+      // signal observation remain on disk" rule byte-for-byte across both
+      // sub-cases (existing-state preservation AND the absent → absent
+      // negative-form "side effects that had not begun do not start after
+      // the signal observation").
+      //
+      // The ordinal `pre-spawn-first` fires on the first workflow processed
+      // in the implementation's auto-install order (`processed.length === 0`).
+      // The named `pre-spawn:<name>` fires on the workflow whose name
+      // matches regardless of ordinal position.
+      //
+      // After resuming from the pause, the IIFE returns without spawning npm
+      // when a signal has been observed; the head-of-iteration check on the
+      // next iteration then breaks the outer loop, satisfying the SPEC §10.10
+      // "no further `npm install` children are started" guarantee.
+      // ─────────────────────────────────────────────────────────────────────
+      if (pauseSpec) {
+        const fireOrdinal =
+          pauseSpec.kind === "ordinal" &&
+          pauseSpec.window === "pre-spawn-first" &&
+          processed.length === 0;
+        const fireNamed =
+          pauseSpec.kind === "named" &&
+          pauseSpec.window === "pre-spawn" &&
+          pauseSpec.workflow === workflowName;
+        if (fireOrdinal || fireNamed) {
+          const resolvedWindow =
+            pauseSpec.kind === "ordinal"
+              ? "pre-spawn-first"
+              : `pre-spawn:${workflowName}`;
+          await pauseAutoInstallSeam(
+            resolvedWindow,
+            {
+              current: workflowName,
+              processed: [...processed],
+              remaining: committed.slice(i + 1),
+              gitignoreStateAtPause: captureGitignoreStateAtPause(workflowDir),
+            },
+            signalContext
+          );
+          if (signalContext && signalContext.receivedSignal() !== null) {
+            return;
+          }
+        }
+      }
+
+      // 3. Spawn `npm install`.
+      //
+      // SPEC §10.10 "Signals during `npm install`": SIGINT / SIGTERM received
+      // while an `npm install` child is active propagates to the child's
+      // process group. We spawn detached so the child becomes its own process
+      // group leader; the CLI signal handlers (bin.ts) consult the
+      // signalContext's active-child slot and forward the signal via
+      // `process.kill(-pid, sig)` plus a SPEC §7.3 5-second grace + SIGKILL
+      // escalation. The child inherits stdin/stdout/stderr unchanged so the
+      // npm streaming-passthrough contract from T-INST-119 holds.
+      //
+      // The spawn-and-wait is split across two awaits so the
+      // `child-active-after-failure` pause seam (TEST-SPEC §1.4) can fire
+      // AFTER spawn but BEFORE child exit. The first phase (synchronous)
+      // sets up the spawn and prepares an exit-promise; the optional seam
+      // pause then runs (early-returning when the harness delivers a
+      // signal); the second phase awaits the exit promise to learn the
+      // child's terminal outcome.
+      try {
+        // TEST-SPEC §1.4 `npm-spawn-fail` seam: synthesize an ENOENT
+        // spawn failure for the named workflow before any real spawn
+        // is attempted. The shape (`code: "ENOENT"`) matches what
+        // node's `child_process.spawn` produces when `npm` is not on
+        // PATH, so the existing ENOENT catch branch below records
+        // the failure identically to the production path. Production
+        // behavior is unaffected (NODE_ENV=test gating in
+        // getAutoInstallFault). T-INST-116m / 116m2 use this to
+        // deterministically reach the post-spawn-failure-first window.
+        if (fault.npmSpawnFail.has(workflowName)) {
+          throw Object.assign(new Error("spawn npm ENOENT"), {
+            code: "ENOENT",
+          });
+        }
+        const child = spawn("npm", ["install"], {
+          cwd: workflowDir,
+          stdio: "inherit",
+          env: process.env,
+          detached: true,
+        });
+        if (signalContext) signalContext.setActiveNpmChild(child);
+        const activeChildPid = child.pid;
+        const spawnExitPromise = new Promise<void>((resolve, reject) => {
+          child.on("error", (err) => {
+            if (signalContext) signalContext.setActiveNpmChild(null);
+            // Spawn failure (most commonly: npm not on PATH → ENOENT).
+            reject(err);
+          });
+          child.on("exit", (code, signal) => {
+            if (signalContext) signalContext.setActiveNpmChild(null);
+            if (signal) {
+              reject(
+                Object.assign(new Error(`npm install terminated by ${signal}`), {
+                  code: "NPM_SIGNAL",
+                  signal,
+                })
+              );
+              return;
+            }
+            if (code === 0) {
+              resolve();
+            } else {
+              reject(
+                Object.assign(
+                  new Error(`npm install exited with code ${code}`),
+                  { code: "NPM_NONZERO_EXIT", exitCode: code }
+                )
+              );
+            }
+          });
+        });
+        // Attach a noop catch immediately so Node doesn't flag the
+        // rejection as unhandled when the child exits during the
+        // optional seam pause (await pauseAutoInstallSeam) below —
+        // Node 25's default unhandled-rejection-is-fatal behavior
+        // would crash the process between the rejection landing and
+        // our `await spawnExitPromise` attaching its own handler.
+        // The original `spawnExitPromise` retains its rejection state
+        // and our await still throws normally.
+        spawnExitPromise.catch(() => {});
+
+        // ─────────────────────────────────────────────────────────────────
+        // Child-active-after-failure pause seam dispatch (TEST-SPEC §1.4
+        // LOOPX_TEST_AUTOINSTALL_PAUSE). Fires AFTER the `spawn("npm",
+        // "install")` call has produced a live child for THIS workflow
+        // AND at least one prior workflow's auto-install failure has
+        // been recorded into the `failures` accumulator, BEFORE the
+        // child-exit promise is awaited. The marker payload reports
+        // `current` as the active-child workflow, `processed` as the
+        // workflows whose iterations completed BEFORE this one (i.e.,
+        // includes the workflow whose failure put `failures.length >=
+        // 1`), `remaining` as the workflows after this one, and
+        // `activeChildPid` as the just-spawned npm child PID (the
+        // process-group leader for `detached: true` spawns) so the
+        // harness can verify post-exit termination via `kill -0 <pid>`
+        // without depending on the shim log (unobservable while the
+        // shim is alive) or the shim's `pidFile` write (which races
+        // against the marker write).
+        //
+        // Pins SPEC §10.10's active-child × prior-failure-suppression
+        // sentence (resolving P-0004-05): when a signal arrives during
+        // the pause, the existing CLI signal handler in bin.ts forwards
+        // the signal to `activeChildPid`'s process group, the child
+        // dies, the spawn-exit promise rejects with NPM_SIGNAL,
+        // sigObserved is true → the catch branch suppresses the
+        // per-workflow failure entry, the head-of-iteration check on
+        // the next iteration aborts the pass, and the end-of-pass
+        // signal-suppression guard at the bottom of `runAutoInstall`
+        // returns 0 BEFORE the aggregate failure report is written
+        // — preserving the prior failures from the accumulator without
+        // emitting the report.
+        //
+        // Ordinal-only (`child-active-after-failure`); no named form
+        // declared. Skipped when no failure has been recorded
+        // (`failures.length === 0`) so a fresh active-child window for
+        // the FIRST workflow does not match — that window is covered by
+        // the existing `pre-spawn-first` seam and the T-INST-116/116a
+        // single-workflow signal-during-npm-install tests instead.
+        // ─────────────────────────────────────────────────────────────────
+        if (
+          pauseSpec &&
+          pauseSpec.kind === "ordinal" &&
+          pauseSpec.window === "child-active-after-failure" &&
+          failures.length >= 1 &&
+          activeChildPid !== undefined
+        ) {
+          await pauseAutoInstallSeam(
+            "child-active-after-failure",
+            {
+              current: workflowName,
+              processed: [...processed],
+              remaining: committed.slice(i + 1),
+              activeChildPid,
+            },
+            signalContext
+          );
+        }
+
+        await spawnExitPromise;
+        // Resolved: child exited successfully (code 0).
+        npmExitObserved = true;
+      } catch (err) {
+        const e = err as NodeJS.ErrnoException & {
+          code?: string;
+          exitCode?: number;
+          signal?: NodeJS.Signals;
+        };
+        // SPEC §10.10 "Signals during `npm install`": when the npm child was
+        // terminated by a forwarded SIGINT / SIGTERM (originating from the CLI
+        // signal handler in bin.ts), the surfacing terminal outcome is the
+        // signal itself, not a per-workflow auto-install failure. Suppress the
+        // failure entry in that case so the aggregate report does not list a
+        // signal-induced exit as if it were an install error. The pass also
+        // breaks immediately after this iteration (the head-of-loop check on
+        // receivedSignal aborts further workflows).
+        const sigObserved =
+          signalContext !== undefined &&
+          signalContext.receivedSignal() !== null;
+        if (e.code === "NPM_SIGNAL" && sigObserved) {
+          // Skip recording — terminal outcome is the signal.
+          npmExitObserved = true;
+        } else if (e.code === "ENOENT") {
+          failures.push({
+            workflow: workflowName,
+            reason: "npm install spawn failed (npm not found on PATH)",
+          });
+          spawnFailureCount++;
+
+          // ───────────────────────────────────────────────────────────────────
+          // Post-spawn-failure pause seam dispatch (TEST-SPEC §1.4
+          // LOOPX_TEST_AUTOINSTALL_PAUSE). Fires AFTER the spawn-failure
+          // entry has been recorded into the `failures` accumulator and
+          // BEFORE the next workflow's iteration begins. The marker payload
+          // reports `processed` as the workflows whose iterations completed
+          // BEFORE this one (the failed workflow is NOT included), `current`
+          // as the failed workflow, and `remaining` as the workflows after
+          // this one.
+          //
+          // The ordinal `post-spawn-failure-first` fires on the first
+          // spawn-failure observation in the implementation's auto-install
+          // order (`spawnFailureCount === 1`). The named
+          // `post-spawn-failure:<name>` fires on the workflow whose name
+          // matches regardless of ordinal position.
+          //
+          // Per SPEC §10.10 "the aggregate failure report is suppressed
+          // when receivedSignal is non-null at end-of-pass": even though
+          // `failures` already has this workflow's spawn-failure entry, the
+          // end-of-pass guard at the bottom of `runAutoInstall` returns 0
+          // before emitting the aggregate report.
+          // ───────────────────────────────────────────────────────────────────
+          if (pauseSpec) {
+            const fireOrdinal =
+              pauseSpec.kind === "ordinal" &&
+              pauseSpec.window === "post-spawn-failure-first" &&
+              spawnFailureCount === 1;
+            const fireNamed =
+              pauseSpec.kind === "named" &&
+              pauseSpec.window === "post-spawn-failure" &&
+              pauseSpec.workflow === workflowName;
+            if (fireOrdinal || fireNamed) {
+              const resolvedWindow =
+                pauseSpec.kind === "ordinal"
+                  ? "post-spawn-failure-first"
+                  : `post-spawn-failure:${workflowName}`;
+              await pauseAutoInstallSeam(
+                resolvedWindow,
+                {
+                  current: workflowName,
+                  processed: [...processed],
+                  remaining: committed.slice(i + 1),
+                },
+                signalContext
+              );
+            }
+          }
+        } else if (e.code === "NPM_NONZERO_EXIT") {
+          failures.push({
+            workflow: workflowName,
+            reason: `npm install exited with code ${e.exitCode}`,
+          });
+          npmExitObserved = true;
+        } else if (e.code === "NPM_SIGNAL") {
+          failures.push({
+            workflow: workflowName,
+            reason: `npm install terminated by signal ${e.signal}`,
+          });
+          npmExitObserved = true;
+        } else {
+          failures.push({
+            workflow: workflowName,
+            reason: `npm install failed: ${e.message}`,
+          });
+        }
+      }
+    })();
+
+    if (npmExitObserved) npmChildExitCount++;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Auto-install pause seam dispatch (TEST-SPEC §1.4).
+    // Fires AFTER the workflow's terminal outcome has been recorded into
+    // the failures accumulator (per SPEC §10.10 "AND recorded that
+    // workflow's auto-install terminal outcome, including any non-zero-exit
+    // aggregate failure entry"), and BEFORE any further per-workflow
+    // processing begins. The marker payload's `processed` field reports
+    // workflows whose iteration completed BEFORE this one's focal point;
+    // `current` is the workflow at the focal point; `remaining` lists the
+    // workflows whose iteration has not started.
+    // ─────────────────────────────────────────────────────────────────────
+    if (pauseSpec) {
+      const remaining = committed.slice(i + 1);
+      // post-exit-first / post-exit:<name>
+      if (npmExitObserved) {
+        const fireOrdinal =
+          pauseSpec.kind === "ordinal" &&
+          pauseSpec.window === "post-exit-first" &&
+          npmChildExitCount === 1;
+        const fireNamed =
+          pauseSpec.kind === "named" &&
+          pauseSpec.window === "post-exit" &&
+          pauseSpec.workflow === workflowName;
+        if (fireOrdinal || fireNamed) {
+          const resolvedWindow =
+            pauseSpec.kind === "ordinal"
+              ? "post-exit-first"
+              : `post-exit:${workflowName}`;
+          await pauseAutoInstallSeam(
+            resolvedWindow,
+            {
+              current: workflowName,
+              processed: [...processed],
+              remaining,
+            },
+            signalContext
+          );
+        }
+      }
+    }
+
+    processed.push(workflowName);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Between-workflows pause seam dispatch (TEST-SPEC §1.4).
+    // Fires AFTER the workflow's iteration body completes (and after the
+    // workflow name has been pushed onto `processed`), and BEFORE any
+    // subsequent workflow's iteration body begins — including its
+    // `.gitignore` safeguard `lstat`. The marker payload's `processed`
+    // field reports workflows whose iteration completed BEFORE the
+    // upcoming workflow (i.e., includes the just-completed one);
+    // `current` is the upcoming workflow name; `remaining` lists the
+    // workflows whose iteration has not started after `current`.
+    //
+    // The ordinal `between-workflows-after-first` fires only on the first
+    // workflow-to-workflow transition (after the first workflow's
+    // iteration completes — `processed.length === 1`). The named
+    // `between-workflows:<name>` fires after the named workflow's
+    // iteration completes regardless of its ordinal position. Neither
+    // fires when the just-completed workflow is the last one in
+    // `committed` (no upcoming workflow exists).
+    // ─────────────────────────────────────────────────────────────────────
+    if (pauseSpec && i + 1 < committed.length) {
+      const fireOrdinal =
+        pauseSpec.kind === "ordinal" &&
+        pauseSpec.window === "between-workflows-after-first" &&
+        processed.length === 1;
+      const fireNamed =
+        pauseSpec.kind === "named" &&
+        pauseSpec.window === "between-workflows" &&
+        pauseSpec.workflow === workflowName;
+      if (fireOrdinal || fireNamed) {
+        const next = committed[i + 1];
+        const resolvedWindow =
+          pauseSpec.kind === "ordinal"
+            ? "between-workflows-after-first"
+            : `between-workflows:${workflowName}`;
+        await pauseAutoInstallSeam(
+          resolvedWindow,
+          {
+            current: next,
+            processed: [...processed],
+            remaining: committed.slice(i + 2),
+          },
+          signalContext
+        );
+      }
+    }
+  }
+
+  // SPEC §10.10 "Signals during the auto-install pass when no npm child is
+  // active": when receivedSignal is non-null at end-of-pass and BEFORE the
+  // aggregate failure report is emitted, suppress the report ("report not
+  // yet emitted" half of the SPEC §10.10 signal-termination clause). The
+  // complementary "unless it had already been emitted" carve-out is handled
+  // below by the post-aggregate-report pause seam.
+  if (signalContext && signalContext.receivedSignal() !== null) {
+    return 0;
+  }
+
+  if (failures.length > 0) {
+    // Use synchronous fd-2 writes so the report bytes reach the kernel pipe
+    // before the post-aggregate-report seam below writes (and fsync's) its
+    // marker file. On POSIX, `process.stderr.write` for a pipe is async and
+    // can leave data in libuv's user-space buffer past the fsync. The
+    // harness polls for the marker and then signals; if the report were
+    // still in the user-space buffer at signal time and the subsequent
+    // `process.exit(128+sig)` truncated the buffer, the test's stderr
+    // capture would miss the report bytes. `writeSync(2, …)` avoids that
+    // race by going directly to the fd.
+    writeSync(2, "Error: auto-install failures:\n");
+    for (const f of failures) {
+      writeSync(2, `  [${f.workflow}] ${f.reason}\n`);
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Post-aggregate-report pause seam dispatch (TEST-SPEC §1.4
+    // LOOPX_TEST_AUTOINSTALL_PAUSE). Fires AFTER the aggregate failure
+    // report has been emitted to stderr and BEFORE this function returns
+    // (and therefore before bin.ts's outer install signal handler observes
+    // process exit). The seam fires only when an aggregate report is
+    // actually emitted (failures.length > 0); it is a no-op on a clean /
+    // no-failure auto-install pass per TEST-SPEC §1.4.
+    //
+    // Marker payload: `current = null` (no per-workflow focal position
+    // applies — all per-workflow processing has reached terminal state by
+    // the time the report is emitted), `processed = [...processed]`
+    // (workflow names whose iteration body ran to terminal state during
+    // the pass — for the T-INST-116l fixture with FIFO-replacement FAULT
+    // applied to all three workflows, all three are present), `remaining
+    // = []` (no further workflows pending). Ordinal-only — no named form.
+    //
+    // After resuming from the pause, if a signal was observed during the
+    // pause, return 0 so installCommand does NOT call process.exit(1) —
+    // bin.ts's outer install signal handler sees `installReceivedSignal`
+    // and exits with `128 + signum` per SPEC §10.10's signal-exit-code
+    // clause. The aggregate report was written to stderr above and is
+    // preserved on disk / in the kernel pipe (the SPEC §10.10 "unless it
+    // had already been emitted" carve-out half).
+    //
+    // No second emission of the report after the pause: this branch
+    // returns 1 only on the no-signal path (timeout/no-trigger case),
+    // and the writeSync calls above ran exactly once.
+    // ───────────────────────────────────────────────────────────────────
+    if (
+      pauseSpec &&
+      pauseSpec.kind === "ordinal" &&
+      pauseSpec.window === "post-aggregate-report"
+    ) {
+      await pauseAutoInstallSeam(
+        "post-aggregate-report",
+        {
+          current: null,
+          processed: [...processed],
+          remaining: [],
+        },
+        signalContext
+      );
+      if (signalContext && signalContext.receivedSignal() !== null) {
+        return 0;
+      }
+    }
+
+    return 1;
+  }
+  return 0;
+}
+
+/**
+ * Apply the SPEC §10.10 .gitignore safeguard. Returns ok=true and writes a
+ * synthesized .gitignore on ENOENT; returns ok=true unchanged on a regular
+ * file; returns ok=false (with a reason) on any non-regular entry, on a
+ * non-ENOENT lstat failure, or on a write failure when synthesizing.
+ */
+function runGitignoreSafeguard(
+  workflowDir: string,
+  workflowName: string,
+  fault: AutoInstallFault
+): { ok: true } | { ok: false; reason: string } {
+  const gitignorePath = join(workflowDir, ".gitignore");
+  // TEST-SPEC §1.4 `gitignore-replace-with-fifo` seam: place a FIFO at the
+  // workflow's `.gitignore` path immediately before this safeguard's `lstat`.
+  // The existing non-regular-file branch below will then record a safeguard
+  // failure organically, exactly as it would for a real FIFO. Production
+  // behavior is unaffected (NODE_ENV=test gating in getAutoInstallFault).
+  if (fault.gitignoreReplaceWithFifo.has(workflowName)) {
+    try {
+      execFileSync("mkfifo", [gitignorePath], { stdio: "pipe" });
+    } catch {
+      // If mkfifo is unavailable or the path already has a non-empty entry,
+      // fall through; the test will surface the deviation. Production code
+      // never reaches this branch (gated on NODE_ENV=test).
+    }
+  }
+  let st;
+  try {
+    st = lstatSync(gitignorePath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      // Synthesize a .gitignore with `node_modules`. The test-only
+      // `gitignore-write-fail:<workflow>` seam (TEST-SPEC §1.4) short-
+      // circuits this branch with a simulated EACCES write failure
+      // before any bytes touch disk; SPEC §10.10's safeguard-failure
+      // dispatch then runs identically to a real EACCES write failure.
+      if (fault.gitignoreWriteFail.has(workflowName)) {
+        return {
+          ok: false,
+          reason: `failed to synthesize .gitignore: EACCES: permission denied, open '${gitignorePath}'`,
+        };
+      }
+      try {
+        writeFileSync(gitignorePath, "node_modules\n", "utf-8");
+        return { ok: true };
+      } catch (writeErr) {
+        return {
+          ok: false,
+          reason: `failed to synthesize .gitignore: ${(writeErr as Error).message}`,
+        };
+      }
+    }
+    return {
+      ok: false,
+      reason: `failed to lstat .gitignore: ${(err as Error).message}`,
+    };
+  }
+  if (st.isFile()) {
+    return { ok: true };
+  }
+  // Any non-regular entry (directory, symlink, FIFO, socket, etc.).
+  return {
+    ok: false,
+    reason: `.gitignore exists but is not a regular file (${describeFsType(st)})`,
+  };
+}
+
+function describeFsType(st: NonNullable<ReturnType<typeof lstatSync>>): string {
+  if (st.isSymbolicLink()) return "symlink";
+  if (st.isDirectory()) return "directory";
+  if (st.isFIFO()) return "FIFO";
+  if (st.isSocket()) return "socket";
+  if (st.isBlockDevice()) return "block device";
+  if (st.isCharacterDevice()) return "character device";
+  return "non-regular";
 }
 
 function mkTempDir(prefix: string, parent?: string): string {
@@ -571,15 +1690,30 @@ function copyWorkflow(src: string, dest: string): void {
   // `src` is the workflow root directory itself. We create `dest` then
   // iterate its children — children are "root-level" entries of the workflow;
   // grandchildren and deeper are not.
-  const rootStat = lstatSync(src);
+  let resolvedSrc = src;
+  let rootStat = lstatSync(resolvedSrc);
+  if (rootStat.isSymbolicLink()) {
+    // SPEC §10.11: a selected top-level workflow entry that is a symlink to
+    // a directory is installed as a real directory at the destination,
+    // containing a copy of the symlink target's workflow contents. Resolve
+    // the symlink and proceed against the target — the destination is
+    // created via mkdirSync below (no symlinkSync), so the materialized
+    // directory is real.
+    resolvedSrc = realpathSync(src);
+    rootStat = lstatSync(resolvedSrc);
+  }
   if (!rootStat.isDirectory()) {
     // Shouldn't happen for a workflow, but handle defensively.
     throw new Error(`Workflow source is not a directory: ${src}`);
   }
   mkdirSync(dest, { recursive: true, mode: rootStat.mode & 0o777 });
-  for (const entry of readdirSync(src)) {
+  for (const entry of readdirSync(resolvedSrc)) {
     if (entry === ".git") continue;
-    copyEntry(join(src, entry), join(dest, entry), /*isRootLevel*/ true);
+    copyEntry(
+      join(resolvedSrc, entry),
+      join(dest, entry),
+      /*isRootLevel*/ true,
+    );
   }
   try {
     chmodSync(dest, rootStat.mode & 0o777);

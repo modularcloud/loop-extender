@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
-import { chmod, readFile } from "node:fs/promises";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { execSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import {
@@ -14,6 +14,7 @@ import {
 import { runCLI } from "../helpers/cli.js";
 import { startLocalGitServer, type GitServer } from "../helpers/servers.js";
 import { forEachRuntime } from "../helpers/runtime.js";
+import { withFakeNpm } from "../helpers/fake-npm.js";
 
 // ─────────────────────────────────────────────────────────────
 // Version & range helpers
@@ -141,6 +142,27 @@ function countUnreadableWarnings(
     ).length;
 }
 
+/** True iff stderr has a non-regular-path warning mentioning the workflow. */
+function hasNonRegularWarning(stderr: string, workflowName: string): boolean {
+  return (
+    stderr.includes(workflowName) &&
+    /not.*regular.*file/i.test(stderr)
+  );
+}
+
+function countNonRegularWarnings(
+  stderr: string,
+  workflowName: string,
+): number {
+  return stderr
+    .split("\n")
+    .filter(
+      (line) =>
+        line.includes(workflowName) &&
+        /not.*regular.*file/i.test(line),
+    ).length;
+}
+
 /** True iff stderr has any package.json-related warning mentioning the workflow. */
 function hasAnyPackageJsonWarning(
   stderr: string,
@@ -149,7 +171,8 @@ function hasAnyPackageJsonWarning(
   return (
     hasInvalidJsonWarning(stderr, workflowName) ||
     hasInvalidSemverWarning(stderr, workflowName) ||
-    hasUnreadableWarning(stderr, workflowName)
+    hasUnreadableWarning(stderr, workflowName) ||
+    hasNonRegularWarning(stderr, workflowName)
   );
 }
 
@@ -647,6 +670,36 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       expect(hasInvalidSemverWarning(result.stderr, "ralph")).toBe(true);
     });
 
+    it("T-VER-09a: non-string dependencies.loopx (number 42) → invalid-semver warning, execution continues", async () => {
+      // SPEC §3.2: "Valid JSON but `loopx` version field contains an invalid
+      // semver range: A warning is printed to stderr." Applies symmetrically
+      // to non-string values (which cannot be a semver range by type).
+      project = await createTempProject();
+      const markerFile = join(project.dir, "ran.marker");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        bashMarker(markerFile),
+      );
+      // JSON number, not a string.
+      await createWorkflowPackageJson(project, "ralph", {
+        dependencies: { loopx: 42 },
+      });
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(markerFile)).toBe(true);
+      expect(hasInvalidSemverWarning(result.stderr, "ralph")).toBe(true);
+      // Distinct from "no warning at all": the non-string value must be
+      // detected, not silently coerced to "no loopx declared".
+      expect(hasVersionMismatchWarning(result.stderr, "ralph")).toBe(false);
+    });
+
     // ─────────────────────────────────────────────
     // dependencies vs devDependencies precedence
     // ─────────────────────────────────────────────
@@ -819,6 +872,32 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       expect(hasAnyPackageJsonWarning(result.stderr, "ralph")).toBe(false);
     });
 
+    it("T-VER-11b2: peerDependencies.loopx with invalid semver → ignored (no warning)", async () => {
+      // SPEC §3.2: workflow-level checks read only `dependencies` and
+      // `devDependencies`. peerDependencies is fully invisible — even when
+      // malformed, no warning is emitted.
+      project = await createTempProject();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"result":"ok"}'`,
+      );
+      await createWorkflowPackageJson(project, "ralph", {
+        peerDependencies: { loopx: INVALID_SEMVER },
+      });
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(hasVersionMismatchWarning(result.stderr, "ralph")).toBe(false);
+      expect(hasInvalidSemverWarning(result.stderr, "ralph")).toBe(false);
+      expect(hasAnyPackageJsonWarning(result.stderr, "ralph")).toBe(false);
+    });
+
     it("T-VER-11c: optionalDependencies.loopx (satisfied) does not rescue deps.loopx (unsatisfied)", async () => {
       project = await createTempProject();
       await createBashWorkflowScript(
@@ -839,6 +918,34 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
 
       expect(result.exitCode).toBe(0);
       expect(hasVersionMismatchWarning(result.stderr, "ralph")).toBe(true);
+    });
+
+    it("T-VER-11d: invalid semver in non-loopx dependency field is fully ignored", async () => {
+      // SPEC §3.2: only `dependencies.loopx` and `devDependencies.loopx`
+      // are read. An invalid semver range on an unrelated dependency must
+      // not produce any warning — loopx does not walk every dep entry.
+      project = await createTempProject();
+      const markerFile = join(project.dir, "ran.marker");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        bashMarker(markerFile),
+      );
+      await createWorkflowPackageJson(project, "ralph", {
+        dependencies: { "not-loopx": INVALID_SEMVER },
+      });
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(markerFile)).toBe(true);
+      expect(hasAnyPackageJsonWarning(result.stderr, "ralph")).toBe(false);
+      expect(hasVersionMismatchWarning(result.stderr, "ralph")).toBe(false);
+      expect(hasInvalidSemverWarning(result.stderr, "ralph")).toBe(false);
     });
 
     // ─────────────────────────────────────────────
@@ -886,6 +993,87 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
 
       expect(result.exitCode).toBe(0);
       expect(hasVersionMismatchWarning(result.stderr, "ralph")).toBe(true);
+    });
+
+    it("T-VER-14b: standalone devDependencies.loopx (satisfied) → no warning", async () => {
+      // SPEC §3.2: when only `devDependencies.loopx` is present and the
+      // running version satisfies it, no warning fires. Closes the
+      // standalone-devDeps-satisfied gap; T-VER-10 covers it only in a
+      // mixed-precedence context.
+      project = await createTempProject();
+      const markerFile = join(project.dir, "ran.marker");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        bashMarker(markerFile),
+      );
+      await createWorkflowPackageJson(project, "ralph", {
+        devDependencies: { loopx: satisfiedRange() },
+      });
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(markerFile)).toBe(true);
+      expect(hasVersionMismatchWarning(result.stderr, "ralph")).toBe(false);
+      expect(hasAnyPackageJsonWarning(result.stderr, "ralph")).toBe(false);
+    });
+
+    it("T-VER-14c: standalone devDependencies.loopx (invalid semver) → invalid-semver warning, execution continues", async () => {
+      // Standalone-devDeps invalid semver path. T-VER-10a/10b cover the
+      // mixed-precedence case (deps + devDeps); this closes the
+      // standalone-devDeps-only-invalid gap.
+      project = await createTempProject();
+      const markerFile = join(project.dir, "ran.marker");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        bashMarker(markerFile),
+      );
+      await createWorkflowPackageJson(project, "ralph", {
+        devDependencies: { loopx: INVALID_SEMVER },
+      });
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(markerFile)).toBe(true);
+      expect(countInvalidSemverWarnings(result.stderr, "ralph")).toBeGreaterThanOrEqual(1);
+    });
+
+    it("T-VER-14d: standalone devDependencies.loopx (non-string) → invalid-semver warning, execution continues", async () => {
+      // SPEC §3.2: non-string `devDependencies.loopx` is symmetric with
+      // T-VER-09a (non-string `dependencies.loopx`) — neither value can be
+      // a semver range, so both fire the invalid-semver warning.
+      project = await createTempProject();
+      const markerFile = join(project.dir, "ran.marker");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        bashMarker(markerFile),
+      );
+      await createWorkflowPackageJson(project, "ralph", {
+        devDependencies: { loopx: 42 },
+      });
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(markerFile)).toBe(true);
+      expect(hasInvalidSemverWarning(result.stderr, "ralph")).toBe(true);
+      expect(hasVersionMismatchWarning(result.stderr, "ralph")).toBe(false);
     });
 
     // ─────────────────────────────────────────────
@@ -1623,6 +1811,46 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       expect(countInvalidSemverWarnings(result.stderr, "broken")).toBe(1);
       expect(hasAnyPackageJsonWarning(result.stderr, "clean")).toBe(false);
     });
+
+    // ─────────────────────────────────────────────
+    // Non-Regular Workflow `package.json` Path (SPEC §3.2)
+    // ─────────────────────────────────────────────
+
+    it("T-VER-28: workflow package.json is a directory → one non-regular warning, version check skipped, execution continues", async () => {
+      project = await createTempProject();
+      const markerFile = join(project.dir, "ran.marker");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        bashMarker(markerFile),
+      );
+      // Replace the (default-absent) package.json with a directory containing
+      // a placeholder file. The directory must be non-empty so its identity
+      // is stable for assertion (d).
+      const pkgPath = join(project.loopxDir, "ralph", "package.json");
+      await mkdir(pkgPath, { recursive: true });
+      const placeholderPath = join(pkgPath, "README");
+      const placeholderContent = "placeholder content";
+      await writeFile(placeholderPath, placeholderContent, "utf-8");
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      // (a) exit code 0 — non-regular path is non-fatal per SPEC §3.2.
+      expect(result.exitCode).toBe(0);
+      // (b) stderr contains exactly one package.json warning for ralph.
+      expect(countNonRegularWarnings(result.stderr, "ralph")).toBe(1);
+      // (c) script ran.
+      expect(existsSync(markerFile)).toBe(true);
+      // (d) directory entry preserved unchanged with placeholder file intact.
+      const pkgStat = lstatSync(pkgPath);
+      expect(pkgStat.isDirectory()).toBe(true);
+      expect(existsSync(placeholderPath)).toBe(true);
+      expect(readFileSync(placeholderPath, "utf-8")).toBe(placeholderContent);
+    });
   });
 
   // ═════════════════════════════════════════════════════════════
@@ -1634,6 +1862,10 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
 
     forEachRuntime((runtime) => {
       it("T-VER-12: install — dependencies wins over devDependencies (precedence)", async () => {
+        // With --no-install per the §4.10 suite-wide auto-install-awareness rule
+        // (the SPEC §10.10 auto-install pass would invoke real `npm install`
+        // against the workflow, which fails in the sandboxed test environment).
+        //
         // Case A: deps satisfied, devDeps unsatisfied → install succeeds
         {
           project = await createTempProject();
@@ -1651,7 +1883,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", `${gitServer.url}/ralph.git`],
+            ["install", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1682,7 +1914,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", `${gitServer.url}/ralph.git`],
+            ["install", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1717,6 +1949,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       });
 
       it("T-VER-12b: install — deps satisfied → devDeps fully ignored (no warning even if malformed)", async () => {
+        // With --no-install per the §4.10 suite-wide auto-install-awareness rule.
         project = await createTempProject();
         gitServer = await startLocalGitServer([
           {
@@ -1731,14 +1964,44 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
-          cwd: project.dir,
-          runtime,
-        });
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/ralph.git`],
+          { cwd: project.dir, runtime },
+        );
 
         expect(result.exitCode).toBe(0);
         expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
         expect(hasInvalidSemverWarning(result.stderr, "ralph")).toBe(false);
+      });
+
+      it("T-VER-12c: install — non-string dependencies.loopx → invalid-semver warning, install succeeds", async () => {
+        // Install-time counterpart to T-VER-09a. SPEC §3.2's "Valid JSON
+        // but `loopx` version field contains an invalid semver range" rule
+        // applies to non-string values (which cannot be a semver range).
+        // Use --no-install to keep the test scope narrow (the auto-install
+        // pass would skip per malformed-package.json rules anyway, but
+        // T-VER-15c covers the auto-install-skip contract explicitly).
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": INDEX_SH,
+              "package.json": JSON.stringify({
+                dependencies: { loopx: 42 },
+              }),
+            },
+          },
+        ]);
+
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/ralph.git`],
+          { cwd: project.dir, runtime },
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(hasInvalidSemverWarning(result.stderr, "ralph")).toBe(true);
       });
 
       it("T-VER-13: install — optionalDependencies.loopx is ignored", async () => {
@@ -1790,6 +2053,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       });
 
       it("T-VER-13b: install — peerDependencies.loopx is ignored", async () => {
+        // With --no-install per the §4.10 suite-wide auto-install-awareness rule.
         project = await createTempProject();
         gitServer = await startLocalGitServer([
           {
@@ -1803,14 +2067,72 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
-          cwd: project.dir,
-          runtime,
-        });
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/ralph.git`],
+          { cwd: project.dir, runtime },
+        );
 
         expect(result.exitCode).toBe(0);
         expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
         expect(hasAnyPackageJsonWarning(result.stderr, "ralph")).toBe(false);
+      });
+
+      it("T-VER-13b2: install — peerDependencies.loopx with invalid semver is ignored", async () => {
+        // Install-time counterpart to T-VER-11b2. peerDependencies is
+        // fully invisible to workflow-level version checking — even a
+        // malformed range produces no warning at install.
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": INDEX_SH,
+              "package.json": JSON.stringify({
+                peerDependencies: { loopx: INVALID_SEMVER },
+              }),
+            },
+          },
+        ]);
+
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/ralph.git`],
+          { cwd: project.dir, runtime },
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(hasInvalidSemverWarning(result.stderr, "ralph")).toBe(false);
+        expect(hasAnyPackageJsonWarning(result.stderr, "ralph")).toBe(false);
+      });
+
+      it("T-VER-13d: install — invalid semver in non-loopx dependency field is fully ignored", async () => {
+        // Install-time counterpart to T-VER-11d. SPEC §3.2 restricts
+        // version validation to `dependencies.loopx` and
+        // `devDependencies.loopx`; an invalid range on an unrelated dep
+        // field must not warn or block install.
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": INDEX_SH,
+              "package.json": JSON.stringify({
+                dependencies: { "not-loopx": INVALID_SEMVER },
+              }),
+            },
+          },
+        ]);
+
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/ralph.git`],
+          { cwd: project.dir, runtime },
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(hasInvalidSemverWarning(result.stderr, "ralph")).toBe(false);
+        expect(hasAnyPackageJsonWarning(result.stderr, "ralph")).toBe(false);
+        expect(hasVersionMismatchWarning(result.stderr, "ralph")).toBe(false);
       });
 
       it("T-VER-13c: install — optionalDependencies does not rescue unsatisfied dependencies; -y overrides", async () => {
@@ -1895,6 +2217,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       });
 
       it("T-VER-15a: install — optionalDependencies does not rescue unsatisfied devDependencies; -y overrides", async () => {
+        // With --no-install per the §4.10 suite-wide auto-install-awareness rule.
         // Without -y
         {
           project = await createTempProject();
@@ -1912,7 +2235,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", `${gitServer.url}/ralph.git`],
+            ["install", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1943,13 +2266,158 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", "-y", `${gitServer.url}/ralph.git`],
+            ["install", "--no-install", "-y", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
           expect(result.exitCode).toBe(0);
           expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
         }
+      });
+
+      it("T-VER-15b: install — standalone devDependencies.loopx (satisfied) → install succeeds, no warning", async () => {
+        // Install-time counterpart to T-VER-14b. Closes the
+        // standalone-devDeps-only-satisfied gap at install time. T-VER-15
+        // covers the unsatisfied-only branch; T-VER-15a covers the mixed
+        // optionalDeps-satisfied case. With --no-install per the §4.10
+        // suite-wide auto-install-awareness rule.
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": INDEX_SH,
+              "package.json": JSON.stringify({
+                devDependencies: { loopx: satisfiedRange() },
+              }),
+            },
+          },
+        ]);
+
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/ralph.git`],
+          { cwd: project.dir, runtime },
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(hasVersionMismatchWarning(result.stderr, "ralph")).toBe(false);
+        expect(hasAnyPackageJsonWarning(result.stderr, "ralph")).toBe(false);
+      });
+
+      it("T-VER-15c: install — devDependencies.loopx only with invalid semver → warning, install succeeds, auto-install skips", async () => {
+        // SPEC §3.2: invalid semver range emits a warning (the version check
+        // is skipped) and installation proceeds. SPEC §10.10 "Malformed
+        // package.json": when the committed package.json has an invalid
+        // `loopx` semver range, auto-install **skips that workflow silently**
+        // — loopx does not invoke `npm install` against a file that failed
+        // version validation, and the .gitignore safeguard is also skipped.
+        //
+        // Install-time companion to T-VER-12c (which pins the same warning
+        // for `dependencies.loopx`). T-VER-12c uses `--no-install` to keep
+        // its scope narrow on the warning side; T-VER-15c uses `withFakeNpm`
+        // to assert the auto-install-skip contract explicitly — a buggy
+        // implementation that emitted the warning correctly but failed to
+        // gate `runAutoInstall` on the same `invalid-semver` classification
+        // would pass T-VER-12c yet fail this test.
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": INDEX_SH,
+              "package.json": JSON.stringify({
+                devDependencies: { loopx: INVALID_SEMVER },
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/ralph.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+
+          // (a) exit 0 — invalid semver does not block install.
+          expect(result.exitCode).toBe(0);
+
+          // (b) workflow installed at .loopx/ralph/.
+          expect(existsSync(join(project!.loopxDir, "ralph"))).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", "index.sh")),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", "package.json")),
+          ).toBe(true);
+
+          // (c) exactly one invalid-semver warning for the workflow.
+          expect(hasInvalidSemverWarning(result.stderr, "ralph")).toBe(true);
+          expect(countInvalidSemverWarnings(result.stderr, "ralph")).toBe(1);
+
+          // (d) auto-install skipped — fake-npm log empty (npm install never invoked).
+          expect(fake.readInvocations().length).toBe(0);
+
+          // (e) no .gitignore synthesis — safeguard skipped under same trigger.
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", ".gitignore")),
+          ).toBe(false);
+        });
+      });
+
+      it("T-VER-15d: install — devDependencies.loopx only with non-string value → warning, install succeeds, auto-install skips", async () => {
+        // Install-time companion to T-VER-14d (runtime non-string devDependencies.loopx)
+        // and parity with T-VER-12c (install-time non-string dependencies.loopx).
+        // SPEC §3.2 routes non-string `loopx` values through the `invalid-semver`
+        // warning class (a non-string cannot be a semver range). SPEC §10.10
+        // routes the same `invalid-semver` classification through the auto-install
+        // skip path — a buggy implementation might classify the warning correctly
+        // but fail to gate auto-install on the same classification.
+        project = await createTempProject();
+        const logFile = join(project.dir, "fake-npm.log");
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": INDEX_SH,
+              "package.json": JSON.stringify({
+                devDependencies: { loopx: 42 },
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0, logFile }, async (fake) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/ralph.git`],
+            { cwd: project!.dir, runtime, timeout: 60_000 },
+          );
+
+          // (a) exit 0.
+          expect(result.exitCode).toBe(0);
+
+          // (b) workflow installed at .loopx/ralph/.
+          expect(existsSync(join(project!.loopxDir, "ralph"))).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", "index.sh")),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", "package.json")),
+          ).toBe(true);
+
+          // (c) invalid-semver warning emitted exactly once for the workflow.
+          expect(hasInvalidSemverWarning(result.stderr, "ralph")).toBe(true);
+          expect(countInvalidSemverWarnings(result.stderr, "ralph")).toBe(1);
+
+          // (d) auto-install skipped — fake-npm log empty.
+          expect(fake.readInvocations().length).toBe(0);
+
+          // (e) no .gitignore synthesis.
+          expect(
+            existsSync(join(project!.loopxDir, "ralph", ".gitignore")),
+          ).toBe(false);
+        });
       });
 
       it("T-VER-17: install — valid package.json with no loopx declared → no version check, no warnings", async () => {

@@ -1,8 +1,10 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
-import { chmod } from "node:fs/promises";
-import { execSync } from "node:child_process";
-import { join, resolve } from "node:path";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { chmod, mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { execSync, spawnSync } from "node:child_process";
+import { dirname, join, resolve } from "node:path";
+import { tmpdir as osTmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 import {
   createTempProject,
   createWorkflowScript,
@@ -323,16 +325,19 @@ console.log(JSON.stringify(results));
       expect(readFileSync(markerPath, "utf-8")).toBe(project.dir);
     });
 
-    // T-API-07a: RunOptions.cwd does not control script execution cwd — scripts run with
-    //            the workflow directory as their cwd, not the provided RunOptions.cwd.
-    it("T-API-07a: RunOptions.cwd does not control script execution cwd", async () => {
+    // T-API-07a: RunOptions.cwd controls script execution cwd (project-root-unified per
+    //            ADR-0004 §3 / SPEC 9.5). Script execution cwd equals the project root,
+    //            and LOOPX_WORKFLOW_DIR exposes the workflow-relative path independently.
+    it("T-API-07a: RunOptions.cwd controls script execution cwd (project-root-unified)", async () => {
       project = await createTempProject();
-      const markerPath = join(project.dir, "cwd-marker.txt");
+      const cwdMarker = join(project.dir, "cwd-marker.txt");
+      const wfdirMarker = join(project.dir, "wfdir-marker.txt");
       await createBashWorkflowScript(
         project,
         "ralph",
         "index",
-        `printf '%s' "$PWD" > "${markerPath}"
+        `printf '%s' "$(/bin/pwd -P)" > "${cwdMarker}"
+printf '%s' "$LOOPX_WORKFLOW_DIR" > "${wfdirMarker}"
 printf '{"stop":true}'`,
       );
 
@@ -345,12 +350,19 @@ console.log("done");
 `;
       const result = await runAPIDriver(runtime, driverCode);
       expect(result.exitCode).toBe(0);
-      expect(existsSync(markerPath)).toBe(true);
-      // Script's cwd must be the workflow dir (.loopx/ralph), NOT projectA.
-      // Use realpath-tolerant comparison: resolve both sides.
-      const actualCwd = readFileSync(markerPath, "utf-8");
-      expect(resolve(actualCwd)).toBe(resolve(workflowDir));
-      expect(resolve(actualCwd)).not.toBe(resolve(project.dir));
+      expect(existsSync(cwdMarker)).toBe(true);
+      // Per SPEC 9.5 (rewritten by ADR-0004 §3): RunOptions.cwd specifies BOTH
+      // the project root and the script execution cwd. The previous "cwd does
+      // not control script execution cwd" disclaimer no longer applies.
+      // /bin/pwd -P returns the kernel-canonical form, so compare against
+      // realpath(project.dir).
+      const actualCwd = readFileSync(cwdMarker, "utf-8");
+      const expectedRoot = realpathSync(project.dir);
+      expect(actualCwd).toBe(expectedRoot);
+      expect(actualCwd).not.toBe(workflowDir);
+      // The workflow-relative path is exposed via LOOPX_WORKFLOW_DIR, not cwd.
+      expect(existsSync(wfdirMarker)).toBe(true);
+      expect(readFileSync(wfdirMarker, "utf-8")).toBe(workflowDir);
     });
 
     // T-API-08: maxIterations: 0 → completes immediately, no yields, no child spawn.
@@ -2111,15 +2123,17 @@ console.log(JSON.stringify(outputs));
       expect(outputs[0].result).toBe("no-index-ok");
     });
 
-    // T-API-47b: RunOptions.cwd sets LOOPX_PROJECT_ROOT; script still runs with workflow dir as cwd.
-    it("T-API-47b: runPromise — cwd sets LOOPX_PROJECT_ROOT, script cwd is workflow dir", async () => {
+    // T-API-47b: runPromise — RunOptions.cwd sets BOTH LOOPX_PROJECT_ROOT and the
+    //            script execution cwd. LOOPX_WORKFLOW_DIR independently exposes the
+    //            workflow-relative path.
+    it("T-API-47b: runPromise — cwd sets LOOPX_PROJECT_ROOT and script execution cwd", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cwd-marker.txt");
       await createBashWorkflowScript(
         project,
         "ralph",
         "index",
-        `printf '{"cwd":"%s","root":"%s"}' "$PWD" "$LOOPX_PROJECT_ROOT" > "${markerPath}"
+        `printf '{"cwd":"%s","root":"%s","wfdir":"%s"}' "$(/bin/pwd -P)" "$LOOPX_PROJECT_ROOT" "$LOOPX_WORKFLOW_DIR" > "${markerPath}"
 printf '{"stop":true}'`,
       );
       const workflowDir = join(project.loopxDir, "ralph");
@@ -2133,8 +2147,14 @@ console.log("done");
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
       const parsed = JSON.parse(readFileSync(markerPath, "utf-8"));
-      expect(resolve(parsed.cwd)).toBe(resolve(workflowDir));
-      expect(resolve(parsed.root)).toBe(resolve(project.dir));
+      // Per SPEC 9.5 (rewritten by ADR-0004 §3): RunOptions.cwd specifies BOTH
+      // the project root AND the script execution cwd. /bin/pwd -P yields the
+      // kernel-canonical form, so the cwd assertion uses realpath(project.dir).
+      const expectedRoot = realpathSync(project.dir);
+      expect(parsed.cwd).toBe(expectedRoot);
+      expect(parsed.root).toBe(project.dir);
+      // LOOPX_WORKFLOW_DIR exposes the workflow-relative path (independent of cwd).
+      expect(parsed.wfdir).toBe(workflowDir);
     });
   });
 });
@@ -3952,5 +3972,15251 @@ console.log(JSON.stringify({ rejected }));
       expect(result.exitCode).toBe(0);
       expect(JSON.parse(result.stdout).rejected).toBe(true);
     });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — Inherited Env Snapshot Timing (SPEC §9.1 / §9.2 / §8.1)
+// ═════════════════════════════════════════════════════════════
+//
+// Under run(), the inherited process.env snapshot is LAZY — captured on the
+// first next() call alongside the rest of the pre-iteration sequence.
+// Mutations between run() returning and first next() ARE observed; later
+// mutations between iterations are not (the snapshot is reused once taken).
+//
+// Under runPromise(), the inherited process.env snapshot is EAGER — captured
+// synchronously at the runPromise() call site. Mutations to process.env
+// after runPromise() returns are NOT observed. The same eager schedule
+// applies to global env file path resolution (XDG_CONFIG_HOME / HOME).
+
+describe("SPEC: Inherited Env Snapshot Timing", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // T-API-71: run() inherited-env snapshot is lazy (captured at first next()).
+    it("T-API-71: run() inherited-env snapshot is lazy — mutation between run() and first next() observed", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.env.MYVAR = "A";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+process.env.MYVAR = "B";
+const results = [];
+for await (const o of gen) { results.push(o); }
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // Lazy snapshot taken on first next() — the post-call mutation ("B") is
+      // observed because the snapshot had not yet been taken when the mutation
+      // happened.
+      expect(readFileSync(marker, "utf-8")).toBe("B");
+    });
+
+    // T-API-71a: run() inherited-env snapshot is frozen at first next().
+    it("T-API-71a: run() inherited-env snapshot is frozen at first next() — mutation between iterations not observed", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.env.MYVAR = "A";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+const r1 = await gen.next();
+// Mutation between gen.next() calls: must NOT propagate to iteration 2 because
+// the inherited-env snapshot is frozen at first next().
+process.env.MYVAR = "B";
+const r2 = await gen.next();
+const r3 = await gen.next();
+console.log(JSON.stringify({ done3: r3.done, count: [r1, r2].filter(x => !x.done).length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.done3).toBe(true);
+      expect(parsed.count).toBe(2);
+      // Both iterations observe the snapshot taken at first next() — "A".
+      expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("A");
+      expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("A");
+    });
+
+    // T-API-72: runPromise() inherited-env snapshot is eager (captured at call site).
+    it("T-API-72: runPromise() inherited-env snapshot is eager — mutation after return not observed", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.env.MYVAR = "A";
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+// Eager snapshot taken at runPromise() call site — this mutation is too late.
+process.env.MYVAR = "B";
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("A");
+    });
+
+    // T-API-72a: runPromise() inherited-env snapshot is reused across iterations.
+    // Uses a release-sentinel barrier to synchronize a mid-run mutation between
+    // iter 1 and iter 2 — the eager snapshot taken at call time must be reused
+    // for every iteration of the run.
+    it("T-API-72a: runPromise() inherited-env snapshot reused across iterations — mid-run mutation not observed", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const releasePath = join(project.dir, "release.sentinel");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+RELEASE="${releasePath}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -eq 1 ]; then
+  # Iter 1 waits for release before exiting so the driver can mutate MYVAR
+  # between iter-1 capture and iter-2 spawn.
+  while [ ! -f "$RELEASE" ]; do sleep 0.02; done
+fi
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, writeFileSync } from "node:fs";
+process.env.MYVAR = "A";
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+// Wait for iter-1 marker to confirm iter 1 has captured MYVAR before mutating.
+const deadline = Date.now() + 15_000;
+while (Date.now() < deadline) {
+  if (existsSync(${JSON.stringify(join(markerDir, "iter1.txt"))})) break;
+  await new Promise(r => setTimeout(r, 25));
+}
+// Mutate MYVAR mid-run, then release iter 1 so iter 2 can spawn.
+process.env.MYVAR = "B";
+writeFileSync(${JSON.stringify(releasePath)}, "");
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, { timeout: 30_000 });
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(2);
+      // Both iterations observe the eager snapshot ("A") — the mid-run
+      // mutation to "B" must not propagate to iter 2 because the inherited
+      // env snapshot is reused for the entire run.
+      expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("A");
+      expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("A");
+    });
+
+    // T-API-73a: runPromise() global env file path resolution via XDG_CONFIG_HOME
+    // is eager (captured at call site).
+    // SPEC §9.2 / §8.1: "Global env file path resolution (XDG_CONFIG_HOME / HOME)
+    // reads the inherited env on the same schedule as the inherited-env snapshot."
+    it("T-API-73a: runPromise() XDG_CONFIG_HOME mutation after return does not redirect global env file lookup", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myglobal.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MY_GLOBAL:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      // Two XDG_CONFIG_HOME directories with different env file contents.
+      const xdgA = await mkdtemp(join(osTmpdir(), "loopx-xdg-a-"));
+      await mkdir(join(xdgA, "loopx"), { recursive: true });
+      await writeFile(join(xdgA, "loopx", "env"), "MY_GLOBAL=valueA\n", "utf-8");
+
+      const xdgB = await mkdtemp(join(osTmpdir(), "loopx-xdg-b-"));
+      await mkdir(join(xdgB, "loopx"), { recursive: true });
+      await writeFile(join(xdgB, "loopx", "env"), "MY_GLOBAL=valueB\n", "utf-8");
+
+      try {
+        const driverCode = `
+import { runPromise } from "loopx";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgA)};
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+// Eager path resolution at call site pinned the global env file to xdgA.
+// A post-return mutation must not redirect the lookup to xdgB.
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgB)};
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(readFileSync(marker, "utf-8")).toBe("valueA");
+      } finally {
+        await Promise.all([
+          rm(xdgA, { recursive: true, force: true }),
+          rm(xdgB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+
+    // T-API-73: run() global env file path resolution via XDG_CONFIG_HOME is
+    // lazy (captured at first next()) — counterpart to T-API-73a.
+    // SPEC §9.1 / §8.1: a buggy implementation that read XDG_CONFIG_HOME eagerly
+    // would show "valueA"; the lazy snapshot picks up the post-call mutation.
+    it("T-API-73: run() XDG_CONFIG_HOME mutation between run() and first next() redirects global env file lookup", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myglobal.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MY_GLOBAL:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const xdgA = await mkdtemp(join(osTmpdir(), "loopx-xdg-a-"));
+      await mkdir(join(xdgA, "loopx"), { recursive: true });
+      await writeFile(join(xdgA, "loopx", "env"), "MY_GLOBAL=valueA\n", "utf-8");
+
+      const xdgB = await mkdtemp(join(osTmpdir(), "loopx-xdg-b-"));
+      await mkdir(join(xdgB, "loopx"), { recursive: true });
+      await writeFile(join(xdgB, "loopx", "env"), "MY_GLOBAL=valueB\n", "utf-8");
+
+      try {
+        const driverCode = `
+import { run } from "loopx";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgA)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+// Lazy path resolution — mutation before first next() redirects the lookup.
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgB)};
+const results = [];
+for await (const o of gen) { results.push(o); }
+console.log(JSON.stringify({ count: results.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(readFileSync(marker, "utf-8")).toBe("valueB");
+      } finally {
+        await Promise.all([
+          rm(xdgA, { recursive: true, force: true }),
+          rm(xdgB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+
+    // T-API-73b: run() global env file path resolution via the HOME fallback
+    // is lazy. With XDG_CONFIG_HOME unset, loopx falls back to
+    // $HOME/.config/loopx/env. A HOME mutation between run() and first next()
+    // must redirect the lookup, exactly mirroring the XDG_CONFIG_HOME case
+    // (T-API-73). SPEC §9.1 / §8.1.
+    it("T-API-73b: run() HOME mutation between run() and first next() redirects global env file lookup via the fallback path", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myglobal.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MY_GLOBAL:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const homeA = await mkdtemp(join(osTmpdir(), "loopx-home-a-"));
+      await mkdir(join(homeA, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeA, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueA\n",
+        "utf-8",
+      );
+
+      const homeB = await mkdtemp(join(osTmpdir(), "loopx-home-b-"));
+      await mkdir(join(homeB, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeB, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueB\n",
+        "utf-8",
+      );
+
+      try {
+        const driverCode = `
+import { run } from "loopx";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(homeA)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+// Lazy fallback resolution — HOME mutation before first next() redirects
+// the lookup to homeB's loopx env file.
+process.env.HOME = ${JSON.stringify(homeB)};
+const results = [];
+for await (const o of gen) { results.push(o); }
+console.log(JSON.stringify({ count: results.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(readFileSync(marker, "utf-8")).toBe("valueB");
+      } finally {
+        await Promise.all([
+          rm(homeA, { recursive: true, force: true }),
+          rm(homeB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+
+    // T-API-73c: runPromise() global env file path resolution via the HOME
+    // fallback is eager. With XDG_CONFIG_HOME unset, the eager call-site
+    // snapshot of HOME pins the fallback path; later HOME mutations do not
+    // redirect the lookup. SPEC §9.2 / §8.1.
+    it("T-API-73c: runPromise() HOME mutation after return does not redirect global env file lookup via the fallback path", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myglobal.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MY_GLOBAL:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const homeA = await mkdtemp(join(osTmpdir(), "loopx-home-a-"));
+      await mkdir(join(homeA, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeA, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueA\n",
+        "utf-8",
+      );
+
+      const homeB = await mkdtemp(join(osTmpdir(), "loopx-home-b-"));
+      await mkdir(join(homeB, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeB, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueB\n",
+        "utf-8",
+      );
+
+      try {
+        const driverCode = `
+import { runPromise } from "loopx";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(homeA)};
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+// Eager fallback resolution at call site pinned the global env file under
+// homeA. A post-return HOME mutation must not redirect the lookup.
+process.env.HOME = ${JSON.stringify(homeB)};
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(readFileSync(marker, "utf-8")).toBe("valueA");
+      } finally {
+        await Promise.all([
+          rm(homeA, { recursive: true, force: true }),
+          rm(homeB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — Cross-Iteration Global Env File Path Resolution Snapshot Reuse
+//        (SPEC §9.1 / §9.2 / §8.1)
+// ═════════════════════════════════════════════════════════════
+//
+// T-API-73 / 73a / 73b / 73c pin the FIRST-iteration timing for global env
+// file path resolution. T-API-71a / 72a pin the cross-iteration reuse
+// contract for the inherited-env snapshot. T-ENV-25 / 25a pin the env-file
+// CONTENT cache.
+//
+// These tests pin the cross-iteration reuse of the global env-file PATH
+// resolution itself: even if a buggy implementation re-resolved the path on
+// each iteration (re-reading XDG_CONFIG_HOME / HOME per spawn), the
+// already-cached file CONTENT would mask the bug. We probe by mutating the
+// resolution input mid-run and asserting the second iteration's spawned
+// script still observes the file loaded for the first iteration.
+
+describe("SPEC: Cross-Iteration Global Env File Path Resolution Snapshot Reuse", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // T-API-74: run() XDG_CONFIG_HOME path resolution is reused across
+    // iterations (frozen at the lazy first-next() snapshot). Mid-run mutation
+    // of process.env.XDG_CONFIG_HOME does not redirect the second iteration's
+    // global env file lookup. SPEC §9.1 / §8.1.
+    it("T-API-74: run() XDG_CONFIG_HOME path resolution is reused across iterations — mid-run mutation does not redirect", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const releasePath = join(project.dir, "release.sentinel");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+RELEASE="${releasePath}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MY_GLOBAL:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -eq 1 ]; then
+  while [ ! -f "$RELEASE" ]; do sleep 0.02; done
+fi
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const xdgA = await mkdtemp(join(osTmpdir(), "loopx-xdg-a-"));
+      await mkdir(join(xdgA, "loopx"), { recursive: true });
+      await writeFile(join(xdgA, "loopx", "env"), "MY_GLOBAL=valueA\n", "utf-8");
+
+      const xdgB = await mkdtemp(join(osTmpdir(), "loopx-xdg-b-"));
+      await mkdir(join(xdgB, "loopx"), { recursive: true });
+      await writeFile(join(xdgB, "loopx", "env"), "MY_GLOBAL=valueB\n", "utf-8");
+
+      try {
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync, writeFileSync } from "node:fs";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgA)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+// Start the first yield without awaiting — iter 1 will block on the release
+// sentinel after writing its observation, so awaiting here would deadlock.
+const firstNextP = gen.next();
+const deadline = Date.now() + 15_000;
+while (Date.now() < deadline) {
+  if (existsSync(${JSON.stringify(join(markerDir, "iter1.txt"))})) break;
+  await new Promise(r => setTimeout(r, 25));
+}
+// Mutate XDG_CONFIG_HOME between iter 1's lazy snapshot and iter 2's spawn.
+// Path resolution snapshot taken at first next() must be reused, so iter 2
+// must still observe valueA — not the mutated valueB path.
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgB)};
+writeFileSync(${JSON.stringify(releasePath)}, "");
+const r1 = await firstNextP;
+const results = [r1];
+for await (const o of gen) { results.push({ value: o, done: false }); }
+console.log(JSON.stringify({ count: results.filter(r => !r.done).length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, { timeout: 30_000 });
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(2);
+        expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("valueA");
+        expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("valueA");
+      } finally {
+        await Promise.all([
+          rm(xdgA, { recursive: true, force: true }),
+          rm(xdgB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+
+    // T-API-74a: runPromise() XDG_CONFIG_HOME path resolution is reused across
+    // iterations (frozen at the eager call-site snapshot). Mid-run mutation
+    // of process.env.XDG_CONFIG_HOME does not redirect the second iteration's
+    // global env file lookup. SPEC §9.2 / §8.1.
+    it("T-API-74a: runPromise() XDG_CONFIG_HOME path resolution is reused across iterations — mid-run mutation does not redirect", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const releasePath = join(project.dir, "release.sentinel");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+RELEASE="${releasePath}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MY_GLOBAL:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -eq 1 ]; then
+  while [ ! -f "$RELEASE" ]; do sleep 0.02; done
+fi
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const xdgA = await mkdtemp(join(osTmpdir(), "loopx-xdg-a-"));
+      await mkdir(join(xdgA, "loopx"), { recursive: true });
+      await writeFile(join(xdgA, "loopx", "env"), "MY_GLOBAL=valueA\n", "utf-8");
+
+      const xdgB = await mkdtemp(join(osTmpdir(), "loopx-xdg-b-"));
+      await mkdir(join(xdgB, "loopx"), { recursive: true });
+      await writeFile(join(xdgB, "loopx", "env"), "MY_GLOBAL=valueB\n", "utf-8");
+
+      try {
+        const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, writeFileSync } from "node:fs";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgA)};
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+const deadline = Date.now() + 15_000;
+while (Date.now() < deadline) {
+  if (existsSync(${JSON.stringify(join(markerDir, "iter1.txt"))})) break;
+  await new Promise(r => setTimeout(r, 25));
+}
+// Mutate XDG_CONFIG_HOME after iter 1's eager snapshot was already taken at
+// the runPromise() call site. The reused snapshot must keep iter 2 on xdgA.
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdgB)};
+writeFileSync(${JSON.stringify(releasePath)}, "");
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, { timeout: 30_000 });
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(2);
+        expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("valueA");
+        expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("valueA");
+      } finally {
+        await Promise.all([
+          rm(xdgA, { recursive: true, force: true }),
+          rm(xdgB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+
+    // T-API-74b: run() HOME-fallback path resolution is reused across
+    // iterations (frozen at the lazy first-next() snapshot). Mid-run mutation
+    // of process.env.HOME (with XDG_CONFIG_HOME unset) does not redirect the
+    // second iteration's fallback global env file lookup. SPEC §9.1 / §8.1.
+    it("T-API-74b: run() HOME-fallback path resolution is reused across iterations — mid-run mutation does not redirect", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const releasePath = join(project.dir, "release.sentinel");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+RELEASE="${releasePath}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MY_GLOBAL:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -eq 1 ]; then
+  while [ ! -f "$RELEASE" ]; do sleep 0.02; done
+fi
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const homeA = await mkdtemp(join(osTmpdir(), "loopx-home-a-"));
+      await mkdir(join(homeA, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeA, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueA\n",
+        "utf-8",
+      );
+
+      const homeB = await mkdtemp(join(osTmpdir(), "loopx-home-b-"));
+      await mkdir(join(homeB, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeB, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueB\n",
+        "utf-8",
+      );
+
+      try {
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync, writeFileSync } from "node:fs";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(homeA)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+const firstNextP = gen.next();
+const deadline = Date.now() + 15_000;
+while (Date.now() < deadline) {
+  if (existsSync(${JSON.stringify(join(markerDir, "iter1.txt"))})) break;
+  await new Promise(r => setTimeout(r, 25));
+}
+// Mutate HOME between iter 1's lazy fallback snapshot and iter 2's spawn.
+// The frozen snapshot must keep iter 2 on homeA.
+process.env.HOME = ${JSON.stringify(homeB)};
+writeFileSync(${JSON.stringify(releasePath)}, "");
+const r1 = await firstNextP;
+const results = [r1];
+for await (const o of gen) { results.push({ value: o, done: false }); }
+console.log(JSON.stringify({ count: results.filter(r => !r.done).length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, { timeout: 30_000 });
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(2);
+        expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("valueA");
+        expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("valueA");
+      } finally {
+        await Promise.all([
+          rm(homeA, { recursive: true, force: true }),
+          rm(homeB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+
+    // T-API-74c: runPromise() HOME-fallback path resolution is reused across
+    // iterations (frozen at the eager call-site snapshot). Mid-run mutation
+    // of process.env.HOME (with XDG_CONFIG_HOME unset) does not redirect the
+    // second iteration's fallback global env file lookup. SPEC §9.2 / §8.1.
+    it("T-API-74c: runPromise() HOME-fallback path resolution is reused across iterations — mid-run mutation does not redirect", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const releasePath = join(project.dir, "release.sentinel");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+RELEASE="${releasePath}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MY_GLOBAL:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -eq 1 ]; then
+  while [ ! -f "$RELEASE" ]; do sleep 0.02; done
+fi
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const homeA = await mkdtemp(join(osTmpdir(), "loopx-home-a-"));
+      await mkdir(join(homeA, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeA, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueA\n",
+        "utf-8",
+      );
+
+      const homeB = await mkdtemp(join(osTmpdir(), "loopx-home-b-"));
+      await mkdir(join(homeB, ".config", "loopx"), { recursive: true });
+      await writeFile(
+        join(homeB, ".config", "loopx", "env"),
+        "MY_GLOBAL=valueB\n",
+        "utf-8",
+      );
+
+      try {
+        const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, writeFileSync } from "node:fs";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(homeA)};
+const p = runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
+const deadline = Date.now() + 15_000;
+while (Date.now() < deadline) {
+  if (existsSync(${JSON.stringify(join(markerDir, "iter1.txt"))})) break;
+  await new Promise(r => setTimeout(r, 25));
+}
+// Mutate HOME after iter 1's eager fallback snapshot was already taken at
+// the runPromise() call site. The reused snapshot must keep iter 2 on homeA.
+process.env.HOME = ${JSON.stringify(homeB)};
+writeFileSync(${JSON.stringify(releasePath)}, "");
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, { timeout: 30_000 });
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(2);
+        expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("valueA");
+        expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("valueA");
+      } finally {
+        await Promise.all([
+          rm(homeA, { recursive: true, force: true }),
+          rm(homeB, { recursive: true, force: true }),
+        ]);
+      }
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — Abort After Final Yield (SPEC §9.3 / §9.1)
+// ═════════════════════════════════════════════════════════════
+//
+// Per SPEC §9.3: "Abort observed after the final yield but before the
+// generator settles produces the abort error on the next generator
+// interaction — `g.next()`, `.return()`, or `.throw()`."
+//
+// The "final yield" can be triggered by either `maxIterations`-reached or by
+// a script-emitted `stop: true`. The abort-after-final-yield rule applies
+// symmetrically across both triggers and across all three settle-triggering
+// interactions.
+//
+// For `.throw()`, the abort error displaces the consumer-supplied error per
+// SPEC §9.3 (signal wins).
+//
+// These tests pin the OUTCOME axis of the contract (error identity and
+// rejection rather than silent settlement). The CLEANUP-ORDERING axis (tmpdir
+// removed before the abort error surfaces) is pinned by the T-TMP-23/24a/24c/
+// 24d/24e/24f/24g family in tmpdir.test.ts.
+
+describe("SPEC: Abort After Final Yield", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-66: Abort after maxIterations-driven final yield + .next() →
+    // abort error (not silent { done: true }). SPEC §9.3.
+    // ------------------------------------------------------------------------
+    it("T-API-66: abort after final yield (maxIter) + .next() → abort error", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.next();
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+console.log(JSON.stringify({
+  firstDone: first.done,
+  firstHasValue: first.value !== undefined,
+  result,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.firstHasValue).toBe(true);
+      expect(data.result.kind).toBe("rejected");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-66a: Abort after maxIterations-driven final yield + .return() →
+    // abort error (not silent settlement). SPEC §9.3 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-66a: abort after final yield (maxIter) + .return() → abort error", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.return(undefined);
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+console.log(JSON.stringify({
+  firstDone: first.done,
+  result,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.result.kind).toBe("rejected");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-66b: Abort after maxIterations-driven final yield + .throw() →
+    // abort error displaces consumer-supplied error. SPEC §9.3 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-66b: abort after final yield (maxIter) + .throw() → abort displaces consumer error", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '{"result":"ok"}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.throw(new Error("consumer-err"));
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+console.log(JSON.stringify({
+  firstDone: first.done,
+  result,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.result.kind).toBe("rejected");
+      // Abort error displaces consumer-supplied "consumer-err".
+      expect(data.result.msg).not.toBe("consumer-err");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-66c: Abort after stop:true-driven final yield + .next() → abort
+    // error (not silent settlement). SPEC §9.3 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-66c: abort after stop:true final yield + .next() → abort error", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.next();
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+console.log(JSON.stringify({
+  firstDone: first.done,
+  firstStop: first.value && first.value.stop === true,
+  result,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstDone).toBe(false);
+      expect(data.firstStop).toBe(true);
+      expect(data.result.kind).toBe("rejected");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-66d: Abort after stop:true-driven final yield + .return() →
+    // abort error (not silent settlement). SPEC §9.3 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-66d: abort after stop:true final yield + .return() → abort error", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.return(undefined);
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+console.log(JSON.stringify({
+  firstStop: first.value && first.value.stop === true,
+  result,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstStop).toBe(true);
+      expect(data.result.kind).toBe("rejected");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-66e: Abort after stop:true-driven final yield + .throw() →
+    // abort error displaces consumer-supplied error. SPEC §9.3 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-66e: abort after stop:true final yield + .throw() → abort displaces consumer error", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+printf '{"stop":true}'
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5, signal: c.signal });
+const first = await gen.next();
+c.abort();
+let result;
+try {
+  await gen.throw(new Error("consumer-err"));
+  result = { kind: "resolved" };
+} catch (e) {
+  result = { kind: "rejected", name: e instanceof Error ? (e.name || "") : "", msg: e instanceof Error ? e.message : String(e) };
+}
+console.log(JSON.stringify({
+  firstStop: first.value && first.value.stop === true,
+  result,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.firstStop).toBe(true);
+      expect(data.result.kind).toBe("rejected");
+      // Abort error displaces consumer-supplied "consumer-err".
+      expect(data.result.msg).not.toBe("consumer-err");
+      expect(data.result.name === "AbortError" || /abort/i.test(data.result.msg)).toBe(true);
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — Pre-first-`next()` Consumer-Cancellation Carve-out
+//        (SPEC §9.1 — `.return()` and `.throw()` as first interaction)
+// ═════════════════════════════════════════════════════════════
+//
+// Per SPEC §9.1: "A `.return(value)` or `.throw(err)` call as the consumer's
+// *first* interaction with the generator returned by `run()` settles the
+// generator per standard JS async-generator semantics; the loop body is
+// never entered. No pre-iteration step runs and no pre-iteration error is
+// surfaced: captured option-snapshot errors, invalid `target` values and
+// target-syntax validation, `.loopx/` discovery failures, env-file loading
+// failures, target resolution failures, and tmpdir creation failures are
+// all suppressed. A `signal` captured at call time is not consulted; even
+// an already-aborted signal does not surface the abort error through this
+// path. This carve-out applies only to `run()`; `runPromise()` has no
+// equivalent."
+//
+// Standard async-generator semantics: `.return(value)` settles with
+// `{ value, done: true }` without entering the body; `.throw(err)` rejects
+// with the consumer-supplied `err` without entering the body — so for the
+// `.throw()` surface, the consumer's error surfaces (rather than the post-
+// first-`next()` silent-completion contract that swallows consumer errors).
+
+describe("SPEC: Pre-first-next() Consumer-Cancellation Carve-out — .return()", () => {
+  let project: TempProject | null = null;
+  let projectB: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    if (projectB) {
+      await projectB.cleanup().catch(() => {});
+      projectB = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-68: .return() as first interaction suppresses invalid-target
+    // error. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68: .return() suppresses invalid-target error (no throw, no spawn)", async () => {
+      project = await createTempProject();
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const gen = run(undefined);
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+const next = await gen.next();
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+  settledValueIsUndefined: settled && settled.value === undefined,
+  nextDone: next.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(data.settledValueIsUndefined).toBe(true);
+      expect(data.nextDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68a: .return() as first interaction suppresses .loopx/ discovery
+    // failure. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68a: .return() suppresses .loopx/ discovery failure", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).toBe("");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68b: .return() as first interaction suppresses missing-envFile
+    // failure. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68b: .return() suppresses missing-envFile failure", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: "nonexistent.env",
+});
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68c: .return() as first interaction suppresses option-snapshot
+    // failure (maxIterations: -1). SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68c: .return() suppresses invalid maxIterations option-snapshot failure", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  maxIterations: -1,
+});
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68d: .return() as first interaction suppresses pre-aborted
+    // signal. Per SPEC §9.1: "A `signal` captured at call time is not
+    // consulted; even an already-aborted signal does not surface the abort
+    // error through this path."
+    // ------------------------------------------------------------------------
+    it("T-API-68d: .return() suppresses pre-aborted signal (real AbortSignal)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+});
+let threw = false;
+let errMsg = null;
+let errName = null;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? e.name : null;
+}
+console.log(JSON.stringify({
+  threw,
+  errMsg,
+  errName,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68e: .return() as first interaction does NOT create a tmpdir.
+    // SPEC §9.1, §7.4.
+    // ------------------------------------------------------------------------
+    it("T-API-68e: .return() does NOT create LOOPX_TMPDIR", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+
+      const isolatedTmp = await mkdtemp(join(osTmpdir(), "loopx-test-tmpdir-"));
+      try {
+        const driverCode = `
+import { run } from "loopx";
+import { readdirSync } from "node:fs";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+});
+const before = readdirSync(${JSON.stringify(isolatedTmp)}).filter(n => n.startsWith("loopx-"));
+await gen.return(undefined);
+const after = readdirSync(${JSON.stringify(isolatedTmp)}).filter(n => n.startsWith("loopx-"));
+console.log(JSON.stringify({
+  before,
+  after,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: isolatedTmp },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.before).toEqual([]);
+        expect(data.after).toEqual([]);
+      } finally {
+        await rm(isolatedTmp, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68f: .return(value) as first interaction settles with the
+    // supplied value per standard async-generator semantics. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68f: .return(value) propagates supplied value through settlement", async () => {
+      project = await createTempProject();
+      const driverCode = `
+import { run } from "loopx";
+const gen = run(undefined);
+const result = await gen.return("my-return-value");
+const next = await gen.next();
+console.log(JSON.stringify({
+  resultValue: result.value,
+  resultDone: result.done,
+  nextValue: next.value === undefined ? "<undef>" : next.value,
+  nextDone: next.done,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.resultValue).toBe("my-return-value");
+      expect(data.resultDone).toBe(true);
+      expect(data.nextValue).toBe("<undef>");
+      expect(data.nextDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68h: .return() suppresses a throwing options.env getter.
+    // SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68h: .return() suppresses throwing options.env getter", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "env", {
+  enumerable: true,
+  get() { throw new Error("evil-env-getter"); },
+});
+const gen = run("ralph", opts);
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+  settledValueIsUndefined: settled && settled.value === undefined,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(data.settledValueIsUndefined).toBe(true);
+      expect(result.stderr).not.toContain("evil-env-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68j: .return(value) suppresses a live-signal abort that fires
+    // between run() returning and consumer's first interaction. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68j: .return(value) suppresses live-signal abort fired between run() and first interaction", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+});
+c.abort();
+let threw = false;
+let result;
+try {
+  result = await gen.return("my-return-value");
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  resultValue: result && result.value,
+  resultDone: result && result.done,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.resultValue).toBe("my-return-value");
+      expect(data.resultDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68k: .return() suppresses a throwing options.signal getter.
+    // SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68k: .return() suppresses throwing options.signal getter", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "signal", {
+  enumerable: true,
+  get() { throw new Error("evil-signal-getter"); },
+});
+const gen = run("ralph", opts);
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).not.toContain("evil-signal-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68l: .return() suppresses a throwing options.cwd getter.
+    // SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68l: .return() suppresses throwing options.cwd getter", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = {};
+Object.defineProperty(opts, "cwd", {
+  enumerable: true,
+  get() { throw new Error("evil-cwd-getter"); },
+});
+const gen = run("ralph", opts);
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).not.toContain("evil-cwd-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68m: .return() suppresses a throwing options.envFile getter.
+    // SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68m: .return() suppresses throwing options.envFile getter", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "envFile", {
+  enumerable: true,
+  get() { throw new Error("evil-envFile-getter"); },
+});
+const gen = run("ralph", opts);
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).not.toContain("evil-envFile-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68n: .return() suppresses a throwing options.maxIterations
+    // getter. SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68n: .return() suppresses throwing options.maxIterations getter", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "maxIterations", {
+  enumerable: true,
+  get() { throw new Error("evil-maxIterations-getter"); },
+});
+const gen = run("ralph", opts);
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).not.toContain("evil-maxIterations-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68v: .return(value) suppresses abort observation on a static
+    // duck-typed signal whose `aborted` field is true at call time and whose
+    // `addEventListener` is a no-op. SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68v: .return(value) suppresses static duck-signal aborted:true at call time", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const duck = {
+  aborted: true,
+  addEventListener(_type, _fn) { /* no-op: never fires */ },
+};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+let threw = false;
+let result;
+try {
+  result = await gen.return("my-return-value");
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  resultValue: result && result.value,
+  resultDone: result && result.done,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.resultValue).toBe("my-return-value");
+      expect(data.resultDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68s: .return(value) suppresses reentrant duck-signal abort
+    // (listener fires synchronously during registration AND mutates aborted).
+    // SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68s: .return(value) suppresses reentrant duck-signal (listener-fires + aborted mutation)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") {
+      this.aborted = true;
+      fn();
+    }
+  },
+};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+let threw = false;
+let result;
+try {
+  result = await gen.return("my-return-value");
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  resultValue: result && result.value,
+  resultDone: result && result.done,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.resultValue).toBe("my-return-value");
+      expect(data.resultDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68s2: .return(value) suppresses reentrant duck-signal abort
+    // (listener fires synchronously during registration WITHOUT mutating
+    // aborted). SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-68s2: .return(value) suppresses reentrant duck-signal (listener-fires only, no aborted mutation)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") fn();
+    /* do NOT mutate this.aborted */
+  },
+};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+let threw = false;
+let result;
+try {
+  result = await gen.return("my-return-value");
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  resultValue: result && result.value,
+  resultDone: result && result.done,
+}));
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode);
+      expect(apiResult.exitCode).toBe(0);
+      const data = JSON.parse(apiResult.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.resultValue).toBe("my-return-value");
+      expect(data.resultDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68t: .return() suppresses discovery validation failures (sibling
+    // workflows with same-base-name collisions, invalid workflow names, or
+    // invalid script names — SPEC §5.2 / §5.3 / §5.4). SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68t: .return() suppresses sibling-workflow same-base-name collision (SPEC §5.2)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      // Sibling workflow with collision: `check.sh` and `check.ts` collide
+      // on base name "check" per SPEC §5.2.
+      await createBashWorkflowScript(project, "broken", "check", `printf '{"stop":true}'`);
+      await createWorkflowScript(project, "broken", "check", ".ts", `output({ stop: true });`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).toBe("");
+    });
+
+    it("T-API-68t (invalid-workflow-name): .return() suppresses sibling invalid-workflow-name violation (SPEC §5.3)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      // Sibling workflow with leading-dash name violates SPEC §5.3.
+      await createBashWorkflowScript(project, "-bad-workflow", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).toBe("");
+    });
+
+    it("T-API-68t (invalid-script-name): .return() suppresses sibling invalid-script-name violation (SPEC §5.3)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      await createBashWorkflowScript(project, "other", "index", `printf '{"stop":true}'`);
+      // Sibling workflow with leading-dash script name violates SPEC §5.3.
+      await createBashWorkflowScript(project, "other", "-bad", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).toBe("");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68i: .return() suppresses a representative sample of pre-iteration
+    // failure modes — full enumerated invalid-maxIterations set plus
+    // representative selections of remaining option-snapshot families,
+    // target-resolution sub-paths, and target-syntax validation. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    const t68iVariants: Array<{ name: string; opts: string; target: string }> = [
+      { name: "i-options-null", opts: "null", target: '"ralph"' },
+      { name: "ii-options-array", opts: "[]", target: '"ralph"' },
+      { name: "iii-options-function", opts: "(() => {})", target: '"ralph"' },
+      { name: "iv-options-number", opts: "42", target: '"ralph"' },
+      { name: "v-signal-non-shape", opts: '{ signal: "not-a-signal" }', target: '"ralph"' },
+      { name: "vi-cwd-non-string", opts: "{ cwd: 42 }", target: '"ralph"' },
+      { name: "vii-envFile-non-string", opts: "{ envFile: 42 }", target: '"ralph"' },
+      { name: "viii-maxIter-fractional", opts: "{ maxIterations: 1.5 }", target: '"ralph"' },
+      { name: "ix-maxIter-NaN", opts: "{ maxIterations: NaN }", target: '"ralph"' },
+      { name: "x-maxIter-Infinity", opts: "{ maxIterations: Infinity }", target: '"ralph"' },
+      { name: "xi-maxIter-null", opts: "{ maxIterations: null }", target: '"ralph"' },
+      { name: "xii-maxIter-string", opts: '{ maxIterations: "1" }', target: '"ralph"' },
+      { name: "xiii-env-array", opts: "{ env: [] }", target: '"ralph"' },
+      { name: "xiv-env-non-string", opts: "{ env: { KEY: 42 } }", target: '"ralph"' },
+      { name: "xix-target-syntax", opts: "undefined", target: '"a:b:c"' },
+    ];
+
+    for (const v of t68iVariants) {
+      it(`T-API-68i (${v.name}): .return() suppresses ${v.name}`, async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+        const optsExpr = v.opts === "undefined" ? "undefined" : v.opts;
+        const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const opts = ${optsExpr};
+const gen = run(${v.target}, opts);
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.threw).toBe(false);
+        expect(data.settledDone).toBe(true);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-68i (xv-env-ownKeys-throw): proxy ownKeys trap that throws.
+    // ------------------------------------------------------------------------
+    it("T-API-68i (xv-env-ownKeys-throw): .return() suppresses Proxy ownKeys throw", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const env = new Proxy({}, {
+  ownKeys() { throw new Error("ownKeys-trap-boom"); },
+});
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, env });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).not.toContain("ownKeys-trap-boom");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68i (xx-env-entry-throw): throwing enumerable getter inside env.
+    // ------------------------------------------------------------------------
+    it("T-API-68i (xx-env-entry-getter-throw): .return() suppresses throwing env-entry getter", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const env = {};
+Object.defineProperty(env, "KEY", {
+  enumerable: true,
+  get() { throw new Error("env-entry-getter-boom"); },
+});
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, env });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).not.toContain("env-entry-getter-boom");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68i (xvi-target-missing-workflow): target-resolution sub-path —
+    // missing workflow.
+    // ------------------------------------------------------------------------
+    it("T-API-68i (xvi-target-missing-workflow): .return() suppresses missing-workflow target-resolution", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "other", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68i (xvii-target-missing-script): target-resolution sub-path —
+    // missing script in existing workflow.
+    // ------------------------------------------------------------------------
+    it("T-API-68i (xvii-target-missing-script): .return() suppresses missing-script target-resolution", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph:check", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68i (xviii-target-missing-default): target-resolution sub-path —
+    // missing default `index`.
+    // ------------------------------------------------------------------------
+    it("T-API-68i (xviii-target-missing-default): .return() suppresses missing-default-index target-resolution", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "check", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68g: .return() suppresses tmpdir-creation failure (TMPDIR points
+    // to mode-000 parent so mkdtemp would fail). SPEC §9.1, §7.4.
+    // Conditional on uid != 0 (root can write to mode-000 dirs).
+    // ------------------------------------------------------------------------
+    (IS_ROOT ? it.skip : it)("T-API-68g: .return() suppresses tmpdir-creation failure", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+
+      const unwritableParent = await mkdtemp(join(osTmpdir(), "loopx-test-unwritable-"));
+      try {
+        await chmod(unwritableParent, 0o000);
+        const driverCode = `
+import { run } from "loopx";
+import { readdirSync } from "node:fs";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+let after = [];
+try {
+  after = readdirSync(${JSON.stringify(unwritableParent)}).filter(n => n.startsWith("loopx-"));
+} catch {
+  // Mode-000 parent — readdir may also fail; not creating a tmpdir is the
+  // observable outcome. The throw=false assertion is the canonical pin.
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+  after,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: unwritableParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.threw).toBe(false);
+        expect(data.settledDone).toBe(true);
+        expect(data.after).toEqual([]);
+        expect(result.stderr).not.toMatch(/tmpdir|mkdtemp|EACCES|EPERM/i);
+      } finally {
+        await chmod(unwritableParent, 0o700).catch(() => {});
+        await rm(unwritableParent, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68u: .return() suppresses unreadable local envFile (mode 000).
+    // SPEC §9.1, §8.2. Conditional on uid != 0.
+    // ------------------------------------------------------------------------
+    (IS_ROOT ? it.skip : it)("T-API-68u: .return() suppresses unreadable local envFile (mode 000)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const envPath = join(project.dir, "local.env");
+      await writeFile(envPath, "OK=fine\n", "utf-8");
+      try {
+        await chmod(envPath, 0o000);
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(envPath)},
+});
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.threw).toBe(false);
+        expect(data.settledDone).toBe(true);
+        expect(result.stderr).toBe("");
+      } finally {
+        await chmod(envPath, 0o600).catch(() => {});
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68o: .return() suppresses unreadable global env file. SPEC §9.1,
+    // §8.1. Conditional on uid != 0.
+    // ------------------------------------------------------------------------
+    (IS_ROOT ? it.skip : it)("T-API-68o: .return() suppresses unreadable global env file", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const xdgConfigHome = await mkdtemp(join(osTmpdir(), "loopx-test-xdg-"));
+      const loopxConfigDir = join(xdgConfigHome, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const envPath = join(loopxConfigDir, "env");
+      await writeFile(envPath, "OK=fine\n", "utf-8");
+      try {
+        await chmod(envPath, 0o000);
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { XDG_CONFIG_HOME: xdgConfigHome },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.threw).toBe(false);
+        expect(data.settledDone).toBe(true);
+        expect(result.stderr).toBe("");
+      } finally {
+        await chmod(envPath, 0o600).catch(() => {});
+        await rm(xdgConfigHome, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68p: .return() suppresses local env-file parser warnings —
+    // the env-file parse step never runs under the carve-out. SPEC §9.1,
+    // §8.1, §8.2.
+    // ------------------------------------------------------------------------
+    it("T-API-68p: .return() suppresses local env-file parser warnings", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const envPath = join(project.dir, "local.env");
+      await writeFile(envPath, "1BAD=val\nOK=fine\n", "utf-8");
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(envPath)},
+});
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.threw).toBe(false);
+      expect(data.settledDone).toBe(true);
+      expect(result.stderr).toBe("");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68q: .return() suppresses global env-file parser warnings.
+    // SPEC §9.1, §8.1.
+    // ------------------------------------------------------------------------
+    it("T-API-68q: .return() suppresses global env-file parser warnings", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const xdgConfigHome = await mkdtemp(join(osTmpdir(), "loopx-test-xdg-"));
+      const loopxConfigDir = join(xdgConfigHome, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const envPath = join(loopxConfigDir, "env");
+      await writeFile(envPath, "1BAD=val\nOK=fine\n", "utf-8");
+      try {
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { XDG_CONFIG_HOME: xdgConfigHome },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.threw).toBe(false);
+        expect(data.settledDone).toBe(true);
+        expect(result.stderr).toBe("");
+      } finally {
+        await rm(xdgConfigHome, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-68r: .return() suppresses workflow `package.json` warnings from
+    // the starting-workflow version check (SPEC §3.2 / §7.1 step 5).
+    // ------------------------------------------------------------------------
+    interface PkgVariant {
+      name: string;
+      pkgContent: string | null; // null means "directory" variant
+    }
+    const t68rVariants: PkgVariant[] = [
+      { name: "i-unsatisfied-range", pkgContent: JSON.stringify({ dependencies: { loopx: ">=999.0.0" } }) },
+      { name: "ii-invalid-json", pkgContent: "{broken" },
+      { name: "iii-invalid-semver-range", pkgContent: JSON.stringify({ dependencies: { loopx: "not-a-range!!!" } }) },
+    ];
+    for (const v of t68rVariants) {
+      it(`T-API-68r (${v.name}): .return() suppresses workflow package.json warning`, async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+        if (v.pkgContent !== null) {
+          await createWorkflowPackageJson(project, "ralph", v.pkgContent);
+        }
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let threw = false;
+let settled;
+try {
+  settled = await gen.return(undefined);
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({
+  threw,
+  settledDone: settled && settled.done === true,
+}));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.threw).toBe(false);
+        expect(data.settledDone).toBe(true);
+        expect(result.stderr).toBe("");
+      });
+    }
+  });
+});
+
+describe("SPEC: Pre-first-next() Consumer-Cancellation Carve-out — .throw()", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-69: .throw() as first interaction — the consumer-supplied error
+    // surfaces, NOT the invalid-target / pre-iteration error. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-69: .throw() surfaces consumer error (invalid-target suppressed)", async () => {
+      project = await createTempProject();
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const gen = run(undefined);
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const next = await gen.next();
+console.log(JSON.stringify({
+  errMsg,
+  nextDone: next.done === true,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(data.nextDone).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69a: .throw() suppresses missing-envFile failure.
+    // ------------------------------------------------------------------------
+    it("T-API-69a: .throw() surfaces consumer error (missing-envFile suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: "nonexistent.env",
+});
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69b: .throw() suppresses pre-aborted signal — consumer error
+    // surfaces, not abort error. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-69b: .throw() surfaces consumer error (pre-aborted signal suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+});
+let errMsg = null;
+let errName = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? e.name : null;
+}
+console.log(JSON.stringify({ errMsg, errName }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(data.errName).not.toBe("AbortError");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69c: .throw() does NOT create a tmpdir. SPEC §9.1, §7.4.
+    // ------------------------------------------------------------------------
+    it("T-API-69c: .throw() does NOT create LOOPX_TMPDIR", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const isolatedTmp = await mkdtemp(join(osTmpdir(), "loopx-test-tmpdir-"));
+      try {
+        const driverCode = `
+import { run } from "loopx";
+import { readdirSync } from "node:fs";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+const before = readdirSync(${JSON.stringify(isolatedTmp)}).filter(n => n.startsWith("loopx-"));
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+const after = readdirSync(${JSON.stringify(isolatedTmp)}).filter(n => n.startsWith("loopx-"));
+console.log(JSON.stringify({ errMsg, before, after }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: isolatedTmp },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.errMsg).toBe("my-err");
+        expect(data.before).toEqual([]);
+        expect(data.after).toEqual([]);
+      } finally {
+        await rm(isolatedTmp, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69d: .throw() suppresses tmpdir-creation failure. Conditional
+    // on uid != 0.
+    // ------------------------------------------------------------------------
+    (IS_ROOT ? it.skip : it)("T-API-69d: .throw() surfaces consumer error (tmpdir-creation failure suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const unwritableParent = await mkdtemp(join(osTmpdir(), "loopx-test-unwritable-"));
+      try {
+        await chmod(unwritableParent, 0o000);
+        const driverCode = `
+import { run } from "loopx";
+import { readdirSync } from "node:fs";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+let after = [];
+try {
+  after = readdirSync(${JSON.stringify(unwritableParent)}).filter(n => n.startsWith("loopx-"));
+} catch { /* readdir may fail on mode-000 dir */ }
+console.log(JSON.stringify({ errMsg, after }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: unwritableParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.errMsg).toBe("my-err");
+        expect(data.after).toEqual([]);
+        expect(result.stderr).not.toMatch(/tmpdir|mkdtemp|EACCES|EPERM/i);
+      } finally {
+        await chmod(unwritableParent, 0o700).catch(() => {});
+        await rm(unwritableParent, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69e: .throw() suppresses throwing options.env getter.
+    // ------------------------------------------------------------------------
+    it("T-API-69e: .throw() surfaces consumer error (throwing options.env getter suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "env", {
+  enumerable: true,
+  get() { throw new Error("evil-env-getter"); },
+});
+const gen = run("ralph", opts);
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(result.stderr).not.toContain("evil-env-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69f: .throw() suppresses .loopx/ discovery failure.
+    // ------------------------------------------------------------------------
+    it("T-API-69f: .throw() surfaces consumer error (.loopx/ discovery failure suppressed)", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69i: .throw(err) surfaces consumer error even when a live signal
+    // aborts between run() and the consumer's first interaction. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-69i: .throw() surfaces consumer error (live-signal abort between run() and first interaction suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+});
+c.abort();
+let errMsg = null;
+let errName = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? e.name : null;
+}
+console.log(JSON.stringify({ errMsg, errName }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(data.errName).not.toBe("AbortError");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69r: .throw(err) surfaces consumer error on reentrant duck-signal
+    // (listener fires synchronously + aborted mutation). SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-69r: .throw() surfaces consumer error (reentrant duck-signal with mutation suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") {
+      this.aborted = true;
+      fn();
+    }
+  },
+};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+let errMsg = null;
+let errName = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? e.name : null;
+}
+console.log(JSON.stringify({ errMsg, errName }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(data.errName).not.toBe("AbortError");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69r2: .throw(err) surfaces consumer error on reentrant duck-signal
+    // (listener fires only, no aborted mutation). SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-69r2: .throw() surfaces consumer error (reentrant duck-signal listener-only suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") fn();
+    /* do NOT mutate this.aborted */
+  },
+};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+let errMsg = null;
+let errName = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? e.name : null;
+}
+console.log(JSON.stringify({ errMsg, errName }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(data.errName).not.toBe("AbortError");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69u: .throw(err) surfaces consumer error on static duck-typed
+    // signal aborted:true at call time. SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-69u: .throw() surfaces consumer error (static duck-signal aborted:true suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const duck = {
+  aborted: true,
+  addEventListener(_type, _fn) { /* no-op: never fires */ },
+};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+let errMsg = null;
+let errName = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? e.name : null;
+}
+console.log(JSON.stringify({ errMsg, errName }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(data.errName).not.toBe("AbortError");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69j: .throw() surfaces consumer error (throwing options.signal
+    // getter suppressed). SPEC §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-69j: .throw() surfaces consumer error (throwing options.signal getter suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "signal", {
+  enumerable: true,
+  get() { throw new Error("evil-signal-getter"); },
+});
+const gen = run("ralph", opts);
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(result.stderr).not.toContain("evil-signal-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69k: .throw() surfaces consumer error (throwing options.cwd getter).
+    // ------------------------------------------------------------------------
+    it("T-API-69k: .throw() surfaces consumer error (throwing options.cwd getter suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = {};
+Object.defineProperty(opts, "cwd", {
+  enumerable: true,
+  get() { throw new Error("evil-cwd-getter"); },
+});
+const gen = run("ralph", opts);
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(result.stderr).not.toContain("evil-cwd-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69l: .throw() surfaces consumer error (throwing options.envFile
+    // getter suppressed).
+    // ------------------------------------------------------------------------
+    it("T-API-69l: .throw() surfaces consumer error (throwing options.envFile getter suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "envFile", {
+  enumerable: true,
+  get() { throw new Error("evil-envFile-getter"); },
+});
+const gen = run("ralph", opts);
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(result.stderr).not.toContain("evil-envFile-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69m: .throw() surfaces consumer error (throwing
+    // options.maxIterations getter suppressed).
+    // ------------------------------------------------------------------------
+    it("T-API-69m: .throw() surfaces consumer error (throwing options.maxIterations getter suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { run } from "loopx";
+const opts = { cwd: ${JSON.stringify(project.dir)} };
+Object.defineProperty(opts, "maxIterations", {
+  enumerable: true,
+  get() { throw new Error("evil-maxIterations-getter"); },
+});
+const gen = run("ralph", opts);
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(result.stderr).not.toContain("evil-maxIterations-getter");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69h: .throw() suppresses representative pre-iteration failures —
+    // full enumerated invalid-maxIterations set + representative selections
+    // of remaining option-snapshot, target-resolution, and target-syntax
+    // sub-paths. SPEC §9.1.
+    // ------------------------------------------------------------------------
+    const t69hVariants: Array<{ name: string; opts: string; target: string }> = [
+      { name: "i-options-null", opts: "null", target: '"ralph"' },
+      { name: "ii-options-array", opts: "[]", target: '"ralph"' },
+      { name: "iii-options-function", opts: "(() => {})", target: '"ralph"' },
+      { name: "iv-options-number", opts: "42", target: '"ralph"' },
+      { name: "v-signal-non-shape", opts: '{ signal: "not-a-signal" }', target: '"ralph"' },
+      { name: "vi-cwd-non-string", opts: "{ cwd: 42 }", target: '"ralph"' },
+      { name: "vii-envFile-non-string", opts: "{ envFile: 42 }", target: '"ralph"' },
+      { name: "viii-maxIter-fractional", opts: "{ maxIterations: 1.5 }", target: '"ralph"' },
+      { name: "ix-maxIter-NaN", opts: "{ maxIterations: NaN }", target: '"ralph"' },
+      { name: "x-maxIter-Infinity", opts: "{ maxIterations: Infinity }", target: '"ralph"' },
+      { name: "xi-maxIter-null", opts: "{ maxIterations: null }", target: '"ralph"' },
+      { name: "xii-maxIter-string", opts: '{ maxIterations: "1" }', target: '"ralph"' },
+      { name: "xix-target-syntax", opts: "undefined", target: '"a:b:c"' },
+    ];
+    for (const v of t69hVariants) {
+      it(`T-API-69h (${v.name}): .throw() surfaces consumer error (${v.name} suppressed)`, async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+        const optsExpr = v.opts === "undefined" ? "undefined" : v.opts;
+        const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const opts = ${optsExpr};
+const gen = run(${v.target}, opts);
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.errMsg).toBe("my-err");
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-69s: .throw() suppresses sibling-workflow discovery validation
+    // failures. SPEC §5.2 / §5.3 / §5.4 × §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-69s (collision): .throw() surfaces consumer error (sibling collision suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      await createBashWorkflowScript(project, "broken", "check", `printf '{"stop":true}'`);
+      await createWorkflowScript(project, "broken", "check", ".ts", `output({ stop: true });`);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(result.stderr).toBe("");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69t: .throw() suppresses unreadable local envFile (mode 000).
+    // SPEC §9.1, §8.2. Conditional on uid != 0.
+    // ------------------------------------------------------------------------
+    (IS_ROOT ? it.skip : it)("T-API-69t: .throw() surfaces consumer error (unreadable local envFile suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const envPath = join(project.dir, "local.env");
+      await writeFile(envPath, "OK=fine\n", "utf-8");
+      try {
+        await chmod(envPath, 0o000);
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(envPath)},
+});
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.errMsg).toBe("my-err");
+        expect(result.stderr).toBe("");
+      } finally {
+        await chmod(envPath, 0o600).catch(() => {});
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69n: .throw() suppresses unreadable global env file. Conditional
+    // on uid != 0.
+    // ------------------------------------------------------------------------
+    (IS_ROOT ? it.skip : it)("T-API-69n: .throw() surfaces consumer error (unreadable global env file suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const xdgConfigHome = await mkdtemp(join(osTmpdir(), "loopx-test-xdg-"));
+      const loopxConfigDir = join(xdgConfigHome, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const envPath = join(loopxConfigDir, "env");
+      await writeFile(envPath, "OK=fine\n", "utf-8");
+      try {
+        await chmod(envPath, 0o000);
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { XDG_CONFIG_HOME: xdgConfigHome },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.errMsg).toBe("my-err");
+        expect(result.stderr).toBe("");
+      } finally {
+        await chmod(envPath, 0o600).catch(() => {});
+        await rm(xdgConfigHome, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69o: .throw() suppresses local env-file parser warnings.
+    // ------------------------------------------------------------------------
+    it("T-API-69o: .throw() surfaces consumer error (local env-file parser warnings suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const envPath = join(project.dir, "local.env");
+      await writeFile(envPath, "1BAD=val\nOK=fine\n", "utf-8");
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(envPath)},
+});
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.errMsg).toBe("my-err");
+      expect(result.stderr).toBe("");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69p: .throw() suppresses global env-file parser warnings.
+    // ------------------------------------------------------------------------
+    it("T-API-69p: .throw() surfaces consumer error (global env-file parser warnings suppressed)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const xdgConfigHome = await mkdtemp(join(osTmpdir(), "loopx-test-xdg-"));
+      const loopxConfigDir = join(xdgConfigHome, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const envPath = join(loopxConfigDir, "env");
+      await writeFile(envPath, "1BAD=val\nOK=fine\n", "utf-8");
+      try {
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { XDG_CONFIG_HOME: xdgConfigHome },
+        });
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.errMsg).toBe("my-err");
+        expect(result.stderr).toBe("");
+      } finally {
+        await rm(xdgConfigHome, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-69q: .throw() suppresses workflow package.json warnings (parameterized).
+    // ------------------------------------------------------------------------
+    interface PkgVariantThrow { name: string; pkgContent: string; }
+    const t69qVariants: PkgVariantThrow[] = [
+      { name: "i-unsatisfied-range", pkgContent: JSON.stringify({ dependencies: { loopx: ">=999.0.0" } }) },
+      { name: "ii-invalid-json", pkgContent: "{broken" },
+      { name: "iii-invalid-semver-range", pkgContent: JSON.stringify({ dependencies: { loopx: "not-a-range!!!" } }) },
+    ];
+    for (const v of t69qVariants) {
+      it(`T-API-69q (${v.name}): .throw() surfaces consumer error (workflow package.json warning suppressed)`, async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+        await createWorkflowPackageJson(project, "ralph", v.pkgContent);
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)} });
+let errMsg = null;
+try {
+  await gen.throw(new Error("my-err"));
+} catch (e) {
+  errMsg = e instanceof Error ? e.message : String(e);
+}
+console.log(JSON.stringify({ errMsg }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const data = JSON.parse(result.stdout);
+        expect(data.errMsg).toBe("my-err");
+        expect(result.stderr).toBe("");
+      });
+    }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — runPromise() has no Pre-First-next() Carve-out (SPEC §9.2)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.2: "There is no runPromise() equivalent of the run() pre-first-
+// next() consumer-cancellation carve-out: any pre-iteration error surfaces
+// via promise rejection." T-API-70 parameterizes over the same invalid-input
+// fixtures used by T-API-68 / T-API-68a / T-API-68b / T-API-68c / T-API-68d
+// on the .return() carve-out surface — invalid target, missing-`.loopx/`
+// discovery, missing local envFile, invalid maxIterations:-1, and a
+// pre-aborted signal — and asserts that runPromise() rejects with some
+// applicable pre-iteration error in each case (per the "any applicable
+// pre-iteration error" implementation-neutral form: SPEC §9.3 leaves relative
+// priority among non-abort pre-iteration errors largely implementation-
+// defined, so the test does not over-specify which error wins; the
+// pre-aborted-signal sub-case rejects with the abort error per SPEC §9.3
+// "Abort precedence over pre-iteration failures").
+
+describe("SPEC: runPromise() has no Pre-First-next() Carve-out", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-70 (invalid-target): counterpart fixture to T-API-68. Invalid
+    // target argument (undefined) — the .return() carve-out on the run()
+    // surface would suppress this error and settle silently, but runPromise()
+    // has no such carve-out so the promise must reject.
+    // ------------------------------------------------------------------------
+    it("T-API-70 (invalid-target): runPromise(undefined) rejects (no carve-out)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, errMsg = "";
+try { await runPromise(undefined, { cwd: ${JSON.stringify(project.dir)} }); }
+catch (e) { rejected = true; errMsg = e instanceof Error ? e.message : String(e); }
+console.log(JSON.stringify({ rejected, errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.rejected).toBe(true);
+      expect(data.errMsg.length).toBeGreaterThan(0);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-70 (discovery-missing): counterpart fixture to T-API-68a. Missing
+    // .loopx/ directory — the .return() carve-out on the run() surface would
+    // suppress the discovery failure and settle silently, but runPromise()
+    // must reject.
+    // ------------------------------------------------------------------------
+    it("T-API-70 (discovery-missing): runPromise rejects on missing .loopx/ (no carve-out)", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, errMsg = "";
+try { await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)} }); }
+catch (e) { rejected = true; errMsg = e instanceof Error ? e.message : String(e); }
+console.log(JSON.stringify({ rejected, errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.rejected).toBe(true);
+      expect(data.errMsg.length).toBeGreaterThan(0);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-70 (missing-envFile): counterpart fixture to T-API-68b. Missing
+    // local env file — the .return() carve-out on the run() surface would
+    // suppress the env-file-load failure and settle silently, but
+    // runPromise() must reject.
+    // ------------------------------------------------------------------------
+    it("T-API-70 (missing-envFile): runPromise rejects on missing local envFile (no carve-out)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, errMsg = "";
+try { await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: "nonexistent.env",
+}); }
+catch (e) { rejected = true; errMsg = e instanceof Error ? e.message : String(e); }
+console.log(JSON.stringify({ rejected, errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.rejected).toBe(true);
+      expect(data.errMsg.length).toBeGreaterThan(0);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-70 (invalid-maxIterations): counterpart fixture to T-API-68c.
+    // Invalid maxIterations: -1 — the .return() carve-out on the run() surface
+    // would suppress the option-snapshot failure and settle silently, but
+    // runPromise() must reject.
+    // ------------------------------------------------------------------------
+    it("T-API-70 (invalid-maxIterations): runPromise rejects on maxIterations:-1 (no carve-out)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, errMsg = "";
+try { await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  maxIterations: -1,
+}); }
+catch (e) { rejected = true; errMsg = e instanceof Error ? e.message : String(e); }
+console.log(JSON.stringify({ rejected, errMsg }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.rejected).toBe(true);
+      expect(data.errMsg.length).toBeGreaterThan(0);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-70 (pre-aborted-signal): counterpart fixture to T-API-68d. A real
+    // pre-aborted AbortSignal — the .return() carve-out on the run() surface
+    // would suppress the abort and settle silently, but runPromise() must
+    // reject. Per SPEC §9.3 "Abort precedence over pre-iteration failures",
+    // the rejection reason is specifically the abort error (not a generic
+    // option-snapshot or pre-iteration error).
+    // ------------------------------------------------------------------------
+    it("T-API-70 (pre-aborted-signal): runPromise rejects with abort error (no carve-out)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, errMsg = "", errName = null;
+try { await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+}); }
+catch (e) {
+  rejected = true;
+  errMsg = e instanceof Error ? e.message : String(e);
+  errName = e instanceof Error ? e.name : null;
+}
+console.log(JSON.stringify({ rejected, errMsg, errName }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.rejected).toBe(true);
+      // SPEC §9.3: pre-aborted signal rejects with the abort error.
+      expect(data.errName === "AbortError" || /\babort(ed)?\b/i.test(data.errMsg)).toBe(true);
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — RunOptions.env Basic Injection (SPEC §9.5 / §8.3)
+// ═════════════════════════════════════════════════════════════
+//
+// Per SPEC §9.5: RunOptions.env entries are injected into every spawned
+// script's environment. Entries merge into the child environment after global
+// and local env-file loading and before loopx-injected protocol variables (see
+// §8.3 precedence list). The entries apply to every script in the run —
+// starting target, intra- and cross-workflow goto destinations, and loop
+// resets all receive the same env additions.
+
+describe("SPEC: RunOptions.env Basic Injection", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-50: RunOptions.env injects a variable into the spawned script.
+    // SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-50: runPromise() RunOptions.env injects MYVAR into the spawned script", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `if [ -n "\${MYVAR+x}" ]; then
+  printf 'present\\t%s' "$MYVAR" > "${marker}"
+else
+  printf 'absent' > "${marker}"
+fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { MYVAR: "hello" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("present\thello");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50a: RunOptions.env applies across iterations (every iteration's
+    // spawned child observes MYVAR). SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-50a: RunOptions.env applies across multiple iterations", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const results = [];
+for await (const o of run("ralph", { cwd: ${JSON.stringify(project.dir)}, env: { MYVAR: "shared" }, maxIterations: 3 })) {
+  results.push(o);
+}
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(2);
+      expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("shared");
+      expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("shared");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50b: RunOptions.env applies across intra-workflow goto.
+    // ralph:index → ralph:check; both observe MYVAR. SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-50b: RunOptions.env applies across intra-workflow goto", async () => {
+      project = await createTempProject();
+      const markerDir = project.dir;
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/index.txt"
+printf '{"goto":"ralph:check"}'`,
+      );
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "check",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/check.txt"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const results = [];
+for await (const o of run("ralph", { cwd: ${JSON.stringify(project.dir)}, env: { MYVAR: "intra" } })) {
+  results.push(o);
+}
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(2);
+      expect(readFileSync(join(markerDir, "index.txt"), "utf-8")).toBe("intra");
+      expect(readFileSync(join(markerDir, "check.txt"), "utf-8")).toBe("intra");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50c: RunOptions.env applies across cross-workflow goto.
+    // alpha:index → beta:step; both observe MYVAR. SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-50c: RunOptions.env applies across cross-workflow goto", async () => {
+      project = await createTempProject();
+      const markerDir = project.dir;
+      await createBashWorkflowScript(
+        project,
+        "alpha",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/alpha.txt"
+printf '{"goto":"beta:step"}'`,
+      );
+      await createBashWorkflowScript(
+        project,
+        "beta",
+        "step",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/beta.txt"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const results = [];
+for await (const o of run("alpha", { cwd: ${JSON.stringify(project.dir)}, env: { MYVAR: "cross" } })) {
+  results.push(o);
+}
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(2);
+      expect(readFileSync(join(markerDir, "alpha.txt"), "utf-8")).toBe("cross");
+      expect(readFileSync(join(markerDir, "beta.txt"), "utf-8")).toBe("cross");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50d: RunOptions.env applies on loop reset. ralph:index returns to
+    // ralph:index after a chain completes without stop:true. Both runs of
+    // ralph:index observe MYVAR. SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-50d: RunOptions.env applies on loop reset", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/run\${N}.txt"
+if [ "$N" -ge 2 ]; then
+  printf '{"stop":true}'
+fi`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const results = [];
+for await (const o of run("ralph", { cwd: ${JSON.stringify(project.dir)}, env: { MYVAR: "reset" } })) {
+  results.push(o);
+}
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(2);
+      expect(readFileSync(join(markerDir, "run1.txt"), "utf-8")).toBe("reset");
+      expect(readFileSync(join(markerDir, "run2.txt"), "utf-8")).toBe("reset");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50e: Empty-string entry value reaches the spawned script as the
+    // empty string (distinguishable from `undefined`). SPEC §8.3 / §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-50e: empty-string entry value reaches script as empty string (present, not unset)", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `if [ -n "\${MYVAR+x}" ]; then
+  printf 'present\\t%s' "$MYVAR" > "${marker}"
+else
+  printf 'absent' > "${marker}"
+fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { MYVAR: "" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // present\t<empty> — the variable IS set in the env (distinguishable
+      // from "absent", which would mean MYVAR was not set at all).
+      expect(readFileSync(marker, "utf-8")).toBe("present\t");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50h: Tricky non-NUL string values (whitespace, embedded `=`, `#`,
+    // quotes, backslash, UTF-8, `\n`, `\r\n`, `\t`, whitespace-only) reach the
+    // spawned script byte-for-byte unchanged across both API surfaces.
+    // SPEC §9.5 / §8.3 — RunOptions.env is NOT subject to env-file parser
+    // normalization.
+    // ------------------------------------------------------------------------
+    it("T-API-50h: tricky non-NUL string values reach script byte-for-byte unchanged (runPromise + run)", async () => {
+      project = await createTempProject();
+      const markerDir = project.dir;
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `# Dump every observed entry verbatim into per-key marker files.
+# Use bash indirect expansion (\${!key}) — eval "val=\\"\\$\\$key\\"" would
+# expand \\$\\$ as the shell PID rather than escaped-dollar then key-expansion.
+for key in V_SPACES V_EQ V_HASH V_DQ V_SQ V_BS V_UTF V_LF V_CRLF V_TAB V_WSONLY; do
+  printf '%s' "\${!key}" > "${markerDir}/\${key}.txt"
+done
+printf '{"stop":true}'`,
+      );
+
+      // Construct a payload of tricky values (NO embedded NUL — those would
+      // surface as runtime spawn failures per T-API-57).
+      const payload = {
+        V_SPACES: "  leading and trailing  ",
+        V_EQ: "a=b=c",
+        V_HASH: "value # not a comment",
+        V_DQ: 'has "double" quotes',
+        V_SQ: "has 'single' quotes",
+        V_BS: "back\\slash\\path",
+        V_UTF: "UTF-8 ✅ é 日本語",
+        V_LF: "line1\nline2",
+        V_CRLF: "win1\r\nwin2",
+        V_TAB: "col1\tcol2",
+        V_WSONLY: "   ",
+      };
+
+      // Surface 1: runPromise().
+      const driverCode1 = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: ${JSON.stringify(payload)},
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result1 = await runAPIDriver(runtime, driverCode1);
+      expect(result1.exitCode).toBe(0);
+      expect(JSON.parse(result1.stdout).count).toBe(1);
+      for (const [key, expected] of Object.entries(payload)) {
+        expect(readFileSync(join(markerDir, `${key}.txt`), "utf-8")).toBe(expected);
+      }
+
+      // Reset markers between surfaces (each surface writes the same files).
+      for (const key of Object.keys(payload)) {
+        await rm(join(markerDir, `${key}.txt`), { force: true });
+      }
+
+      // Surface 2: run().
+      const driverCode2 = `
+import { run } from "loopx";
+let count = 0;
+for await (const _ of run("ralph", { cwd: ${JSON.stringify(project.dir)}, env: ${JSON.stringify(payload)}, maxIterations: 1 })) {
+  count++;
+}
+console.log(JSON.stringify({ count }));
+`;
+      const result2 = await runAPIDriver(runtime, driverCode2);
+      expect(result2.exitCode).toBe(0);
+      expect(JSON.parse(result2.stdout).count).toBe(1);
+      for (const [key, expected] of Object.entries(payload)) {
+        expect(readFileSync(join(markerDir, `${key}.txt`), "utf-8")).toBe(expected);
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50f: Concurrent runPromise() calls receive isolated RunOptions.env
+    // values. Pins ADR-0004's core motivation: per-run env values reach scripts
+    // without racy global process.env mutation. Two distinct workflows in the
+    // same project (alpha, beta), each observing MYVAR into a caller-supplied
+    // marker, each waiting on a caller-supplied release file before emitting
+    // stop:true. The release-file barrier guarantees the two scripts overlap
+    // on the RunOptions.env snapshot / spawn boundary — when one script blocks
+    // waiting for its release file, the other is already past runPromise()-call
+    // and has spawned. A buggy implementation that mutated process.env to
+    // apply per-run values would observably leak across concurrent runs.
+    // SPEC §9.5 / §9.2 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-50f: concurrent runPromise() calls receive isolated RunOptions.env values", async () => {
+      project = await createTempProject();
+      const alphaMarker = join(project.dir, "alpha-marker.txt");
+      const betaMarker = join(project.dir, "beta-marker.txt");
+      const releaseAlpha = join(project.dir, "release-alpha");
+      const releaseBeta = join(project.dir, "release-beta");
+
+      await createBashWorkflowScript(
+        project,
+        "alpha",
+        "index",
+        `printf '%s' "$MYVAR" > "$ALPHA_MARKER"
+while [ ! -f "$ALPHA_RELEASE" ]; do sleep 0.05; done
+printf '{"stop":true}'`,
+      );
+      await createBashWorkflowScript(
+        project,
+        "beta",
+        "index",
+        `printf '%s' "$MYVAR" > "$BETA_MARKER"
+while [ ! -f "$BETA_RELEASE" ]; do sleep 0.05; done
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync, writeFileSync } from "node:fs";
+const cwd = ${JSON.stringify(project.dir)};
+const releaseAlpha = ${JSON.stringify(releaseAlpha)};
+const releaseBeta = ${JSON.stringify(releaseBeta)};
+const alphaMarker = ${JSON.stringify(alphaMarker)};
+const betaMarker = ${JSON.stringify(betaMarker)};
+const pAlpha = runPromise("alpha", {
+  cwd,
+  maxIterations: 1,
+  env: { MYVAR: "alpha-value", ALPHA_MARKER: alphaMarker, ALPHA_RELEASE: releaseAlpha },
+});
+const pBeta = runPromise("beta", {
+  cwd,
+  maxIterations: 1,
+  env: { MYVAR: "beta-value", BETA_MARKER: betaMarker, BETA_RELEASE: releaseBeta },
+});
+// Wait for both markers — proves both scripts have spawned and observed
+// MYVAR before either completes. The two runs genuinely overlap.
+const deadline = Date.now() + 20000;
+while (Date.now() < deadline) {
+  if (existsSync(alphaMarker) && existsSync(betaMarker)) break;
+  await new Promise((r) => setTimeout(r, 50));
+}
+writeFileSync(releaseAlpha, "");
+writeFileSync(releaseBeta, "");
+const [outA, outB] = await Promise.all([pAlpha, pBeta]);
+console.log(JSON.stringify({ alphaCount: outA.length, betaCount: outB.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, { timeout: 25_000 });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.alphaCount).toBe(1);
+      expect(data.betaCount).toBe(1);
+      // (a) alpha saw only its own value.
+      expect(readFileSync(alphaMarker, "utf-8")).toBe("alpha-value");
+      // (b) beta saw only its own value.
+      expect(readFileSync(betaMarker, "utf-8")).toBe("beta-value");
+      // (c) no cross-contamination either way.
+      expect(readFileSync(alphaMarker, "utf-8")).not.toBe("beta-value");
+      expect(readFileSync(betaMarker, "utf-8")).not.toBe("alpha-value");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-50g: Concurrent run() generator calls receive isolated
+    // RunOptions.env values. Generator-surface counterpart to T-API-50f.
+    // SPEC §9.1 lazy-process.env-snapshot timing differs from §9.2 eager-
+    // snapshot; an implementation that wired RunOptions.env correctly on the
+    // eager runPromise() path while losing isolation on the lazy run() path —
+    // for example, by re-reading shared mutable state at first next() rather
+    // than from a captured snapshot — would pass T-API-50f and fail this test.
+    // Same fixture; both next() calls are issued WITHOUT awaiting so both
+    // generators advance past their RunOptions.env snapshot and into their
+    // first child spawn before either fixture script can yield (both block
+    // on the release file). SPEC §9.5 / §9.1 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-50g: concurrent run() generator calls receive isolated RunOptions.env values", async () => {
+      project = await createTempProject();
+      const alphaMarker = join(project.dir, "alpha-marker.txt");
+      const betaMarker = join(project.dir, "beta-marker.txt");
+      const releaseAlpha = join(project.dir, "release-alpha");
+      const releaseBeta = join(project.dir, "release-beta");
+
+      await createBashWorkflowScript(
+        project,
+        "alpha",
+        "index",
+        `printf '%s' "$MYVAR" > "$ALPHA_MARKER"
+while [ ! -f "$ALPHA_RELEASE" ]; do sleep 0.05; done
+printf '{"stop":true}'`,
+      );
+      await createBashWorkflowScript(
+        project,
+        "beta",
+        "index",
+        `printf '%s' "$MYVAR" > "$BETA_MARKER"
+while [ ! -f "$BETA_RELEASE" ]; do sleep 0.05; done
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync, writeFileSync } from "node:fs";
+const cwd = ${JSON.stringify(project.dir)};
+const releaseAlpha = ${JSON.stringify(releaseAlpha)};
+const releaseBeta = ${JSON.stringify(releaseBeta)};
+const alphaMarker = ${JSON.stringify(alphaMarker)};
+const betaMarker = ${JSON.stringify(betaMarker)};
+const ga = run("alpha", {
+  cwd,
+  maxIterations: 1,
+  env: { MYVAR: "alpha-value", ALPHA_MARKER: alphaMarker, ALPHA_RELEASE: releaseAlpha },
+});
+const gb = run("beta", {
+  cwd,
+  maxIterations: 1,
+  env: { MYVAR: "beta-value", BETA_MARKER: betaMarker, BETA_RELEASE: releaseBeta },
+});
+// Drive both generators to their first yield concurrently. Awaiting
+// Promise.all([ga.next(), gb.next()]) directly would deadlock — both fixtures
+// block at the release-file barrier before yielding the first Output.
+// Issuing the next() promises without immediately awaiting lets the harness
+// advance both generators past their first spawn while retaining control.
+const aNextP = ga.next();
+const bNextP = gb.next();
+const deadline = Date.now() + 20000;
+while (Date.now() < deadline) {
+  if (existsSync(alphaMarker) && existsSync(betaMarker)) break;
+  await new Promise((r) => setTimeout(r, 50));
+}
+writeFileSync(releaseAlpha, "");
+writeFileSync(releaseBeta, "");
+const [aFirst, bFirst] = await Promise.all([aNextP, bNextP]);
+// Drain to settlement.
+let aCount = aFirst.done ? 0 : 1;
+let bCount = bFirst.done ? 0 : 1;
+while (true) {
+  const r = await ga.next();
+  if (r.done) break;
+  aCount++;
+}
+while (true) {
+  const r = await gb.next();
+  if (r.done) break;
+  bCount++;
+}
+console.log(JSON.stringify({ alphaCount: aCount, betaCount: bCount }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, { timeout: 25_000 });
+      expect(result.exitCode).toBe(0);
+      const data = JSON.parse(result.stdout);
+      expect(data.alphaCount).toBe(1);
+      expect(data.betaCount).toBe(1);
+      // (a) alpha saw only its own value.
+      expect(readFileSync(alphaMarker, "utf-8")).toBe("alpha-value");
+      // (b) beta saw only its own value.
+      expect(readFileSync(betaMarker, "utf-8")).toBe("beta-value");
+      // (c) no cross-contamination either way.
+      expect(readFileSync(alphaMarker, "utf-8")).not.toBe("beta-value");
+      expect(readFileSync(betaMarker, "utf-8")).not.toBe("alpha-value");
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TEST-SPEC §4.9 — Programmatic API › RunOptions.env › Precedence
+//
+// SPEC §8.3 / §9.5 precedence chain (highest wins):
+//   1. protocol vars (LOOPX_BIN / LOOPX_PROJECT_ROOT / LOOPX_WORKFLOW /
+//      LOOPX_WORKFLOW_DIR / LOOPX_TMPDIR) — applied in execution.ts
+//   2. RunOptions.env
+//   3. local env file (-e / RunOptions.envFile)
+//   4. global loopx env ($XDG_CONFIG_HOME/loopx/env)
+//   5. inherited process.env
+// ---------------------------------------------------------------------------
+
+describe("SPEC: RunOptions.env Precedence", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-51a: tier-1 protocol vars override tier-2 RunOptions.env for all
+    // five script-protocol-protected names. Override is silent (no stderr
+    // warning / notice). LOOPX_TMPDIR observation is during-run (via
+    // in-script stat) so a real loopx-created tmpdir can be distinguished
+    // from a string substitution; the cleanup at SPEC §7.4 would erase a
+    // post-run stat. SPEC §9.5 / §8.3 / §13 / §7.4.
+    // ------------------------------------------------------------------------
+    it("T-API-51a: runPromise() — protocol vars silently override RunOptions.env LOOPX_* keys", async () => {
+      project = await createTempProject();
+      const projectRoot = realpathSync(project.dir);
+      const markerDir = project.dir;
+      const binMarker = join(markerDir, "loopx_bin.txt");
+      const rootMarker = join(markerDir, "loopx_project_root.txt");
+      const wfMarker = join(markerDir, "loopx_workflow.txt");
+      const wfDirMarker = join(markerDir, "loopx_workflow_dir.txt");
+      const tmpdirMarker = join(markerDir, "loopx_tmpdir.txt");
+      const tmpdirStatMarker = join(markerDir, "loopx_tmpdir_stat.txt");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_BIN" > "${binMarker}"
+printf '%s' "$LOOPX_PROJECT_ROOT" > "${rootMarker}"
+printf '%s' "$LOOPX_WORKFLOW" > "${wfMarker}"
+printf '%s' "$LOOPX_WORKFLOW_DIR" > "${wfDirMarker}"
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${tmpdirStatMarker}"
+else
+  printf 'not-dir' > "${tmpdirStatMarker}"
+fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: {
+    LOOPX_WORKFLOW: "fake",
+    LOOPX_PROJECT_ROOT: "/tmp/fake",
+    LOOPX_WORKFLOW_DIR: "/tmp/fake-dir",
+    LOOPX_TMPDIR: "/tmp/fake-tmp",
+    LOOPX_BIN: "/tmp/fake-bin",
+  },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+
+      // (a) Each marker records the real tier-1 protocol value, not the
+      //     tier-2 RunOptions.env value.
+      const observedBin = readFileSync(binMarker, "utf-8");
+      expect(observedBin).not.toBe("/tmp/fake-bin");
+      expect(existsSync(observedBin)).toBe(true);
+
+      const observedRoot = readFileSync(rootMarker, "utf-8");
+      expect(observedRoot).not.toBe("/tmp/fake");
+      expect(observedRoot).toBe(projectRoot);
+
+      const observedWorkflow = readFileSync(wfMarker, "utf-8");
+      expect(observedWorkflow).not.toBe("fake");
+      expect(observedWorkflow).toBe("ralph");
+
+      const observedWorkflowDir = readFileSync(wfDirMarker, "utf-8");
+      expect(observedWorkflowDir).not.toBe("/tmp/fake-dir");
+      expect(observedWorkflowDir).toBe(join(projectRoot, ".loopx", "ralph"));
+
+      const observedTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(observedTmpdir).not.toBe("/tmp/fake-tmp");
+      // Real loopx-created tmpdir under the test runtime's os.tmpdir() (or
+      // the test-isolated parent), matching the `loopx-*` naming pattern.
+      expect(observedTmpdir).toMatch(/\/loopx-[^/]+$/);
+
+      // (b) During-run stat: the path that LOOPX_TMPDIR pointed to existed
+      //     as a directory while the script was running. Proves the value
+      //     is the real loopx-created tmpdir, not merely a substituted
+      //     string. SPEC §7.4 cleanup runs after the script, so a post-run
+      //     stat would observe absence — the in-script stat is what
+      //     distinguishes real from substituted.
+      expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+
+      // (c) Stderr contains no override warning / error / notice for any
+      //     of the five script-protocol-protected names (silent override
+      //     contract — SPEC §8.3 / §13).
+      const stderrLower = result.stderr.toLowerCase();
+      for (const name of [
+        "loopx_bin",
+        "loopx_project_root",
+        "loopx_workflow",
+        "loopx_workflow_dir",
+        "loopx_tmpdir",
+      ]) {
+        const re = new RegExp(
+          `${name}.*(override|overrid|ignored|warning|notice)`,
+          "i",
+        );
+        expect(stderrLower).not.toMatch(re);
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-51a2: generator-surface counterpart to T-API-51a — all five
+    // LOOPX_* keys silently overridden on the run() surface. SPEC §9.5 /
+    // §9.1 / §8.3 / §13 / §7.4.
+    // ------------------------------------------------------------------------
+    it("T-API-51a2: run() — protocol vars silently override RunOptions.env LOOPX_* keys", async () => {
+      project = await createTempProject();
+      const projectRoot = realpathSync(project.dir);
+      const markerDir = project.dir;
+      const binMarker = join(markerDir, "loopx_bin.txt");
+      const rootMarker = join(markerDir, "loopx_project_root.txt");
+      const wfMarker = join(markerDir, "loopx_workflow.txt");
+      const wfDirMarker = join(markerDir, "loopx_workflow_dir.txt");
+      const tmpdirMarker = join(markerDir, "loopx_tmpdir.txt");
+      const tmpdirStatMarker = join(markerDir, "loopx_tmpdir_stat.txt");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_BIN" > "${binMarker}"
+printf '%s' "$LOOPX_PROJECT_ROOT" > "${rootMarker}"
+printf '%s' "$LOOPX_WORKFLOW" > "${wfMarker}"
+printf '%s' "$LOOPX_WORKFLOW_DIR" > "${wfDirMarker}"
+printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${tmpdirStatMarker}"
+else
+  printf 'not-dir' > "${tmpdirStatMarker}"
+fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+let count = 0;
+for await (const _ of run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: {
+    LOOPX_WORKFLOW: "fake",
+    LOOPX_PROJECT_ROOT: "/tmp/fake",
+    LOOPX_WORKFLOW_DIR: "/tmp/fake-dir",
+    LOOPX_TMPDIR: "/tmp/fake-tmp",
+    LOOPX_BIN: "/tmp/fake-bin",
+  },
+  maxIterations: 1,
+})) {
+  count++;
+}
+console.log(JSON.stringify({ count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      // (g) generator settled cleanly with one yield.
+      expect(JSON.parse(result.stdout).count).toBe(1);
+
+      // (a) LOOPX_BIN overridden to real path.
+      const observedBin = readFileSync(binMarker, "utf-8");
+      expect(observedBin).not.toBe("/tmp/fake-bin");
+      expect(existsSync(observedBin)).toBe(true);
+      // (b) LOOPX_PROJECT_ROOT overridden.
+      const observedRoot = readFileSync(rootMarker, "utf-8");
+      expect(observedRoot).not.toBe("/tmp/fake");
+      expect(observedRoot).toBe(projectRoot);
+      // (c) LOOPX_WORKFLOW overridden.
+      const observedWorkflow = readFileSync(wfMarker, "utf-8");
+      expect(observedWorkflow).not.toBe("fake");
+      expect(observedWorkflow).toBe("ralph");
+      // (d) LOOPX_WORKFLOW_DIR overridden.
+      const observedWorkflowDir = readFileSync(wfDirMarker, "utf-8");
+      expect(observedWorkflowDir).not.toBe("/tmp/fake-dir");
+      expect(observedWorkflowDir).toBe(join(projectRoot, ".loopx", "ralph"));
+      // (e) LOOPX_TMPDIR overridden.
+      const observedTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(observedTmpdir).not.toBe("/tmp/fake-tmp");
+      expect(observedTmpdir).toMatch(/\/loopx-[^/]+$/);
+      // (f) During-run stat marker confirms real loopx-created tmpdir.
+      expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+      // (h) No override warning on stderr for any of the five names.
+      const stderrLower = result.stderr.toLowerCase();
+      for (const name of [
+        "loopx_bin",
+        "loopx_project_root",
+        "loopx_workflow",
+        "loopx_workflow_dir",
+        "loopx_tmpdir",
+      ]) {
+        const re = new RegExp(
+          `${name}.*(override|overrid|ignored|warning|notice)`,
+          "i",
+        );
+        expect(stderrLower).not.toMatch(re);
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-51b: RunOptions.env (tier 2) overrides local env-file values
+    // (tier 3). SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-51b: runPromise() — RunOptions.env overrides local env-file value", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      const localEnv = join(project.dir, ".env");
+      await createEnvFile(localEnv, { MYVAR: "from-file" });
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ".env",
+  env: { MYVAR: "from-options" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("from-options");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-51c: RunOptions.env (tier 2) overrides global env-file values
+    // (tier 4). SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-51c: runPromise() — RunOptions.env overrides global env-file value", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const xdg = await mkdtemp(join(osTmpdir(), "loopx-xdg-51c-"));
+      await mkdir(join(xdg, "loopx"), { recursive: true });
+      await writeFile(join(xdg, "loopx", "env"), "MYVAR=from-global\n", "utf-8");
+
+      try {
+        const driverCode = `
+import { runPromise } from "loopx";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdg)};
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { MYVAR: "from-options" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(readFileSync(marker, "utf-8")).toBe("from-options");
+      } finally {
+        await rm(xdg, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-51d: RunOptions.env (tier 2) overrides inherited process.env
+    // values (tier 5). SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-51d: runPromise() — RunOptions.env overrides inherited process.env value", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.env.MYVAR = "inherited";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { MYVAR: "from-options" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("from-options");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-51e: full precedence chain on the runPromise() surface.
+    // Inherited process.env MYVAR=1 (tier 5), global env file MYVAR=2
+    // (tier 4), local env file MYVAR=3 (tier 3), RunOptions.env MYVAR=4
+    // (tier 2). MYVAR is not a protocol name, so RunOptions.env is the
+    // effective winner. SPEC §9.5 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-51e: runPromise() — full precedence chain (RunOptions.env wins over local, global, inherited)", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      const localEnv = join(project.dir, ".env");
+      await createEnvFile(localEnv, { MYVAR: "3" });
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const xdg = await mkdtemp(join(osTmpdir(), "loopx-xdg-51e-"));
+      await mkdir(join(xdg, "loopx"), { recursive: true });
+      await writeFile(join(xdg, "loopx", "env"), "MYVAR=2\n", "utf-8");
+
+      try {
+        const driverCode = `
+import { runPromise } from "loopx";
+process.env.MYVAR = "1";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdg)};
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ".env",
+  env: { MYVAR: "4" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(readFileSync(marker, "utf-8")).toBe("4");
+      } finally {
+        await rm(xdg, { recursive: true, force: true });
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-51f: full precedence chain on the run() generator surface
+    // (counterpart to T-API-51e). SPEC §9.5 / §9.1 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-API-51f: run() — full precedence chain (RunOptions.env wins over local, global, inherited)", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      const localEnv = join(project.dir, ".env");
+      await createEnvFile(localEnv, { MYVAR: "3" });
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const xdg = await mkdtemp(join(osTmpdir(), "loopx-xdg-51f-"));
+      await mkdir(join(xdg, "loopx"), { recursive: true });
+      await writeFile(join(xdg, "loopx", "env"), "MYVAR=2\n", "utf-8");
+
+      try {
+        const driverCode = `
+import { run } from "loopx";
+process.env.MYVAR = "1";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(xdg)};
+let count = 0;
+for await (const _ of run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ".env",
+  env: { MYVAR: "4" },
+  maxIterations: 1,
+})) {
+  count++;
+}
+console.log(JSON.stringify({ count }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(readFileSync(marker, "utf-8")).toBe("4");
+      } finally {
+        await rm(xdg, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — RunOptions.env Snapshot Semantics (SPEC §9.5 / §9.1 / §9.2)
+// ═════════════════════════════════════════════════════════════
+//
+// Per SPEC §9.5: "Entries are captured synchronously at call time as a shallow
+// copy — loopx reads the supplied object's own enumerable string-keyed
+// properties once. The capture runs at the run() / runPromise() call site …".
+// These tests pin the eager-shallow-copy semantics across both API surfaces:
+//   - value mutation after call → not observed (T-API-52, T-API-52b)
+//   - key-set mutation after call → not observed (T-API-52a, T-API-52f)
+//   - per-entry accessor getter invoked exactly once at call site, not per
+//     spawn (T-API-52c, T-API-52d)
+//   - proxy `ownKeys` and `get` traps invoked exactly once per included key
+//     at call site, not per spawn (T-API-52e, T-API-52e2)
+
+describe("SPEC: RunOptions.env Snapshot Semantics", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-52: runPromise() — RunOptions.env is snapshotted at call time;
+    // mutating the original object's value after runPromise() returns has no
+    // effect on the running loop. SPEC §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-52: runPromise() — value mutation after call is not observed", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const e = { MYVAR: "initial" };
+const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+e.MYVAR = "mutated";
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("initial");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52a: run() — RunOptions.env snapshot is shallow on the key-set
+    // axis; a key added to the original object after run() is not observed
+    // by the spawned script. SPEC §9.5 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-52a: run() — added key after call is not observed (shallow snapshot)", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      const newvarMarker = join(project.dir, "newvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `if [ -n "\${MYVAR+x}" ]; then
+  printf 'present\\t%s' "$MYVAR" > "${myvarMarker}"
+else
+  printf 'absent' > "${myvarMarker}"
+fi
+if [ -n "\${NEWVAR+x}" ]; then
+  printf 'present\\t%s' "$NEWVAR" > "${newvarMarker}"
+else
+  printf 'absent' > "${newvarMarker}"
+fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const e = { MYVAR: "initial" };
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+e.NEWVAR = "added";
+const results = [];
+for await (const o of gen) {
+  results.push(o);
+}
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("present\tinitial");
+      expect(readFileSync(newvarMarker, "utf-8")).toBe("absent");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52b: run() — RunOptions.env snapshot is taken eagerly at call
+    // time, not lazily at first next(). SPEC §9.5 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-52b: run() — value mutation between call and first next() is not observed (eager snapshot)", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const e = { MYVAR: "A" };
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+e.MYVAR = "B";
+const results = [];
+for await (const o of gen) {
+  results.push(o);
+}
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("A");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52c: run() — RunOptions.env per-entry accessor getter is invoked
+    // exactly once at call time (eager-capture clause), not at first next()
+    // and not re-invoked per spawn. SPEC §9.5 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-52c: run() — accessor getter invoked exactly once at call time, not per spawn", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+let count = 0;
+let backing = "initial";
+const env = {};
+Object.defineProperty(env, "MYVAR", {
+  enumerable: true,
+  configurable: true,
+  get() { count += 1; return backing; },
+});
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 1,
+});
+const countAfterRun = count;
+backing = "mutated";
+const countAfterMutate = count;
+const results = [];
+for await (const o of gen) {
+  results.push(o);
+}
+const countAfterSettle = count;
+console.log(JSON.stringify({ countAfterRun, countAfterMutate, countAfterSettle, outputs: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.countAfterRun).toBe(1);
+      expect(parsed.countAfterMutate).toBe(1);
+      expect(parsed.countAfterSettle).toBe(1);
+      expect(parsed.outputs).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("initial");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52d: runPromise() — RunOptions.env per-entry accessor getter is
+    // invoked exactly once synchronously before runPromise() returns, and
+    // the captured value is observed by every script across multiple
+    // iterations even after the backing state mutates. SPEC §9.5 / §9.2.
+    // ------------------------------------------------------------------------
+    it("T-API-52d: runPromise() — accessor getter invoked exactly once at call time, snapshot reused across iterations", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/iter\${N}.txt"
+if [ "$N" -ge 3 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let count = 0;
+let backing = "initial";
+const env = {};
+Object.defineProperty(env, "MYVAR", {
+  enumerable: true,
+  configurable: true,
+  get() { count += 1; return backing; },
+});
+const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 3,
+});
+const countAfterCall = count;
+backing = "mutated";
+const countAfterMutate = count;
+const outputs = await p;
+const countAfterResolve = count;
+console.log(JSON.stringify({ countAfterCall, countAfterMutate, countAfterResolve, outputCount: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.countAfterCall).toBe(1);
+      expect(parsed.countAfterMutate).toBe(1);
+      expect(parsed.countAfterResolve).toBe(1);
+      expect(parsed.outputCount).toBe(3);
+      expect(readFileSync(join(markerDir, "iter1.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "iter2.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "iter3.txt"), "utf-8")).toBe("initial");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52e (variant a — run): proxy ownKeys + get traps. SPEC §9.5.
+    //   - ownKeys invoked exactly once at call time
+    //   - get invoked exactly once per included string key at call time
+    //   - neither re-invoked across iterations / spawns
+    // ------------------------------------------------------------------------
+    it("T-API-52e: run() — proxy ownKeys/get traps invoked exactly once at call time, not per spawn", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/myvar\${N}.txt"
+printf '%s' "\${OTHERVAR:-UNSET}" > "${markerDir}/othervar\${N}.txt"
+if [ "$N" -ge 3 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+let ownKeysCount = 0;
+let getCount = 0;
+const valueGetCounts = new Map();
+const target = { MYVAR: "initial", OTHERVAR: "second" };
+const env = new Proxy(target, {
+  ownKeys(t) { ownKeysCount += 1; return Reflect.ownKeys(t); },
+  getOwnPropertyDescriptor(t, key) { return Reflect.getOwnPropertyDescriptor(t, key); },
+  get(t, key) {
+    if (typeof key === "string") {
+      getCount += 1;
+      valueGetCounts.set(key, (valueGetCounts.get(key) ?? 0) + 1);
+    }
+    return Reflect.get(t, key);
+  },
+});
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 3,
+});
+const ownKeysAfterCall = ownKeysCount;
+const getAfterCall = getCount;
+const valueGetSnapshot = Object.fromEntries(valueGetCounts);
+const outputs = [];
+for await (const o of gen) {
+  outputs.push(o);
+}
+const ownKeysAfterDone = ownKeysCount;
+const getAfterDone = getCount;
+const valueGetAfterDone = Object.fromEntries(valueGetCounts);
+console.log(JSON.stringify({
+  ownKeysAfterCall, ownKeysAfterDone,
+  getAfterCall, getAfterDone,
+  valueGetSnapshot, valueGetAfterDone,
+  outputs: outputs.length,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.ownKeysAfterCall).toBe(1);
+      expect(parsed.ownKeysAfterDone).toBe(parsed.ownKeysAfterCall);
+      expect(parsed.getAfterCall).toBe(2);
+      expect(parsed.valueGetSnapshot.MYVAR).toBe(1);
+      expect(parsed.valueGetSnapshot.OTHERVAR).toBe(1);
+      expect(parsed.getAfterDone).toBe(parsed.getAfterCall);
+      expect(parsed.valueGetAfterDone.MYVAR).toBe(parsed.valueGetSnapshot.MYVAR);
+      expect(parsed.valueGetAfterDone.OTHERVAR).toBe(parsed.valueGetSnapshot.OTHERVAR);
+      expect(parsed.outputs).toBe(3);
+      expect(readFileSync(join(markerDir, "myvar1.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar2.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar3.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "othervar1.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar2.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar3.txt"), "utf-8")).toBe("second");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52e (variant b — runPromise): same trap-call invariants on the
+    // eager-snapshot surface. SPEC §9.5 / §9.2.
+    // ------------------------------------------------------------------------
+    it("T-API-52e: runPromise() — proxy ownKeys/get traps invoked exactly once at call time, not per spawn", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/myvar\${N}.txt"
+printf '%s' "\${OTHERVAR:-UNSET}" > "${markerDir}/othervar\${N}.txt"
+if [ "$N" -ge 3 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let ownKeysCount = 0;
+let getCount = 0;
+const valueGetCounts = new Map();
+const target = { MYVAR: "initial", OTHERVAR: "second" };
+const env = new Proxy(target, {
+  ownKeys(t) { ownKeysCount += 1; return Reflect.ownKeys(t); },
+  getOwnPropertyDescriptor(t, key) { return Reflect.getOwnPropertyDescriptor(t, key); },
+  get(t, key) {
+    if (typeof key === "string") {
+      getCount += 1;
+      valueGetCounts.set(key, (valueGetCounts.get(key) ?? 0) + 1);
+    }
+    return Reflect.get(t, key);
+  },
+});
+const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 3,
+});
+const ownKeysAfterCall = ownKeysCount;
+const getAfterCall = getCount;
+const valueGetSnapshot = Object.fromEntries(valueGetCounts);
+const outputs = await p;
+const ownKeysAfterDone = ownKeysCount;
+const getAfterDone = getCount;
+const valueGetAfterDone = Object.fromEntries(valueGetCounts);
+console.log(JSON.stringify({
+  ownKeysAfterCall, ownKeysAfterDone,
+  getAfterCall, getAfterDone,
+  valueGetSnapshot, valueGetAfterDone,
+  outputs: outputs.length,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.ownKeysAfterCall).toBe(1);
+      expect(parsed.ownKeysAfterDone).toBe(parsed.ownKeysAfterCall);
+      expect(parsed.getAfterCall).toBe(2);
+      expect(parsed.valueGetSnapshot.MYVAR).toBe(1);
+      expect(parsed.valueGetSnapshot.OTHERVAR).toBe(1);
+      expect(parsed.getAfterDone).toBe(parsed.getAfterCall);
+      expect(parsed.valueGetAfterDone.MYVAR).toBe(parsed.valueGetSnapshot.MYVAR);
+      expect(parsed.valueGetAfterDone.OTHERVAR).toBe(parsed.valueGetSnapshot.OTHERVAR);
+      expect(parsed.outputs).toBe(3);
+      expect(readFileSync(join(markerDir, "myvar1.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar2.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar3.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "othervar1.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar2.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar3.txt"), "utf-8")).toBe("second");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52e2 (variant a): only `getOwnPropertyDescriptor` is custom-
+    // trapped. SPEC §9.5 leaves the per-call descriptor count
+    // implementation-defined; we assert no per-spawn re-invocation. The
+    // snapshot values still reach every spawn. SPEC §9.5 / §9.1 / §9.2.
+    // ------------------------------------------------------------------------
+    it("T-API-52e2: runPromise() — descriptor-only proxy is not re-invoked per spawn", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/myvar\${N}.txt"
+printf '%s' "\${OTHERVAR:-UNSET}" > "${markerDir}/othervar\${N}.txt"
+if [ "$N" -ge 3 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let descCount = 0;
+const target = { MYVAR: "initial", OTHERVAR: "second" };
+const env = new Proxy(target, {
+  getOwnPropertyDescriptor(t, key) {
+    descCount += 1;
+    return Reflect.getOwnPropertyDescriptor(t, key);
+  },
+});
+const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 3,
+});
+const descAfterCall = descCount;
+const outputs = await p;
+const descAfterDone = descCount;
+console.log(JSON.stringify({ descAfterCall, descAfterDone, outputs: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // SPEC §9.5 leaves the per-call descriptor count implementation-defined,
+      // so only assert no per-spawn re-invocation across the multi-iteration run.
+      expect(parsed.descAfterDone).toBe(parsed.descAfterCall);
+      expect(parsed.outputs).toBe(3);
+      expect(readFileSync(join(markerDir, "myvar1.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar2.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar3.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "othervar1.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar2.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar3.txt"), "utf-8")).toBe("second");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52e2 (variant b): only `get` is custom-trapped. SPEC §9.5
+    // [[Get]]-semantics-exactly-once contract on the value-read axis. Per
+    // SPEC §9.5 / §9.2.
+    // ------------------------------------------------------------------------
+    it("T-API-52e2: runPromise() — get-only proxy fires exactly once per included key, not per spawn", async () => {
+      project = await createTempProject();
+      const counterFile = join(project.dir, "counter.txt");
+      const markerDir = project.dir;
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+if [ -f "$COUNTER_FILE" ]; then
+  N=$(cat "$COUNTER_FILE")
+  N=$((N + 1))
+else
+  N=1
+fi
+printf '%s' "$N" > "$COUNTER_FILE"
+printf '%s' "\${MYVAR:-UNSET}" > "${markerDir}/myvar\${N}.txt"
+printf '%s' "\${OTHERVAR:-UNSET}" > "${markerDir}/othervar\${N}.txt"
+if [ "$N" -ge 3 ]; then
+  printf '{"stop":true}'
+else
+  printf '{}'
+fi`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let getCount = 0;
+const valueGetCounts = new Map();
+const target = { MYVAR: "initial", OTHERVAR: "second" };
+const env = new Proxy(target, {
+  get(t, key) {
+    if (typeof key === "string") {
+      getCount += 1;
+      valueGetCounts.set(key, (valueGetCounts.get(key) ?? 0) + 1);
+    }
+    return Reflect.get(t, key);
+  },
+});
+const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 3,
+});
+const getAfterCall = getCount;
+const valueGetSnapshot = Object.fromEntries(valueGetCounts);
+const outputs = await p;
+const getAfterDone = getCount;
+const valueGetAfterDone = Object.fromEntries(valueGetCounts);
+console.log(JSON.stringify({
+  getAfterCall, getAfterDone,
+  valueGetSnapshot, valueGetAfterDone,
+  outputs: outputs.length,
+}));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.getAfterCall).toBe(2);
+      expect(parsed.valueGetSnapshot.MYVAR).toBe(1);
+      expect(parsed.valueGetSnapshot.OTHERVAR).toBe(1);
+      expect(parsed.getAfterDone).toBe(parsed.getAfterCall);
+      expect(parsed.valueGetAfterDone.MYVAR).toBe(parsed.valueGetSnapshot.MYVAR);
+      expect(parsed.valueGetAfterDone.OTHERVAR).toBe(parsed.valueGetSnapshot.OTHERVAR);
+      expect(parsed.outputs).toBe(3);
+      expect(readFileSync(join(markerDir, "myvar1.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar2.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "myvar3.txt"), "utf-8")).toBe("initial");
+      expect(readFileSync(join(markerDir, "othervar1.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar2.txt"), "utf-8")).toBe("second");
+      expect(readFileSync(join(markerDir, "othervar3.txt"), "utf-8")).toBe("second");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-52f: runPromise() — RunOptions.env snapshot is shallow on the
+    // key-set axis; a key added to the original object after runPromise()
+    // returns is not observed. SPEC §9.5 / §9.2.
+    // ------------------------------------------------------------------------
+    it("T-API-52f: runPromise() — added key after call is not observed (shallow snapshot)", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      const newvarMarker = join(project.dir, "newvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `if [ -n "\${MYVAR+x}" ]; then
+  printf 'present\\t%s' "$MYVAR" > "${myvarMarker}"
+else
+  printf 'absent' > "${myvarMarker}"
+fi
+if [ -n "\${NEWVAR+x}" ]; then
+  printf 'present\\t%s' "$NEWVAR" > "${newvarMarker}"
+else
+  printf 'absent' > "${newvarMarker}"
+fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const e = { MYVAR: "initial" };
+const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+e.NEWVAR = "added";
+const outputs = await p;
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("present\tinitial");
+      expect(readFileSync(newvarMarker, "utf-8")).toBe("absent");
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — RunOptions.env Filtering (SPEC §9.5)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.5: loopx reads only the supplied object's own enumerable string-keyed
+// properties. The filtering is a hard predicate, applied BEFORE value-shape
+// validation:
+//   - inherited (prototype-chain) properties: filtered (T-API-56, 56f, 56j)
+//   - symbol-keyed properties: filtered (T-API-56a, 56d)
+//   - non-enumerable string-keyed properties: filtered (T-API-56b, 56e)
+//
+// The structural-not-nominal env-shape contract: SPEC §9.5 rejects only null,
+// arrays, and functions; any other non-null object qualifies as a valid env
+// shape, regardless of prototype:
+//   - null-prototype object: accepted, own entries reach child (T-API-56c)
+//   - class instance: accepted, class fields reach child (T-API-56g)
+//   - Map: accepted as a shape but contributes no entries (T-API-56h)
+//
+// T-API-56i is the run()-surface parity counterpart, parameterizing the
+// runPromise() matrix across the eight sub-rules to verify the generator
+// surface routes env through the same filtering predicate.
+
+describe("SPEC: RunOptions.env Filtering", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  // Bash fixture template that observes a list of environment variables into
+  // a marker file each. Each marker contains `present\t<value>` if the
+  // variable is set (including empty string), or `absent` if unset.
+  function makeObserveBashFixture(varToMarker: Record<string, string>): string {
+    const lines: string[] = [];
+    for (const [varname, marker] of Object.entries(varToMarker)) {
+      lines.push(
+        `if [ -n "\${${varname}+x}" ]; then\n  printf 'present\\t%s' "\${${varname}}" > "${marker}"\nelse\n  printf 'absent' > "${marker}"\nfi`
+      );
+    }
+    lines.push(`printf '{"stop":true}'`);
+    return lines.join("\n");
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-56: Inherited keys on options.env are ignored (runPromise).
+    // SPEC §9.5: own enumerable string-keyed properties only.
+    // ------------------------------------------------------------------------
+    it("T-API-56: runPromise() — inherited prototype keys are filtered out", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const inheritedMarker = join(project.dir, "inherited.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          OWN: ownMarker,
+          INHERITED: inheritedMarker,
+        })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const proto = { INHERITED: "proto-val" };
+const e = Object.create(proto);
+e.OWN = "own-val";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      // Inherited slot is filtered before value-read; absent in child env.
+      expect(readFileSync(inheritedMarker, "utf-8")).toBe("absent");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56a: Symbol-keyed entries are ignored (runPromise).
+    // SPEC §9.5: own enumerable STRING-keyed entries only — symbol keys are
+    // excluded by predicate. The Symbol value never appears in the child env
+    // under any stringification (Symbol(SYM), description "SYM", etc.).
+    // ------------------------------------------------------------------------
+    it("T-API-56a: runPromise() — symbol-keyed entries are filtered out", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const allEnvMarker = join(project.dir, "all-env.txt");
+      // Bash fixture: observe OWN normally, then dump every env var name (one
+      // per line) to a marker so the test can assert no symbol-derived stringification leaked.
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `if [ -n "\${OWN+x}" ]; then
+  printf 'present\\t%s' "$OWN" > "${ownMarker}"
+else
+  printf 'absent' > "${ownMarker}"
+fi
+# Dump all env var names (one per line) to a marker.
+env | cut -d= -f1 | sort > "${allEnvMarker}"
+printf '{"stop":true}'`
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const sym = Symbol("SYM");
+const e = { OWN: "own-val", [sym]: "sym-val" };
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      // Verify no symbol-derived stringified key leaked into the child env.
+      // Common buggy stringifications would produce keys like:
+      //   "Symbol(SYM)", "SYM", "@@SYM", or similar.
+      const envNames = readFileSync(allEnvMarker, "utf-8").split("\n");
+      for (const name of envNames) {
+        if (!name) continue;
+        // No env var name should contain the Symbol description "SYM" as a
+        // standalone token (excluding cases like "OWN" or system vars).
+        // The buggy stringification "Symbol(SYM)" would produce a name
+        // containing "Symbol(" — check for that.
+        expect(name).not.toMatch(/^Symbol\(/);
+        expect(name).not.toBe("SYM");
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56b: Non-enumerable string-keyed entries are ignored (runPromise).
+    // SPEC §9.5: own ENUMERABLE string-keyed entries only — non-enumerable
+    // are excluded by predicate.
+    // ------------------------------------------------------------------------
+    it("T-API-56b: runPromise() — non-enumerable string-keyed entries are filtered out", async () => {
+      project = await createTempProject();
+      const visibleMarker = join(project.dir, "visible.txt");
+      const hiddenMarker = join(project.dir, "hidden.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          VISIBLE: visibleMarker,
+          HIDDEN: hiddenMarker,
+        })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const e = {};
+Object.defineProperty(e, "HIDDEN", { value: "hidden-val", enumerable: false });
+e.VISIBLE = "visible-val";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(visibleMarker, "utf-8")).toBe("present\tvisible-val");
+      expect(readFileSync(hiddenMarker, "utf-8")).toBe("absent");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56c: Null-prototype options.env (Object.create(null)) is accepted.
+    // SPEC §9.5: env shape is structural-not-nominal; the absence of
+    // Object.prototype is fine. A buggy implementation that uses
+    // `instanceof Object` (false for null-prototype) or
+    // `env.hasOwnProperty(...)` (TypeError on null-prototype) would fail.
+    // ------------------------------------------------------------------------
+    it("T-API-56c: runPromise() — null-prototype env is accepted, own entries reach child", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      const othervarMarker = join(project.dir, "othervar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          MYVAR: myvarMarker,
+          OTHERVAR: othervarMarker,
+        })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const e = Object.create(null);
+e.MYVAR = "from-options";
+e.OTHERVAR = "second-value";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: e,
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected: false }));
+} catch (err) {
+  rejected = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("present\tfrom-options");
+      expect(readFileSync(othervarMarker, "utf-8")).toBe("present\tsecond-value");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56d: Symbol-keyed property with a THROWING getter does not fire.
+    // SPEC §9.5: symbol-keyed slots are filtered by predicate before any
+    // [[Get]] runs. The getter's throw must not surface as a snapshot error.
+    // ------------------------------------------------------------------------
+    it("T-API-56d: runPromise() — symbol-keyed throwing getter never fires", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ OWN: ownMarker })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const sym = Symbol("SYM-throw");
+const e = { OWN: "own-val" };
+Object.defineProperty(e, sym, {
+  enumerable: true,
+  get() { throw new Error("symbol-getter-should-never-fire"); },
+});
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: e,
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected: false }));
+} catch (err) {
+  rejected = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // Symbol getter never invoked → no rejection.
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      // The getter's distinctive throw message must NOT appear in stderr.
+      expect(result.stderr).not.toMatch(/symbol-getter-should-never-fire/);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56e: Non-enumerable string-keyed THROWING getter does not fire.
+    // Companion to T-API-56d for the non-enumerable-ignore axis.
+    // ------------------------------------------------------------------------
+    it("T-API-56e: runPromise() — non-enumerable throwing getter never fires", async () => {
+      project = await createTempProject();
+      const visibleMarker = join(project.dir, "visible.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ VISIBLE: visibleMarker })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const e = { VISIBLE: "visible-val" };
+Object.defineProperty(e, "HIDDEN", {
+  enumerable: false,
+  get() { throw new Error("non-enumerable-getter-should-never-fire"); },
+});
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: e,
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected: false }));
+} catch (err) {
+  rejected = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(visibleMarker, "utf-8")).toBe("present\tvisible-val");
+      expect(result.stderr).not.toMatch(/non-enumerable-getter-should-never-fire/);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56f: Inherited property with a NON-STRING value is ignored.
+    // SPEC §9.5: inherited slots are filtered BEFORE value-shape validation.
+    // A buggy implementation enumerating via `for ... in` would surface the
+    // inherited number as a value-shape error and reject.
+    // ------------------------------------------------------------------------
+    it("T-API-56f: runPromise() — inherited non-string-value property never reaches value validation", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const inheritedMarker = join(project.dir, "inherited-number.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          OWN: ownMarker,
+          INHERITED_NUMBER: inheritedMarker,
+        })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const proto = { INHERITED_NUMBER: 42 };
+const e = Object.create(proto);
+e.OWN = "own-val";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: e,
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected: false }));
+} catch (err) {
+  rejected = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      // Inherited slot filtered out — never reached value validation.
+      expect(readFileSync(inheritedMarker, "utf-8")).toBe("absent");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56g: Class-instance options.env is accepted. Class fields are
+    // own enumerable string-keyed properties on the instance (ES2022) and
+    // reach the spawned child. SPEC §9.5: structural-not-nominal contract.
+    // ------------------------------------------------------------------------
+    it("T-API-56g: runPromise() — class-instance env is accepted, class fields reach child", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ MYVAR: myvarMarker })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+class Env {
+  MYVAR = "from-class";
+}
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: new Env(),
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected: false }));
+} catch (err) {
+  rejected = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("present\tfrom-class");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56h: Map passed as options.env is accepted as a shape but
+    // contributes ZERO entries — Map data lives in [[MapData]], not as own
+    // enumerable string-keyed properties. SPEC §9.5: structural-not-nominal,
+    // strict own-enumerable-string-key predicate.
+    // ------------------------------------------------------------------------
+    it("T-API-56h: runPromise() — Map env accepted but contributes no entries", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ MYVAR: myvarMarker })
+      );
+
+      // Scrub MYVAR from inherited env so any observed value can only come
+      // from the env option (not from the surrounding test process).
+      const driverCode = `
+import { runPromise } from "loopx";
+delete process.env.MYVAR;
+const e = new Map([["MYVAR", "x"]]);
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: e,
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected: false }));
+} catch (err) {
+  rejected = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // Map is a non-null, non-array, non-function object — accepted as a shape.
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      // Map's "MYVAR" → "x" entry lives in [[MapData]], not as an own
+      // enumerable string-keyed property — filtered out by SPEC §9.5.
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("absent");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56j: Inherited THROWING getter never fires. SPEC §9.5: inherited
+    // slots are filtered by predicate. Parameterized over both runPromise
+    // and run() per TEST-SPEC.
+    // ------------------------------------------------------------------------
+    it("T-API-56j: runPromise() — inherited throwing getter never fires", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const inheritedMarker = join(project.dir, "inherited.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          OWN: ownMarker,
+          INHERITED_THROW: inheritedMarker,
+        })
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const proto = {};
+Object.defineProperty(proto, "INHERITED_THROW", {
+  enumerable: true,
+  get() { throw new Error("inherited-getter-should-never-fire"); },
+});
+const e = Object.create(proto);
+e.OWN = "ok";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: e,
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected: false }));
+} catch (err) {
+  rejected = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\tok");
+      expect(readFileSync(inheritedMarker, "utf-8")).toBe("absent");
+      expect(result.stderr).not.toMatch(/inherited-getter-should-never-fire/);
+    });
+
+    it("T-API-56j: run() — inherited throwing getter never fires", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const inheritedMarker = join(project.dir, "inherited.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          OWN: ownMarker,
+          INHERITED_THROW: inheritedMarker,
+        })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const proto = {};
+Object.defineProperty(proto, "INHERITED_THROW", {
+  enumerable: true,
+  get() { throw new Error("inherited-getter-should-never-fire-run"); },
+});
+const e = Object.create(proto);
+e.OWN = "ok";
+let threw = false, message = "";
+try {
+  const gen = run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: e,
+    maxIterations: 1,
+  });
+  let count = 0;
+  for await (const _ of gen) {
+    count += 1;
+  }
+  console.log(JSON.stringify({ count, threw: false }));
+} catch (err) {
+  threw = true;
+  message = err && err.message ? err.message : String(err);
+  console.log(JSON.stringify({ threw, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\tok");
+      expect(readFileSync(inheritedMarker, "utf-8")).toBe("absent");
+      expect(result.stderr).not.toMatch(/inherited-getter-should-never-fire-run/);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-56i: run()-surface parity for the SPEC §9.5 filtering matrix.
+    // Eight sub-variants matching the runPromise() coverage:
+    //   (a) inherited keys ignored
+    //   (b) symbol-keyed entries ignored
+    //   (c) non-enumerable string-keyed entries ignored
+    //   (d) null-prototype env accepted, own entries reach child
+    //   (e1) class-instance env accepted, fields reach child
+    //   (e2) Map env accepted, no entries reach child
+    //   (f) symbol-keyed throwing getter never fires
+    //   (g) non-enumerable throwing getter never fires
+    //   (h) inherited non-string-value never reaches value validation
+    // SPEC §9.5 / §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-56i (a): run() — inherited keys filtered out", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const inheritedMarker = join(project.dir, "inherited.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          OWN: ownMarker,
+          INHERITED: inheritedMarker,
+        })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const proto = { INHERITED: "proto-val" };
+const e = Object.create(proto);
+e.OWN = "own-val";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0;
+for await (const _ of gen) { count += 1; }
+console.log(JSON.stringify({ count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      expect(readFileSync(inheritedMarker, "utf-8")).toBe("absent");
+    });
+
+    it("T-API-56i (b): run() — symbol-keyed entries filtered out", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const allEnvMarker = join(project.dir, "all-env.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `if [ -n "\${OWN+x}" ]; then
+  printf 'present\\t%s' "$OWN" > "${ownMarker}"
+else
+  printf 'absent' > "${ownMarker}"
+fi
+env | cut -d= -f1 | sort > "${allEnvMarker}"
+printf '{"stop":true}'`
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const sym = Symbol("SYM");
+const e = { OWN: "own-val", [sym]: "sym-val" };
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0;
+for await (const _ of gen) { count += 1; }
+console.log(JSON.stringify({ count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      const envNames = readFileSync(allEnvMarker, "utf-8").split("\n");
+      for (const name of envNames) {
+        if (!name) continue;
+        expect(name).not.toMatch(/^Symbol\(/);
+        expect(name).not.toBe("SYM");
+      }
+    });
+
+    it("T-API-56i (c): run() — non-enumerable string-keyed entries filtered out", async () => {
+      project = await createTempProject();
+      const visibleMarker = join(project.dir, "visible.txt");
+      const hiddenMarker = join(project.dir, "hidden.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          VISIBLE: visibleMarker,
+          HIDDEN: hiddenMarker,
+        })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const e = {};
+Object.defineProperty(e, "HIDDEN", { value: "hidden-val", enumerable: false });
+e.VISIBLE = "visible-val";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0;
+for await (const _ of gen) { count += 1; }
+console.log(JSON.stringify({ count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(visibleMarker, "utf-8")).toBe("present\tvisible-val");
+      expect(readFileSync(hiddenMarker, "utf-8")).toBe("absent");
+    });
+
+    it("T-API-56i (d): run() — null-prototype env accepted, own entries reach child", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ MYVAR: myvarMarker })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const e = Object.create(null);
+e.MYVAR = "from-options";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of gen) { count += 1; }
+} catch (err) {
+  threw = true;
+  message = err && err.message ? err.message : String(err);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("present\tfrom-options");
+    });
+
+    it("T-API-56i (e1): run() — class-instance env accepted, fields reach child", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ MYVAR: myvarMarker })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+class Env { MYVAR = "from-class"; }
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: new Env(),
+  maxIterations: 1,
+});
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of gen) { count += 1; }
+} catch (err) {
+  threw = true;
+  message = err && err.message ? err.message : String(err);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("present\tfrom-class");
+    });
+
+    it("T-API-56i (e2): run() — Map env accepted but contributes no entries", async () => {
+      project = await createTempProject();
+      const myvarMarker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ MYVAR: myvarMarker })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+delete process.env.MYVAR;
+const e = new Map([["MYVAR", "x"]]);
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of gen) { count += 1; }
+} catch (err) {
+  threw = true;
+  message = err && err.message ? err.message : String(err);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("absent");
+    });
+
+    it("T-API-56i (f): run() — symbol-keyed throwing getter never fires", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ OWN: ownMarker })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const sym = Symbol("SYM-throw");
+const e = { OWN: "own-val" };
+Object.defineProperty(e, sym, {
+  enumerable: true,
+  get() { throw new Error("symbol-getter-should-never-fire-run"); },
+});
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of gen) { count += 1; }
+} catch (err) {
+  threw = true;
+  message = err && err.message ? err.message : String(err);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      expect(result.stderr).not.toMatch(/symbol-getter-should-never-fire-run/);
+    });
+
+    it("T-API-56i (g): run() — non-enumerable throwing getter never fires", async () => {
+      project = await createTempProject();
+      const visibleMarker = join(project.dir, "visible.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({ VISIBLE: visibleMarker })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const e = { VISIBLE: "visible-val" };
+Object.defineProperty(e, "HIDDEN", {
+  enumerable: false,
+  get() { throw new Error("non-enumerable-getter-should-never-fire-run"); },
+});
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of gen) { count += 1; }
+} catch (err) {
+  threw = true;
+  message = err && err.message ? err.message : String(err);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(visibleMarker, "utf-8")).toBe("present\tvisible-val");
+      expect(result.stderr).not.toMatch(/non-enumerable-getter-should-never-fire-run/);
+    });
+
+    it("T-API-56i (h): run() — inherited non-string-value never reaches value validation", async () => {
+      project = await createTempProject();
+      const ownMarker = join(project.dir, "own.txt");
+      const inheritedMarker = join(project.dir, "inherited-number.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        makeObserveBashFixture({
+          OWN: ownMarker,
+          INHERITED_NUMBER: inheritedMarker,
+        })
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const proto = { INHERITED_NUMBER: 42 };
+const e = Object.create(proto);
+e.OWN = "own-val";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: e,
+  maxIterations: 1,
+});
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of gen) { count += 1; }
+} catch (err) {
+  threw = true;
+  message = err && err.message ? err.message : String(err);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(readFileSync(ownMarker, "utf-8")).toBe("present\town-val");
+      expect(readFileSync(inheritedMarker, "utf-8")).toBe("absent");
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — RunOptions.env Invalid Shape (SPEC §9.5)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.5 specifies RunOptions.env must be a non-null, non-array,
+// non-function object whose own enumerable string-keyed entries all have
+// string values. Any of: invalid object types, non-string entry values,
+// snapshot-time throws — surface as option-snapshot errors via the standard
+// pre-iteration error path: throwing on the first generator next() under
+// run(), or rejecting the returned promise under runPromise().
+//
+// T-API-53 series — whole-`env` primitive variants (run() surface):
+//   - 53: env: null
+//   - 53a: env: [] (array)
+//   - 53b: env: () => {} (function)
+//   - 53c: env: "string"
+//   - 53d: env: 42 (number)
+//   - 53e: env: true (boolean)
+//   - 53f: env: Symbol("x")
+//   - 53g: env: 1n (bigint)
+//
+// T-API-54 series — entry-value variants (run() surface):
+//   - 54: { MYVAR: 42 } (number)
+//   - 54a: { MYVAR: undefined }
+//   - 54b: { MYVAR: null }
+//   - 54c: { MYVAR: { nested: "value" } } (object)
+//   - 54d: accessor returning non-string (Object.defineProperty)
+//   - 54e: 54d's runPromise() counterpart
+//   - 54f: { MYVAR: true } (boolean)
+//   - 54g: { MYVAR: Symbol("x") }
+//   - 54h: { MYVAR: 1n } (bigint)
+//
+// T-API-55 — runPromise() equivalents — parameterized across all
+// whole-`env` and entry-value invalid shapes; each variant rejects the
+// promise with an option-snapshot error.
+
+describe("SPEC: RunOptions.env Invalid Shape", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-53 series — whole-`env` primitive variants on run() surface.
+    // SPEC §9.5: invalid `env` shape surfaces as a generator throw on
+    // first next().
+    // ------------------------------------------------------------------------
+    interface WholeEnvVariant {
+      id: string;
+      label: string;
+      // Inline literal (since values like Symbol(...) and BigInt cannot be
+      // serialized through JSON.stringify); spliced into the driver code.
+      envExpr: string;
+    }
+
+    const wholeEnvVariants: WholeEnvVariant[] = [
+      { id: "T-API-53", label: "null", envExpr: "null" },
+      { id: "T-API-53a", label: "array", envExpr: "[]" },
+      { id: "T-API-53b", label: "function", envExpr: "(() => {})" },
+      { id: "T-API-53c", label: "string", envExpr: '"string"' },
+      { id: "T-API-53d", label: "number", envExpr: "42" },
+      { id: "T-API-53e", label: "boolean", envExpr: "true" },
+      { id: "T-API-53f", label: "symbol", envExpr: 'Symbol("x")' },
+      { id: "T-API-53g", label: "bigint", envExpr: "1n" },
+    ];
+
+    for (const v of wholeEnvVariants) {
+      it(`${v.id}: run() with env: ${v.label} throws on first next()`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: ${v.envExpr},
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+  name = e.name || "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.threw).toBe(true);
+        // Error message must reference the env / RunOptions context
+        // (load-bearing — proves the failure surfaces from env-shape
+        // validation, not some unrelated downstream error).
+        expect(parsed.message).toMatch(/env|RunOptions/i);
+        // Script must NOT have been spawned (shape error fires
+        // pre-iteration, before any spawn).
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-54 series — entry-value variants on run() surface. SPEC §9.5:
+    // all entries must have string values; non-string values reject with
+    // an option-snapshot error.
+    // ------------------------------------------------------------------------
+    interface EntryValueVariant {
+      id: string;
+      label: string;
+      envExpr: string;
+    }
+
+    const entryValueVariants: EntryValueVariant[] = [
+      { id: "T-API-54", label: "number", envExpr: "{ MYVAR: 42 }" },
+      { id: "T-API-54a", label: "undefined", envExpr: "{ MYVAR: undefined }" },
+      { id: "T-API-54b", label: "null", envExpr: "{ MYVAR: null }" },
+      {
+        id: "T-API-54c",
+        label: "object",
+        envExpr: '{ MYVAR: { nested: "value" } }',
+      },
+      { id: "T-API-54f", label: "boolean", envExpr: "{ MYVAR: true }" },
+      { id: "T-API-54g", label: "symbol", envExpr: '{ MYVAR: Symbol("x") }' },
+      { id: "T-API-54h", label: "bigint", envExpr: "{ MYVAR: 1n }" },
+    ];
+
+    for (const v of entryValueVariants) {
+      it(`${v.id}: run() with env entry value ${v.label} throws on first next()`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: ${v.envExpr},
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+  name = e.name || "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.threw).toBe(true);
+        // Error message must reference env / MYVAR / string-shape context.
+        expect(parsed.message).toMatch(/env|MYVAR|string/i);
+        // No child was spawned.
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-54d: run() — accessor-returning-non-string entry value throws on
+    // first next(). SPEC §9.5: the [[Get]]-semantics value-read on each
+    // included key must yield a string; an accessor that returns a non-string
+    // value is invalid for the same reason as a data-property non-string
+    // value (T-API-54). Test-construction: build env directly via
+    // Object.defineProperty on the same object passed as options.env — NEVER
+    // via object spread (which would invoke the getter in the test harness
+    // before run() is called).
+    // ------------------------------------------------------------------------
+    it("T-API-54d: run() — accessor returning non-string value throws on first next()", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "spawn-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const env = {};
+Object.defineProperty(env, "KEY", {
+  enumerable: true,
+  configurable: true,
+  get() { return 42; },
+});
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+  name = e.name || "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(true);
+      // Error must reference the entry name KEY or string-shape context —
+      // a buggy implementation using descriptor-based extraction
+      // (descriptor.value === undefined on accessor properties) would
+      // surface a different error or skip validation.
+      expect(parsed.message).toMatch(/env|KEY|string/i);
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-54e: runPromise() — accessor-returning-non-string entry value
+    // rejects the promise. Companion to T-API-54d.
+    // ------------------------------------------------------------------------
+    it("T-API-54e: runPromise() — accessor returning non-string value rejects", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "spawn-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const env = {};
+Object.defineProperty(env, "KEY", {
+  enumerable: true,
+  configurable: true,
+  get() { return 42; },
+});
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+  name = e.name || "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(true);
+      expect(parsed.message).toMatch(/env|KEY|string/i);
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-55: runPromise() equivalents for all invalid env shapes.
+    // SPEC §9.5 / §9.2: all invalid RunOptions.env shapes reject the
+    // promise. Parameterized across the same whole-`env` primitive variants
+    // (T-API-53–53g) and entry-value variants (T-API-54–54c, 54f–54h) on
+    // the runPromise() surface.
+    // ------------------------------------------------------------------------
+    interface RunPromiseVariant {
+      label: string;
+      envExpr: string;
+    }
+
+    const runPromiseVariants: RunPromiseVariant[] = [
+      // Whole-env primitives (mirrors T-API-53–53g).
+      { label: "null", envExpr: "null" },
+      { label: "array", envExpr: "[]" },
+      { label: "function", envExpr: "(() => {})" },
+      { label: "string", envExpr: '"string"' },
+      { label: "number", envExpr: "42" },
+      { label: "boolean", envExpr: "true" },
+      { label: "symbol", envExpr: 'Symbol("x")' },
+      { label: "bigint", envExpr: "1n" },
+      // Entry-value primitives (mirrors T-API-54–54c, 54f–54h).
+      { label: "entry-number", envExpr: "{ MYVAR: 42 }" },
+      { label: "entry-undefined", envExpr: "{ MYVAR: undefined }" },
+      { label: "entry-null", envExpr: "{ MYVAR: null }" },
+      { label: "entry-object", envExpr: '{ MYVAR: { nested: "value" } }' },
+      { label: "entry-boolean", envExpr: "{ MYVAR: true }" },
+      { label: "entry-symbol", envExpr: '{ MYVAR: Symbol("x") }' },
+      { label: "entry-bigint", envExpr: "{ MYVAR: 1n }" },
+    ];
+
+    for (const v of runPromiseVariants) {
+      it(`T-API-55: runPromise() rejects on env: ${v.label}`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: ${v.envExpr},
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+  name = e.name || "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.message).toMatch(/env|MYVAR|RunOptions|string/i);
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC: RunOptions.env — Runtime-Rejected Names/Values (T-API-57 series)
+//
+// SPEC §9.5 "No name validation beyond string-to-string": loopx accepts any
+// shape-conforming entries (own-enumerable string-keyed string-to-string
+// pairs) and does not pre-validate names beyond shape. Runtime-level
+// rejections — most reliably an embedded NUL byte in name or value — surface
+// as child launch / spawn failures at spawn time per SPEC §7.2 / §9.3.
+//
+// SPEC §7.4 cleanup trigger list ("Child launch / spawn failure after tmpdir
+// creation") + SPEC §9.3 ("Cleanup ordering is observable. When LOOPX_TMPDIR
+// cleanup runs as part of an error path … it runs before the generator
+// throws or the promise rejects") together require that no `loopx-*`
+// directory remains under the test-isolated TMPDIR parent after the spawn
+// failure surfaces.
+//
+// Coverage matrix (this block):
+//   T-API-57    runPromise + NUL in value, maxIterations: 1
+//   T-API-57a   runPromise + NUL in key,   maxIterations: 1
+//   T-API-57b   runPromise + "=" in key,   maxIterations: 1 (impl-defined)
+//   T-API-57c   runPromise + empty key,    maxIterations: 1 (impl-defined)
+//   T-API-57d   runPromise + NUL in value, maxIterations: 0 → resolves []
+//   T-API-57e   runPromise + NUL in key,   maxIterations: 0 → resolves []
+//   T-API-57f   run        + NUL in value, maxIterations: 0 → done immediately
+//   T-API-57f2  run        + NUL in key,   maxIterations: 0 → done immediately
+//   T-API-57g   runPromise + non-POSIX names → success, byte-exact propagation
+//   T-API-57g2  run        + non-POSIX names → success, byte-exact propagation
+//   T-API-57h   run        + NUL in value, maxIterations: 1 → throws + cleanup
+//   T-API-57i   run        + NUL in key,   maxIterations: 1 → throws + cleanup
+// ---------------------------------------------------------------------------
+
+describe("SPEC: RunOptions.env Runtime Rejection", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    for (const cleanup of cleanups.splice(0)) {
+      await cleanup().catch(() => {});
+    }
+  });
+
+  // Creates a writable test-isolated TMPDIR parent under the system tmpdir.
+  // Per TEST-SPEC §4.7 isolation guidance — concurrent test workers must not
+  // race on `/tmp` for `loopx-*` entries. Returns the parent path; cleanup
+  // is registered for afterEach.
+  async function makeIsolatedTmpdirParent(label: string): Promise<string> {
+    const dir = await mkdtemp(join(osTmpdir(), `loopx-test-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  // List `loopx-*` entries directly under `parent`, filtering implementation-
+  // internal helpers (per AGENT.md / SPEC §7.4: nodepath-shim, bun-jsx, and
+  // install staging are NOT LOOPX_TMPDIR).
+  function listLoopxEntries(parent: string): string[] {
+    try {
+      return readdirSync(parent)
+        .filter((e) => e.startsWith("loopx-"))
+        .filter(
+          (e) =>
+            !e.startsWith("loopx-nodepath-shim-") &&
+            !e.startsWith("loopx-bun-jsx-") &&
+            !e.startsWith("loopx-install-") &&
+            !e.startsWith("loopx-test-"),
+        );
+    } catch {
+      return [];
+    }
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-57: runPromise() + NUL byte in entry value at maxIterations: 1
+    //   surfaces as a spawn-failure rejection AND LOOPX_TMPDIR is cleaned up
+    //   before the rejection. Load-bearing: a buggy implementation that
+    //   surfaced spawn failure without running cleanup would leave a
+    //   `loopx-*` directory under the isolated parent and fail (c).
+    // SPEC §7.2 / §7.4 / §9.3 / §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-57: runPromise() — NUL byte in env value rejects with spawn failure and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57v");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { MYVAR: "bad\\u0000val" },
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with a spawn-failure error — NOT a shape-
+      //     validation error (the shape is valid: own-enumerable string key
+      //     mapped to a string value).
+      expect(parsed.rejected).toBe(true);
+      // The error message must NOT match the shape-validation surface
+      // (which would say `env|RunOptions|string`-shape). Spawn-failure
+      // messages mention argument validation, ENOENT-like, NUL, or
+      // similar runtime failures.
+      expect(parsed.message).not.toMatch(/RunOptions\.env\[.*\] must be a string/);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) Cleanup ran before rejection — no loopx-* residue under parent.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57a: NUL-in-key counterpart to T-API-57. Same cleanup contract.
+    // ------------------------------------------------------------------------
+    it("T-API-57a: runPromise() — NUL byte in env key rejects with spawn failure and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57a");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const env = {};
+env["BAD\\u0000KEY"] = "val";
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Spawn-failure rejection (not shape-validation).
+      expect(parsed.rejected).toBe(true);
+      expect(parsed.message).not.toMatch(/RunOptions\.env\[.*\] must be a string/);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) Cleanup ran before rejection.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57b: "=" in key — runtime behavior is impl-defined. Outcome must
+    //   be EITHER (a) spawn-failure rejection OR (b) clean resolution; loopx
+    //   must NEVER surface this as a shape/options-validation error.
+    // ------------------------------------------------------------------------
+    it("T-API-57b: runPromise() — '=' in env key surfaces per runtime behavior, never as shape error", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57b");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "", name = "";
+let resolved = false, count = 0;
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { "BAD=KEY": "val" },
+    maxIterations: 1,
+  });
+  resolved = true;
+  count = outputs.length;
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name, resolved, count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // Outcome is either rejection OR resolution — never a shape error.
+      expect(parsed.rejected || parsed.resolved).toBe(true);
+      if (parsed.rejected) {
+        // Failure surface must NOT be shape-validation.
+        expect(parsed.message).not.toMatch(/RunOptions\.env\[.*\] must be a string/);
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57c: Empty-string key — shape-valid (own-enumerable string-keyed
+    //   property with string value); runtime behavior impl-defined. Same
+    //   "never a shape error" assertion.
+    // ------------------------------------------------------------------------
+    it("T-API-57c: runPromise() — empty-string env key not rejected at shape level", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57c");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "", name = "";
+let resolved = false, count = 0;
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { "": "empty-key-value" },
+    maxIterations: 1,
+  });
+  resolved = true;
+  count = outputs.length;
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name, resolved, count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // Outcome is rejection OR resolution — never a shape error.
+      expect(parsed.rejected || parsed.resolved).toBe(true);
+      if (parsed.rejected) {
+        expect(parsed.message).not.toMatch(/RunOptions\.env\[.*\] must be a string/);
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57d: maxIterations: 0 + NUL in value — no spawn step runs, so
+    //   the runtime-rejection path cannot fire. SPEC §9.5 / §4.2 / §7.1:
+    //   "executes zero iterations". SPEC §7.4: tmpdir is not created under
+    //   maxIterations: 0. Promise resolves with [].
+    // ------------------------------------------------------------------------
+    it("T-API-57d: runPromise() — maxIterations:0 + NUL in value resolves [] (no spawn, no tmpdir)", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57d");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "", isArray = false, length = 0;
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { MYVAR: "bad\\u0000val" },
+    maxIterations: 0,
+  });
+  isArray = Array.isArray(outputs);
+  length = outputs.length;
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ rejected, message, isArray, length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise resolves.
+      expect(parsed.rejected).toBe(false);
+      // (b) Resolved value is [] (empty array).
+      expect(parsed.isArray).toBe(true);
+      expect(parsed.length).toBe(0);
+      // (c) No spawn-failure error on stderr.
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      // (d) No LOOPX_TMPDIR was created.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57e: maxIterations: 0 + NUL in key — same contract as 57d.
+    // ------------------------------------------------------------------------
+    it("T-API-57e: runPromise() — maxIterations:0 + NUL in key resolves [] (no spawn, no tmpdir)", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57e");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const env = {};
+env["BAD\\u0000KEY"] = "val";
+let rejected = false, message = "", isArray = false, length = 0;
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env,
+    maxIterations: 0,
+  });
+  isArray = Array.isArray(outputs);
+  length = outputs.length;
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ rejected, message, isArray, length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.isArray).toBe(true);
+      expect(parsed.length).toBe(0);
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57f: run() + maxIterations: 0 + NUL in value — first next()
+    //   returns { done: true, value: undefined }; no spawn, no tmpdir.
+    // ------------------------------------------------------------------------
+    it("T-API-57f: run() — maxIterations:0 + NUL in value completes immediately (no spawn, no tmpdir)", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57f");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { MYVAR: "bad\\u0000val" },
+  maxIterations: 0,
+});
+let threw = false, message = "", firstDone = null, firstValue = "<not-set>";
+try {
+  const first = await gen.next();
+  firstDone = first.done;
+  firstValue = first.value === undefined ? "undefined" : JSON.stringify(first.value);
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message, firstDone, firstValue }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() returned { done: true, value: undefined }.
+      expect(parsed.threw).toBe(false);
+      expect(parsed.firstDone).toBe(true);
+      expect(parsed.firstValue).toBe("undefined");
+      // (b) No spawn-failure error.
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      // (c) No LOOPX_TMPDIR was created.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57f2: run() + maxIterations: 0 + NUL in key — same as 57f.
+    // ------------------------------------------------------------------------
+    it("T-API-57f2: run() — maxIterations:0 + NUL in key completes immediately (no spawn, no tmpdir)", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57f2");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const env = {};
+env["BAD\\u0000KEY"] = "val";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 0,
+});
+let threw = false, message = "", firstDone = null, firstValue = "<not-set>";
+try {
+  const first = await gen.next();
+  firstDone = first.done;
+  firstValue = first.value === undefined ? "undefined" : JSON.stringify(first.value);
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message, firstDone, firstValue }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.firstDone).toBe(true);
+      expect(parsed.firstValue).toBe("undefined");
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57g: Positive coverage — non-POSIX names ("1BAD", "FOO-BAR")
+    //   reach the spawned script unchanged. SPEC §9.5: "loopx does not
+    //   enforce the POSIX [A-Za-z_][A-Za-z0-9_]* name pattern". Catches an
+    //   implementation that wrongly applied the SPEC §8.1 env-file POSIX
+    //   key validator to RunOptions.env.
+    // ------------------------------------------------------------------------
+    it("T-API-57g: runPromise() — non-POSIX names propagate unchanged to child env", async () => {
+      project = await createTempProject();
+      const digitMarker = join(project.dir, "digit.txt");
+      const dashMarker = join(project.dir, "dash.txt");
+      // TS fixture reads each name explicitly via process.env[<name>] (bash
+      // would mangle digit-prefix and dash-interior names through identifier
+      // parsing). Marker file holds JSON-encoded values for round-trip
+      // fidelity (distinguish empty string from undefined).
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".ts",
+        `import { writeFileSync } from "node:fs";
+const digit = process.env["1BAD"];
+const dash = process.env["FOO-BAR"];
+writeFileSync(${JSON.stringify(digitMarker)}, JSON.stringify({ present: digit !== undefined, value: digit }));
+writeFileSync(${JSON.stringify(dashMarker)}, JSON.stringify({ present: dash !== undefined, value: dash }));
+process.stdout.write('{"stop":true}');
+`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const env = {};
+env["1BAD"] = "ok-digit-prefix";
+env["FOO-BAR"] = "ok-dash-interior";
+let rejected = false, message = "", count = 0;
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env,
+    maxIterations: 1,
+  });
+  count = outputs.length;
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ rejected, message, count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise resolved (non-POSIX names are not validated by loopx).
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      // (b) Both names reached the child env unchanged.
+      const digitObserved = JSON.parse(readFileSync(digitMarker, "utf-8"));
+      expect(digitObserved.present).toBe(true);
+      expect(digitObserved.value).toBe("ok-digit-prefix");
+      const dashObserved = JSON.parse(readFileSync(dashMarker, "utf-8"));
+      expect(dashObserved.present).toBe(true);
+      expect(dashObserved.value).toBe("ok-dash-interior");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57g2: run() — non-POSIX names propagate. Surface-parity counter
+    //   to T-API-57g; catches implementations that drop non-POSIX names
+    //   on the lazy-snapshot generator path.
+    // ------------------------------------------------------------------------
+    it("T-API-57g2: run() — non-POSIX names propagate unchanged to child env", async () => {
+      project = await createTempProject();
+      const digitMarker = join(project.dir, "digit.txt");
+      const dashMarker = join(project.dir, "dash.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".ts",
+        `import { writeFileSync } from "node:fs";
+const digit = process.env["1BAD"];
+const dash = process.env["FOO-BAR"];
+writeFileSync(${JSON.stringify(digitMarker)}, JSON.stringify({ present: digit !== undefined, value: digit }));
+writeFileSync(${JSON.stringify(dashMarker)}, JSON.stringify({ present: dash !== undefined, value: dash }));
+process.stdout.write('{"stop":true}');
+`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const env = {};
+env["1BAD"] = "ok-digit-prefix";
+env["FOO-BAR"] = "ok-dash-interior";
+let threw = false, message = "", count = 0;
+try {
+  for await (const _ of run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env,
+    maxIterations: 1,
+  })) {
+    count++;
+  }
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message, count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      const digitObserved = JSON.parse(readFileSync(digitMarker, "utf-8"));
+      expect(digitObserved.present).toBe(true);
+      expect(digitObserved.value).toBe("ok-digit-prefix");
+      const dashObserved = JSON.parse(readFileSync(dashMarker, "utf-8"));
+      expect(dashObserved.present).toBe(true);
+      expect(dashObserved.value).toBe("ok-dash-interior");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57h: run() + NUL in value at maxIterations: 1 — first next()
+    //   throws spawn-failure AND tmpdir is cleaned up before the throw.
+    //   Generator-surface counterpart to T-API-57.
+    // ------------------------------------------------------------------------
+    it("T-API-57h: run() — NUL in env value throws spawn failure on first next() and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57h");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { MYVAR: "bad\\u0000val" },
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() rejected with spawn-failure (not shape-validation).
+      expect(parsed.threw).toBe(true);
+      expect(parsed.message).not.toMatch(/RunOptions\.env\[.*\] must be a string/);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) Cleanup ran before throw.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-57i: run() + NUL in key at maxIterations: 1 — counterpart to
+    //   T-API-57h on the NUL-in-key axis.
+    // ------------------------------------------------------------------------
+    it("T-API-57i: run() — NUL in env key throws spawn failure on first next() and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api57i");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const env = {};
+env["BAD\\u0000KEY"] = "val";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() rejected with spawn-failure (not shape-validation).
+      expect(parsed.threw).toBe(true);
+      expect(parsed.message).not.toMatch(/RunOptions\.env\[.*\] must be a string/);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) Cleanup ran before throw.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC: RunOptions.env / envFile — LOOPX_* Silent-Override Contract
+//   (T-API-58 series)
+//
+// SPEC §8.3 / §9.5 / §13: The five script-protocol-protected names
+// (LOOPX_BIN, LOOPX_PROJECT_ROOT, LOOPX_WORKFLOW, LOOPX_WORKFLOW_DIR,
+// LOOPX_TMPDIR) are silently overridden by protocol injection when supplied
+// via RunOptions.env. Non-protocol LOOPX_* names (e.g., LOOPX_DELEGATED) are
+// NOT script-protocol-protected and reach the spawned child unchanged from
+// every env-supply tier (inherited env, global env file, CLI `-e`,
+// programmatic `RunOptions.envFile`, and `RunOptions.env`).
+//
+// T-API-51a/51a2 cover all five protocol names with arbitrary fake values
+// silently overridden, but they don't isolate the per-name override behavior
+// against a non-protocol same-prefix name. T-API-58 series adds:
+//   T-API-58    runPromise + LOOPX_WORKFLOW (fake) + CUSTOM (user-val)
+//   T-API-58a   runPromise + RunOptions.env LOOPX_DELEGATED reaches script
+//   T-API-58a2  run        + RunOptions.env LOOPX_DELEGATED reaches script
+//   T-API-58a3  runPromise + RunOptions.envFile LOOPX_DELEGATED reaches script
+//   T-API-58a4  run        + RunOptions.envFile LOOPX_DELEGATED reaches script
+// ---------------------------------------------------------------------------
+
+describe("SPEC: RunOptions.env LOOPX_* Silent Override", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    for (const cleanup of cleanups.splice(0)) {
+      await cleanup().catch(() => {});
+    }
+  });
+
+  // Test-isolated TMPDIR parent under the system tmpdir for the NUL × protocol
+  // merge-order tests below — concurrent test workers must not race on `/tmp`
+  // for `loopx-*` entries (TEST-SPEC §4.7). Cleanup registered for afterEach.
+  async function makeIsolatedTmpdirParent(label: string): Promise<string> {
+    const dir = await mkdtemp(join(osTmpdir(), `loopx-test-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-58: runPromise() — supplying a LOOPX_* protocol name is silently
+    //   overridden by protocol injection while non-protocol entries reach
+    //   the child. Stderr contains no override warning. Mirrors T-API-51a's
+    //   silent-override but isolates one protocol name + one non-protocol
+    //   peer entry to confirm the override is per-name (not env-wide).
+    // ------------------------------------------------------------------------
+    it("T-API-58: runPromise() — LOOPX_* protocol name silently overridden, peer entry reaches child", async () => {
+      project = await createTempProject();
+      const wfMarker = join(project.dir, "workflow.txt");
+      const customMarker = join(project.dir, "custom.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_WORKFLOW" > "${wfMarker}"
+printf '%s' "\${CUSTOM:-UNSET}" > "${customMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { LOOPX_WORKFLOW: "user-fake", CUSTOM: "user-val" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) LOOPX_WORKFLOW silently overridden — script observes "ralph"
+      //     (real workflow name), NOT "user-fake".
+      expect(readFileSync(wfMarker, "utf-8")).toBe("ralph");
+      // (b) CUSTOM (non-protocol peer) reached the child unchanged —
+      //     confirms the override is per-name, not env-wide.
+      expect(readFileSync(customMarker, "utf-8")).toBe("user-val");
+      // (c) Stderr contains no warning/notice/error about LOOPX_WORKFLOW
+      //     being overridden — silent-override contract per SPEC §13 / §8.3.
+      const re = /loopx_workflow.*(override|overrid|ignored|warning|notice)/i;
+      expect(result.stderr).not.toMatch(re);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58a: runPromise() — LOOPX_DELEGATED is startup-reserved only,
+    //   NOT script-protocol-protected. RunOptions.env.LOOPX_DELEGATED reaches
+    //   the spawned script unchanged. Distinguishes the five script-protocol
+    //   names from the startup-only LOOPX_DELEGATED.
+    // ------------------------------------------------------------------------
+    it("T-API-58a: runPromise() — LOOPX_DELEGATED (non-script-protocol) reaches child unchanged", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "delegated.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${LOOPX_DELEGATED:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { LOOPX_DELEGATED: "user-supplied" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) LOOPX_DELEGATED reached the spawned script unchanged.
+      expect(readFileSync(marker, "utf-8")).toBe("user-supplied");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58a2: run() — generator-surface counterpart to T-API-58a.
+    //   Surface-parity for LOOPX_DELEGATED's startup-reserved-only contract.
+    // ------------------------------------------------------------------------
+    it("T-API-58a2: run() — LOOPX_DELEGATED reaches child unchanged on generator surface", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "delegated.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${LOOPX_DELEGATED:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+let count = 0;
+for await (const _ of run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { LOOPX_DELEGATED: "user-supplied" },
+  maxIterations: 1,
+})) {
+  count++;
+}
+console.log(JSON.stringify({ count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("user-supplied");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58a3: runPromise() — RunOptions.envFile (programmatic local
+    //   env-file) supplying LOOPX_DELEGATED reaches the spawned script
+    //   unchanged. Closes the per-tier supply matrix for LOOPX_DELEGATED on
+    //   the programmatic surface alongside T-API-58a (RunOptions.env tier),
+    //   T-ENV-24a (inherited env), T-ENV-24a2 (global env file), and
+    //   T-ENV-24a3 (CLI -e). Confirms that the no-protection contract for
+    //   LOOPX_DELEGATED holds on the §8.3 tier-3 RunOptions.envFile path,
+    //   not just on tier-2 RunOptions.env.
+    // ------------------------------------------------------------------------
+    it("T-API-58a3: runPromise() — RunOptions.envFile LOOPX_DELEGATED reaches child unchanged", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "delegated.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await createEnvFile(envFilePath, { LOOPX_DELEGATED: "from-envfile" });
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${LOOPX_DELEGATED:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      // Per TEST-SPEC §1.4: harness must scrub LOOPX_DELEGATED from inherited
+      // env so the only tier supplying the value is RunOptions.envFile,
+      // mirroring T-ENV-24a3's discipline for the CLI local env-file tier.
+      const driverCode = `
+import { runPromise } from "loopx";
+delete process.env.LOOPX_DELEGATED;
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(envFilePath)},
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // LOOPX_DELEGATED from the programmatic-envFile tier reached the child
+      // unchanged. Distinguishes LOOPX_DELEGATED from script-protocol-protected
+      // LOOPX_* names whose lower-tier values are silently overridden by
+      // protocol injection.
+      expect(readFileSync(marker, "utf-8")).toBe("from-envfile");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58a4: run() — generator-surface counterpart to T-API-58a3.
+    //   Surface-parity for LOOPX_DELEGATED's startup-reserved-only contract on
+    //   the §8.3 tier-3 RunOptions.envFile path, mirroring the runPromise/run
+    //   surface-parity already pinned for the RunOptions.env tier by
+    //   T-API-58a / T-API-58a2.
+    // ------------------------------------------------------------------------
+    it("T-API-58a4: run() — RunOptions.envFile LOOPX_DELEGATED reaches child unchanged on generator surface", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "delegated.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await createEnvFile(envFilePath, { LOOPX_DELEGATED: "from-envfile" });
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${LOOPX_DELEGATED:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+delete process.env.LOOPX_DELEGATED;
+let count = 0;
+for await (const _ of run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(envFilePath)},
+  maxIterations: 1,
+})) {
+  count++;
+}
+console.log(JSON.stringify({ count }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("from-envfile");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58b: runPromise() — RunOptions.env supplying a NUL-containing value
+    //   for a protocol-variable name (LOOPX_WORKFLOW) is silently overridden by
+    //   protocol injection. The promise resolves; the script observes the real
+    //   workflow name; no spawn-failure error / override-warning surfaces.
+    //
+    //   Per SPEC §8.3 / §9.5 / §13: protocol-tier overlay (tier 1) replaces
+    //   user-supplied LOOPX_* values from RunOptions.env (tier 2) BEFORE the
+    //   merged env reaches child_process.spawn — so the runtime never observes
+    //   the NUL-containing value. A buggy implementation that merged
+    //   RunOptions.env into the child env BEFORE protocol injection would
+    //   surface a spawn-failure on the NUL byte and fail (a)/(c)/(e).
+    //   SPEC §7.2 / §8.3 / §9.2 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    it("T-API-58b: runPromise() — NUL in RunOptions.env LOOPX_WORKFLOW silently overridden by protocol injection", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api58b");
+      const wfMarker = join(project.dir, "workflow.txt");
+      const ranMarker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_WORKFLOW" > "${wfMarker}"
+printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { LOOPX_WORKFLOW: "bad\\u0000value" },
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected, message }));
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  console.log(JSON.stringify({ count: 0, rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise resolved (no rejection — protocol-tier overlay replaced
+      //     the NUL value before the runtime saw it).
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      // (b) Marker records the real workflow name from protocol injection,
+      //     NOT the user-supplied "bad value".
+      expect(readFileSync(wfMarker, "utf-8")).toBe("ralph");
+      // (c) No spawn-failure error on stderr.
+      expect(result.stderr).not.toMatch(/exited with code/);
+      expect(result.stderr).not.toMatch(/spawn/i);
+      // (d) No override-warning on stderr (silent-override per SPEC §13 / §8.3).
+      expect(result.stderr).not.toMatch(
+        /loopx_workflow.*(override|overrid|ignored|warning|notice)/i,
+      );
+      // (e) Workflow script ran exactly once (distinguishes from the spawn-
+      //     failure-no-script-ran outcome of T-API-57).
+      expect(existsSync(ranMarker)).toBe(true);
+      expect(readFileSync(ranMarker, "utf-8")).toBe("spawned");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58c: run() generator counterpart to T-API-58b. Same merge-order
+    //   contract on the lazy-snapshot run() surface (SPEC §9.1) — verifies
+    //   that both API surfaces share the protocol-tier overlay code path.
+    //   SPEC §7.2 / §8.3 / §9.1 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    it("T-API-58c: run() — NUL in RunOptions.env LOOPX_WORKFLOW silently overridden by protocol injection", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api58c");
+      const wfMarker = join(project.dir, "workflow.txt");
+      const ranMarker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_WORKFLOW" > "${wfMarker}"
+printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { LOOPX_WORKFLOW: "bad\\u0000value" },
+    maxIterations: 1,
+  })) {
+    count++;
+  }
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Generator settled cleanly (no throw — protocol-tier overlay
+      //     replaced the NUL value before the runtime saw it).
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      // (b) Marker records "ralph", NOT "bad value".
+      expect(readFileSync(wfMarker, "utf-8")).toBe("ralph");
+      // (c) No spawn-failure error on stderr.
+      expect(result.stderr).not.toMatch(/exited with code/);
+      expect(result.stderr).not.toMatch(/spawn/i);
+      // (d) No override-warning on stderr.
+      expect(result.stderr).not.toMatch(
+        /loopx_workflow.*(override|overrid|ignored|warning|notice)/i,
+      );
+      // (e) Workflow script ran exactly once.
+      expect(existsSync(ranMarker)).toBe(true);
+      expect(readFileSync(ranMarker, "utf-8")).toBe("spawned");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58d: runPromise() — same merge-order contract on LOOPX_TMPDIR (the
+    //   dynamically-computed protocol-injection axis per SPEC §7.4 — value is
+    //   computed during pre-iteration, not derived from a static call-time
+    //   identifier). T-API-58b/c cover LOOPX_WORKFLOW (call-time-identifier-
+    //   derived); a buggy implementation could plausibly route static-identifier
+    //   protocol injection through one merge code path and dynamic-tmpdir
+    //   injection through another — pinning both axes catches that.
+    //
+    //   The during-run stat (matching T-API-51a's rigor) is essential: cleanup
+    //   removes the tmpdir on run completion, so a post-run stat would observe
+    //   absence even if the value were a real path. The in-script stat proves
+    //   the value points to a real loopx-created directory.
+    //   SPEC §7.2 / §7.4 / §8.3 / §9.2 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    it("T-API-58d: runPromise() — NUL in RunOptions.env LOOPX_TMPDIR silently overridden by protocol injection", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api58d");
+      const tmpdirMarker = join(project.dir, "loopx_tmpdir.txt");
+      const tmpdirStatMarker = join(project.dir, "loopx_tmpdir_stat.txt");
+      const ranMarker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${tmpdirStatMarker}"
+else
+  printf 'not-dir' > "${tmpdirStatMarker}"
+fi
+printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { LOOPX_TMPDIR: "bad\\u0000value" },
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected, message }));
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  console.log(JSON.stringify({ count: 0, rejected, message }));
+}
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise resolved.
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.count).toBe(1);
+      // (b) Marker records a real absolute path under the test-isolated parent
+      //     matching the loopx-* naming convention from SPEC §7.4 mkdtemp.
+      const observedTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(observedTmpdir).not.toBe("bad value");
+      expect(observedTmpdir).toMatch(/\/loopx-[^/]+$/);
+      const realTmpdirParent = realpathSync(tmpdirParent);
+      expect(observedTmpdir.startsWith(realTmpdirParent)).toBe(true);
+      // (c) During-run stat marker proves the path was a real directory while
+      //     the script ran (not a substituted string). SPEC §7.4 cleanup
+      //     removes the dir AFTER the script exits.
+      expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+      // (d) No spawn-failure error on stderr.
+      expect(result.stderr).not.toMatch(/exited with code/);
+      expect(result.stderr).not.toMatch(/spawn/i);
+      // (e) No override-warning on stderr.
+      expect(result.stderr).not.toMatch(
+        /loopx_tmpdir.*(override|overrid|ignored|warning|notice)/i,
+      );
+      // (f) Workflow script ran.
+      expect(existsSync(ranMarker)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58d2: run() generator counterpart to T-API-58d — NUL-merge-order on
+    //   the dynamically-computed LOOPX_TMPDIR protocol injection on the lazy-
+    //   snapshot run() surface. Distinct snapshot timing from runPromise() per
+    //   SPEC §9.1 vs §9.2 — a buggy implementation that wired the dynamically-
+    //   computed protocol injection correctly under the eager schedule but
+    //   incorrectly under the lazy schedule would pass T-API-58d and fail this.
+    //   SPEC §7.2 / §7.4 / §8.3 / §9.1 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    it("T-API-58d2: run() — NUL in RunOptions.env LOOPX_TMPDIR silently overridden by protocol injection", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api58d2");
+      const tmpdirMarker = join(project.dir, "loopx_tmpdir.txt");
+      const tmpdirStatMarker = join(project.dir, "loopx_tmpdir_stat.txt");
+      const ranMarker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${tmpdirStatMarker}"
+else
+  printf 'not-dir' > "${tmpdirStatMarker}"
+fi
+printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { LOOPX_TMPDIR: "bad\\u0000value" },
+    maxIterations: 1,
+  })) {
+    count++;
+  }
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Generator settled cleanly.
+      expect(parsed.threw).toBe(false);
+      expect(parsed.count).toBe(1);
+      // (b) Marker records a real absolute path under the test-isolated parent.
+      const observedTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(observedTmpdir).not.toBe("bad value");
+      expect(observedTmpdir).toMatch(/\/loopx-[^/]+$/);
+      const realTmpdirParent = realpathSync(tmpdirParent);
+      expect(observedTmpdir.startsWith(realTmpdirParent)).toBe(true);
+      // (c) During-run stat proves the path was a real directory.
+      expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+      // (d) No spawn-failure error on stderr.
+      expect(result.stderr).not.toMatch(/exited with code/);
+      expect(result.stderr).not.toMatch(/spawn/i);
+      // (e) No override-warning on stderr.
+      expect(result.stderr).not.toMatch(
+        /loopx_tmpdir.*(override|overrid|ignored|warning|notice)/i,
+      );
+      // (f) Workflow script ran.
+      expect(existsSync(ranMarker)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-58e (i)–(iii): runPromise() — parameterized hardening over the
+    //   remaining three script-protocol-protected names (LOOPX_BIN,
+    //   LOOPX_PROJECT_ROOT, LOOPX_WORKFLOW_DIR). T-API-58b/c/d cover the two
+    //   structurally distinct axes (call-time-derived LOOPX_WORKFLOW + pre-
+    //   iteration-computed LOOPX_TMPDIR). The remaining three are call-time-
+    //   derived but not workflow-identity-derived — this catches a buggy
+    //   implementation that special-cased the two pinned names into one merge-
+    //   order-correct path while routing the other three through a separate,
+    //   merge-order-broken path. SPEC §7.2 / §8.3 / §9.2 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      { name: "LOOPX_BIN", id: "i", marker: "loopx_bin" },
+      { name: "LOOPX_PROJECT_ROOT", id: "ii", marker: "loopx_project_root" },
+      { name: "LOOPX_WORKFLOW_DIR", id: "iii", marker: "loopx_workflow_dir" },
+    ]) {
+      it(`T-API-58e (${variant.id} ${variant.name}): runPromise() — NUL in RunOptions.env ${variant.name} silently overridden by protocol injection`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api58e-${variant.id}`);
+        const projectRoot = realpathSync(project.dir);
+        const obsMarker = join(project.dir, `${variant.marker}.txt`);
+        const ranMarker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '%s' "\$${variant.name}" > "${obsMarker}"
+printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { ${variant.name}: "bad\\u0000value" },
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected, message }));
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  console.log(JSON.stringify({ count: 0, rejected, message }));
+}
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise resolved.
+        expect(parsed.rejected).toBe(false);
+        expect(parsed.count).toBe(1);
+        // (b) Marker records the real protocol value, not the NUL string.
+        const observed = readFileSync(obsMarker, "utf-8");
+        expect(observed).not.toBe("bad value");
+        if (variant.name === "LOOPX_BIN") {
+          // LOOPX_BIN is the resolved realpath of the loopx binary — must
+          // exist on disk.
+          expect(existsSync(observed)).toBe(true);
+        } else if (variant.name === "LOOPX_PROJECT_ROOT") {
+          expect(observed).toBe(projectRoot);
+        } else if (variant.name === "LOOPX_WORKFLOW_DIR") {
+          expect(observed).toBe(join(projectRoot, ".loopx", "ralph"));
+        }
+        // (c) No spawn-failure error on stderr.
+        expect(result.stderr).not.toMatch(/exited with code/);
+        expect(result.stderr).not.toMatch(/spawn/i);
+        // (d) No override-warning on stderr.
+        const re = new RegExp(
+          `${variant.name.toLowerCase()}.*(override|overrid|ignored|warning|notice)`,
+          "i",
+        );
+        expect(result.stderr).not.toMatch(re);
+        // (e) Workflow script ran exactly once.
+        expect(existsSync(ranMarker)).toBe(true);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-58e2 (i)–(iii): run() generator counterpart to T-API-58e —
+    //   parameterized hardening over the remaining three names on the lazy-
+    //   snapshot surface. SPEC §7.2 / §8.3 / §9.1 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      { name: "LOOPX_BIN", id: "i", marker: "loopx_bin" },
+      { name: "LOOPX_PROJECT_ROOT", id: "ii", marker: "loopx_project_root" },
+      { name: "LOOPX_WORKFLOW_DIR", id: "iii", marker: "loopx_workflow_dir" },
+    ]) {
+      it(`T-API-58e2 (${variant.id} ${variant.name}): run() — NUL in RunOptions.env ${variant.name} silently overridden by protocol injection`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api58e2-${variant.id}`);
+        const projectRoot = realpathSync(project.dir);
+        const obsMarker = join(project.dir, `${variant.marker}.txt`);
+        const ranMarker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '%s' "\$${variant.name}" > "${obsMarker}"
+printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    env: { ${variant.name}: "bad\\u0000value" },
+    maxIterations: 1,
+  })) {
+    count++;
+  }
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Generator settled cleanly.
+        expect(parsed.threw).toBe(false);
+        expect(parsed.count).toBe(1);
+        // (b) Marker records the real protocol value.
+        const observed = readFileSync(obsMarker, "utf-8");
+        expect(observed).not.toBe("bad value");
+        if (variant.name === "LOOPX_BIN") {
+          expect(existsSync(observed)).toBe(true);
+        } else if (variant.name === "LOOPX_PROJECT_ROOT") {
+          expect(observed).toBe(projectRoot);
+        } else if (variant.name === "LOOPX_WORKFLOW_DIR") {
+          expect(observed).toBe(join(projectRoot, ".loopx", "ralph"));
+        }
+        // (c) No spawn-failure error on stderr.
+        expect(result.stderr).not.toMatch(/exited with code/);
+        expect(result.stderr).not.toMatch(/spawn/i);
+        // (d) No override-warning on stderr.
+        const re = new RegExp(
+          `${variant.name.toLowerCase()}.*(override|overrid|ignored|warning|notice)`,
+          "i",
+        );
+        expect(result.stderr).not.toMatch(re);
+        // (e) Workflow script ran exactly once.
+        expect(existsSync(ranMarker)).toBe(true);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-58f (i)–(v): runPromise() — RunOptions.envFile (programmatic local
+    //   env file, §8.3 tier 3) supplying a NUL-containing value for any of the
+    //   five script-protocol-protected names (LOOPX_BIN, LOOPX_PROJECT_ROOT,
+    //   LOOPX_WORKFLOW, LOOPX_WORKFLOW_DIR, LOOPX_TMPDIR) is silently
+    //   overridden by protocol injection (tier 1). Programmatic counterpart to
+    //   CLI tests T-ENV-28/T-ENV-28a (CLI -e local env file). Closes the
+    //   programmatic-`envFile` tier merge-order matrix; T-API-58b/c/d/d2/e/e2
+    //   pin the contract on the RunOptions.env (tier 2) merge-order. Same
+    //   five-variant parameterization for parity.
+    //
+    //   Per SPEC §8.1: env-file values may contain embedded NUL bytes — the
+    //   parser splits content on '\n' and reads from after the first '=' to
+    //   end of line, with no NUL-byte filtering. The NUL byte therefore
+    //   reaches mergeEnv unchanged from the envFile-loaded localEnv. The
+    //   protocol-tier overlay in execution.ts (lines 179-185) applies AFTER
+    //   the merged env is computed in run.ts (lines 661-664), so for the five
+    //   script-protocol-protected names the user-supplied NUL value is
+    //   replaced before the merged env reaches child_process.spawn — no spawn
+    //   failure surfaces.
+    //
+    //   A buggy implementation that wired the protocol-tier-overlay-after-
+    //   merge contract correctly on the RunOptions.env tier (T-API-58b..e2)
+    //   but merged the programmatic envFile tier AFTER protocol injection (or
+    //   used a separate merge code path that omitted the protocol-tier
+    //   overlay) would surface a spawn-failure on the NUL byte and fail (a),
+    //   (c), and (e). SPEC §7.2 / §7.4 / §8.1 / §8.3 / §9.2 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      { name: "LOOPX_WORKFLOW", id: "i", marker: "loopx_workflow" },
+      { name: "LOOPX_TMPDIR", id: "ii", marker: "loopx_tmpdir" },
+      { name: "LOOPX_BIN", id: "iii", marker: "loopx_bin" },
+      { name: "LOOPX_PROJECT_ROOT", id: "iv", marker: "loopx_project_root" },
+      { name: "LOOPX_WORKFLOW_DIR", id: "v", marker: "loopx_workflow_dir" },
+    ]) {
+      it(`T-API-58f (${variant.id} ${variant.name}): runPromise() — NUL in RunOptions.envFile ${variant.name} silently overridden by protocol injection`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api58f-${variant.id}`);
+        const projectRoot = realpathSync(project.dir);
+        const obsMarker = join(project.dir, `${variant.marker}.txt`);
+        const tmpdirStatMarker = join(project.dir, "loopx_tmpdir_stat.txt");
+        const ranMarker = join(project.dir, "child-ran.txt");
+        const envFilePath = join(project.dir, "local.env");
+        // SPEC §8.1: env-file parser splits on '\n' and reads value from
+        // after the first '=' to end of line — NUL bytes within the value
+        // are preserved verbatim and reach mergeEnv unchanged.
+        await writeEnvFileRaw(
+          envFilePath,
+          `${variant.name}=bad\x00value\n`,
+        );
+        const tmpdirStatBlock =
+          variant.name === "LOOPX_TMPDIR"
+            ? `if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${tmpdirStatMarker}"
+else
+  printf 'not-dir' > "${tmpdirStatMarker}"
+fi
+`
+            : "";
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '%s' "\$${variant.name}" > "${obsMarker}"
+${tmpdirStatBlock}printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    envFile: ${JSON.stringify(envFilePath)},
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected, message }));
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  console.log(JSON.stringify({ count: 0, rejected, message }));
+}
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise resolved (no rejection — protocol-tier overlay replaced
+        //     the NUL value before the runtime saw it).
+        expect(parsed.rejected).toBe(false);
+        expect(parsed.count).toBe(1);
+        // (b) Marker records the real protocol value, not the NUL string.
+        const observed = readFileSync(obsMarker, "utf-8");
+        expect(observed).not.toBe("bad value");
+        if (variant.name === "LOOPX_WORKFLOW") {
+          expect(observed).toBe("ralph");
+        } else if (variant.name === "LOOPX_TMPDIR") {
+          // Real loopx-created tmpdir per SPEC §7.4 mkdtemp naming convention.
+          expect(observed).toMatch(/\/loopx-[^/]+$/);
+          const realTmpdirParent = realpathSync(tmpdirParent);
+          expect(observed.startsWith(realTmpdirParent)).toBe(true);
+          // (c) During-run stat marker proves real loopx-created directory
+          //     (not a substituted string). SPEC §7.4 cleanup removes the
+          //     dir AFTER the script exits, so a post-run stat would
+          //     observe absence even if the value were a real path.
+          expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+        } else if (variant.name === "LOOPX_BIN") {
+          // LOOPX_BIN is the resolved realpath of the loopx binary.
+          expect(existsSync(observed)).toBe(true);
+        } else if (variant.name === "LOOPX_PROJECT_ROOT") {
+          expect(observed).toBe(projectRoot);
+        } else if (variant.name === "LOOPX_WORKFLOW_DIR") {
+          expect(observed).toBe(join(projectRoot, ".loopx", "ralph"));
+        }
+        // (d) No spawn-failure error on stderr.
+        expect(result.stderr).not.toMatch(/exited with code/);
+        expect(result.stderr).not.toMatch(/spawn/i);
+        // (e) No override-warning on stderr (silent-override per §13 / §8.3).
+        const re = new RegExp(
+          `${variant.name.toLowerCase()}.*(override|overrid|ignored|warning|notice)`,
+          "i",
+        );
+        expect(result.stderr).not.toMatch(re);
+        // (f) Workflow script ran exactly once.
+        expect(existsSync(ranMarker)).toBe(true);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-58f2 (i)–(v): run() generator counterpart to T-API-58f. Same NUL-
+    //   merge-order contract on the programmatic envFile tier on the lazy-
+    //   snapshot run() surface (SPEC §9.1). A buggy implementation that wired
+    //   the protocol-tier overlay correctly on the eager-snapshot runPromise()
+    //   programmatic-envFile path while routing the lazy-snapshot run()
+    //   programmatic-envFile path through a separate, merge-order-broken code
+    //   path would pass T-API-58f and fail T-API-58f2.
+    //   SPEC §7.2 / §7.4 / §8.1 / §8.3 / §9.1 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      { name: "LOOPX_WORKFLOW", id: "i", marker: "loopx_workflow" },
+      { name: "LOOPX_TMPDIR", id: "ii", marker: "loopx_tmpdir" },
+      { name: "LOOPX_BIN", id: "iii", marker: "loopx_bin" },
+      { name: "LOOPX_PROJECT_ROOT", id: "iv", marker: "loopx_project_root" },
+      { name: "LOOPX_WORKFLOW_DIR", id: "v", marker: "loopx_workflow_dir" },
+    ]) {
+      it(`T-API-58f2 (${variant.id} ${variant.name}): run() — NUL in RunOptions.envFile ${variant.name} silently overridden by protocol injection`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api58f2-${variant.id}`);
+        const projectRoot = realpathSync(project.dir);
+        const obsMarker = join(project.dir, `${variant.marker}.txt`);
+        const tmpdirStatMarker = join(project.dir, "loopx_tmpdir_stat.txt");
+        const ranMarker = join(project.dir, "child-ran.txt");
+        const envFilePath = join(project.dir, "local.env");
+        await writeEnvFileRaw(
+          envFilePath,
+          `${variant.name}=bad\x00value\n`,
+        );
+        const tmpdirStatBlock =
+          variant.name === "LOOPX_TMPDIR"
+            ? `if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${tmpdirStatMarker}"
+else
+  printf 'not-dir' > "${tmpdirStatMarker}"
+fi
+`
+            : "";
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '%s' "\$${variant.name}" > "${obsMarker}"
+${tmpdirStatBlock}printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    envFile: ${JSON.stringify(envFilePath)},
+    maxIterations: 1,
+  })) {
+    count++;
+  }
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Generator settled cleanly.
+        expect(parsed.threw).toBe(false);
+        expect(parsed.count).toBe(1);
+        // (b) Marker records the real protocol value.
+        const observed = readFileSync(obsMarker, "utf-8");
+        expect(observed).not.toBe("bad value");
+        if (variant.name === "LOOPX_WORKFLOW") {
+          expect(observed).toBe("ralph");
+        } else if (variant.name === "LOOPX_TMPDIR") {
+          expect(observed).toMatch(/\/loopx-[^/]+$/);
+          const realTmpdirParent = realpathSync(tmpdirParent);
+          expect(observed.startsWith(realTmpdirParent)).toBe(true);
+          // During-run stat proves real loopx-created directory.
+          expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+        } else if (variant.name === "LOOPX_BIN") {
+          expect(existsSync(observed)).toBe(true);
+        } else if (variant.name === "LOOPX_PROJECT_ROOT") {
+          expect(observed).toBe(projectRoot);
+        } else if (variant.name === "LOOPX_WORKFLOW_DIR") {
+          expect(observed).toBe(join(projectRoot, ".loopx", "ralph"));
+        }
+        // (c) No spawn-failure error on stderr.
+        expect(result.stderr).not.toMatch(/exited with code/);
+        expect(result.stderr).not.toMatch(/spawn/i);
+        // (d) No override-warning on stderr.
+        const re = new RegExp(
+          `${variant.name.toLowerCase()}.*(override|overrid|ignored|warning|notice)`,
+          "i",
+        );
+        expect(result.stderr).not.toMatch(re);
+        // (e) Workflow script ran exactly once.
+        expect(existsSync(ranMarker)).toBe(true);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-58g (i)–(v): runPromise() — global env file (§8.3 tier 4) supplying
+    //   a NUL-containing value for any of the five script-protocol-protected
+    //   names is silently overridden by protocol injection (tier 1).
+    //   Programmatic counterpart to CLI tests T-ENV-29 / T-ENV-29a (CLI global
+    //   env file); closes the global-env-file tier merge-order matrix on the
+    //   eager-snapshot programmatic surface. T-API-58b/c/d/d2/e/e2 pin the
+    //   contract on RunOptions.env (tier 2); T-API-58f / T-API-58f2 pin it on
+    //   the programmatic local-env-file (tier 3 via RunOptions.envFile). This
+    //   is the last uncovered tier on the programmatic surface.
+    //
+    //   A buggy implementation that wired the protocol-tier-overlay-after-
+    //   merge contract correctly on the CLI's global-env-file code path while
+    //   routing the programmatic global-env-file load through a separate,
+    //   merge-order-broken path would pass T-ENV-29 / T-ENV-29a (and T-API-58f
+    //   / T-API-58f2 for the local env-file tier) yet fail this test.
+    //
+    //   No `envFile` is supplied so the global env file is the highest-
+    //   precedence env-file tier — a buggy implementation cannot mask its
+    //   load by routing through the local-tier path.
+    //   SPEC §7.2 / §7.4 / §8.1 / §8.3 / §9.2 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      { name: "LOOPX_WORKFLOW", id: "i", marker: "loopx_workflow" },
+      { name: "LOOPX_TMPDIR", id: "ii", marker: "loopx_tmpdir" },
+      { name: "LOOPX_BIN", id: "iii", marker: "loopx_bin" },
+      { name: "LOOPX_PROJECT_ROOT", id: "iv", marker: "loopx_project_root" },
+      { name: "LOOPX_WORKFLOW_DIR", id: "v", marker: "loopx_workflow_dir" },
+    ]) {
+      it(`T-API-58g (${variant.id} ${variant.name}): runPromise() — NUL in global env file ${variant.name} silently overridden by protocol injection`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api58g-${variant.id}`);
+        const projectRoot = realpathSync(project.dir);
+        const obsMarker = join(project.dir, `${variant.marker}.txt`);
+        const tmpdirStatMarker = join(project.dir, "loopx_tmpdir_stat.txt");
+        const ranMarker = join(project.dir, "child-ran.txt");
+        // Provision a writable XDG_CONFIG_HOME with a global env file under
+        // <xdg>/loopx/env containing the NUL-bearing protocol-name line.
+        const xdgDir = await mkdtemp(join(osTmpdir(), `loopx-test-xdg-${variant.id}-`));
+        cleanups.push(async () => {
+          await rm(xdgDir, { recursive: true, force: true }).catch(() => {});
+        });
+        const loopxConfigDir = join(xdgDir, "loopx");
+        await mkdir(loopxConfigDir, { recursive: true });
+        const globalEnvFilePath = join(loopxConfigDir, "env");
+        // SPEC §8.1: env-file parser splits on '\n' and reads value from
+        // after the first '=' to end of line — NUL bytes within the value
+        // are preserved verbatim and reach mergeEnv unchanged.
+        await writeEnvFileRaw(
+          globalEnvFilePath,
+          `${variant.name}=bad\x00value\n`,
+        );
+        const tmpdirStatBlock =
+          variant.name === "LOOPX_TMPDIR"
+            ? `if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${tmpdirStatMarker}"
+else
+  printf 'not-dir' > "${tmpdirStatMarker}"
+fi
+`
+            : "";
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '%s' "\$${variant.name}" > "${obsMarker}"
+${tmpdirStatBlock}printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    maxIterations: 1,
+  });
+  console.log(JSON.stringify({ count: outputs.length, rejected, message }));
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  console.log(JSON.stringify({ count: 0, rejected, message }));
+}
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdgDir },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise resolved (no rejection — protocol-tier overlay replaced
+        //     the NUL value before the runtime saw it).
+        expect(parsed.rejected).toBe(false);
+        expect(parsed.count).toBe(1);
+        // (b) Marker records the real protocol value, not the NUL string.
+        const observed = readFileSync(obsMarker, "utf-8");
+        expect(observed).not.toBe("bad value");
+        if (variant.name === "LOOPX_WORKFLOW") {
+          expect(observed).toBe("ralph");
+        } else if (variant.name === "LOOPX_TMPDIR") {
+          // Real loopx-created tmpdir per SPEC §7.4 mkdtemp naming convention.
+          expect(observed).toMatch(/\/loopx-[^/]+$/);
+          const realTmpdirParent = realpathSync(tmpdirParent);
+          expect(observed.startsWith(realTmpdirParent)).toBe(true);
+          // (c) During-run stat marker proves real loopx-created directory
+          //     (not a substituted string). SPEC §7.4 cleanup removes the
+          //     dir AFTER the script exits, so a post-run stat would
+          //     observe absence even if the value were a real path.
+          expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+        } else if (variant.name === "LOOPX_BIN") {
+          // LOOPX_BIN is the resolved realpath of the loopx binary.
+          expect(existsSync(observed)).toBe(true);
+        } else if (variant.name === "LOOPX_PROJECT_ROOT") {
+          expect(observed).toBe(projectRoot);
+        } else if (variant.name === "LOOPX_WORKFLOW_DIR") {
+          expect(observed).toBe(join(projectRoot, ".loopx", "ralph"));
+        }
+        // (d) No spawn-failure error on stderr and no parser warning about NUL.
+        expect(result.stderr).not.toMatch(/exited with code/);
+        expect(result.stderr).not.toMatch(/spawn/i);
+        expect(result.stderr).not.toMatch(/nul|\\x00/i);
+        // (e) No override-warning on stderr (silent-override per §13 / §8.3).
+        const re = new RegExp(
+          `${variant.name.toLowerCase()}.*(override|overrid|ignored|warning|notice)`,
+          "i",
+        );
+        expect(result.stderr).not.toMatch(re);
+        // (f) Workflow script ran exactly once.
+        expect(existsSync(ranMarker)).toBe(true);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-58g2 (i)–(v): run() generator counterpart to T-API-58g. Same NUL-
+    //   merge-order contract on the global env-file tier on the lazy-snapshot
+    //   run() surface (SPEC §9.1). A buggy implementation that wired the
+    //   protocol-tier overlay correctly on the eager-snapshot runPromise()
+    //   global-env-file path while routing the lazy-snapshot run() global-env-
+    //   file path through a separate, merge-order-broken code path would pass
+    //   T-API-58g and fail T-API-58g2.
+    //   SPEC §7.2 / §7.4 / §8.1 / §8.3 / §9.1 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      { name: "LOOPX_WORKFLOW", id: "i", marker: "loopx_workflow" },
+      { name: "LOOPX_TMPDIR", id: "ii", marker: "loopx_tmpdir" },
+      { name: "LOOPX_BIN", id: "iii", marker: "loopx_bin" },
+      { name: "LOOPX_PROJECT_ROOT", id: "iv", marker: "loopx_project_root" },
+      { name: "LOOPX_WORKFLOW_DIR", id: "v", marker: "loopx_workflow_dir" },
+    ]) {
+      it(`T-API-58g2 (${variant.id} ${variant.name}): run() — NUL in global env file ${variant.name} silently overridden by protocol injection`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api58g2-${variant.id}`);
+        const projectRoot = realpathSync(project.dir);
+        const obsMarker = join(project.dir, `${variant.marker}.txt`);
+        const tmpdirStatMarker = join(project.dir, "loopx_tmpdir_stat.txt");
+        const ranMarker = join(project.dir, "child-ran.txt");
+        const xdgDir = await mkdtemp(join(osTmpdir(), `loopx-test-xdg-${variant.id}-`));
+        cleanups.push(async () => {
+          await rm(xdgDir, { recursive: true, force: true }).catch(() => {});
+        });
+        const loopxConfigDir = join(xdgDir, "loopx");
+        await mkdir(loopxConfigDir, { recursive: true });
+        const globalEnvFilePath = join(loopxConfigDir, "env");
+        await writeEnvFileRaw(
+          globalEnvFilePath,
+          `${variant.name}=bad\x00value\n`,
+        );
+        const tmpdirStatBlock =
+          variant.name === "LOOPX_TMPDIR"
+            ? `if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${tmpdirStatMarker}"
+else
+  printf 'not-dir' > "${tmpdirStatMarker}"
+fi
+`
+            : "";
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '%s' "\$${variant.name}" > "${obsMarker}"
+${tmpdirStatBlock}printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+let count = 0, threw = false, message = "";
+try {
+  for await (const _ of run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    maxIterations: 1,
+  })) {
+    count++;
+  }
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdgDir },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Generator settled cleanly.
+        expect(parsed.threw).toBe(false);
+        expect(parsed.count).toBe(1);
+        // (b) Marker records the real protocol value.
+        const observed = readFileSync(obsMarker, "utf-8");
+        expect(observed).not.toBe("bad value");
+        if (variant.name === "LOOPX_WORKFLOW") {
+          expect(observed).toBe("ralph");
+        } else if (variant.name === "LOOPX_TMPDIR") {
+          expect(observed).toMatch(/\/loopx-[^/]+$/);
+          const realTmpdirParent = realpathSync(tmpdirParent);
+          expect(observed.startsWith(realTmpdirParent)).toBe(true);
+          // During-run stat proves real loopx-created directory.
+          expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+        } else if (variant.name === "LOOPX_BIN") {
+          expect(existsSync(observed)).toBe(true);
+        } else if (variant.name === "LOOPX_PROJECT_ROOT") {
+          expect(observed).toBe(projectRoot);
+        } else if (variant.name === "LOOPX_WORKFLOW_DIR") {
+          expect(observed).toBe(join(projectRoot, ".loopx", "ralph"));
+        }
+        // (c) No spawn-failure error on stderr and no parser warning about NUL.
+        expect(result.stderr).not.toMatch(/exited with code/);
+        expect(result.stderr).not.toMatch(/spawn/i);
+        expect(result.stderr).not.toMatch(/nul|\\x00/i);
+        // (d) No override-warning on stderr.
+        const re = new RegExp(
+          `${variant.name.toLowerCase()}.*(override|overrid|ignored|warning|notice)`,
+          "i",
+        );
+        expect(result.stderr).not.toMatch(re);
+        // (e) Workflow script ran exactly once.
+        expect(existsSync(ranMarker)).toBe(true);
+      });
+    }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — RunOptions.env / RunOptions.envFile do NOT redirect loopx's own
+//        global env-file path resolution (SPEC §8.1 / §8.3 / §9.1 / §9.5)
+//
+// SPEC §8.1: "Global env file path resolution ($XDG_CONFIG_HOME/loopx/env,
+// with the documented HOME-based fallback) reads XDG_CONFIG_HOME / HOME
+// from the inherited environment on the same schedule." User-supplied
+// XDG_CONFIG_HOME / HOME values via RunOptions.env (tier 2) or env files
+// (tiers 3/4) reach the spawned child but do not redirect WHERE loopx looks
+// for its own global env file.
+// ═════════════════════════════════════════════════════════════
+
+describe("SPEC: RunOptions.env Does Not Affect Loopx's Own Lookups", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    for (const cleanup of cleanups.splice(0)) {
+      await cleanup().catch(() => {});
+    }
+  });
+
+  // mkdtemp two distinct config homes: one for "real" inherited env,
+  // one for "fake" RunOptions.env / env-file value. Both are registered
+  // for cleanup. Each receives a loopx/env file with MARKER set distinctly.
+  async function setupRealAndFakeXdg(label: string): Promise<{
+    realXdg: string;
+    fakeXdg: string;
+  }> {
+    const realXdg = await mkdtemp(join(osTmpdir(), `loopx-test-real-xdg-${label}-`));
+    cleanups.push(async () => {
+      await rm(realXdg, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(realXdg, "loopx"), { recursive: true });
+    await writeFile(join(realXdg, "loopx", "env"), "MARKER=real\n", "utf-8");
+
+    const fakeXdg = await mkdtemp(join(osTmpdir(), `loopx-test-fake-xdg-${label}-`));
+    cleanups.push(async () => {
+      await rm(fakeXdg, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(fakeXdg, "loopx"), { recursive: true });
+    await writeFile(join(fakeXdg, "loopx", "env"), "MARKER=fake\n", "utf-8");
+
+    return { realXdg, fakeXdg };
+  }
+
+  // For HOME-fallback tests: the global env file lives at
+  // <HOME>/.config/loopx/env (when XDG_CONFIG_HOME is unset).
+  async function setupRealAndFakeHome(label: string): Promise<{
+    realHome: string;
+    fakeHome: string;
+  }> {
+    const realHome = await mkdtemp(join(osTmpdir(), `loopx-test-real-home-${label}-`));
+    cleanups.push(async () => {
+      await rm(realHome, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(realHome, ".config", "loopx"), { recursive: true });
+    await writeFile(
+      join(realHome, ".config", "loopx", "env"),
+      "MARKER=real\n",
+      "utf-8",
+    );
+
+    const fakeHome = await mkdtemp(join(osTmpdir(), `loopx-test-fake-home-${label}-`));
+    cleanups.push(async () => {
+      await rm(fakeHome, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(fakeHome, ".config", "loopx"), { recursive: true });
+    await writeFile(
+      join(fakeHome, ".config", "loopx", "env"),
+      "MARKER=fake\n",
+      "utf-8",
+    );
+
+    return { realHome, fakeHome };
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-59: runPromise() — RunOptions.env does not redirect global env-
+    //   file lookup via XDG_CONFIG_HOME. Inherited XDG_CONFIG_HOME points at
+    //   real config dir (containing MARKER=real). RunOptions.env supplies a
+    //   fake XDG_CONFIG_HOME value (with a decoy global env file containing
+    //   MARKER=fake). The script observes both XDG_CONFIG_HOME (which should
+    //   reflect the user-supplied fake value, proving the merge into the
+    //   child env happened) AND MARKER (which should reflect the real value,
+    //   proving loopx loaded the global env file from the inherited env, not
+    //   from RunOptions.env). SPEC §8.1, §8.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59: runPromise() — RunOptions.env does NOT redirect global env-file lookup via XDG_CONFIG_HOME", async () => {
+      project = await createTempProject();
+      const xdgMarker = join(project.dir, "xdg.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${XDG_CONFIG_HOME:-UNSET}" > "${xdgMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realXdg, fakeXdg } = await setupRealAndFakeXdg("api59");
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(realXdg)};
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { XDG_CONFIG_HOME: ${JSON.stringify(fakeXdg)} },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed XDG_CONFIG_HOME from RunOptions.env (the fake path).
+      expect(readFileSync(xdgMarker, "utf-8")).toBe(fakeXdg);
+      // (b) But loopx loaded the global env file using its OWN inherited
+      //     process.env.XDG_CONFIG_HOME (the real path) — so MARKER=real.
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59a: runPromise() — RunOptions.env does not redirect global env-
+    //   file lookup via HOME (the fallback when XDG_CONFIG_HOME is unset).
+    //   SPEC §8.1, §8.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59a: runPromise() — RunOptions.env does NOT redirect global env-file lookup via HOME", async () => {
+      project = await createTempProject();
+      const homeMarker = join(project.dir, "home.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${HOME:-UNSET}" > "${homeMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realHome, fakeHome } = await setupRealAndFakeHome("api59a");
+
+      // Unset XDG_CONFIG_HOME so HOME fallback applies, then set HOME=realHome.
+      const driverCode = `
+import { runPromise } from "loopx";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(realHome)};
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { HOME: ${JSON.stringify(fakeHome)} },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed HOME from RunOptions.env (the fake path).
+      expect(readFileSync(homeMarker, "utf-8")).toBe(fakeHome);
+      // (b) But loopx loaded the global env file using its OWN inherited
+      //     process.env.HOME (the real path) — so MARKER=real.
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59b: run() generator — RunOptions.env does not redirect global
+    //   env-file lookup via XDG_CONFIG_HOME. Generator-surface counterpart to
+    //   T-API-59. The two run surfaces have different snapshot timing for
+    //   inherited process.env (lazy under run() per SPEC §9.1; eager under
+    //   runPromise() per SPEC §9.2) but both must apply SPEC §8.1's rule.
+    //   A buggy implementation that re-read RunOptions.env at first next()
+    //   and merged it into the lazy process.env snapshot before resolving
+    //   the global env-file path on the run() path — but performed eager
+    //   resolution correctly under runPromise() — would pass T-API-59 but
+    //   fail this test. SPEC §8.1, §8.3, §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59b: run() — RunOptions.env does NOT redirect global env-file lookup via XDG_CONFIG_HOME", async () => {
+      project = await createTempProject();
+      const xdgMarker = join(project.dir, "xdg.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${XDG_CONFIG_HOME:-UNSET}" > "${xdgMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realXdg, fakeXdg } = await setupRealAndFakeXdg("api59b");
+
+      const driverCode = `
+import { run } from "loopx";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(realXdg)};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { XDG_CONFIG_HOME: ${JSON.stringify(fakeXdg)} },
+  maxIterations: 1,
+});
+const results = [];
+for await (const o of gen) { results.push(o); }
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed XDG_CONFIG_HOME from RunOptions.env (fake path).
+      expect(readFileSync(xdgMarker, "utf-8")).toBe(fakeXdg);
+      // (b) loopx loaded global env file using inherited process.env (real).
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59c: run() generator — RunOptions.env does not redirect global
+    //   env-file lookup via HOME. SPEC §8.1, §8.3, §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59c: run() — RunOptions.env does NOT redirect global env-file lookup via HOME", async () => {
+      project = await createTempProject();
+      const homeMarker = join(project.dir, "home.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${HOME:-UNSET}" > "${homeMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realHome, fakeHome } = await setupRealAndFakeHome("api59c");
+
+      const driverCode = `
+import { run } from "loopx";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(realHome)};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { HOME: ${JSON.stringify(fakeHome)} },
+  maxIterations: 1,
+});
+const results = [];
+for await (const o of gen) { results.push(o); }
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed HOME from RunOptions.env (fake path).
+      expect(readFileSync(homeMarker, "utf-8")).toBe(fakeHome);
+      // (b) loopx loaded global env file using inherited HOME (real path).
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59d: runPromise() — Local envFile (RunOptions.envFile, tier 3)
+    //   does not redirect global env-file lookup via XDG_CONFIG_HOME.
+    //   The local env file containing XDG_CONFIG_HOME=fakePath is loaded
+    //   AFTER loopx has already located the global env file using the
+    //   inherited environment. The child sees the fake XDG_CONFIG_HOME
+    //   (proving the local env file values reach the spawned script) but
+    //   loopx loaded the real global env file. SPEC §8.1, §8.2, §8.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59d: runPromise() — Local envFile does NOT redirect global env-file lookup via XDG_CONFIG_HOME", async () => {
+      project = await createTempProject();
+      const xdgMarker = join(project.dir, "xdg.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${XDG_CONFIG_HOME:-UNSET}" > "${xdgMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realXdg, fakeXdg } = await setupRealAndFakeXdg("api59d");
+
+      // Local env file containing XDG_CONFIG_HOME=<fakeXdg>.
+      const localEnvFile = join(project.dir, "local.env");
+      await writeFile(localEnvFile, `XDG_CONFIG_HOME=${fakeXdg}\n`, "utf-8");
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(realXdg)};
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(localEnvFile)},
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed XDG_CONFIG_HOME from local env file (fake).
+      expect(readFileSync(xdgMarker, "utf-8")).toBe(fakeXdg);
+      // (b) loopx loaded global env file using inherited XDG_CONFIG_HOME (real).
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59e: runPromise() — Local envFile does not redirect global env-
+    //   file lookup via HOME. SPEC §8.1, §8.2, §8.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59e: runPromise() — Local envFile does NOT redirect global env-file lookup via HOME", async () => {
+      project = await createTempProject();
+      const homeMarker = join(project.dir, "home.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${HOME:-UNSET}" > "${homeMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realHome, fakeHome } = await setupRealAndFakeHome("api59e");
+
+      const localEnvFile = join(project.dir, "local.env");
+      await writeFile(localEnvFile, `HOME=${fakeHome}\n`, "utf-8");
+
+      const driverCode = `
+import { runPromise } from "loopx";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(realHome)};
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(localEnvFile)},
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed HOME from local env file (fake).
+      expect(readFileSync(homeMarker, "utf-8")).toBe(fakeHome);
+      // (b) loopx loaded global env file using inherited HOME (real path).
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59h: run() generator — Local envFile does not redirect global
+    //   env-file lookup via XDG_CONFIG_HOME. Generator-surface counterpart to
+    //   T-API-59d; exercises the lazy pre-iteration timing per SPEC §9.1.
+    //   SPEC §8.1, §8.2, §8.3, §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59h: run() — Local envFile does NOT redirect global env-file lookup via XDG_CONFIG_HOME", async () => {
+      project = await createTempProject();
+      const xdgMarker = join(project.dir, "xdg.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${XDG_CONFIG_HOME:-UNSET}" > "${xdgMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realXdg, fakeXdg } = await setupRealAndFakeXdg("api59h");
+
+      const localEnvFile = join(project.dir, "local.env");
+      await writeFile(localEnvFile, `XDG_CONFIG_HOME=${fakeXdg}\n`, "utf-8");
+
+      const driverCode = `
+import { run } from "loopx";
+process.env.XDG_CONFIG_HOME = ${JSON.stringify(realXdg)};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(localEnvFile)},
+  maxIterations: 1,
+});
+const results = [];
+for await (const o of gen) { results.push(o); }
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed XDG_CONFIG_HOME from local env file (fake).
+      expect(readFileSync(xdgMarker, "utf-8")).toBe(fakeXdg);
+      // (b) loopx loaded global env file using inherited XDG_CONFIG_HOME (real).
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59i: run() generator — Local envFile does not redirect global
+    //   env-file lookup via HOME. SPEC §8.1, §8.2, §8.3, §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-59i: run() — Local envFile does NOT redirect global env-file lookup via HOME", async () => {
+      project = await createTempProject();
+      const homeMarker = join(project.dir, "home.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${HOME:-UNSET}" > "${homeMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realHome, fakeHome } = await setupRealAndFakeHome("api59i");
+
+      const localEnvFile = join(project.dir, "local.env");
+      await writeFile(localEnvFile, `HOME=${fakeHome}\n`, "utf-8");
+
+      const driverCode = `
+import { run } from "loopx";
+delete process.env.XDG_CONFIG_HOME;
+process.env.HOME = ${JSON.stringify(realHome)};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(localEnvFile)},
+  maxIterations: 1,
+});
+const results = [];
+for await (const o of gen) { results.push(o); }
+console.log(JSON.stringify({ count: results.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).count).toBe(1);
+      // (a) Child observed HOME from local env file (fake).
+      expect(readFileSync(homeMarker, "utf-8")).toBe(fakeHome);
+      // (b) loopx loaded global env file using inherited HOME (real).
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// SPEC: RunOptions.env Does Not Affect Loopx's Tmpdir Parent
+//
+// SPEC §7.4: loopx selects its tmpdir parent from `os.tmpdir()`, which
+// itself reads `TMPDIR` / `TEMP` / `TMP` from the inherited environment
+// (timing per SPEC §9.1 / §9.2). User-supplied values for those names via
+// `RunOptions.env` (tier 2) reach the spawned child but do not redirect
+// the parent loopx selects for its own `mkdtemp(<parent>/loopx-)` call.
+//
+// T-API-60 / 60a / 60b / 60c close the contract on both API surfaces ×
+// {TMPDIR, TEMP, TMP}. For TEMP / TMP, the contract is runtime-aware: on
+// POSIX runtimes only TMPDIR redirects `os.tmpdir()`, so the test pins
+// the parent against `os.tmpdir()` evaluated in an identically-configured
+// child process via getRuntimeOsTmpdir. The complementary T-TMP-29 / 29b /
+// 29c family (in tmpdir.test.ts) covers the `runPromise()` surface; this
+// block adds the `run()` generator surface plus a redundant `runPromise()`
+// pin in the API test file for symmetry with T-API-59.
+// ═════════════════════════════════════════════════════════════
+
+/**
+ * Returns the value of `os.tmpdir()` inside an `envOverrides`-configured
+ * child process of the given runtime. POSIX runtimes only consult TMPDIR;
+ * Windows runtimes additionally consult TEMP / TMP. Mirrors the helper
+ * used in tmpdir.test.ts for T-TMP-25/29 runtime-aware assertions.
+ */
+function getRuntimeOsTmpdir(
+  runtime: "node" | "bun",
+  envOverrides: Record<string, string | undefined>,
+): string {
+  const effectiveEnv: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) effectiveEnv[key] = value;
+  }
+  for (const [key, value] of Object.entries(envOverrides)) {
+    if (value === undefined) {
+      delete effectiveEnv[key];
+    } else {
+      effectiveEnv[key] = value;
+    }
+  }
+  const command = runtime === "bun" ? "bun" : "node";
+  const result = spawnSync(
+    command,
+    ["-e", "process.stdout.write(require('os').tmpdir())"],
+    { env: effectiveEnv, encoding: "utf-8" },
+  );
+  if (result.status !== 0) {
+    throw new Error(
+      `getRuntimeOsTmpdir(${runtime}) probe failed: status=${result.status} stderr=${result.stderr}`,
+    );
+  }
+  return result.stdout.trim();
+}
+
+describe("SPEC: RunOptions.env Does Not Affect Loopx's Tmpdir Parent", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    for (const cleanup of cleanups.splice(0)) {
+      await cleanup().catch(() => {});
+    }
+  });
+
+  /**
+   * Allocate a writable test-isolated parent directory under the system
+   * tmpdir, registered for cleanup. Per TEST-SPEC §4.7, parallel CI workers
+   * must not race on a shared `/tmp/<name>` literal.
+   */
+  async function makeIsolatedTmpdirParent(label: string): Promise<string> {
+    const dir = await mkdtemp(
+      join(osTmpdir(), `loopx-test-${label}-parent-`),
+    );
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  /**
+   * A unique nonexistent path under the system tmpdir. Used as the wrong-
+   * parent value passed via `RunOptions.env` — loopx must not consult it,
+   * so it need not exist on disk.
+   */
+  function makeNonexistentParent(label: string): string {
+    return join(osTmpdir(), `loopx-test-${label}-fake-${randomUUID()}`);
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-60: runPromise() — RunOptions.env does NOT redirect tmpdir parent
+    //   selection (TMPDIR axis). Inherited TMPDIR points at realParent (a
+    //   writable mkdtemp directory loopx uses as its tmpdir parent).
+    //   RunOptions.env supplies a unique nonexistent fakeParent value. The
+    //   script observes both TMPDIR and LOOPX_TMPDIR. Assert (a) child's
+    //   TMPDIR == fakeParent (the RunOptions.env value reaches the child
+    //   per SPEC §8.3 tier-2 injection), (b) LOOPX_TMPDIR lives under
+    //   realParent (loopx's own tmpdir parent was captured from loopx's
+    //   own process.env, NOT from RunOptions.env). SPEC §7.4, §8.3, §9.5.
+    //
+    //   Companion to T-TMP-29 (runPromise + TMPDIR — same contract pinned in
+    //   tmpdir.test.ts). T-API-60 redundantly pins the same case in
+    //   programmatic-api.test.ts for symmetry with T-API-60a/60b/60c on the
+    //   run() surface, and to surface a regression as a programmatic-api
+    //   suite failure rather than only a tmpdir-suite failure.
+    // ------------------------------------------------------------------------
+    it("T-API-60: runPromise() — RunOptions.env TMPDIR does NOT redirect tmpdir parent", async () => {
+      project = await createTempProject();
+      const realParent = await makeIsolatedTmpdirParent("api60");
+      const fakeParent = makeNonexistentParent("api60");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpdirMarker = join(project.dir, "tmpdir-env.txt");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TMPDIR" > "${observedTmpdirMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, env: { TMPDIR: ${JSON.stringify(fakeParent)} } });
+console.log("done");
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: realParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      // (a) Child observed TMPDIR from RunOptions.env (the fake nonexistent path).
+      const observedTmpdir = readFileSync(observedTmpdirMarker, "utf-8");
+      expect(observedTmpdir).toBe(fakeParent);
+      // (b) loopx selected its own tmpdir parent from inherited process.env
+      //     (the real path) — LOOPX_TMPDIR is rooted under realParent.
+      const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(dirname(observedLoopxTmpdir)).toBe(realParent);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-60a: run() — generator-surface counterpart to T-API-60. The two
+    //   run surfaces have different snapshot timing for inherited env /
+    //   tmpdir parent (lazy on run() per SPEC §9.1 / §7.4; eager on
+    //   runPromise() per SPEC §9.2 / §7.4) but identical timing for
+    //   RunOptions.env (eager / call-site capture on both surfaces per
+    //   SPEC §9.5). A buggy implementation that special-cased the
+    //   tmpdir-parent / RunOptions.env interaction on the lazy-snapshot
+    //   run() surface — perhaps by re-reading RunOptions.env at first
+    //   next() and merging it into the lazy process.env snapshot before
+    //   computing os.tmpdir() — would pass T-API-60 / T-TMP-29 but fail
+    //   this test. SPEC §7.4, §8.3, §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-60a: run() — RunOptions.env TMPDIR does NOT redirect tmpdir parent", async () => {
+      project = await createTempProject();
+      const realParent = await makeIsolatedTmpdirParent("api60a");
+      const fakeParent = makeNonexistentParent("api60a");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpdirMarker = join(project.dir, "tmpdir-env.txt");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TMPDIR" > "${observedTmpdirMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, env: { TMPDIR: ${JSON.stringify(fakeParent)} } });
+for await (const _ of gen) {}
+console.log("done");
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: realParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const observedTmpdir = readFileSync(observedTmpdirMarker, "utf-8");
+      expect(observedTmpdir).toBe(fakeParent);
+      const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(dirname(observedLoopxTmpdir)).toBe(realParent);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-60b: run() — RunOptions.env does NOT redirect tmpdir parent
+    //   selection via TEMP. SPEC §7.4 / §9.5 apply the rule symmetrically
+    //   across TMPDIR / TEMP / TMP. T-API-60a covers TMPDIR on the run()
+    //   surface; T-TMP-29b covers TEMP on the runPromise() surface; this
+    //   test parameterizes the run() generator surface over TEMP. A buggy
+    //   implementation that special-cased the TEMP branch of os.tmpdir()
+    //   resolution on the lazy-snapshot run() surface would pass
+    //   T-API-60a / T-TMP-29b yet fail this test.
+    //
+    //   Apply T-TMP-25a's runtime-aware expected-parent logic: assert
+    //   LOOPX_TMPDIR lives under rightParent iff the active runtime's
+    //   os.tmpdir() consults TEMP in this configuration; otherwise assert
+    //   the parent matches os.tmpdir() evaluated in an identically-
+    //   configured child process. SPEC §7.4, §8.3, §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-60b: run() — RunOptions.env TEMP does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      project = await createTempProject();
+      const rightParent = await makeIsolatedTmpdirParent("api60b-right");
+      const wrongParent = makeNonexistentParent("api60b-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTempMarker = join(project.dir, "temp-env.txt");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TEMP" > "${observedTempMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TMP: undefined,
+        TEMP: rightParent,
+      });
+
+      const driverCode = `
+import { run } from "loopx";
+delete process.env.TMPDIR;
+delete process.env.TMP;
+process.env.TEMP = ${JSON.stringify(rightParent)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, env: { TEMP: ${JSON.stringify(wrongParent)} } });
+for await (const _ of gen) {}
+console.log("done");
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TEMP: rightParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const observedTemp = readFileSync(observedTempMarker, "utf-8");
+      expect(observedTemp).toBe(wrongParent);
+      const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(dirname(observedLoopxTmpdir)).toBe(expectedParent);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-60c: run() — RunOptions.env does NOT redirect tmpdir parent
+    //   selection via TMP. Same runtime-aware pattern as T-API-60b for the
+    //   TMP branch; together with T-API-60a (run() × TMPDIR), T-API-60b
+    //   (run() × TEMP), T-API-60 (runPromise() × TMPDIR), and T-TMP-29 /
+    //   29b / 29c (runPromise() × TMPDIR / TEMP / TMP), this closes the
+    //   RunOptions.env × tmpdir-parent contract across both run surfaces ×
+    //   all three variables. SPEC §7.4, §8.3, §9.1, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-60c: run() — RunOptions.env TMP does NOT redirect tmpdir parent (runtime-aware)", async () => {
+      project = await createTempProject();
+      const rightParent = await makeIsolatedTmpdirParent("api60c-right");
+      const wrongParent = makeNonexistentParent("api60c-wrong");
+      const tmpdirMarker = join(project.dir, "loopx-tmpdir.txt");
+      const observedTmpMarker = join(project.dir, "tmp-env.txt");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_TMPDIR" > "${tmpdirMarker}"
+printf '%s' "$TMP" > "${observedTmpMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const expectedParent = getRuntimeOsTmpdir(runtime, {
+        TMPDIR: undefined,
+        TEMP: undefined,
+        TMP: rightParent,
+      });
+
+      const driverCode = `
+import { run } from "loopx";
+delete process.env.TMPDIR;
+delete process.env.TEMP;
+process.env.TMP = ${JSON.stringify(rightParent)};
+const gen = run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1, env: { TMP: ${JSON.stringify(wrongParent)} } });
+for await (const _ of gen) {}
+console.log("done");
+`;
+      const apiResult = await runAPIDriver(runtime, driverCode, {
+        env: { TMP: rightParent },
+      });
+      expect(apiResult.exitCode).toBe(0);
+      const observedTmp = readFileSync(observedTmpMarker, "utf-8");
+      expect(observedTmp).toBe(wrongParent);
+      const observedLoopxTmpdir = readFileSync(tmpdirMarker, "utf-8");
+      expect(dirname(observedLoopxTmpdir)).toBe(expectedParent);
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — Outer Options Shape Validation (SPEC §9.5)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.5: `options` must be omitted, `undefined`, or a non-null,
+// non-array, non-function object. T-API-61 series pins the primitive
+// matrix on both API surfaces:
+//   - run() rejects null / array / function / string / number / boolean /
+//     symbol / bigint (T-API-61, 61a, 61b, 61c, 61c2)
+//   - runPromise() rejects null / array / function / string / number /
+//     boolean / symbol / bigint (T-API-61d, 61e, 61e2)
+//   - run() / runPromise() accept explicit `undefined` outer options
+//     (T-API-61f / 61g)
+//   - runPromise() / run() accept explicit-`undefined` field values
+//     for cwd / envFile / maxIterations / signal / env (T-API-61h /
+//     61h2)
+//
+// All invalid-shape rejections surface lazily on first generator
+// next() under run(), or as promise rejection under runPromise(),
+// per SPEC §9.1 / §9.2 — never as a synchronous throw at the call
+// site.
+
+describe("SPEC: Outer Options Shape Validation", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-61, T-API-61a, T-API-61b, T-API-61c, T-API-61c2 —
+    // run() rejects null / array / function / string / number / boolean /
+    // symbol / bigint outer options. SPEC §9.5: options must be a
+    // non-null, non-array, non-function object. The contract is the union
+    // of three rejection rules — the symbol and bigint variants pin the
+    // structurally-distinct branches (typeof === "symbol", "bigint")
+    // that a buggy `typeof !== "object"`-only validator would already
+    // reject correctly, while string/number/boolean variants exercise
+    // primitives that ARE not "object" via typeof but a buggy validator
+    // gating on a different discriminator could miss.
+    // ------------------------------------------------------------------------
+    interface OuterShapeVariant {
+      id: string;
+      label: string;
+      // Inline literal spliced into the driver code. Symbols and BigInts
+      // cannot round-trip through JSON.
+      optionsExpr: string;
+    }
+
+    const runOuterShapeVariants: OuterShapeVariant[] = [
+      { id: "T-API-61", label: "null", optionsExpr: "null" },
+      { id: "T-API-61a", label: "array", optionsExpr: "[]" },
+      { id: "T-API-61b", label: "function", optionsExpr: "(() => {})" },
+      { id: "T-API-61c", label: "string", optionsExpr: '"string"' },
+      { id: "T-API-61c2 (number)", label: "number", optionsExpr: "42" },
+      { id: "T-API-61c2 (boolean true)", label: "boolean true", optionsExpr: "true" },
+      { id: "T-API-61c2 (boolean false)", label: "boolean false", optionsExpr: "false" },
+      { id: "T-API-61c2 (symbol)", label: "symbol", optionsExpr: 'Symbol("x")' },
+      { id: "T-API-61c2 (bigint)", label: "bigint", optionsExpr: "1n" },
+    ];
+
+    for (const v of runOuterShapeVariants) {
+      it(`${v.id}: run() with options: ${v.label} throws on first next() with no spawn`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", ${v.optionsExpr});
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let threw = false, message = "", name = "";
+if (!synchronousThrew) {
+  try {
+    await gen.next();
+  } catch (e) {
+    threw = true;
+    message = e.message || String(e);
+    name = e.name || "";
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // SPEC §9.1: option-shape errors do not throw at the call site;
+        // they surface lazily on first next().
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.threw).toBe(true);
+        // Error must reference the options context.
+        expect(parsed.message).toMatch(/options|RunOptions/i);
+        // No child was spawned (shape error fires pre-iteration).
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-61d, T-API-61e, T-API-61e2 — runPromise() counterpart.
+    // Closes the matrix on the eager-snapshot surface so a buggy
+    // implementation that wired up shape validation correctly on run()
+    // but used a different code path on runPromise() is caught.
+    // SPEC §9.2: runPromise() always returns a promise; option-shape
+    // errors surface as promise rejections, not synchronous throws.
+    // ------------------------------------------------------------------------
+    const runPromiseOuterShapeVariants: OuterShapeVariant[] = [
+      { id: "T-API-61d", label: "null", optionsExpr: "null" },
+      { id: "T-API-61e", label: "array", optionsExpr: "[]" },
+      { id: "T-API-61e2 (function)", label: "function", optionsExpr: "(() => {})" },
+      { id: "T-API-61e2 (string)", label: "string", optionsExpr: '"string"' },
+      { id: "T-API-61e2 (number)", label: "number", optionsExpr: "42" },
+      { id: "T-API-61e2 (boolean true)", label: "boolean true", optionsExpr: "true" },
+      { id: "T-API-61e2 (boolean false)", label: "boolean false", optionsExpr: "false" },
+      { id: "T-API-61e2 (symbol)", label: "symbol", optionsExpr: 'Symbol("x")' },
+      { id: "T-API-61e2 (bigint)", label: "bigint", optionsExpr: "1n" },
+    ];
+
+    for (const v of runPromiseOuterShapeVariants) {
+      it(`${v.id}: runPromise() with options: ${v.label} rejects with no spawn`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let synchronousThrew = false, callTimeMessage = "";
+let p;
+try {
+  p = runPromise("ralph", ${v.optionsExpr});
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let rejected = false, message = "", name = "";
+if (!synchronousThrew) {
+  try {
+    await p;
+  } catch (e) {
+    rejected = true;
+    message = e.message || String(e);
+    name = e.name || "";
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // SPEC §9.2: runPromise() always returns a promise; option-shape
+        // errors surface as promise rejections, never synchronous throws.
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.message).toMatch(/options|RunOptions/i);
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-61f: run("ralph", undefined) is equivalent to run("ralph") —
+    // explicit undefined is accepted as "no options supplied" per SPEC §9.5
+    // ("options must be omitted or undefined, or a non-null non-array
+    // non-function object"). Pins down the explicit-undefined positive
+    // case so a buggy validator cannot silently tighten acceptance to
+    // "omitted only".
+    // ------------------------------------------------------------------------
+    it("T-API-61f: run() with options: undefined is equivalent to options omitted", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'ran' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let threw = false, message = "";
+const outputs = [];
+try {
+  const gen = run("ralph", undefined);
+  for await (const out of gen) { outputs.push(out); }
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ threw, message, outputCount: outputs.length, lastStop: outputs[outputs.length - 1]?.stop ?? null }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.outputCount).toBe(1);
+      expect(parsed.lastStop).toBe(true);
+      // Script ran exactly once.
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, "utf-8")).toBe("ran");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-61g: runPromise("ralph", undefined) is equivalent to
+    // runPromise("ralph"). Companion to T-API-61f.
+    // ------------------------------------------------------------------------
+    it("T-API-61g: runPromise() with options: undefined is equivalent to options omitted", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'ran' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let rejected = false, message = "";
+let outputs = [];
+try {
+  outputs = await runPromise("ralph", undefined);
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ rejected, message, outputCount: outputs.length, lastStop: outputs[outputs.length - 1]?.stop ?? null }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.outputCount).toBe(1);
+      expect(parsed.lastStop).toBe(true);
+      expect(existsSync(marker)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-61h: runPromise() — every recognized option field explicitly
+    // `undefined` is treated as absent. SPEC §9.5: each option field's
+    // type is `T | undefined`; explicit undefined is equivalent to the
+    // field being omitted. Catches a buggy validator that rejected
+    // explicit-undefined fields as "not provided but defined", or a
+    // precedence layer that treated `undefined` as a distinct value in
+    // the spawn-environment builder.
+    // ------------------------------------------------------------------------
+    it("T-API-61h: runPromise() — every option field explicit undefined treated as absent", async () => {
+      project = await createTempProject();
+      const ranMarker = join(project.dir, "ran.txt");
+      const cwdMarker = join(project.dir, "cwd.txt");
+      const myvarMarker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'ran' > "${ranMarker}"
+/bin/pwd -P > "${cwdMarker}"
+if [ -z "\${MYVAR+x}" ]; then printf 'absent' > "${myvarMarker}"; else printf 'present\\t%s' "$MYVAR" > "${myvarMarker}"; fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+delete process.env.MYVAR;
+let rejected = false, message = "";
+let outputs = [];
+try {
+  outputs = await runPromise("ralph", { cwd: undefined, envFile: undefined, maxIterations: undefined, signal: undefined, env: undefined });
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ rejected, message, outputCount: outputs.length, lastStop: outputs[outputs.length - 1]?.stop ?? null }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // SPEC §9.5: explicit undefined is valid for every option field.
+      expect(parsed.rejected).toBe(false);
+      expect(parsed.outputCount).toBe(1);
+      expect(parsed.lastStop).toBe(true);
+      // Script ran in the project dir (cwd: undefined → defaults to process.cwd()).
+      expect(existsSync(cwdMarker)).toBe(true);
+      const observedCwd = readFileSync(cwdMarker, "utf-8").trim();
+      expect(observedCwd).toBe(realpathSync(project.dir));
+      // env: undefined contributed no entries; envFile: undefined skipped
+      // local-env-file load. MYVAR was explicitly deleted from the
+      // spawned driver's process.env, so a buggy implementation that
+      // injected an `undefined`-valued MYVAR would surface "present" or
+      // a runtime-rejection failure.
+      expect(existsSync(myvarMarker)).toBe(true);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("absent");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-61h2: run() — every recognized option field explicitly
+    // `undefined` is treated as absent. Generator-surface counterpart to
+    // T-API-61h. Pins the same explicit-undefined acceptance contract on
+    // run()'s lazy first-next() snapshot path.
+    // ------------------------------------------------------------------------
+    it("T-API-61h2: run() — every option field explicit undefined treated as absent", async () => {
+      project = await createTempProject();
+      const ranMarker = join(project.dir, "ran.txt");
+      const cwdMarker = join(project.dir, "cwd.txt");
+      const myvarMarker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'ran' > "${ranMarker}"
+/bin/pwd -P > "${cwdMarker}"
+if [ -z "\${MYVAR+x}" ]; then printf 'absent' > "${myvarMarker}"; else printf 'present\\t%s' "$MYVAR" > "${myvarMarker}"; fi
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+delete process.env.MYVAR;
+let threw = false, message = "";
+const outputs = [];
+try {
+  const gen = run("ralph", { cwd: undefined, envFile: undefined, maxIterations: undefined, signal: undefined, env: undefined });
+  for await (const out of gen) { outputs.push(out); }
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ threw, message, outputCount: outputs.length, lastStop: outputs[outputs.length - 1]?.stop ?? null }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(false);
+      expect(parsed.outputCount).toBe(1);
+      expect(parsed.lastStop).toBe(true);
+      expect(existsSync(cwdMarker)).toBe(true);
+      const observedCwd = readFileSync(cwdMarker, "utf-8").trim();
+      expect(observedCwd).toBe(realpathSync(project.dir));
+      expect(existsSync(myvarMarker)).toBe(true);
+      expect(readFileSync(myvarMarker, "utf-8")).toBe("absent");
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.10 — Throwing Option-Field Getters (SPEC §9.1 / §9.5)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.1: "Any exception raised during the snapshot — a throwing
+// option-field getter, throwing entry getter, throwing proxy ownKeys /
+// get trap, or throwing addEventListener — is captured and surfaced via
+// the standard pre-iteration error path on the first next(), not at
+// the call site." SPEC §9.2: "Identical to run() (section 9.1)" —
+// errors surface as promise rejection.
+//
+// T-API-62 series pins the captured-not-escape contract on every option
+// field that the snapshot reads via [[Get]] semantics, plus the
+// throwing-trap branches inside options.env (Proxy ownKeys / get traps,
+// own enumerable getter on an entry).
+
+describe("SPEC: Throwing Option-Field Getters", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-62 / T-API-62a / T-API-62b / T-API-62c / T-API-62d:
+    // Throwing getter on a single options field — generator throws on first
+    // next() with the captured exception. The call site does NOT throw
+    // synchronously. No child is spawned. SPEC §9.1 / §9.5.
+    //
+    // Each variant installs a throwing getter on a different option field
+    // via Object.defineProperty (per the §1.1 getter-construction rule —
+    // never via object spread, since spreading invokes the getter at the
+    // spread expression in the test harness BEFORE run() / runPromise() is
+    // called, which would surface the throw at the test call site rather
+    // than letting the implementation observe it).
+    // ------------------------------------------------------------------------
+    interface ThrowingFieldVariant {
+      id: string;
+      field: "env" | "signal" | "cwd" | "envFile" | "maxIterations";
+      message: string;
+    }
+
+    const throwingFieldVariants: ThrowingFieldVariant[] = [
+      { id: "T-API-62", field: "env", message: "env-getter-boom" },
+      { id: "T-API-62a", field: "signal", message: "signal-getter-boom" },
+      { id: "T-API-62b", field: "cwd", message: "cwd-getter-boom" },
+      { id: "T-API-62c", field: "envFile", message: "envFile-getter-boom" },
+      {
+        id: "T-API-62d",
+        field: "maxIterations",
+        message: "maxIterations-getter-boom",
+      },
+    ];
+
+    for (const v of throwingFieldVariants) {
+      it(`${v.id}: run() with throwing options.${v.field} getter — captured at call site, surfaced on first next()`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const opts = {};
+Object.defineProperty(opts, ${JSON.stringify(v.field)}, {
+  enumerable: true,
+  configurable: true,
+  get() { throw new Error(${JSON.stringify(v.message)}); },
+});
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let threw = false, message = "";
+let isObject = false, hasNext = false, hasReturn = false, hasThrow = false;
+if (!synchronousThrew) {
+  isObject = gen !== null && typeof gen === "object";
+  hasNext = typeof gen.next === "function";
+  hasReturn = typeof gen.return === "function";
+  hasThrow = typeof gen.throw === "function";
+  try {
+    await gen.next();
+  } catch (e) {
+    threw = true;
+    message = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message, isObject, hasNext, hasReturn, hasThrow }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // SPEC §9.1: never throws at the call site; captured into snapshot.
+        expect(parsed.synchronousThrew).toBe(false);
+        // run() returns a generator-shaped object even under invalid options.
+        expect(parsed.isObject).toBe(true);
+        expect(parsed.hasNext).toBe(true);
+        expect(parsed.hasReturn).toBe(true);
+        expect(parsed.hasThrow).toBe(true);
+        // Captured throw surfaces on first next().
+        expect(parsed.threw).toBe(true);
+        expect(parsed.message).toContain(v.message);
+        // No child spawned (pre-iteration error fires before any spawn).
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-62e: Throwing enumerable getter on a NAMED ENTRY inside
+    // options.env — captured during snapshotEnv's value-read pass and
+    // surfaced as a snapshot error on first next().
+    //
+    // Distinct from T-API-62 (throwing getter on options.env itself) — this
+    // test exercises the per-entry value-read path inside snapshotEnv.
+    // ------------------------------------------------------------------------
+    it("T-API-62e: run() — throwing enumerable getter on options.env entry surfaces on first next()", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "spawn-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const env = { A: "a" };
+Object.defineProperty(env, "B", {
+  enumerable: true,
+  configurable: true,
+  get() { throw new Error("entry-getter-boom"); },
+});
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", { env });
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let threw = false, message = "";
+if (!synchronousThrew) {
+  try {
+    await gen.next();
+  } catch (e) {
+    threw = true;
+    message = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.synchronousThrew).toBe(false);
+      expect(parsed.threw).toBe(true);
+      expect(parsed.message).toContain("entry-getter-boom");
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62f: Proxy ownKeys trap that throws while enumerating
+    // options.env — captured during snapshotEnv's Object.keys pass and
+    // surfaced on first next().
+    // ------------------------------------------------------------------------
+    it("T-API-62f: run() — throwing Proxy ownKeys trap on options.env surfaces on first next()", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "spawn-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const env = new Proxy({ A: "a" }, {
+  ownKeys() { throw new Error("ownKeys-trap-boom"); },
+});
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", { env });
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let threw = false, message = "";
+if (!synchronousThrew) {
+  try {
+    await gen.next();
+  } catch (e) {
+    threw = true;
+    message = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.synchronousThrew).toBe(false);
+      expect(parsed.threw).toBe(true);
+      expect(parsed.message).toContain("ownKeys-trap-boom");
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62f2 (observational, NOT a direct conformance pin):
+    // Proxy `getOwnPropertyDescriptor` trap behavior while enumerating
+    // options.env. SPEC §9.5 explicitly leaves the enumerability-
+    // determination strategy implementation-defined ("The strategy used
+    // to determine enumerability may invoke descriptor-related proxy
+    // traps and remains otherwise implementation-defined"), so it does
+    // NOT pin a single conforming outcome for a throwing descriptor trap.
+    // The test passes if EXACTLY ONE of:
+    //   (a) generator threw on first next() with the captured trap
+    //       exception (descriptor trap was invoked and snapshot path
+    //       captured the throw); OR
+    //   (b) snapshot completed without surfacing the trap throw and the
+    //       run reached the spawn step normally (descriptor trap was
+    //       not invoked during enumeration).
+    // The test FAILS on any third outcome (synchronous throw at call
+    // site, error message mismatch, or run produced corrupted env + a
+    // misleading spawn failure).
+    // ------------------------------------------------------------------------
+    it("T-API-62f2: run() — Proxy getOwnPropertyDescriptor trap (observational, two valid outcomes)", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "spawn-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const env = new Proxy({ A: "a" }, {
+  getOwnPropertyDescriptor() { throw new Error("descriptor-trap-boom"); },
+});
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", { env });
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let threw = false, message = "", reachedNext = false;
+if (!synchronousThrew) {
+  try {
+    await gen.next();
+    reachedNext = true;
+  } catch (e) {
+    threw = true;
+    message = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message, reachedNext }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+
+      // SPEC §9.1: run() never throws synchronously at the call site.
+      expect(parsed.synchronousThrew).toBe(false);
+
+      const markerExists = existsSync(marker);
+
+      // Exactly one of the two implementation-defined outcomes.
+      if (parsed.threw) {
+        // Outcome (a): descriptor trap invoked, throw captured and
+        // surfaced as an option-snapshot error on first next().
+        expect(parsed.message).toContain("descriptor-trap-boom");
+        // No child spawned: no marker, no spawn-failure leakage.
+        expect(markerExists).toBe(false);
+      } else {
+        // Outcome (b): descriptor trap not invoked; run reached the
+        // spawn step normally — script ran, marker exists.
+        expect(parsed.reachedNext).toBe(true);
+        expect(markerExists).toBe(true);
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62f3: Throwing Proxy `get` trap on an INCLUDED options.env key
+    // — SPEC §9.5 normatively requires `[[Get]]` semantics for value reads,
+    // so a throwing get trap is captured during the per-key value-read pass
+    // and surfaced on first next(). This pins the value-read axis (vs
+    // T-API-62f's enumeration axis).
+    // ------------------------------------------------------------------------
+    it("T-API-62f3: run() — throwing Proxy get trap on included options.env key surfaces on first next()", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "spawn-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const env = new Proxy({ A: "a", B: "b" }, {
+  ownKeys() { return ["A", "B"]; },
+  getOwnPropertyDescriptor(_t, _key) {
+    return { enumerable: true, configurable: true, value: undefined, writable: true };
+  },
+  get(_t, _key) { throw new Error("get-trap-boom"); },
+});
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", { env });
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let threw = false, message = "";
+if (!synchronousThrew) {
+  try {
+    await gen.next();
+  } catch (e) {
+    threw = true;
+    message = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.synchronousThrew).toBe(false);
+      expect(parsed.threw).toBe(true);
+      expect(parsed.message).toContain("get-trap-boom");
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62g: Throwing getter under runPromise — promise rejects, no
+    // synchronous throw at the call site. SPEC §9.2: "the call itself
+    // always returns a promise."
+    //
+    // Uses a Proxy whose `get` trap throws on the `env` key (per the
+    // TEST-SPEC fixture), exercising the runPromise() surface counterpart
+    // of T-API-62.
+    // ------------------------------------------------------------------------
+    it("T-API-62g: runPromise() with throwing options.env getter — promise rejects, no synchronous throw", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "spawn-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const opts = new Proxy({}, {
+  get(_t, k) { if (k === "env") throw new Error("proxy-get-boom"); return undefined; },
+});
+let synchronousThrew = false, callTimeMessage = "";
+let p;
+try {
+  p = runPromise("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+let isPromise = false;
+if (!synchronousThrew) {
+  isPromise = p !== null && typeof p === "object" && typeof p.then === "function";
+}
+let rejected = false, message = "";
+if (!synchronousThrew) {
+  try {
+    await p;
+  } catch (e) {
+    rejected = true;
+    message = e.message || String(e);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, isPromise, rejected, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // SPEC §9.2: call always returns a promise; never throws synchronously.
+      expect(parsed.synchronousThrew).toBe(false);
+      expect(parsed.isPromise).toBe(true);
+      expect(parsed.rejected).toBe(true);
+      expect(parsed.message).toContain("proxy-get-boom");
+      expect(existsSync(marker)).toBe(false);
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.11 — Option-Field Single-Read Contract (SPEC §9.1 / §9.2 / §9.5)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.1 / §9.2: "Each option field is read at most once per call,
+// and a throwing getter or proxy trap is not re-invoked to retry."
+// T-API-62h series pins the single-read contract on the success path
+// (each non-throwing getter fires exactly once) and the no-retry
+// contract on the throwing path (a throwing getter / trap fires
+// exactly once and is not re-invoked during error surfacing).
+
+describe("SPEC: Option-Field Single-Read Contract", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-62h: run() reads each option field at most once per call.
+    // Counter-based getters on every pinned field. After settlement,
+    // each counter must be exactly 1.
+    // ------------------------------------------------------------------------
+    it("T-API-62h: run() reads each option field at most once per call", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+      const envFilePath = join(project.dir, "valid.env");
+      await writeFile(envFilePath, "OTHER=other-val\n");
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let signalCount = 0, cwdCount = 0, envFileCount = 0, maxIterCount = 0, envCount = 0;
+const opts = {};
+const ac = new AbortController();
+Object.defineProperty(opts, "signal", { enumerable: true, configurable: true, get() { signalCount++; return ac.signal; } });
+Object.defineProperty(opts, "cwd", { enumerable: true, configurable: true, get() { cwdCount++; return ${JSON.stringify(project.dir)}; } });
+Object.defineProperty(opts, "envFile", { enumerable: true, configurable: true, get() { envFileCount++; return ${JSON.stringify(envFilePath)}; } });
+Object.defineProperty(opts, "maxIterations", { enumerable: true, configurable: true, get() { maxIterCount++; return 2; } });
+Object.defineProperty(opts, "env", { enumerable: true, configurable: true, get() { envCount++; return { MYVAR: "value" }; } });
+const gen = run("ralph", opts);
+const outputs = [];
+for await (const o of gen) { outputs.push(o); }
+console.log(JSON.stringify({ signalCount, cwdCount, envFileCount, maxIterCount, envCount, outputs: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.signalCount).toBe(1);
+      expect(parsed.cwdCount).toBe(1);
+      expect(parsed.envFileCount).toBe(1);
+      expect(parsed.maxIterCount).toBe(1);
+      expect(parsed.envCount).toBe(1);
+      expect(parsed.outputs).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("value");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62h2: runPromise() reads each option field at most once per call.
+    // ------------------------------------------------------------------------
+    it("T-API-62h2: runPromise() reads each option field at most once per call", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+      const envFilePath = join(project.dir, "valid.env");
+      await writeFile(envFilePath, "OTHER=other-val\n");
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let signalCount = 0, cwdCount = 0, envFileCount = 0, maxIterCount = 0, envCount = 0;
+const opts = {};
+const ac = new AbortController();
+Object.defineProperty(opts, "signal", { enumerable: true, configurable: true, get() { signalCount++; return ac.signal; } });
+Object.defineProperty(opts, "cwd", { enumerable: true, configurable: true, get() { cwdCount++; return ${JSON.stringify(project.dir)}; } });
+Object.defineProperty(opts, "envFile", { enumerable: true, configurable: true, get() { envFileCount++; return ${JSON.stringify(envFilePath)}; } });
+Object.defineProperty(opts, "maxIterations", { enumerable: true, configurable: true, get() { maxIterCount++; return 2; } });
+Object.defineProperty(opts, "env", { enumerable: true, configurable: true, get() { envCount++; return { MYVAR: "value" }; } });
+const outputs = await runPromise("ralph", opts);
+console.log(JSON.stringify({ signalCount, cwdCount, envFileCount, maxIterCount, envCount, outputs: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.signalCount).toBe(1);
+      expect(parsed.cwdCount).toBe(1);
+      expect(parsed.envFileCount).toBe(1);
+      expect(parsed.maxIterCount).toBe(1);
+      expect(parsed.envCount).toBe(1);
+      expect(parsed.outputs).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("value");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62h3 / T-API-62h4: throwing options.env getter — invoked once,
+    // not retried during error surfacing.
+    // ------------------------------------------------------------------------
+    interface NoRetryFieldVariant {
+      id: string;
+      surface: "run" | "runPromise";
+      field: "env" | "signal";
+      message: string;
+    }
+
+    const noRetryFieldVariants: NoRetryFieldVariant[] = [
+      { id: "T-API-62h3", surface: "run", field: "env", message: "env-getter-boom" },
+      { id: "T-API-62h4", surface: "runPromise", field: "env", message: "env-getter-boom" },
+      { id: "T-API-62h7", surface: "run", field: "signal", message: "signal-getter-boom" },
+      { id: "T-API-62h8", surface: "runPromise", field: "signal", message: "signal-getter-boom" },
+    ];
+
+    for (const v of noRetryFieldVariants) {
+      it(`${v.id}: ${v.surface}() throwing options.${v.field} getter is invoked exactly once (no retry)`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driver =
+          v.surface === "run"
+            ? `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const opts = {};
+Object.defineProperty(opts, ${JSON.stringify(v.field)}, {
+  enumerable: true,
+  configurable: true,
+  get() { count++; throw new Error(${JSON.stringify(v.message)}); },
+});
+let threw = false, message = "";
+try {
+  const gen = run("ralph", opts);
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`
+            : `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const opts = {};
+Object.defineProperty(opts, ${JSON.stringify(v.field)}, {
+  enumerable: true,
+  configurable: true,
+  get() { count++; throw new Error(${JSON.stringify(v.message)}); },
+});
+let rejected = false, message = "";
+try {
+  await runPromise("ralph", opts);
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw: rejected, message }));
+`;
+        const result = await runAPIDriver(runtime, driver);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.threw).toBe(true);
+        expect(parsed.message).toContain(v.message);
+        // Load-bearing: getter invoked exactly once (no retry).
+        expect(parsed.count).toBe(1);
+        // No spawn occurred.
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-62h5 / T-API-62h6: throwing Proxy ownKeys trap inside options.env
+    // — invoked once, not retried.
+    // ------------------------------------------------------------------------
+    interface NoRetryProxyVariant {
+      id: string;
+      surface: "run" | "runPromise";
+    }
+
+    const noRetryOwnKeysVariants: NoRetryProxyVariant[] = [
+      { id: "T-API-62h5", surface: "run" },
+      { id: "T-API-62h6", surface: "runPromise" },
+    ];
+
+    for (const v of noRetryOwnKeysVariants) {
+      it(`${v.id}: ${v.surface}() throwing Proxy ownKeys trap on options.env invoked exactly once (no retry)`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driver =
+          v.surface === "run"
+            ? `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const env = new Proxy({ A: "a" }, {
+  ownKeys() { count++; throw new Error("ownKeys-boom"); },
+});
+let threw = false, message = "";
+try {
+  const gen = run("ralph", { env });
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`
+            : `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const env = new Proxy({ A: "a" }, {
+  ownKeys() { count++; throw new Error("ownKeys-boom"); },
+});
+let rejected = false, message = "";
+try {
+  await runPromise("ralph", { env });
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw: rejected, message }));
+`;
+        const result = await runAPIDriver(runtime, driver);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.threw).toBe(true);
+        expect(parsed.message).toContain("ownKeys-boom");
+        expect(parsed.count).toBe(1);
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-62h9: throwing Proxy `get` trap on included options.env key —
+    // invoked once on the first included key, not retried. Pins the
+    // [[Get]]-semantics no-retry axis on both run surfaces.
+    // ------------------------------------------------------------------------
+    interface NoRetryGetVariant {
+      id: string;
+      surface: "run" | "runPromise";
+    }
+
+    const noRetryGetVariants: NoRetryGetVariant[] = [
+      { id: "T-API-62h9 (run)", surface: "run" },
+      { id: "T-API-62h9 (runPromise)", surface: "runPromise" },
+    ];
+
+    for (const v of noRetryGetVariants) {
+      it(`${v.id}: ${v.surface}() throwing Proxy get trap on options.env included key invoked exactly once (no retry)`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driver =
+          v.surface === "run"
+            ? `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const env = new Proxy({ A: "a", B: "b" }, {
+  ownKeys() { return ["A", "B"]; },
+  getOwnPropertyDescriptor() { return { enumerable: true, configurable: true, value: undefined, writable: true }; },
+  get() { count++; throw new Error("get-trap-boom"); },
+});
+let threw = false, message = "";
+try {
+  const gen = run("ralph", { env });
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`
+            : `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const env = new Proxy({ A: "a", B: "b" }, {
+  ownKeys() { return ["A", "B"]; },
+  getOwnPropertyDescriptor() { return { enumerable: true, configurable: true, value: undefined, writable: true }; },
+  get() { count++; throw new Error("get-trap-boom"); },
+});
+let rejected = false, message = "";
+try {
+  await runPromise("ralph", { env });
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw: rejected, message }));
+`;
+        const result = await runAPIDriver(runtime, driver);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.threw).toBe(true);
+        expect(parsed.message).toContain("get-trap-boom");
+        // Load-bearing: get trap invoked exactly once on the first included
+        // key, then captured. A buggy implementation that retried would
+        // report count > 1; a buggy descriptor-extraction implementation
+        // (count === 0) would never observe the throw and fail on `threw`.
+        expect(parsed.count).toBe(1);
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-62h10 / T-API-62h11: throwing own enumerable getter on a NAMED
+    // ENTRY inside options.env — invoked once, not retried. Structurally
+    // distinct from the env-on-options-object getter (T-API-62h3/h4) and
+    // the proxy variants (T-API-62h5/h6/h9).
+    // ------------------------------------------------------------------------
+    interface NoRetryEntryVariant {
+      id: string;
+      surface: "run" | "runPromise";
+    }
+
+    const noRetryEntryVariants: NoRetryEntryVariant[] = [
+      { id: "T-API-62h10", surface: "run" },
+      { id: "T-API-62h11", surface: "runPromise" },
+    ];
+
+    for (const v of noRetryEntryVariants) {
+      it(`${v.id}: ${v.surface}() throwing own enumerable getter on options.env entry invoked exactly once (no retry)`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const driver =
+          v.surface === "run"
+            ? `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const env = { A: "a" };
+Object.defineProperty(env, "B", {
+  enumerable: true,
+  configurable: true,
+  get() { count++; throw new Error("env-entry-getter-boom"); },
+});
+let threw = false, message = "";
+try {
+  const gen = run("ralph", { env });
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw, message }));
+`
+            : `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let count = 0;
+const env = { A: "a" };
+Object.defineProperty(env, "B", {
+  enumerable: true,
+  configurable: true,
+  get() { count++; throw new Error("env-entry-getter-boom"); },
+});
+let rejected = false, message = "";
+try {
+  await runPromise("ralph", { env });
+} catch (e) {
+  rejected = true;
+  message = e.message || String(e);
+}
+console.log(JSON.stringify({ count, threw: rejected, message }));
+`;
+        const result = await runAPIDriver(runtime, driver);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.threw).toBe(true);
+        expect(parsed.message).toContain("env-entry-getter-boom");
+        expect(parsed.count).toBe(1);
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+  });
+});
+
+describe("SPEC: Option-Field Call-Site Read Timing", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-62i: run() reads cwd, envFile, maxIterations, env getters
+    // synchronously at the call site, before returning the generator.
+    // SPEC §9.1: "run() reads its options argument at the call site as a
+    // synchronous snapshot ... Each option field is read at most once per
+    // call." T-API-62h pins the at-most-once contract via a post-settlement
+    // observation; this test pins call-site invocation timing for all four
+    // non-signal fields with a pre-next() observation point. (Signal
+    // call-site timing is covered separately by T-API-64k.) A buggy
+    // implementation that deferred non-signal option reads to first next()
+    // would observe all four counters at 0 immediately after run() returned
+    // and fail this test. Each getter returns a value the implementation
+    // must consume (project dir for cwd, valid env-file path for envFile,
+    // 1 for maxIterations, { MYVAR: "value" } for env), so the
+    // "must have been read at call site" claim is load-bearing rather than
+    // satisfied by short-circuiting on undefined.
+    // ------------------------------------------------------------------------
+    it("T-API-62i: run() reads cwd, envFile, maxIterations, env getters synchronously at call site", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+      const envFilePath = join(project.dir, "valid.env");
+      await writeFile(envFilePath, "OTHER=other-val\n");
+
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let cwdCount = 0, envFileCount = 0, maxIterCount = 0, envCount = 0;
+const opts = {};
+Object.defineProperty(opts, "cwd", { enumerable: true, configurable: true, get() { cwdCount++; return ${JSON.stringify(project.dir)}; } });
+Object.defineProperty(opts, "envFile", { enumerable: true, configurable: true, get() { envFileCount++; return ${JSON.stringify(envFilePath)}; } });
+Object.defineProperty(opts, "maxIterations", { enumerable: true, configurable: true, get() { maxIterCount++; return 1; } });
+Object.defineProperty(opts, "env", { enumerable: true, configurable: true, get() { envCount++; return { MYVAR: "value" }; } });
+const gen = run("ralph", opts);
+const callTimeCounts = { cwdCount, envFileCount, maxIterCount, envCount };
+const outputs = [];
+for await (const o of gen) { outputs.push(o); }
+const finalCounts = { cwdCount, envFileCount, maxIterCount, envCount };
+console.log(JSON.stringify({ callTimeCounts, finalCounts, outputs: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Each non-signal field read exactly once at call site, BEFORE
+      // first next() drove the generator. A buggy lazy implementation
+      // would observe all four counters at 0 here.
+      expect(parsed.callTimeCounts.cwdCount).toBe(1);
+      expect(parsed.callTimeCounts.envFileCount).toBe(1);
+      expect(parsed.callTimeCounts.maxIterCount).toBe(1);
+      expect(parsed.callTimeCounts.envCount).toBe(1);
+      // (b) Counts unchanged after generator settles — no re-read on
+      // iteration. Complements T-API-62h's at-most-once assertion at the
+      // post-settlement observation point with a stronger pre-next()
+      // observation point.
+      expect(parsed.finalCounts.cwdCount).toBe(1);
+      expect(parsed.finalCounts.envFileCount).toBe(1);
+      expect(parsed.finalCounts.maxIterCount).toBe(1);
+      expect(parsed.finalCounts.envCount).toBe(1);
+      // (c) Run completed normally with the getter return values consumed
+      // (env actually reached the spawned script, maxIterations bounded
+      // the loop, cwd controlled the spawn cwd, envFile loaded successfully).
+      expect(parsed.outputs).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("value");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62i2: runPromise() reads cwd, envFile, maxIterations, env
+    // getters synchronously at the call site, before returning the promise.
+    // SPEC §9.2 inherits §9.1's option-snapshot timing contract verbatim.
+    // The async function body runs synchronously up to its first `await`;
+    // runWithInternal is called BEFORE the first `await Promise.resolve()`,
+    // so the option-snapshot pass fires at the call site even on the
+    // promise-returning surface.
+    // ------------------------------------------------------------------------
+    it("T-API-62i2: runPromise() reads cwd, envFile, maxIterations, env getters synchronously at call site", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "myvar.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${MYVAR:-UNSET}" > "${marker}"
+printf '{"stop":true}'`,
+      );
+      const envFilePath = join(project.dir, "valid.env");
+      await writeFile(envFilePath, "OTHER=other-val\n");
+
+      const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let cwdCount = 0, envFileCount = 0, maxIterCount = 0, envCount = 0;
+const opts = {};
+Object.defineProperty(opts, "cwd", { enumerable: true, configurable: true, get() { cwdCount++; return ${JSON.stringify(project.dir)}; } });
+Object.defineProperty(opts, "envFile", { enumerable: true, configurable: true, get() { envFileCount++; return ${JSON.stringify(envFilePath)}; } });
+Object.defineProperty(opts, "maxIterations", { enumerable: true, configurable: true, get() { maxIterCount++; return 1; } });
+Object.defineProperty(opts, "env", { enumerable: true, configurable: true, get() { envCount++; return { MYVAR: "value" }; } });
+const p = runPromise("ralph", opts);
+const callTimeCounts = { cwdCount, envFileCount, maxIterCount, envCount };
+const outputs = await p;
+const finalCounts = { cwdCount, envFileCount, maxIterCount, envCount };
+console.log(JSON.stringify({ callTimeCounts, finalCounts, outputs: outputs.length }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.callTimeCounts.cwdCount).toBe(1);
+      expect(parsed.callTimeCounts.envFileCount).toBe(1);
+      expect(parsed.callTimeCounts.maxIterCount).toBe(1);
+      expect(parsed.callTimeCounts.envCount).toBe(1);
+      expect(parsed.finalCounts.cwdCount).toBe(1);
+      expect(parsed.finalCounts.envFileCount).toBe(1);
+      expect(parsed.finalCounts.maxIterCount).toBe(1);
+      expect(parsed.finalCounts.envCount).toBe(1);
+      expect(parsed.outputs).toBe(1);
+      expect(readFileSync(marker, "utf-8")).toBe("value");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-62i3: run() — throwing non-signal option-field getter is
+    // invoked exactly once at the call site without escaping synchronously,
+    // and the captured error is surfaced lazily on first next(). SPEC §9.1:
+    // "Any exception raised during the snapshot ... is captured and
+    // surfaced via the standard pre-iteration error path on the first
+    // next(), not at the call site." Parameterized over each non-signal
+    // field {cwd, envFile, maxIterations, env}. The combined
+    // assertion (b) throwCount===1 immediately after run() returns +
+    // (d) throwCount===1 post-next() pins the captured-exactly-once-at-
+    // call-site contract — the new surface this test pins beyond
+    // T-API-62 (error surfaces) and T-API-62h3/h4 (no retry post-next).
+    // ------------------------------------------------------------------------
+    interface ThrowingFieldVariant {
+      field: "cwd" | "envFile" | "maxIterations" | "env";
+      siblingField: "cwd" | "envFile" | "maxIterations" | "env";
+      siblingValueLiteral: "PROJECT_DIR" | "1";
+    }
+
+    const throwingFieldVariantsRun: ThrowingFieldVariant[] = [
+      { field: "cwd", siblingField: "maxIterations", siblingValueLiteral: "1" },
+      { field: "envFile", siblingField: "maxIterations", siblingValueLiteral: "1" },
+      { field: "maxIterations", siblingField: "cwd", siblingValueLiteral: "PROJECT_DIR" },
+      { field: "env", siblingField: "maxIterations", siblingValueLiteral: "1" },
+    ];
+
+    for (const v of throwingFieldVariantsRun) {
+      it(`T-API-62i3: run() throwing options.${v.field} getter invoked exactly once at call site (no synchronous throw, no retry)`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const siblingValueExpr =
+          v.siblingValueLiteral === "PROJECT_DIR"
+            ? JSON.stringify(project.dir)
+            : v.siblingValueLiteral;
+        const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let throwCount = 0, siblingCount = 0;
+const opts = {};
+Object.defineProperty(opts, ${JSON.stringify(v.field)}, { enumerable: true, configurable: true, get() { throwCount++; throw new Error(${JSON.stringify(v.field + "-getter-boom")}); } });
+Object.defineProperty(opts, ${JSON.stringify(v.siblingField)}, { enumerable: true, configurable: true, get() { siblingCount++; return ${siblingValueExpr}; } });
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+const callTimeCounts = { throwCount, siblingCount, synchronousThrew };
+let nextThrew = false, nextMessage = "";
+if (!synchronousThrew) {
+  try {
+    await gen.next();
+  } catch (e) {
+    nextThrew = true;
+    nextMessage = e.message || String(e);
+  }
+}
+const finalCounts = { throwCount, siblingCount };
+console.log(JSON.stringify({ callTimeCounts, callTimeMessage, finalCounts, nextThrew, nextMessage }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at call site — the call returned a
+        // generator, matching SPEC §9.1 "never throws at the call site".
+        expect(parsed.callTimeCounts.synchronousThrew).toBe(false);
+        expect(parsed.callTimeMessage).toBe("");
+        // (b) throwCount === 1 immediately after run() returns: the
+        // throwing getter was invoked once at call time, captured rather
+        // than escaping. A buggy lazy implementation that deferred the
+        // read to first next() would observe throwCount === 0 here.
+        expect(parsed.callTimeCounts.throwCount).toBe(1);
+        // (c) The captured exception surfaces on first next().
+        expect(parsed.nextThrew).toBe(true);
+        expect(parsed.nextMessage).toContain(`${v.field}-getter-boom`);
+        // (d) throwCount === 1 post-next() — the captured error was not
+        // re-derived by re-invoking the getter (no-retry contract).
+        expect(parsed.finalCounts.throwCount).toBe(1);
+        // No child spawn (snapshot error fires pre-iteration before any
+        // spawn — sibling read order is implementation-defined, but
+        // marker MUST NOT exist).
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-62i4: runPromise() — throwing non-signal option-field getter
+    // is invoked exactly once at the call site without escaping
+    // synchronously, and the captured error is surfaced via promise
+    // rejection. runPromise() counterpart to T-API-62i3. SPEC §9.2
+    // "Option-snapshot timing. Identical to run() (section 9.1)" — the
+    // same call-site invocation contract holds; the captured error
+    // surfaces via promise rejection rather than first-next() throw.
+    // The async-function-body-runs-synchronously-up-to-first-await
+    // semantics combined with runWithInternal being called BEFORE the
+    // first `await Promise.resolve()` mean the option-snapshot pass
+    // (and any throwing getter) fires before runPromise() returns the
+    // promise.
+    // ------------------------------------------------------------------------
+    const throwingFieldVariantsRunPromise: ThrowingFieldVariant[] = [
+      { field: "cwd", siblingField: "maxIterations", siblingValueLiteral: "1" },
+      { field: "envFile", siblingField: "maxIterations", siblingValueLiteral: "1" },
+      { field: "maxIterations", siblingField: "cwd", siblingValueLiteral: "PROJECT_DIR" },
+      { field: "env", siblingField: "maxIterations", siblingValueLiteral: "1" },
+    ];
+
+    for (const v of throwingFieldVariantsRunPromise) {
+      it(`T-API-62i4: runPromise() throwing options.${v.field} getter invoked exactly once at call site (no synchronous throw, no retry)`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const siblingValueExpr =
+          v.siblingValueLiteral === "PROJECT_DIR"
+            ? JSON.stringify(project.dir)
+            : v.siblingValueLiteral;
+        const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+let throwCount = 0, siblingCount = 0;
+const opts = {};
+Object.defineProperty(opts, ${JSON.stringify(v.field)}, { enumerable: true, configurable: true, get() { throwCount++; throw new Error(${JSON.stringify(v.field + "-getter-boom")}); } });
+Object.defineProperty(opts, ${JSON.stringify(v.siblingField)}, { enumerable: true, configurable: true, get() { siblingCount++; return ${siblingValueExpr}; } });
+let synchronousThrew = false, callTimeMessage = "";
+let p;
+try {
+  p = runPromise("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e.message || String(e);
+}
+const isPromise = p !== undefined && p !== null && typeof p.then === "function";
+const callTimeCounts = { throwCount, siblingCount, synchronousThrew, isPromise };
+let rejected = false, rejMessage = "";
+if (!synchronousThrew && isPromise) {
+  try {
+    await p;
+  } catch (e) {
+    rejected = true;
+    rejMessage = e.message || String(e);
+  }
+}
+const finalCounts = { throwCount, siblingCount };
+console.log(JSON.stringify({ callTimeCounts, callTimeMessage, finalCounts, rejected, rejMessage }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at call site — runPromise() always
+        // returns a promise per SPEC §9.2.
+        expect(parsed.callTimeCounts.synchronousThrew).toBe(false);
+        expect(parsed.callTimeMessage).toBe("");
+        expect(parsed.callTimeCounts.isPromise).toBe(true);
+        // (b) throwCount === 1 immediately after runPromise() returns:
+        // the throwing getter was invoked once at call time, captured
+        // rather than escaping. A buggy implementation that deferred
+        // option reads to its internal pre-iteration sequence (run after
+        // promise creation) would observe throwCount === 0 here.
+        expect(parsed.callTimeCounts.throwCount).toBe(1);
+        // (c) Promise rejects with the captured exception.
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.rejMessage).toContain(`${v.field}-getter-boom`);
+        // (d) throwCount === 1 post-rejection — no retry.
+        expect(parsed.finalCounts.throwCount).toBe(1);
+        // No child spawn.
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — Generator-Returns-Without-Throwing Invariants
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.1 / §9.2: run() always returns a generator and runPromise() always
+// returns a promise — neither call site ever throws synchronously. Errors
+// surface lazily on first next() (run) or as promise rejections (runPromise).
+// This contract is critical for consumer composition: any call-site throw
+// would break try/catch-around-iteration patterns and Promise.all-style
+// orchestration. T-API-63 and T-API-63a pin the "always-returns" contract
+// across the full enumeration of invalid inputs the SPEC defines, including
+// the throwing-getter pathway and the abort-precedence pathway.
+
+describe("SPEC: Generator-Returns-Without-Throwing Invariants", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  // Each variant exercises a distinct invalid-input branch in
+  // snapshotOptions / runInternal. The errorPattern matches the message
+  // surfaced on first next() / promise rejection. The variants are chosen
+  // so each one routes through a structurally different code path:
+  //   - invalid-target: target validation in runInternal
+  //   - invalid-options-shape: snapshotOptions outer shape gate
+  //   - throwing-option-getter: snapshotOptions per-field try/catch
+  //   - already-aborted-signal: SPEC §9.3 abort-precedence pathway
+  //   - invalid-cwd / invalid-envFile / invalid-env: per-field type gates
+  //   - invalid-maxIterations: integer-range gate
+  // A buggy implementation that broke the call-site contract on any single
+  // branch (e.g., letting a throwing getter escape, or doing eager target
+  // validation that threw at the call site) would fail the corresponding
+  // variant.
+  interface ApiInvalidVariant {
+    id: string;
+    desc: string;
+    setup: string;
+    argsExpr: string;
+    errorPattern: RegExp;
+  }
+
+  const apiInvalidVariants: ApiInvalidVariant[] = [
+    {
+      id: "invalid-target",
+      desc: "non-string target (null)",
+      setup: "",
+      argsExpr: "null, { maxIterations: 1 }",
+      errorPattern: /target/i,
+    },
+    {
+      id: "invalid-options-shape",
+      desc: "null options",
+      setup: "",
+      argsExpr: '"ralph", null',
+      errorPattern: /(options|RunOptions)/i,
+    },
+    {
+      id: "throwing-option-getter",
+      desc: "throwing options.cwd getter",
+      setup:
+        'const opts = {}; Object.defineProperty(opts, "cwd", { enumerable: true, configurable: true, get() { throw new Error("cwd-getter-boom"); } });',
+      argsExpr: '"ralph", opts',
+      errorPattern: /cwd-getter-boom/,
+    },
+    {
+      id: "already-aborted-signal",
+      desc: "pre-aborted AbortController",
+      setup: "const c = new AbortController(); c.abort();",
+      argsExpr: '"ralph", { signal: c.signal, maxIterations: 1 }',
+      errorPattern: /abort/i,
+    },
+    {
+      id: "invalid-cwd",
+      desc: "non-string cwd (number)",
+      setup: "",
+      argsExpr: '"ralph", { cwd: 42, maxIterations: 1 }',
+      errorPattern: /(cwd.*string|RunOptions\.cwd)/i,
+    },
+    {
+      id: "invalid-envFile",
+      desc: "non-string envFile (number)",
+      setup: "",
+      argsExpr: '"ralph", { envFile: 42, maxIterations: 1 }',
+      errorPattern: /(envFile.*string|RunOptions\.envFile)/i,
+    },
+    {
+      id: "invalid-maxIterations",
+      desc: "negative maxIterations (-1)",
+      setup: "",
+      argsExpr: '"ralph", { maxIterations: -1 }',
+      errorPattern: /(maxIterations.*integer|Invalid maxIterations)/i,
+    },
+    {
+      id: "invalid-env",
+      desc: "non-object env (string)",
+      setup: "",
+      argsExpr: '"ralph", { env: "not-an-object", maxIterations: 1 }',
+      errorPattern: /(env.*object|RunOptions\.env)/i,
+    },
+  ];
+
+  forEachRuntime((runtime) => {
+    // ----------------------------------------------------------------------
+    // T-API-63: run() returns a generator without throwing, even under
+    // every invalid-options scenario. Per SPEC §9.1: "run() ... still
+    // returns a generator without throwing" — errors surface on first
+    // next(). For each parameterized invalid input, assert (a) NO
+    // synchronous throw at the call site, (b) returned object honors the
+    // AsyncGenerator interface contract (.next, .return, .throw methods —
+    // critical because consumers may register cleanup via these methods
+    // before driving the generator), (c) the error surfaces on first
+    // next() with a message matching the variant-specific pattern, and
+    // (d) no child is spawned (pre-iteration failures fire before any
+    // spawn, and an abort displaces other pre-iteration failures).
+    //
+    // This is the gateway invariant for the entire T-API-63..69u block:
+    // every subsequent abort-precedence / generator-lifecycle test
+    // depends on this "always-returns-a-generator" contract holding.
+    // ----------------------------------------------------------------------
+    for (const v of apiInvalidVariants) {
+      it(`T-API-63: run() returns a generator without throwing — ${v.desc}`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+${v.setup}
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = run(${v.argsExpr});
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e.message || String(e);
+}
+const isObject = returned !== null && returned !== undefined && (typeof returned === "object" || typeof returned === "function");
+const hasNext = isObject && typeof returned.next === "function";
+const hasReturn = isObject && typeof returned.return === "function";
+const hasThrow = isObject && typeof returned.throw === "function";
+let nextThrew = false, nextMessage = "", nextErrName = "";
+if (!synchronousThrew && hasNext) {
+  try {
+    await returned.next();
+  } catch (e) {
+    nextThrew = true;
+    nextMessage = e.message || String(e);
+    nextErrName = (e && e.name) ? e.name : "";
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, isObject, hasNext, hasReturn, hasThrow, nextThrew, nextMessage, nextErrName }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at call site (SPEC §9.1).
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.callSiteMessage).toBe("");
+        // (b) Returned object honors the AsyncGenerator interface contract.
+        expect(parsed.isObject).toBe(true);
+        expect(parsed.hasNext).toBe(true);
+        expect(parsed.hasReturn).toBe(true);
+        expect(parsed.hasThrow).toBe(true);
+        // (c) Error surfaces on first next() with the expected pattern.
+        expect(parsed.nextThrew).toBe(true);
+        expect(parsed.nextMessage).toMatch(v.errorPattern);
+        // (d) No child spawned — pre-iteration failure fires before spawn
+        // (and SPEC §9.3 abort-precedence displaces other pre-iteration
+        // failures including target validation, env-file load, discovery).
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-63a: runPromise() returns a promise (not a thrown error) for
+    // every invalid input. Per SPEC §9.2: "the call itself always returns
+    // a promise" — even under invalid input the call must not throw
+    // synchronously. For each parameterized invalid input, assert (a) NO
+    // synchronous throw at the call site, (b) returned value is a thenable
+    // (typeof p.then === "function") — pinning the SPEC §9.2
+    // always-returns-promise contract on the surface, (c) the promise
+    // rejects with a message matching the variant-specific pattern, and
+    // (d) no child is spawned.
+    //
+    // The async-function-body-runs-synchronously-up-to-first-await
+    // semantics combined with runWithInternal being called BEFORE the
+    // first `await Promise.resolve()` (run.ts:761/776) mean the
+    // option-snapshot pass + signal capture fire before runPromise()
+    // returns the promise — but the surface contract requires the call
+    // not to throw, regardless of whether the snapshot itself records an
+    // error. A buggy implementation that let an option-shape exception
+    // escape past the async-function boundary would fail this test on
+    // the synchronousThrew assertion.
+    // ----------------------------------------------------------------------
+    for (const v of apiInvalidVariants) {
+      it(`T-API-63a: runPromise() returns a promise without throwing — ${v.desc}`, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "spawn-marker.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+${v.setup}
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = runPromise(${v.argsExpr});
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e.message || String(e);
+}
+const isObject = returned !== null && returned !== undefined && (typeof returned === "object" || typeof returned === "function");
+const isThenable = isObject && typeof returned.then === "function";
+let rejected = false, rejMessage = "", rejErrName = "";
+if (!synchronousThrew && isThenable) {
+  try {
+    await returned;
+  } catch (e) {
+    rejected = true;
+    rejMessage = e.message || String(e);
+    rejErrName = (e && e.name) ? e.name : "";
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, isObject, isThenable, rejected, rejMessage, rejErrName }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at call site (SPEC §9.2).
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.callSiteMessage).toBe("");
+        // (b) Returned value is a thenable — SPEC §9.2 always-returns-promise.
+        expect(parsed.isObject).toBe(true);
+        expect(parsed.isThenable).toBe(true);
+        // (c) Promise rejects with the expected pattern.
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.rejMessage).toMatch(v.errorPattern);
+        // (d) No child spawned.
+        expect(existsSync(marker)).toBe(false);
+      });
+    }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — Signal Semantics — Duck-Typed / Reentrant (SPEC §9.1 / §9.2 / §9.3 / §9.5)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.5 defines AbortSignal-compatibility as a duck-typed contract:
+// any object with a readable boolean `aborted` property AND a callable
+// `addEventListener('abort', listener)` method qualifies as a usable
+// signal. SPEC §9.5 also specifies reentrancy semantics: if
+// `addEventListener` synchronously invokes the registered listener during
+// registration, OR if `aborted` is observed as `true` at any point during
+// call-time capture, loopx treats the signal as aborted. SPEC §9.3
+// further specifies that an invalid `options.signal` (one that fails the
+// SPEC §9.5 contract) is an option-snapshot error, NOT an abort error,
+// and does NOT enter the abort-precedence pathway. The T-API-64 series
+// pins down all of these contract pieces across the {run() / runPromise()}
+// surface matrix.
+
+describe("SPEC: Duck-Typed Signal — Acceptance and Contract Violations", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    while (cleanups.length > 0) {
+      const c = cleanups.pop();
+      if (c) await c().catch(() => {});
+    }
+  });
+
+  // Per TEST-SPEC §4.7 isolation guidance — concurrent test workers must
+  // not race on `/tmp` for `loopx-*` entries. Returns the parent path;
+  // cleanup is registered for afterEach.
+  async function makeIsolatedTmpdirParent(label: string): Promise<string> {
+    const dir = await mkdtemp(join(osTmpdir(), `loopx-test-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  // List `loopx-*` entries directly under `parent`, filtering implementation-
+  // internal helpers that are NOT LOOPX_TMPDIR per AGENT.md / SPEC §7.4.
+  function listLoopxEntries(parent: string): string[] {
+    try {
+      return readdirSync(parent)
+        .filter((e) => e.startsWith("loopx-"))
+        .filter(
+          (e) =>
+            !e.startsWith("loopx-nodepath-shim-") &&
+            !e.startsWith("loopx-bun-jsx-") &&
+            !e.startsWith("loopx-install-") &&
+            !e.startsWith("loopx-test-"),
+        );
+    } catch {
+      return [];
+    }
+  }
+
+  forEachRuntime((runtime) => {
+    // ----------------------------------------------------------------------
+    // T-API-64: Invalid `options.signal` shape (a string) is an option
+    // error, not an abort. Per SPEC §9.3: "An invalid `options` value or
+    // non-`AbortSignal`-compatible `options.signal` captures no signal and
+    // does not enter this pathway" — i.e., the abort-precedence pathway.
+    // ----------------------------------------------------------------------
+    it("T-API-64: invalid options.signal (string) is an option error, not an abort", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const gen = run("ralph", { signal: "not-a-signal", maxIterations: 1 });
+let nextThrew = false, nextMessage = "", looksLikeAbort = false;
+try {
+  await gen.next();
+} catch (e) {
+  nextThrew = true;
+  nextMessage = e?.message || String(e);
+  looksLikeAbort = (e?.name === "AbortError") || /aborted|abortError/i.test(nextMessage);
+}
+console.log(JSON.stringify({ nextThrew, nextMessage, looksLikeAbort }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() throws.
+      expect(parsed.nextThrew).toBe(true);
+      // (b) The error references the invalid signal shape (option error),
+      //     NOT an abort error.
+      expect(parsed.nextMessage).toMatch(/(signal|AbortSignal)/i);
+      expect(parsed.looksLikeAbort).toBe(false);
+      // (c) No child spawned.
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    // ----------------------------------------------------------------------
+    // T-API-64a: Duck-typed signal compatibility — runPromise() surface.
+    // SPEC §9.5: "A non-AbortSignal object that exposes `aborted: boolean`
+    // and `addEventListener('abort', fn)` is accepted as a signal."
+    // ----------------------------------------------------------------------
+    it("T-API-64a: runPromise() accepts duck-typed signal; abort fires correctly", async () => {
+      project = await createTempProject();
+      const ready = join(project.dir, "ready.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `touch "${ready}"
+while true; do sleep 1; done`,
+      );
+      const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync } from "node:fs";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) { if (type === "abort") this._listener = fn; },
+  _fire() { this.aborted = true; this._listener?.(); }
+};
+const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+// Wait for the child to write the ready marker.
+while (!existsSync(${JSON.stringify(ready)})) {
+  await new Promise(r => setTimeout(r, 25));
+}
+duck._fire();
+let rejected = false, message = "", looksLikeAbort = false;
+try { await p; }
+catch (e) {
+  rejected = true;
+  message = e?.message || String(e);
+  looksLikeAbort = (e?.name === "AbortError") || /abort/i.test(message);
+}
+console.log(JSON.stringify({ rejected, message, looksLikeAbort }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, { timeout: 60_000 });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(true);
+      expect(parsed.looksLikeAbort).toBe(true);
+    });
+
+    // ----------------------------------------------------------------------
+    // T-API-64a2: Duck-typed signal compatibility — run() generator surface.
+    // SPEC §9.5's contract applies symmetrically to both surfaces.
+    // ----------------------------------------------------------------------
+    it("T-API-64a2: run() accepts duck-typed signal; abort fires correctly", async () => {
+      project = await createTempProject();
+      const ready = join(project.dir, "ready.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `touch "${ready}"
+while true; do sleep 1; done`,
+      );
+      const driverCode = `
+import { run } from "loopx";
+import { existsSync } from "node:fs";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) { if (type === "abort") this._listener = fn; },
+  _fire() { this.aborted = true; this._listener?.(); }
+};
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+const nextP = gen.next();
+// Swallow rejection now to avoid an unhandled rejection during the wait.
+nextP.catch(() => {});
+// Wait for the child to write the ready marker.
+while (!existsSync(${JSON.stringify(ready)})) {
+  await new Promise(r => setTimeout(r, 25));
+}
+duck._fire();
+let threw = false, message = "", looksLikeAbort = false;
+try { await nextP; }
+catch (e) {
+  threw = true;
+  message = e?.message || String(e);
+  looksLikeAbort = (e?.name === "AbortError") || /abort/i.test(message);
+}
+console.log(JSON.stringify({ threw, message, looksLikeAbort }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, { timeout: 60_000 });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.threw).toBe(true);
+      expect(parsed.looksLikeAbort).toBe(true);
+    });
+
+    // ----------------------------------------------------------------------
+    // T-API-64b: Reentrant addEventListener — duck signal's listener fires
+    // synchronously during registration AND aborted transitions to true.
+    // Conjunction case: SPEC §9.5 reentrancy — loopx treats as aborted.
+    // Parameterized over both surfaces.
+    // ----------------------------------------------------------------------
+    for (const surface of ["runPromise", "run"] as const) {
+      it(`T-API-64b: ${surface}() — reentrant addEventListener (conjunction) treated as aborted`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent("api64b");
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run, runPromise } from "loopx";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") { this.aborted = true; fn(); }
+  }
+};
+let observed = false, message = "", looksLikeAbort = false;
+${surface === "runPromise"
+  ? `try {
+       await runPromise("ralph", {
+         cwd: ${JSON.stringify(project.dir)},
+         signal: duck,
+         maxIterations: 1,
+       });
+     } catch (e) {
+       observed = true;
+       message = e?.message || String(e);
+       looksLikeAbort = (e?.name === "AbortError") || /abort/i.test(message);
+     }`
+  : `try {
+       const gen = run("ralph", {
+         cwd: ${JSON.stringify(project.dir)},
+         signal: duck,
+         maxIterations: 1,
+       });
+       await gen.next();
+     } catch (e) {
+       observed = true;
+       message = e?.message || String(e);
+       looksLikeAbort = (e?.name === "AbortError") || /abort/i.test(message);
+     }`}
+console.log(JSON.stringify({ observed, message, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Abort surfaced.
+        expect(parsed.observed).toBe(true);
+        expect(parsed.looksLikeAbort).toBe(true);
+        // (b) No child spawned.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64b2: Isolated reentrant addEventListener — listener fires
+    // synchronously during registration BUT aborted remains false.
+    // Isolates the FIRST disjunct of SPEC §9.5 reentrancy. A buggy
+    // implementation that gated abort treatment on a post-registration
+    // re-read of `aborted` would fail this test.
+    // ----------------------------------------------------------------------
+    for (const surface of ["runPromise", "run"] as const) {
+      it(`T-API-64b2: ${surface}() — isolated reentrant addEventListener (aborted stays false) treated as aborted`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent("api64b2");
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run, runPromise } from "loopx";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") fn();
+    /* deliberately do NOT mutate this.aborted */
+  }
+};
+let observed = false, message = "", looksLikeAbort = false;
+${surface === "runPromise"
+  ? `try {
+       await runPromise("ralph", {
+         cwd: ${JSON.stringify(project.dir)},
+         signal: duck,
+         maxIterations: 1,
+       });
+     } catch (e) {
+       observed = true;
+       message = e?.message || String(e);
+       looksLikeAbort = (e?.name === "AbortError") || /abort/i.test(message);
+     }`
+  : `try {
+       const gen = run("ralph", {
+         cwd: ${JSON.stringify(project.dir)},
+         signal: duck,
+         maxIterations: 1,
+       });
+       await gen.next();
+     } catch (e) {
+       observed = true;
+       message = e?.message || String(e);
+       looksLikeAbort = (e?.name === "AbortError") || /abort/i.test(message);
+     }`}
+console.log(JSON.stringify({ observed, message, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.observed).toBe(true);
+        expect(parsed.looksLikeAbort).toBe(true);
+        expect(existsSync(marker)).toBe(false);
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64c: Duck-typed signal with `aborted: true` at capture time —
+    // loopx treats as aborted, no child spawned. Second disjunct of SPEC
+    // §9.5 reentrancy isolated.
+    // ----------------------------------------------------------------------
+    for (const surface of ["runPromise", "run"] as const) {
+      it(`T-API-64c: ${surface}() — duck signal with aborted:true at capture treated as aborted`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent("api64c");
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run, runPromise } from "loopx";
+const duck = {
+  aborted: true,
+  addEventListener(type, fn) { if (type === "abort") this._listener = fn; }
+};
+let observed = false, message = "", looksLikeAbort = false;
+${surface === "runPromise"
+  ? `try {
+       await runPromise("ralph", {
+         cwd: ${JSON.stringify(project.dir)},
+         signal: duck,
+         maxIterations: 1,
+       });
+     } catch (e) {
+       observed = true;
+       message = e?.message || String(e);
+       looksLikeAbort = (e?.name === "AbortError") || /abort/i.test(message);
+     }`
+  : `try {
+       const gen = run("ralph", {
+         cwd: ${JSON.stringify(project.dir)},
+         signal: duck,
+         maxIterations: 1,
+       });
+       await gen.next();
+     } catch (e) {
+       observed = true;
+       message = e?.message || String(e);
+       looksLikeAbort = (e?.name === "AbortError") || /abort/i.test(message);
+     }`}
+console.log(JSON.stringify({ observed, message, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.observed).toBe(true);
+        expect(parsed.looksLikeAbort).toBe(true);
+        expect(existsSync(marker)).toBe(false);
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64d: Real pre-aborted AbortSignal. SPEC §9.5 — real
+    // AbortSignal instances passed already-aborted must always be
+    // observed as aborted.
+    // ----------------------------------------------------------------------
+    it("T-API-64d: runPromise() — real pre-aborted AbortSignal rejects with abort error, no child spawned", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api64d");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", looksLikeAbort = false;
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e?.message || String(e);
+  looksLikeAbort = (e?.name === "AbortError") || /abort/i.test(message);
+}
+console.log(JSON.stringify({ rejected, message, looksLikeAbort }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.rejected).toBe(true);
+      expect(parsed.looksLikeAbort).toBe(true);
+      expect(existsSync(marker)).toBe(false);
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+    });
+
+    // ----------------------------------------------------------------------
+    // T-API-64e: Signal getter is read first. Per SPEC §9.1 / §9.2, signal
+    // is read BEFORE other recognized RunOptions fields.
+    // ----------------------------------------------------------------------
+    it("T-API-64e: run() reads options.signal before options.env", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      const driverCode = `
+import { run } from "loopx";
+const order = [];
+const opts = {};
+Object.defineProperty(opts, "signal", {
+  enumerable: true,
+  get() { order.push("signal"); return undefined; }
+});
+Object.defineProperty(opts, "env", {
+  enumerable: true,
+  get() { order.push("env"); return undefined; }
+});
+opts.maxIterations = 1;
+process.chdir(${JSON.stringify(project.dir)});
+const gen = run("ralph", opts);
+try { for await (const _ of gen) {} } catch {}
+console.log(JSON.stringify({ order }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.order[0]).toBe("signal");
+    });
+
+    // ----------------------------------------------------------------------
+    // T-API-64f / T-API-64g / T-API-64i / T-API-64i2 / T-API-64i3 /
+    // T-API-64i4: addEventListener-half contract violations on the duck
+    // signal. Three violation modes: throws-on-call (f/g), non-callable
+    // (i/i2), missing (i3/i4) — each on both run surfaces. All must
+    // surface as option-snapshot errors, NOT abort errors.
+    // ----------------------------------------------------------------------
+    interface ContractViolationVariant {
+      id: string;
+      desc: string;
+      duckExpr: string;
+    }
+    const aeContractViolations: ContractViolationVariant[] = [
+      {
+        id: "throwing-addEventListener",
+        desc: "addEventListener throws on call",
+        duckExpr: `{ aborted: false, addEventListener() { throw new Error("listener-register-failed"); } }`,
+      },
+      {
+        id: "non-callable-addEventListener",
+        desc: "addEventListener is non-callable (string)",
+        duckExpr: `{ aborted: false, addEventListener: "not-a-function" }`,
+      },
+      {
+        id: "missing-addEventListener",
+        desc: "addEventListener property missing entirely",
+        duckExpr: `{ aborted: false }`,
+      },
+    ];
+
+    for (const v of aeContractViolations) {
+      const runId =
+        v.id === "throwing-addEventListener" ? "T-API-64f"
+        : v.id === "non-callable-addEventListener" ? "T-API-64i"
+        : "T-API-64i3";
+      it(`${runId}: run() — ${v.desc} surfaces as option-snapshot error, not abort`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64-${v.id}-run`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const duck = ${v.duckExpr};
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let nextThrew = false, nextMessage = "", nextErrName = "", looksLikeAbort = false;
+if (!synchronousThrew && returned && typeof returned.next === "function") {
+  try {
+    await returned.next();
+  } catch (e) {
+    nextThrew = true;
+    nextMessage = e?.message || String(e);
+    nextErrName = e?.name || "";
+    looksLikeAbort = (nextErrName === "AbortError") || /^abort(ed)?$/i.test(nextMessage);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, nextThrew, nextMessage, nextErrName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at call site.
+        expect(parsed.synchronousThrew).toBe(false);
+        // (b) First next() throws.
+        expect(parsed.nextThrew).toBe(true);
+        // (c) The error references the invalid signal (option error).
+        expect(parsed.nextMessage).toMatch(/(signal|listener-register-failed|AbortSignal)/i);
+        // (d) NOT an abort error.
+        expect(parsed.looksLikeAbort).toBe(false);
+        // (e) No child spawned.
+        expect(existsSync(marker)).toBe(false);
+        // (f) No tmpdir created.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+
+      const promiseId =
+        v.id === "throwing-addEventListener" ? "T-API-64g"
+        : v.id === "non-callable-addEventListener" ? "T-API-64i2"
+        : "T-API-64i4";
+      it(`${promiseId}: runPromise() — ${v.desc} rejects with option-snapshot error, not abort`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64-${v.id}-promise`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const duck = ${v.duckExpr};
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let rejected = false, rejMessage = "", rejErrName = "", looksLikeAbort = false;
+if (!synchronousThrew && returned && typeof returned.then === "function") {
+  try {
+    await returned;
+  } catch (e) {
+    rejected = true;
+    rejMessage = e?.message || String(e);
+    rejErrName = e?.name || "";
+    looksLikeAbort = (rejErrName === "AbortError") || /^abort(ed)?$/i.test(rejMessage);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, rejected, rejMessage, rejErrName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.rejMessage).toMatch(/(signal|listener-register-failed|AbortSignal)/i);
+        expect(parsed.looksLikeAbort).toBe(false);
+        expect(existsSync(marker)).toBe(false);
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64h / T-API-64h2: Throwing aborted getter — duck signal whose
+    // aborted getter throws on read surfaces as an option-snapshot error.
+    // ----------------------------------------------------------------------
+    for (const surface of ["run", "runPromise"] as const) {
+      const id = surface === "run" ? "T-API-64h" : "T-API-64h2";
+      it(`${id}: ${surface}() — throwing aborted getter surfaces as option-snapshot error`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64h-${surface}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run, runPromise } from "loopx";
+const duck = { addEventListener() {} };
+Object.defineProperty(duck, "aborted", {
+  enumerable: true,
+  get() { throw new Error("aborted-getter-failed"); }
+});
+let synchronousThrew = false, callSiteMessage = "";
+let observed = false, message = "", errName = "", looksLikeAbort = false;
+try {
+${surface === "run"
+  ? `  const gen = run("ralph", {
+       cwd: ${JSON.stringify(project.dir)},
+       signal: duck,
+       maxIterations: 1,
+     });
+     try { await gen.next(); }
+     catch (e) {
+       observed = true;
+       message = e?.message || String(e);
+       errName = e?.name || "";
+       looksLikeAbort = (errName === "AbortError") || /^abort(ed)?$/i.test(message);
+     }`
+  : `  const p = runPromise("ralph", {
+       cwd: ${JSON.stringify(project.dir)},
+       signal: duck,
+       maxIterations: 1,
+     });
+     try { await p; }
+     catch (e) {
+       observed = true;
+       message = e?.message || String(e);
+       errName = e?.name || "";
+       looksLikeAbort = (errName === "AbortError") || /^abort(ed)?$/i.test(message);
+     }`}
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, observed, message, errName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.observed).toBe(true);
+        // The error references either the invalid signal or wraps the
+        // getter exception.
+        expect(parsed.message).toMatch(/(signal|aborted-getter-failed|AbortSignal)/i);
+        expect(parsed.looksLikeAbort).toBe(false);
+        expect(existsSync(marker)).toBe(false);
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64j / T-API-64j2: Missing or non-boolean `aborted` —
+    // parameterized over (a) missing, (b) undefined, (c) "false" string,
+    // (d) 0 number, (e) null, (f) 1 truthy number, (g) {} object.
+    // Each must surface as option-snapshot error (NO coercion, NO abort).
+    // ----------------------------------------------------------------------
+    interface AbortedShapeVariant {
+      label: string;
+      duckExpr: string;
+    }
+    const abortedVariants: AbortedShapeVariant[] = [
+      { label: "missing", duckExpr: `{ addEventListener() {} }` },
+      { label: "undefined", duckExpr: `{ aborted: undefined, addEventListener() {} }` },
+      { label: "string-false", duckExpr: `{ aborted: "false", addEventListener() {} }` },
+      { label: "zero", duckExpr: `{ aborted: 0, addEventListener() {} }` },
+      { label: "null", duckExpr: `{ aborted: null, addEventListener() {} }` },
+      { label: "one", duckExpr: `{ aborted: 1, addEventListener() {} }` },
+      { label: "object", duckExpr: `{ aborted: {}, addEventListener() {} }` },
+    ];
+
+    for (const v of abortedVariants) {
+      it(`T-API-64j (${v.label}): run() — non-boolean aborted (${v.label}) surfaces as option-snapshot error, not abort`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64j-${v.label}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const duck = ${v.duckExpr};
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let nextThrew = false, nextMessage = "", nextErrName = "", looksLikeAbort = false;
+if (!synchronousThrew && returned && typeof returned.next === "function") {
+  try {
+    await returned.next();
+  } catch (e) {
+    nextThrew = true;
+    nextMessage = e?.message || String(e);
+    nextErrName = e?.name || "";
+    looksLikeAbort = (nextErrName === "AbortError") || /^abort(ed)?$/i.test(nextMessage);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, nextThrew, nextMessage, nextErrName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.nextThrew).toBe(true);
+        expect(parsed.nextMessage).toMatch(/(signal|AbortSignal)/i);
+        expect(parsed.looksLikeAbort).toBe(false);
+        expect(existsSync(marker)).toBe(false);
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+
+      it(`T-API-64j2 (${v.label}): runPromise() — non-boolean aborted (${v.label}) rejects with option-snapshot error, not abort`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64j2-${v.label}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const duck = ${v.duckExpr};
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let rejected = false, rejMessage = "", rejErrName = "", looksLikeAbort = false;
+if (!synchronousThrew && returned && typeof returned.then === "function") {
+  try {
+    await returned;
+  } catch (e) {
+    rejected = true;
+    rejMessage = e?.message || String(e);
+    rejErrName = e?.name || "";
+    looksLikeAbort = (rejErrName === "AbortError") || /^abort(ed)?$/i.test(rejMessage);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, rejected, rejMessage, rejErrName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.rejMessage).toMatch(/(signal|AbortSignal)/i);
+        expect(parsed.looksLikeAbort).toBe(false);
+        expect(existsSync(marker)).toBe(false);
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64k / T-API-64k2 / T-API-64k3 — Call-Site Capture Timing.
+    // SPEC §9.1 / §9.2 / §9.5: options.signal is read at the call site as a
+    // synchronous snapshot; both run surfaces capture before returning. The
+    // duck-typed-signal pathway provides a clean observation surface — a real
+    // AbortSignal.addEventListener is not directly observable as a counter
+    // without monkey-patching the prototype. A buggy implementation that
+    // deferred the signal read (and addEventListener registration) until the
+    // first next() / iteration would still pass abort-during-iteration tests
+    // (the listener would register lazily but in time to observe a same-tick
+    // abort), yet would break the call-site snapshot contract — observable
+    // here via the synchronous post-call counter / order-array assertion.
+    // ----------------------------------------------------------------------
+
+    // T-API-64k: run() registers signal.addEventListener('abort', …) at the
+    // call site, observable synchronously after run() returns and before any
+    // consumer interaction with the generator.
+    it("T-API-64k: run() registers addEventListener at call site (synchronous snapshot)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      const driverCode = `
+import { run } from "loopx";
+let count = 0;
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") { count++; this._listener = fn; }
+  }
+};
+let synchronousThrew = false, callSiteMessage = "";
+let gen;
+try {
+  gen = run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+const countAfterCall = count;
+let drainErr = "";
+if (gen) {
+  try { for await (const _ of gen) {} } catch (e) { drainErr = e?.message || String(e); }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, countAfterCall, drainErr }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) NO synchronous throw at the call site.
+      expect(parsed.synchronousThrew).toBe(false);
+      expect(parsed.callSiteMessage).toBe("");
+      // (b) addEventListener was invoked synchronously during run() — count
+      //     observable === 1 BEFORE any generator interaction.
+      expect(parsed.countAfterCall).toBe(1);
+    });
+
+    // T-API-64k2: runPromise() registers signal.addEventListener('abort', …)
+    // at the call site, observable synchronously after runPromise() returns
+    // and before the promise is awaited. SPEC §9.2 specifies eager snapshot
+    // timing for runPromise — the synchronous body of runPromise runs before
+    // its first `await Promise.resolve()` microtask boundary, so the listener
+    // registration is observable to the caller before the returned promise
+    // suspends.
+    it("T-API-64k2: runPromise() registers addEventListener at call site (synchronous snapshot)", async () => {
+      project = await createTempProject();
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '{"stop":true}'`,
+      );
+      const driverCode = `
+import { runPromise } from "loopx";
+let count = 0;
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") { count++; this._listener = fn; }
+  }
+};
+let synchronousThrew = false, callSiteMessage = "";
+let p;
+try {
+  p = runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+const countAfterCall = count;
+let awaitErr = "";
+if (p) {
+  try { await p; } catch (e) { awaitErr = e?.message || String(e); }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, countAfterCall, awaitErr }));
+`;
+      const result = await runAPIDriver(runtime, driverCode);
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) NO synchronous throw at the call site.
+      expect(parsed.synchronousThrew).toBe(false);
+      expect(parsed.callSiteMessage).toBe("");
+      // (b) addEventListener was invoked synchronously during runPromise() —
+      //     count observable === 1 BEFORE awaiting the returned promise.
+      expect(parsed.countAfterCall).toBe(1);
+    });
+
+    // T-API-64k3: options.signal is READ before every other recognized
+    // RunOptions field, on both run surfaces, against every other field
+    // independently. 8 cells: {run, runPromise} × {env, cwd, envFile,
+    // maxIterations}. The SPEC ordering rule is on the field READ, not on
+    // listener-registration completion — we assert order[0] === "signal"
+    // only, never "addEventListener fired before <other-field>".
+    interface OrderingFieldVariant {
+      field: "env" | "cwd" | "envFile" | "maxIterations";
+      returnExpr: string;
+    }
+    const orderingFields: OrderingFieldVariant[] = [
+      { field: "env", returnExpr: "undefined" },
+      { field: "cwd", returnExpr: "undefined" },
+      { field: "envFile", returnExpr: "undefined" },
+      { field: "maxIterations", returnExpr: "1" },
+    ];
+
+    for (const v of orderingFields) {
+      it(`T-API-64k3 (run, ${v.field}): run() reads options.signal before options.${v.field}`, async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        const driverCode = `
+import { run } from "loopx";
+const order = [];
+const duckSignal = { aborted: false, addEventListener() {} };
+const opts = {};
+Object.defineProperty(opts, "signal", {
+  enumerable: true,
+  get() { order.push("signal"); return duckSignal; }
+});
+Object.defineProperty(opts, ${JSON.stringify(v.field)}, {
+  enumerable: true,
+  get() { order.push(${JSON.stringify(v.field)}); return ${v.returnExpr}; }
+});
+process.chdir(${JSON.stringify(project.dir)});
+let synchronousThrew = false, callSiteMessage = "";
+let gen;
+try {
+  gen = run("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+const orderAfterCall = order.slice();
+let drainErr = "";
+if (gen) {
+  try { for await (const _ of gen) {} } catch (e) { drainErr = e?.message || String(e); }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, orderAfterCall, drainErr }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at the call site.
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.callSiteMessage).toBe("");
+        // (b) signal getter ran first across all recognized outer fields.
+        expect(parsed.orderAfterCall[0]).toBe("signal");
+        // (c) The other field's getter also ran (sanity — proves the
+        //     parameterized field is actually being read by the snapshot).
+        expect(parsed.orderAfterCall).toContain(v.field);
+      });
+
+      it(`T-API-64k3 (runPromise, ${v.field}): runPromise() reads options.signal before options.${v.field}`, async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '{"stop":true}'`,
+        );
+        const driverCode = `
+import { runPromise } from "loopx";
+const order = [];
+const duckSignal = { aborted: false, addEventListener() {} };
+const opts = {};
+Object.defineProperty(opts, "signal", {
+  enumerable: true,
+  get() { order.push("signal"); return duckSignal; }
+});
+Object.defineProperty(opts, ${JSON.stringify(v.field)}, {
+  enumerable: true,
+  get() { order.push(${JSON.stringify(v.field)}); return ${v.returnExpr}; }
+});
+process.chdir(${JSON.stringify(project.dir)});
+let synchronousThrew = false, callSiteMessage = "";
+let p;
+try {
+  p = runPromise("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+const orderAfterCall = order.slice();
+let awaitErr = "";
+if (p) {
+  try { await p; } catch (e) { awaitErr = e?.message || String(e); }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, orderAfterCall, awaitErr }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at the call site.
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.callSiteMessage).toBe("");
+        // (b) signal getter ran first across all recognized outer fields.
+        expect(parsed.orderAfterCall[0]).toBe("signal");
+        // (c) The other field's getter also ran (sanity — proves the
+        //     parameterized field is actually being read by the snapshot).
+        expect(parsed.orderAfterCall).toContain(v.field);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64m / T-API-64m2 — Throwing addEventListener getter on duck
+    // signal surfaces as option-snapshot error. SPEC §9.5: addEventListener
+    // "must be callable and returns without throwing" — the contract is also
+    // violated when the property *read itself* throws, before loopx can
+    // attempt to invoke the result. Distinguishes from T-API-64f / T-API-64g
+    // (function that throws when called); here loopx never observes any
+    // value because the read raises. A buggy implementation that read the
+    // property as a separate uncaught expression before wrapping the call
+    // site in try/catch would let the getter exception escape past the
+    // snapshot-capture boundary.
+    // ----------------------------------------------------------------------
+    for (const surface of ["run", "runPromise"] as const) {
+      const id = surface === "run" ? "T-API-64m" : "T-API-64m2";
+      it(`${id}: ${surface}() — throwing addEventListener getter surfaces as option-snapshot error`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64m-${surface}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run, runPromise } from "loopx";
+const duck = { aborted: false };
+Object.defineProperty(duck, "addEventListener", {
+  enumerable: true,
+  get() { throw new Error("ae-getter-boom"); }
+});
+let synchronousThrew = false, callSiteMessage = "";
+let observed = false, message = "", errName = "", looksLikeAbort = false;
+try {
+${surface === "run"
+  ? `  const gen = run("ralph", {
+       cwd: ${JSON.stringify(project.dir)},
+       signal: duck,
+       maxIterations: 1,
+     });
+     try { await gen.next(); }
+     catch (e) {
+       observed = true;
+       message = e?.message || String(e);
+       errName = e?.name || "";
+       looksLikeAbort = (errName === "AbortError") || /^abort(ed)?$/i.test(message);
+     }`
+  : `  const p = runPromise("ralph", {
+       cwd: ${JSON.stringify(project.dir)},
+       signal: duck,
+       maxIterations: 1,
+     });
+     try { await p; }
+     catch (e) {
+       observed = true;
+       message = e?.message || String(e);
+       errName = e?.name || "";
+       looksLikeAbort = (errName === "AbortError") || /^abort(ed)?$/i.test(message);
+     }`}
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, observed, message, errName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at call site.
+        expect(parsed.synchronousThrew).toBe(false);
+        // (b) Surface observed an option-snapshot error.
+        expect(parsed.observed).toBe(true);
+        // (c) Error references invalid signal or wraps the getter exception.
+        expect(parsed.message).toMatch(/(signal|ae-getter-boom|AbortSignal)/i);
+        // (d) NOT an abort error.
+        expect(parsed.looksLikeAbort).toBe(false);
+        // (e) No child spawned.
+        expect(existsSync(marker)).toBe(false);
+        // (f) No tmpdir created.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64n / T-API-64n2 — Prototype-inherited duck signal (aborted +
+    // addEventListener exposed via the prototype, not own properties) is
+    // accepted as AbortSignal-compatible. SPEC §9.5 uses "expose", not
+    // "has own"; an implementation that probed via Object.hasOwn(...) would
+    // reject this duck despite it satisfying the structural contract.
+    // ----------------------------------------------------------------------
+    for (const surface of ["run", "runPromise"] as const) {
+      const id = surface === "run" ? "T-API-64n" : "T-API-64n2";
+      it(`${id}: ${surface}() accepts prototype-inherited duck signal; abort fires correctly`, async () => {
+        project = await createTempProject();
+        const ready = join(project.dir, "ready.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `touch "${ready}"
+while true; do sleep 1; done`,
+        );
+        const driverCode = `
+import { run, runPromise } from "loopx";
+import { existsSync } from "node:fs";
+class DuckSignal {
+  addEventListener(type, fn) { if (type === "abort") this._listener = fn; }
+  _fire() { this.aborted = true; this._listener?.(); }
+}
+DuckSignal.prototype.aborted = false;
+const duck = new DuckSignal();
+// Sanity: confirm both contract halves are exposed via the prototype only.
+const ownHasAborted = Object.prototype.hasOwnProperty.call(duck, "aborted");
+const ownHasAEL = Object.prototype.hasOwnProperty.call(duck, "addEventListener");
+${surface === "run"
+  ? `const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+const nextP = gen.next();
+nextP.catch(() => {});
+while (!existsSync(${JSON.stringify(ready)})) {
+  await new Promise(r => setTimeout(r, 25));
+}
+duck._fire();
+let observed = false, message = "", errName = "", looksLikeAbort = false;
+try { await nextP; }
+catch (e) {
+  observed = true;
+  message = e?.message || String(e);
+  errName = e?.name || "";
+  looksLikeAbort = (errName === "AbortError") || /abort/i.test(message);
+}`
+  : `const p = runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1,
+});
+while (!existsSync(${JSON.stringify(ready)})) {
+  await new Promise(r => setTimeout(r, 25));
+}
+duck._fire();
+let observed = false, message = "", errName = "", looksLikeAbort = false;
+try { await p; }
+catch (e) {
+  observed = true;
+  message = e?.message || String(e);
+  errName = e?.name || "";
+  looksLikeAbort = (errName === "AbortError") || /abort/i.test(message);
+}`}
+console.log(JSON.stringify({ ownHasAborted, ownHasAEL, observed, message, errName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, { timeout: 60_000 });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // Sanity: duck halves resolved through the prototype, not own props.
+        expect(parsed.ownHasAborted).toBe(false);
+        expect(parsed.ownHasAEL).toBe(false);
+        // (a) Abort surfaced via the inherited contract.
+        expect(parsed.observed).toBe(true);
+        expect(parsed.looksLikeAbort).toBe(true);
+        // (b) The error is an abort error, NOT an option-snapshot error
+        //     (no RunOptions.signal pre-iteration shape error).
+        expect(parsed.message).not.toMatch(/RunOptions\.signal/i);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64o / T-API-64o2 — Duck signal without `removeEventListener`
+    // accepted under normal (stop:true) completion. SPEC §9.5 explicitly
+    // states removeEventListener is NOT part of the AbortSignal-compatibility
+    // contract. A buggy implementation that called signal.removeEventListener
+    // unguarded on settlement would TypeError on a duck lacking it — but
+    // only on the normal-completion path (the abort path may early-return
+    // before reaching the unconditional remove). T-API-64a covers the
+    // abort-path acceptance; this closes the normal-completion-path cell.
+    // ----------------------------------------------------------------------
+    for (const surface of ["run", "runPromise"] as const) {
+      const id = surface === "run" ? "T-API-64o" : "T-API-64o2";
+      it(`${id}: ${surface}() accepts duck signal without removeEventListener under normal completion`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64o-${surface}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const driverCode = `
+import { run, runPromise } from "loopx";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) { if (type === "abort") this._listener = fn; }
+};
+// Sanity: removeEventListener must be entirely absent (own + prototype).
+const hasRemove = "removeEventListener" in duck;
+let observed = false, errMessage = "", errName = "";
+let outputs = [];
+let resolved = false;
+${surface === "run"
+  ? `try {
+  const gen = run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 5,
+  });
+  for await (const out of gen) { outputs.push(out); }
+  resolved = true;
+} catch (e) {
+  observed = true;
+  errMessage = e?.message || String(e);
+  errName = e?.name || "";
+}`
+  : `try {
+  outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 5,
+  });
+  resolved = true;
+} catch (e) {
+  observed = true;
+  errMessage = e?.message || String(e);
+  errName = e?.name || "";
+}`}
+console.log(JSON.stringify({ hasRemove, observed, errMessage, errName, outputs, resolved }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // Sanity: duck genuinely lacks removeEventListener.
+        expect(parsed.hasRemove).toBe(false);
+        // (a) Settled cleanly without throwing.
+        expect(parsed.observed).toBe(false);
+        expect(parsed.errMessage).toBe("");
+        expect(parsed.resolved).toBe(true);
+        // (b) Script ran exactly once and emitted stop:true (proves the loop
+        //     body was entered and reached a normal completion, not a
+        //     pre-iteration short-circuit).
+        expect(existsSync(marker)).toBe(true);
+        expect(parsed.outputs).toHaveLength(1);
+        expect(parsed.outputs[0]).toMatchObject({ stop: true });
+        // (c) No warning / error mentioning removeEventListener in stderr.
+        expect(result.stderr).not.toMatch(/removeEventListener/);
+        expect(result.stderr).not.toMatch(/TypeError/);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64p / T-API-64p2 / T-API-64p3 — `aborted: true` × non-compatible
+    // shape. SPEC §9.3: an `options.signal` that fails the SPEC §9.5
+    // compatibility contract captures no signal and does NOT enter the
+    // abort-precedence pathway, regardless of `aborted`'s value. A buggy
+    // implementation that read `aborted` first and routed `aborted: true`
+    // through abort precedence without first verifying full signal
+    // compatibility would surface an abort error here — instead the result
+    // must be an option-snapshot error. T-API-64p3 closes the maxIterations:0
+    // diagonal: option-shape validation is independent of iteration count
+    // (must NOT be skipped under `maxIterations: 0`, and must NOT route
+    // through abort precedence under any iteration count).
+    // ----------------------------------------------------------------------
+    interface AbortedTrueShapeVariant {
+      label: string;
+      duckExpr: string;
+    }
+    const abortedTrueShapeVariants: AbortedTrueShapeVariant[] = [
+      { label: "missing-AEL", duckExpr: `{ aborted: true }` },
+      {
+        label: "non-callable-AEL",
+        duckExpr: `{ aborted: true, addEventListener: 123 }`,
+      },
+      {
+        label: "throwing-AEL",
+        duckExpr: `{ aborted: true, addEventListener() { throw new Error("listener-register-failed"); } }`,
+      },
+    ];
+
+    for (const v of abortedTrueShapeVariants) {
+      it(`T-API-64p (${v.label}): run() — aborted:true × ${v.label} surfaces as option-snapshot error, not abort`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64p-${v.label}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const duck = ${v.duckExpr};
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let nextThrew = false, nextMessage = "", nextErrName = "", looksLikeAbort = false;
+if (!synchronousThrew && returned && typeof returned.next === "function") {
+  try {
+    await returned.next();
+  } catch (e) {
+    nextThrew = true;
+    nextMessage = e?.message || String(e);
+    nextErrName = e?.name || "";
+    looksLikeAbort = (nextErrName === "AbortError") || /^abort(ed)?$/i.test(nextMessage);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, nextThrew, nextMessage, nextErrName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw at call site.
+        expect(parsed.synchronousThrew).toBe(false);
+        // (b) First next() throws.
+        expect(parsed.nextThrew).toBe(true);
+        // (c) Error references invalid signal or wraps the per-variant
+        //     exception (variant c).
+        expect(parsed.nextMessage).toMatch(/(signal|listener-register-failed|AbortSignal)/i);
+        // (d) NOT an abort error — even though aborted:true, the shape gate
+        //     fires first and routes through option-snapshot path.
+        expect(parsed.looksLikeAbort).toBe(false);
+        // (e) No child spawned.
+        expect(existsSync(marker)).toBe(false);
+        // (f) No tmpdir created.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+
+      it(`T-API-64p2 (${v.label}): runPromise() — aborted:true × ${v.label} rejects with option-snapshot error, not abort`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64p2-${v.label}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const duck = ${v.duckExpr};
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let rejected = false, rejMessage = "", rejErrName = "", looksLikeAbort = false;
+if (!synchronousThrew && returned && typeof returned.then === "function") {
+  try {
+    await returned;
+  } catch (e) {
+    rejected = true;
+    rejMessage = e?.message || String(e);
+    rejErrName = e?.name || "";
+    looksLikeAbort = (rejErrName === "AbortError") || /^abort(ed)?$/i.test(rejMessage);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, rejected, rejMessage, rejErrName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.rejMessage).toMatch(/(signal|listener-register-failed|AbortSignal)/i);
+        expect(parsed.looksLikeAbort).toBe(false);
+        expect(existsSync(marker)).toBe(false);
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+
+      // T-API-64p3 (run-surface variant): same shape variants under
+      // maxIterations:0 — option-shape validation is iteration-count-
+      // independent.
+      it(`T-API-64p3 (${v.label}, run): run() — aborted:true × ${v.label} × maxIterations:0 surfaces as option-snapshot error`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64p3-${v.label}-run`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const duck = ${v.duckExpr};
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 0,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let nextThrew = false, doneSilently = false, nextMessage = "", nextErrName = "", looksLikeAbort = false;
+if (!synchronousThrew && returned && typeof returned.next === "function") {
+  try {
+    const r = await returned.next();
+    if (r && r.done === true) { doneSilently = true; }
+  } catch (e) {
+    nextThrew = true;
+    nextMessage = e?.message || String(e);
+    nextErrName = e?.name || "";
+    looksLikeAbort = (nextErrName === "AbortError") || /^abort(ed)?$/i.test(nextMessage);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, nextThrew, doneSilently, nextMessage, nextErrName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw.
+        expect(parsed.synchronousThrew).toBe(false);
+        // (b) Did NOT silently complete with done:true (would mean
+        //     option-shape validation was skipped under maxIterations:0).
+        expect(parsed.doneSilently).toBe(false);
+        // (c) Threw an option-snapshot error.
+        expect(parsed.nextThrew).toBe(true);
+        expect(parsed.nextMessage).toMatch(/(signal|listener-register-failed|AbortSignal)/i);
+        // (d) NOT an abort error.
+        expect(parsed.looksLikeAbort).toBe(false);
+        // (e) No child spawned.
+        expect(existsSync(marker)).toBe(false);
+        // (f) No tmpdir created (option-shape errors fire before tmpdir
+        //     creation per SPEC §7.1 step-6 ordering).
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+
+      // T-API-64p3 (runPromise-surface variant): same shape variants under
+      // maxIterations:0 on the eager-promise surface.
+      it(`T-API-64p3 (${v.label}, runPromise): runPromise() — aborted:true × ${v.label} × maxIterations:0 rejects with option-snapshot error`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api64p3-${v.label}-promise`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const duck = ${v.duckExpr};
+let synchronousThrew = false, callSiteMessage = "";
+let returned;
+try {
+  returned = runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 0,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let rejected = false, resolvedSilently = false, rejMessage = "", rejErrName = "", looksLikeAbort = false;
+let resolvedValue;
+if (!synchronousThrew && returned && typeof returned.then === "function") {
+  try {
+    resolvedValue = await returned;
+    resolvedSilently = true;
+  } catch (e) {
+    rejected = true;
+    rejMessage = e?.message || String(e);
+    rejErrName = e?.name || "";
+    looksLikeAbort = (rejErrName === "AbortError") || /^abort(ed)?$/i.test(rejMessage);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, rejected, resolvedSilently, resolvedValue, rejMessage, rejErrName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.synchronousThrew).toBe(false);
+        // Did NOT silently resolve.
+        expect(parsed.resolvedSilently).toBe(false);
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.rejMessage).toMatch(/(signal|listener-register-failed|AbortSignal)/i);
+        expect(parsed.looksLikeAbort).toBe(false);
+        expect(existsSync(marker)).toBe(false);
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toHaveLength(0);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // T-API-64q / T-API-64q2 — `addEventListener` returning a non-undefined
+    // value is accepted. SPEC §9.5 requires "callable and returns without
+    // throwing"; it does NOT require the return value to be `undefined`. A
+    // buggy implementation that asserted `result === undefined` after
+    // invoking addEventListener would reject conforming duck signals whose
+    // addEventListener happens to return a value (string, number, the
+    // listener fn itself, or any other non-undefined result).
+    // ----------------------------------------------------------------------
+    interface NonUndefinedReturnVariant {
+      label: string;
+      returnExpr: string;
+    }
+    const nonUndefinedReturnVariants: NonUndefinedReturnVariant[] = [
+      { label: "string", returnExpr: `"registered"` },
+      { label: "number", returnExpr: `123` },
+      { label: "self-listener", returnExpr: `fn` },
+      { label: "object", returnExpr: `{ ok: true }` },
+    ];
+
+    for (const v of nonUndefinedReturnVariants) {
+      it(`T-API-64q (${v.label}): run() accepts duck signal whose addEventListener returns ${v.label}`, async () => {
+        project = await createTempProject();
+        const ready = join(project.dir, "ready.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `touch "${ready}"
+while true; do sleep 1; done`,
+        );
+        const driverCode = `
+import { run } from "loopx";
+import { existsSync } from "node:fs";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") { this._listener = fn; }
+    return ${v.returnExpr};
+  },
+  _fire() { this.aborted = true; this._listener?.(); }
+};
+let synchronousThrew = false, callSiteMessage = "";
+let gen;
+try {
+  gen = run("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let observed = false, message = "", errName = "", looksLikeAbort = false, scriptReachedReady = false;
+if (gen) {
+  const nextP = gen.next();
+  nextP.catch(() => {});
+  while (!existsSync(${JSON.stringify(ready)})) {
+    await new Promise(r => setTimeout(r, 25));
+  }
+  scriptReachedReady = true;
+  duck._fire();
+  try { await nextP; }
+  catch (e) {
+    observed = true;
+    message = e?.message || String(e);
+    errName = e?.name || "";
+    looksLikeAbort = (errName === "AbortError") || /abort/i.test(message);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, scriptReachedReady, observed, message, errName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, { timeout: 60_000 });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) NO synchronous throw — duck signal accepted at call site.
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.callSiteMessage).toBe("");
+        // (b) Script reached "ready" before the abort fired.
+        expect(parsed.scriptReachedReady).toBe(true);
+        // (c) Generator threw an abort error (NOT an option-shape /
+        //     signal-validation error).
+        expect(parsed.observed).toBe(true);
+        expect(parsed.looksLikeAbort).toBe(true);
+        expect(parsed.message).not.toMatch(/RunOptions\.signal/i);
+      });
+
+      it(`T-API-64q2 (${v.label}): runPromise() accepts duck signal whose addEventListener returns ${v.label}`, async () => {
+        project = await createTempProject();
+        const ready = join(project.dir, "ready.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `touch "${ready}"
+while true; do sleep 1; done`,
+        );
+        const driverCode = `
+import { runPromise } from "loopx";
+import { existsSync } from "node:fs";
+const duck = {
+  aborted: false,
+  addEventListener(type, fn) {
+    if (type === "abort") { this._listener = fn; }
+    return ${v.returnExpr};
+  },
+  _fire() { this.aborted = true; this._listener?.(); }
+};
+let synchronousThrew = false, callSiteMessage = "";
+let p;
+try {
+  p = runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1,
+  });
+} catch (e) {
+  synchronousThrew = true;
+  callSiteMessage = e?.message || String(e);
+}
+let rejected = false, message = "", errName = "", looksLikeAbort = false, scriptReachedReady = false;
+if (p) {
+  while (!existsSync(${JSON.stringify(ready)})) {
+    await new Promise(r => setTimeout(r, 25));
+  }
+  scriptReachedReady = true;
+  duck._fire();
+  try { await p; }
+  catch (e) {
+    rejected = true;
+    message = e?.message || String(e);
+    errName = e?.name || "";
+    looksLikeAbort = (errName === "AbortError") || /abort/i.test(message);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callSiteMessage, scriptReachedReady, rejected, message, errName, looksLikeAbort }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, { timeout: 60_000 });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.synchronousThrew).toBe(false);
+        expect(parsed.callSiteMessage).toBe("");
+        expect(parsed.scriptReachedReady).toBe(true);
+        expect(parsed.rejected).toBe(true);
+        expect(parsed.looksLikeAbort).toBe(true);
+        expect(parsed.message).not.toMatch(/RunOptions\.signal/i);
+      });
+    }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9.x — Abort Precedence over Pre-Iteration Failures
+// (T-API-65 series; SPEC §9.3 / §9.5 / §9.1 / §9.2)
+// ═════════════════════════════════════════════════════════════
+//
+// SPEC §9.3 "Abort precedence over pre-iteration failures": Once a usable
+// AbortSignal has been captured (a real AbortSignal or a duck-typed signal
+// that satisfies the §9.5 contract), an already-aborted signal at call time
+// (or one that aborts during pre-iteration before the first child spawn)
+// displaces all other pre-iteration failure modes on the same call:
+// captured option-snapshot errors, target argument / target syntax
+// validation, .loopx/ discovery, env-file loading, target resolution, and
+// tmpdir creation.
+//
+// Carve-outs explicitly excluded by SPEC §9.3:
+//   - "An invalid options value or non-AbortSignal-compatible options.signal
+//     captures no signal and does not enter this pathway."
+//
+// Coverage in this block (foundational subset of T-API-65 series):
+//   T-API-65   runPromise + pre-aborted + missing envFile → abort error
+//   T-API-65a  runPromise + pre-aborted + invalid target  → abort error
+//   T-API-65a2 (param)    + non-string target argument matrix → abort error
+//   T-API-65b  runPromise + pre-aborted + missing .loopx/ → abort error
+//   T-API-65c  runPromise + pre-aborted + unreadable envFile (mode 000) → abort error
+//   T-API-65d  runPromise + pre-aborted + tmpdir creation fail → abort error
+//   T-API-65e  run        + invalid signal shape + missing envFile → NOT abort
+//   T-API-65f  run        + pre-aborted + throwing later-option getter → abort error
+//   T-API-65g  runPromise + pre-aborted + throwing later-option getter → abort error
+//   T-API-65h  runPromise + pre-aborted + missing workflow → abort error
+//   T-API-65i  runPromise + pre-aborted + missing script → abort error
+//   T-API-65j  runPromise + pre-aborted + missing default index → abort error
+//   T-API-65k  run        + pre-aborted + missing envFile → abort error
+//   T-API-65l  run        + pre-aborted + invalid target  → abort error
+//   T-API-65m  run        + pre-aborted + missing .loopx/ → abort error
+//   T-API-65n  run        + pre-aborted + tmpdir creation fail → abort error
+//   T-API-65o  run        + pre-aborted + target-resolution variants → abort error
+//   T-API-65p  runPromise + pre-aborted + 16-variant option-snapshot matrix → abort error
+//   T-API-65q  run        + pre-aborted + 16-variant option-snapshot matrix → abort error
+//   T-API-65r  {runPromise,run} + pre-aborted + unreadable global env (mode 000) → abort error
+//   T-API-65v  runPromise + invalid options wrapper + aborted signal → NOT abort
+//   T-API-65w  run        + invalid options wrapper + aborted signal → NOT abort
+//   T-API-65u  {runPromise,run} + reentrant duck (conjunction) + later failure → abort
+//   T-API-65u2 {runPromise,run} + reentrant duck (first-disjunct) + later failure → abort
+//   T-API-65u3 {runPromise,run} + already-aborted duck + later failure → abort
+//
+// All abort-path tests additionally verify (per SPEC §7.4):
+//   (b) no child was spawned (marker file absent)
+//   (c) no `loopx-*` tmpdir created under the test-isolated TMPDIR parent
+//
+// The cleanup-residue assertion is scoped to a per-test-isolated TMPDIR
+// parent (mkdtemp-based) per TEST-SPEC §4.7 isolation guidance — concurrent
+// test workers must not race on /tmp for `loopx-*` entries.
+
+describe("SPEC: Abort Precedence over Pre-Iteration Failures", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    for (const cleanup of cleanups.splice(0)) {
+      await cleanup().catch(() => {});
+    }
+  });
+
+  // Creates a writable test-isolated TMPDIR parent under the system tmpdir.
+  async function makeIsolatedTmpdirParent(label: string): Promise<string> {
+    const dir = await mkdtemp(join(osTmpdir(), `loopx-test-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  // List `loopx-*` entries directly under `parent`, filtering implementation-
+  // internal helpers (per AGENT.md / SPEC §7.4).
+  function listLoopxEntries(parent: string): string[] {
+    try {
+      return readdirSync(parent)
+        .filter((e) => e.startsWith("loopx-"))
+        .filter(
+          (e) =>
+            !e.startsWith("loopx-nodepath-shim-") &&
+            !e.startsWith("loopx-bun-jsx-") &&
+            !e.startsWith("loopx-install-") &&
+            !e.startsWith("loopx-test-"),
+        );
+    } catch {
+      return [];
+    }
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-65: runPromise() — pre-aborted signal beats missing env-file.
+    // SPEC §9.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-65: runPromise() pre-aborted signal beats missing env-file", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65v");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    envFile: "nonexistent.env",
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with the abort error, not the env-file error.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/nonexistent\.env|envFile|env file|ENOENT/i);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65a: runPromise() — pre-aborted signal beats invalid target.
+    // SPEC §9.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-65a: runPromise() pre-aborted signal beats invalid target", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65a");
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise(":bad", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with the abort error, not invalid-target.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/invalid.*target|target.*syntax|:bad/i);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65b: runPromise() — pre-aborted signal beats missing .loopx/
+    // discovery failure. SPEC §9.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-65b: runPromise() pre-aborted signal beats missing .loopx/ discovery", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65b");
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with the abort error, not the discovery error.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/\.loopx|discover|no.*such.*directory/i);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65c: runPromise() — pre-aborted signal beats env-file-load
+    // failure when the local env file is unreadable (mode 000). SPEC §8.2
+    // classifies an unreadable env file as a real pre-iteration failure
+    // (distinct from the missing-env-file path covered by T-API-65 and
+    // distinct from malformed-line warnings, which are non-fatal per
+    // SPEC §8.1). SPEC §9.3 abort-precedence over pre-iteration failures
+    // covers env-file loading explicitly. SPEC §9.3, §9.5, §8.2.
+    //
+    // Skipped under root: mode 000 does not block reads for uid 0.
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-API-65c: runPromise() pre-aborted signal beats unreadable env-file (mode 000)",
+      async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent("api65c");
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const envFilePath = join(project.dir, "unreadable.env");
+        await writeEnvFileRaw(envFilePath, "FOO=bar\n");
+        await chmod(envFilePath, 0o000);
+        cleanups.push(async () => {
+          await chmod(envFilePath, 0o644).catch(() => {});
+        });
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    envFile: "unreadable.env",
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected with the abort error, not the
+        //     env-file-unreadable error (EACCES / read failure).
+        expect(parsed.rejected).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(
+          /unreadable\.env|envFile|env file|EACCES|permission/i,
+        );
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      },
+    );
+
+    // ------------------------------------------------------------------------
+    // T-API-65r-promise: runPromise() — pre-aborted signal beats env-file-
+    // load failure when the GLOBAL env file ($XDG_CONFIG_HOME/loopx/env) is
+    // unreadable (mode 000). SPEC §9.3 explicitly displaces "env-file
+    // loading" failures, and SPEC §7.1 step 2 covers both local `-e` and
+    // global env files in that loading step. T-API-65 / 65k cover MISSING
+    // local env file; T-API-65c covers UNREADABLE LOCAL env file (mode 000);
+    // this test covers the unreadable GLOBAL env file sub-path on the
+    // programmatic abort-precedence surface (counterpart to T-TMP-12-global-
+    // env-unreadable on the no-abort surface, and T-SIG-30 on the CLI
+    // signal-wins surface).
+    //
+    // Per SPEC §8.1, XDG_CONFIG_HOME is read from the inherited environment
+    // (NOT from RunOptions.env), so the harness injects it via the driver's
+    // inherited env (the `env:` parameter to runAPIDriver — same channel
+    // that delivers TMPDIR).
+    //
+    // Skipped under root: mode 000 does not block reads for uid 0.
+    // SPEC §9.3, §9.5, §9.1, §8.1, §7.1.
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-API-65r-promise: runPromise() pre-aborted signal beats unreadable global env file (mode 000)",
+      async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent("api65r-promise");
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const xdg = join(project.dir, "xdg-config");
+        await mkdir(join(xdg, "loopx"), { recursive: true });
+        const globalEnv = join(xdg, "loopx", "env");
+        await writeFile(globalEnv, "FOO=bar\n", "utf-8");
+        await chmod(globalEnv, 0o000);
+        cleanups.push(async () => {
+          await chmod(globalEnv, 0o644).catch(() => {});
+        });
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdg },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected with the abort error, not the
+        //     global-env-file-unreadable error (EACCES / read failure).
+        expect(parsed.rejected).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(
+          /xdg|global.*env|loopx\/env|EACCES|permission/i,
+        );
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      },
+    );
+
+    // ------------------------------------------------------------------------
+    // T-API-65r-generator: run() — pre-aborted signal beats env-file-load
+    // failure when the GLOBAL env file is unreadable (mode 000). Generator-
+    // surface counterpart to T-API-65r-promise. SPEC §9.3, §9.5, §9.1, §8.1,
+    // §7.1.
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-API-65r-generator: run() pre-aborted signal beats unreadable global env file (mode 000)",
+      async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent("api65r-generator");
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        const xdg = join(project.dir, "xdg-config");
+        await mkdir(join(xdg, "loopx"), { recursive: true });
+        const globalEnv = join(xdg, "loopx", "env");
+        await writeFile(globalEnv, "FOO=bar\n", "utf-8");
+        await chmod(globalEnv, 0o000);
+        cleanups.push(async () => {
+          await chmod(globalEnv, 0o644).catch(() => {});
+        });
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdg },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First next() threw abort error, not the global-env-file-
+        //     unreadable error (EACCES / read failure).
+        expect(parsed.threw).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(
+          /xdg|global.*env|loopx\/env|EACCES|permission/i,
+        );
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      },
+    );
+
+    // ------------------------------------------------------------------------
+    // T-API-65s-promise: runPromise() — pre-aborted signal beats sibling-
+    // validation discovery failure. SPEC §5.4 makes a same-base-name collision
+    // in any sibling workflow under `.loopx/` fatal for `loopx run <target>`,
+    // regardless of whether the target is the broken workflow. SPEC §9.3
+    // names `.loopx/` discovery failures as one of the displaced pre-iteration
+    // failure modes; T-API-65b / 65m close the missing-`.loopx/` existence
+    // sub-path on the abort-precedence surface, this closes the sibling-
+    // validation sub-path — the second SPEC §5.1 / §5.4 discovery-failure
+    // path — completing the abort-precedence × discovery × surface matrix.
+    // The counterparts on other surfaces are T-TMP-12-programmatic-discovery-
+    // validation (no-abort) and T-SIG-25 (CLI signal-wins).
+    //
+    // Fixture pairs a valid target workflow `ralph/index.sh` with a sibling
+    // `broken` workflow whose `check.sh` + `check.ts` pair is a SPEC §5.2
+    // base-name collision (fatal in run mode per SPEC §5.4). With a pre-
+    // aborted signal, abort precedence (SPEC §9.3) must displace the
+    // collision error; a buggy implementation that surfaced the collision
+    // anyway, or that spawned a child / created a tmpdir on the discovery-
+    // validation path before observing the abort, would fail one of (a)–(c).
+    // SPEC §9.3, §9.5, §9.1, §5.1, §5.2, §5.4.
+    // ------------------------------------------------------------------------
+    it("T-API-65s-promise: runPromise() pre-aborted signal beats sibling-validation discovery failure", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65s-promise");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+      // Sibling workflow with a base-name collision: broken/check.sh + broken/check.ts.
+      await createBashWorkflowScript(
+        project,
+        "broken",
+        "check",
+        `printf '{"stop":true}'`,
+      );
+      await createWorkflowScript(
+        project,
+        "broken",
+        "check",
+        ".ts",
+        `console.log('{"stop":true}');`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with the abort error, not the
+      //     sibling-validation collision error.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(
+        /collision|broken|check\.(sh|ts)|multiple files/i,
+      );
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65s-generator: run() — pre-aborted signal beats sibling-validation
+    // discovery failure. Generator-surface counterpart to T-API-65s-promise;
+    // first `next()` throws the abort error rather than the collision error.
+    // SPEC §9.3, §9.5, §9.1, §5.1, §5.2, §5.4.
+    // ------------------------------------------------------------------------
+    it("T-API-65s-generator: run() pre-aborted signal beats sibling-validation discovery failure", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65s-generator");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+      // Sibling workflow with a base-name collision: broken/check.sh + broken/check.ts.
+      await createBashWorkflowScript(
+        project,
+        "broken",
+        "check",
+        `printf '{"stop":true}'`,
+      );
+      await createWorkflowScript(
+        project,
+        "broken",
+        "check",
+        ".ts",
+        `console.log('{"stop":true}');`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() threw abort error, not the sibling-validation
+      //     collision error.
+      expect(parsed.threw).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(
+        /collision|broken|check\.(sh|ts)|multiple files/i,
+      );
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65t: pre-aborted signal beats invalid-name discovery validation
+    // on both surfaces. Companion to T-API-65s: 65s exercises the same-base-
+    // name collision sibling-validation failure path (SPEC §5.2), this test
+    // exercises the name-restriction sibling-validation failure path
+    // (SPEC §5.3) as a distinct sub-path. Both share the SPEC §5.4
+    // "fatal in run mode" classification, but the error class and the
+    // validation code path are distinct (collision vs. name-pattern). A
+    // buggy implementation that routed one path through abort precedence
+    // and the other not would pass T-API-65s yet surface the
+    // name-restriction error here.
+    //
+    // Parameterized over (a) `.loopx/-bad-workflow/index.sh` invalid
+    // workflow name and (b) `.loopx/broken/-bad.sh` invalid script name,
+    // each driven on both `runPromise()` and `run()` surfaces (4 sub-cases
+    // total). The valid target workflow `ralph/index.sh` is present in
+    // every fixture so the sibling-validation error is the only failure
+    // that would surface absent abort precedence. Per SPEC §9.3 / §9.5 /
+    // §9.1 / §5.1 / §5.3 / §5.4, the abort-precedence rule must displace
+    // the name-restriction error.
+    //
+    // Per-variant assertions (each surface):
+    //   (a) the surfaced rejection / throw is the abort error — NOT the
+    //       configured name-restriction error (positive: AbortError name
+    //       OR /abort/i in message; negative: name-restriction marker
+    //       absent from message);
+    //   (b) no child was spawned (marker file absent);
+    //   (c) no `loopx-*` tmpdir was created under the isolated parent.
+    // ------------------------------------------------------------------------
+    type InvalidNameVariant = {
+      id: string;
+      label: string;
+      // Builds the invalid sibling in the project; the valid target
+      // `ralph/index.sh` is created separately by every test.
+      setup: (project: TempProject) => Promise<void>;
+      // Pattern that the displaced name-restriction error would mention
+      // but the abort error must NOT match.
+      negativePattern: RegExp;
+    };
+
+    const INVALID_NAME_VARIANTS: InvalidNameVariant[] = [
+      {
+        id: "a",
+        label: "invalid workflow name (-bad-workflow)",
+        setup: async (project) => {
+          await createBashWorkflowScript(
+            project,
+            "-bad-workflow",
+            "index",
+            `printf '{"stop":true}'`,
+          );
+        },
+        negativePattern: /-bad-workflow|invalid|must match|\[a-zA-Z0-9_\]/i,
+      },
+      {
+        id: "b",
+        label: "invalid script name (broken/-bad.sh)",
+        setup: async (project) => {
+          await createBashWorkflowScript(
+            project,
+            "broken",
+            "-bad",
+            `printf '{"stop":true}'`,
+          );
+        },
+        negativePattern: /-bad|invalid|must match|\[a-zA-Z0-9_\]/i,
+      },
+    ];
+
+    for (const v of INVALID_NAME_VARIANTS) {
+      it(`T-API-65t-promise (${v.id}): runPromise() pre-aborted signal beats discovery name-restriction failure — ${v.label}`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(
+          `api65t-promise-${v.id}`,
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        await v.setup(project);
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected with the abort error, not the discovery
+        //     name-restriction error.
+        expect(parsed.rejected).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(v.negativePattern);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      });
+
+      it(`T-API-65t-generator (${v.id}): run() pre-aborted signal beats discovery name-restriction failure — ${v.label}`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(
+          `api65t-generator-${v.id}`,
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        await v.setup(project);
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First next() threw abort error, not the discovery
+        //     name-restriction error.
+        expect(parsed.threw).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(v.negativePattern);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-65d: runPromise() — pre-aborted signal beats tmpdir-creation
+    // failure. SPEC §9.3, §9.5, §7.4.
+    //
+    // Skipped under root: chmod 0500 does not block writes for uid 0.
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-API-65d: runPromise() pre-aborted signal beats tmpdir-creation failure",
+      async () => {
+        project = await createTempProject();
+        const unwritableParent = await mkdtemp(
+          join(osTmpdir(), "loopx-test-api65d-unwritable-"),
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        cleanups.push(async () => {
+          await chmod(unwritableParent, 0o700).catch(() => {});
+          await rm(unwritableParent, { recursive: true, force: true }).catch(
+            () => {},
+          );
+        });
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        await chmod(unwritableParent, 0o500);
+
+        const before = listLoopxEntries(unwritableParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: unwritableParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected with abort error, not tmpdir-creation error.
+        expect(parsed.rejected).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(/EACCES|mkdtemp|tmpdir.*creat/i);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the unwritable parent.
+        const after = listLoopxEntries(unwritableParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      },
+    );
+
+    // ------------------------------------------------------------------------
+    // T-API-65e: run() — invalid options.signal shape does NOT enter the
+    // abort pathway. The error must reference the invalid signal shape (or
+    // the missing env file — impl-defined ordering between those two), but
+    // NOT be an abort error. SPEC §9.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-65e: run() invalid signal shape does not enter abort pathway", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65e");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: "not-a-signal",
+  envFile: "nonexistent.env",
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "", looksLikeAbort = false;
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+  // Anchored "abort"/"aborted" word match avoids matching the SPEC-mandated
+  // shape error message "must be an AbortSignal-compatible object" (which
+  // naturally contains the substring "Abort"). The default abort error has
+  // name === "AbortError" and message "The operation was aborted." — both
+  // captured by this guard.
+  looksLikeAbort = (name === "AbortError") || /\\babort(ed)?\\b/i.test(message);
+}
+console.log(JSON.stringify({ threw, message, name, looksLikeAbort }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) The error surfaces (not the abort path).
+      expect(parsed.threw).toBe(true);
+      // (b) The surfaced error is NOT an abort error — SPEC §9.3 carve-out
+      //     rules out abort precedence for non-AbortSignal-compatible signal.
+      expect(parsed.looksLikeAbort).toBe(false);
+      // The error message should reference the invalid signal shape OR the
+      //   missing env-file path (impl-defined ordering between those two).
+      expect(parsed.message).toMatch(
+        /signal|RunOptions|nonexistent\.env|envFile|env file|ENOENT/i,
+      );
+      // (c) No child was spawned.
+      expect(existsSync(marker)).toBe(false);
+      // (d) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65k: run() — pre-aborted signal beats missing env-file.
+    // Generator-surface counterpart to T-API-65. SPEC §9.3, §9.5, §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-65k: run() pre-aborted signal beats missing env-file", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65k");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  envFile: "nonexistent.env",
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() throws abort error, not env-file error.
+      expect(parsed.threw).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/nonexistent\.env|envFile|env file|ENOENT/i);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65l: run() — pre-aborted signal beats invalid target.
+    // Generator-surface counterpart to T-API-65a. SPEC §9.3, §9.5, §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-65l: run() pre-aborted signal beats invalid target", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65l");
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run(":bad", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() throws abort error, not invalid-target error.
+      expect(parsed.threw).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/invalid.*target|target.*syntax|:bad/i);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65m: run() — pre-aborted signal beats missing .loopx/ discovery.
+    // Generator-surface counterpart to T-API-65b. SPEC §9.3, §9.5, §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-65m: run() pre-aborted signal beats missing .loopx/ discovery", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65m");
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() throws abort error, not discovery error.
+      expect(parsed.threw).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/\.loopx|discover|no.*such.*directory/i);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65n: run() — pre-aborted signal beats tmpdir-creation failure.
+    // Generator-surface counterpart to T-API-65d. SPEC §9.3, §9.5, §9.1, §7.4.
+    // ------------------------------------------------------------------------
+    it.skipIf(IS_ROOT)(
+      "T-API-65n: run() pre-aborted signal beats tmpdir-creation failure",
+      async () => {
+        project = await createTempProject();
+        const unwritableParent = await mkdtemp(
+          join(osTmpdir(), "loopx-test-api65n-unwritable-"),
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        cleanups.push(async () => {
+          await chmod(unwritableParent, 0o700).catch(() => {});
+          await rm(unwritableParent, { recursive: true, force: true }).catch(
+            () => {},
+          );
+        });
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+        await chmod(unwritableParent, 0o500);
+
+        const before = listLoopxEntries(unwritableParent);
+        const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: unwritableParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First next() throws abort error, not tmpdir-creation error.
+        expect(parsed.threw).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(/EACCES|mkdtemp|tmpdir.*creat/i);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the unwritable parent.
+        const after = listLoopxEntries(unwritableParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      },
+    );
+
+    // ------------------------------------------------------------------------
+    // T-API-65f: run() — pre-aborted signal beats a throwing later-option
+    // getter. SPEC §9.1 / §9.5 specify that `options.signal` is read FIRST
+    // before any other option field, so an already-aborted signal is captured
+    // before any subsequent option-field read can produce a snapshot
+    // exception. SPEC §9.3 then displaces the captured option-snapshot error
+    // (in this case, a throwing `env` getter) with the abort error.
+    //
+    // A buggy implementation that read `options.env` before `options.signal`
+    // would surface the env-getter exception ("env-getter-boom") instead and
+    // fail this test. This directly exercises the "signal first" rule rather
+    // than merely inferring it from the abort-vs-other-pre-iteration-failure
+    // precedence tests (T-API-65 / 65a / 65b / 65d / 65k / 65l / 65m / 65n).
+    // SPEC §9.1, §9.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-65f: run() pre-aborted signal beats throwing later-option getter", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65f");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const throwingOpts = {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  get env() { throw new Error("env-getter-boom"); },
+  maxIterations: 1,
+};
+const gen = run("ralph", throwingOpts);
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() throws abort error, not the env-getter-boom error.
+      expect(parsed.threw).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/env-getter-boom/);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65g: runPromise() — pre-aborted signal beats a throwing
+    // later-option getter. Promise-surface counterpart to T-API-65f.
+    // Per SPEC §9.2 "Option-snapshot timing" ("Identical to run(): each
+    // option field read at most once, options.signal first"), the same
+    // signal-first rule holds under runPromise(). SPEC §9.2, §9.3, §9.5.
+    // ------------------------------------------------------------------------
+    it("T-API-65g: runPromise() pre-aborted signal beats throwing later-option getter", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65g");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+const throwingOpts = {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  get env() { throw new Error("env-getter-boom"); },
+  maxIterations: 1,
+};
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", throwingOpts);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with abort error, not the env-getter-boom error.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(/env-getter-boom/);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65p / T-API-65q: pre-aborted signal beats option-snapshot
+    // failures across the full enumerated `maxIterations` set plus a
+    // representative selection of remaining option-snapshot families.
+    //
+    // SPEC §9.3 abort-precedence rule displaces "captured option-snapshot
+    // errors" once a usable signal is captured (already-aborted at call
+    // time, or aborts during pre-iteration). T-API-65f / T-API-65g cover one
+    // representative option-snapshot variant (throwing `env` getter) on each
+    // surface; this matrix extends that coverage by parameterizing
+    // EXHAUSTIVELY over every invalid `maxIterations` value (i)–(vi) and
+    // REPRESENTATIVELY over the remaining option-snapshot families
+    // (vii)–(xvi):
+    //
+    //   (i)–(vi)  invalid `maxIterations` (-1, 1.5, NaN, Infinity, null, "1")
+    //   (vii)     non-string `cwd` (42)
+    //   (viii)    throwing `cwd` getter
+    //   (ix)      non-string `envFile` (42)
+    //   (x)       throwing `envFile` getter
+    //   (xi)      invalid `env` shape ([])
+    //   (xii)     non-string env entry value ({ KEY: 42 })
+    //   (xiii)    throwing enumerable getter inside `env`
+    //   (xiv)     throwing `env` proxy `ownKeys` trap
+    //   (xv)      throwing `env` proxy `get` trap on an included key
+    //   (xvi)     throwing `options.maxIterations` getter
+    //
+    // Construction rule (SPEC §9.5 "snapshot-time throws" / TEST-SPEC §1.3
+    // "test-construction sanity for getter/proxy variants"): for getter /
+    // proxy variants (viii, x, xiii, xiv, xv, xvi), the throwing accessor
+    // or proxy is installed directly on the object passed to runPromise() /
+    // run() — NEVER via object-spread of an accessor-bearing object —
+    // because spreading invokes the accessor in the test harness BEFORE the
+    // call, surfacing the exception at the call site rather than letting
+    // loopx capture it via the SPEC §9.5 snapshot path.
+    //
+    // T-API-65p drives the runPromise() surface; T-API-65q drives run().
+    // Together they close the abort-precedence-over-option-snapshot
+    // category across both API surfaces. Invalid `options.signal` is
+    // excluded per SPEC §9.3 carve-out (ii) and is covered by T-API-65e
+    // separately. The full invalid `env` shape/value matrix is intentionally
+    // not exhaustively re-parameterized — those validation paths converge
+    // on a single "captured option-snapshot error" code path and tests at
+    // the env-shape-validation surface (T-API-53–55, 55a–55d) carry the
+    // exhaustive coverage without abort-precedence pinning.
+    //
+    // SPEC §9.1, §9.2, §9.3, §9.5.
+    //
+    // Per-variant assertions (each surface):
+    //   (a) the surfaced rejection / throw is the abort error — NOT the
+    //       configured option-snapshot error (positive: AbortError name OR
+    //       /abort/i in message; negative: per-variant marker absent);
+    //   (b) no child was spawned (marker file absent);
+    //   (c) no `loopx-*` tmpdir was created.
+    // ------------------------------------------------------------------------
+    type AbortPrecedenceVariant = {
+      id: string;
+      label: string;
+      // Returns driver-side JS that constructs `const opts = ...` such that
+      // the variant's invalid value is preserved on the final options
+      // object. `cwd` is the JSON-stringified project dir literal.
+      buildOpts: (cwd: string) => string;
+      // Pattern that the displaced option-snapshot error message would
+      // mention but the abort error must NOT match.
+      negativePattern: RegExp;
+    };
+
+    const ABORT_PRECEDENCE_VARIANTS: AbortPrecedenceVariant[] = [
+      {
+        id: "i",
+        label: "maxIterations: -1",
+        buildOpts: (cwd) =>
+          `const opts = { cwd: ${cwd}, signal: c.signal, maxIterations: -1 };`,
+        negativePattern: /maxIterations|integer|negative/i,
+      },
+      {
+        id: "ii",
+        label: "maxIterations: 1.5",
+        buildOpts: (cwd) =>
+          `const opts = { cwd: ${cwd}, signal: c.signal, maxIterations: 1.5 };`,
+        negativePattern: /maxIterations|integer|1\.5/i,
+      },
+      {
+        id: "iii",
+        label: "maxIterations: NaN",
+        buildOpts: (cwd) =>
+          `const opts = { cwd: ${cwd}, signal: c.signal, maxIterations: NaN };`,
+        negativePattern: /maxIterations|NaN|integer/i,
+      },
+      {
+        id: "iv",
+        label: "maxIterations: Infinity",
+        buildOpts: (cwd) =>
+          `const opts = { cwd: ${cwd}, signal: c.signal, maxIterations: Infinity };`,
+        negativePattern: /maxIterations|Infinity|integer/i,
+      },
+      {
+        id: "v",
+        label: "maxIterations: null",
+        buildOpts: (cwd) =>
+          `const opts: any = { cwd: ${cwd}, signal: c.signal, maxIterations: null as any };`,
+        negativePattern: /maxIterations|null|integer/i,
+      },
+      {
+        id: "vi",
+        label: 'maxIterations: "1"',
+        buildOpts: (cwd) =>
+          `const opts: any = { cwd: ${cwd}, signal: c.signal, maxIterations: "1" as any };`,
+        negativePattern: /maxIterations|integer/i,
+      },
+      {
+        id: "vii",
+        label: "cwd: 42",
+        buildOpts: (_cwd) =>
+          `const opts: any = { cwd: 42 as any, signal: c.signal, maxIterations: 1 };`,
+        negativePattern: /RunOptions\.cwd|cwd must|cwd.*string/i,
+      },
+      {
+        id: "viii",
+        label: "throwing cwd getter",
+        buildOpts: (_cwd) =>
+          `const opts: any = { signal: c.signal, maxIterations: 1 };
+Object.defineProperty(opts, "cwd", { enumerable: true, get() { throw new Error("cwd-getter-boom"); } });`,
+        negativePattern: /cwd-getter-boom/i,
+      },
+      {
+        id: "ix",
+        label: "envFile: 42",
+        buildOpts: (cwd) =>
+          `const opts: any = { cwd: ${cwd}, signal: c.signal, envFile: 42 as any, maxIterations: 1 };`,
+        negativePattern: /envFile/i,
+      },
+      {
+        id: "x",
+        label: "throwing envFile getter",
+        buildOpts: (cwd) =>
+          `const opts: any = { cwd: ${cwd}, signal: c.signal, maxIterations: 1 };
+Object.defineProperty(opts, "envFile", { enumerable: true, get() { throw new Error("envFile-getter-boom"); } });`,
+        negativePattern: /envFile-getter-boom/i,
+      },
+      {
+        id: "xi",
+        label: "env: []",
+        buildOpts: (cwd) =>
+          `const opts: any = { cwd: ${cwd}, signal: c.signal, env: [] as any, maxIterations: 1 };`,
+        negativePattern: /RunOptions\.env|env.*shape|env.*array|env must/i,
+      },
+      {
+        id: "xii",
+        label: "env: { KEY: 42 }",
+        buildOpts: (cwd) =>
+          `const opts: any = { cwd: ${cwd}, signal: c.signal, env: { KEY: 42 as any }, maxIterations: 1 };`,
+        negativePattern: /RunOptions\.env|env.*KEY|env.*string|KEY.*string/i,
+      },
+      {
+        id: "xiii",
+        label: "throwing enumerable getter inside env",
+        buildOpts: (cwd) =>
+          `const env: any = {};
+Object.defineProperty(env, "KEY", { enumerable: true, get() { throw new Error("env-entry-getter-boom"); } });
+const opts: any = { cwd: ${cwd}, signal: c.signal, maxIterations: 1, env };`,
+        negativePattern: /env-entry-getter-boom/i,
+      },
+      {
+        id: "xiv",
+        label: "throwing env proxy ownKeys trap",
+        buildOpts: (cwd) =>
+          `const env: any = new Proxy({}, { ownKeys() { throw new Error("ownKeys-trap-boom"); } });
+const opts: any = { cwd: ${cwd}, signal: c.signal, maxIterations: 1, env };`,
+        negativePattern: /ownKeys-trap-boom/i,
+      },
+      {
+        id: "xv",
+        label: "throwing env proxy get trap on included key",
+        buildOpts: (cwd) =>
+          `const env: any = new Proxy({ KEY: "value" }, {
+  ownKeys() { return ["KEY"]; },
+  getOwnPropertyDescriptor() { return { enumerable: true, configurable: true, value: undefined, writable: true }; },
+  get() { throw new Error("get-trap-boom"); },
+});
+const opts: any = { cwd: ${cwd}, signal: c.signal, maxIterations: 1, env };`,
+        negativePattern: /get-trap-boom/i,
+      },
+      {
+        id: "xvi",
+        label: "throwing options.maxIterations getter",
+        buildOpts: (cwd) =>
+          `const opts: any = { cwd: ${cwd}, signal: c.signal };
+Object.defineProperty(opts, "maxIterations", { enumerable: true, get() { throw new Error("maxIterations-getter-boom"); } });`,
+        negativePattern: /maxIterations-getter-boom/i,
+      },
+    ];
+
+    for (const v of ABORT_PRECEDENCE_VARIANTS) {
+      it(`T-API-65p (${v.id}): runPromise() pre-aborted signal beats option-snapshot — ${v.label}`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api65p-${v.id}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+${v.buildOpts(JSON.stringify(project.dir))}
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", opts);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected with the abort error, not the option-snapshot error.
+        expect(parsed.rejected).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(v.negativePattern);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      });
+
+      it(`T-API-65q (${v.id}): run() pre-aborted signal beats option-snapshot — ${v.label}`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`api65q-${v.id}`);
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+${v.buildOpts(JSON.stringify(project.dir))}
+const gen = run("ralph", opts);
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First next() threw the abort error, not the option-snapshot error.
+        expect(parsed.threw).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(v.negativePattern);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created under the isolated parent.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-65a2 (i)–(iii): pre-aborted signal beats NON-STRING target
+    // arguments. SPEC §9.3 / §9.5 / §9.1 / §9.2.
+    //
+    // T-API-65a / T-API-65l cover the target-syntax branch (invalid string
+    // ":bad"); this test covers the target-argument branch — non-string
+    // target values per SPEC §9.1 ("runtime-invalid `target` values
+    // (e.g., `undefined`, `null`, `42`, or any non-string) are rejected
+    // lazily"). Together they close both target-argument-validation
+    // sub-branches under SPEC §9.3's "target argument / target syntax
+    // validation" displacement.
+    //
+    // Variants: (i) target = undefined, (ii) target = null, (iii) target = 42.
+    // Each variant runs on both surfaces — runPromise() (eager-snapshot
+    // surface per SPEC §9.2) and run() (lazy-on-first-next() surface per
+    // SPEC §9.1) — so a buggy implementation that routed only one surface's
+    // non-string-target rejection through the abort-precedence pathway
+    // (e.g., honored precedence in run() but not runPromise(), or vice
+    // versa) would pass the same-target tests on the conforming surface yet
+    // fail on the non-conforming surface.
+    //
+    // A buggy implementation that routed target-syntax validation
+    // (parseTarget on the captured string) through the abort-precedence
+    // pathway but rejected non-string targets via a separate eager
+    // type-check (e.g., a synchronous `typeof target !== "string"` guard at
+    // the call site that escaped the captured-error path) would pass
+    // T-API-65a / T-API-65l yet fail this test.
+    //
+    // The fixture creates a valid `.loopx/ralph/index.sh` workflow that
+    // would write a marker if it ever ran — even though `undefined` /
+    // `null` / `42` can never resolve to "ralph", the marker check (b) is
+    // a belt-and-suspenders sanity net against an impl that somehow
+    // routes the call past target validation despite the non-string input.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      { id: "i", label: "undefined", expr: "undefined" },
+      { id: "ii", label: "null", expr: "null" },
+      { id: "iii", label: "numeric (42)", expr: "42" },
+    ]) {
+      it(`T-API-65a2 (${variant.id} ${variant.label}): runPromise() pre-aborted signal beats non-string target ${variant.expr}`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(
+          `api65a2-promise-${variant.id}`,
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise(${variant.expr} as any, {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected with abort error, not non-string-target error.
+        expect(parsed.rejected).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(
+          /target is required|must be a string|invalid.*target|target.*syntax/i,
+        );
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      });
+
+      it(`T-API-65a2 (${variant.id} ${variant.label}): run() pre-aborted signal beats non-string target ${variant.expr}`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(
+          `api65a2-run-${variant.id}`,
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run(${variant.expr} as any, {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First next() throws abort error, not non-string-target error.
+        expect(parsed.threw).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(
+          /target is required|must be a string|invalid.*target|target.*syntax/i,
+        );
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-65h: runPromise() — pre-aborted signal beats target-resolution
+    // failure (missing workflow). SPEC §9.3 / §9.5 / §7.1.
+    //
+    // SPEC §9.3 enumerates "target resolution" as one of the displaced
+    // pre-iteration failure modes. SPEC §7.1 step 3 enumerates target
+    // resolution sub-paths: missing workflow, missing script in existing
+    // workflow, and missing default entry point. T-API-65 covers env-file
+    // failure; T-API-65b covers `.loopx/` discovery failure; this test
+    // closes the missing-workflow branch — a distinct failure category per
+    // SPEC §7.1 step 3 that existing abort-precedence tests do not exercise
+    // directly.
+    //
+    // Setup: `.loopx/ralph/index.sh` (valid). Target a workflow that does
+    // not exist. The error path comes from runInternal's workflow lookup
+    // at run.ts:700 (`Workflow 'X' not found in .loopx/`).
+    //
+    // A buggy implementation that routed pre-aborted-signal precedence
+    // through env-file / discovery / target-syntax checks but bypassed
+    // abort-precedence on the workflow-lookup path would surface the
+    // missing-workflow error instead and fail (a).
+    // ------------------------------------------------------------------------
+    it("T-API-65h: runPromise() pre-aborted signal beats missing workflow", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65h");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("nonexistent-workflow", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with abort error, not missing-workflow error.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(
+        /workflow.*not.*found|not.*found.*workflow|nonexistent-workflow/i,
+      );
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65i: runPromise() — pre-aborted signal beats target-resolution
+    // failure (missing script in existing workflow). SPEC §9.3 / §9.5 /
+    // §7.1 / §4.1.
+    //
+    // Missing-script counterpart to T-API-65h (missing workflow). SPEC §7.1
+    // step 3 enumerates missing workflow and missing script as distinct
+    // target-resolution sub-paths, and SPEC §9.3's abort-precedence rule
+    // must cover both.
+    //
+    // Setup: `.loopx/ralph/index.sh` (valid, `index` present) but no
+    // `check` script. Target `ralph:check`. The error path comes from
+    // runInternal's script lookup at run.ts:719-724 (`Script 'X' not found
+    // in workflow 'Y'`).
+    // ------------------------------------------------------------------------
+    it("T-API-65i: runPromise() pre-aborted signal beats missing script in existing workflow", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65i");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph:check", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with abort error, not missing-script error.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(
+        /script.*not.*found|not.*found.*script|'check'/i,
+      );
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65j: runPromise() — pre-aborted signal beats target-resolution
+    // failure (missing default entry point — workflow has scripts but no
+    // `index`). SPEC §9.3 / §9.5 / §7.1 / §4.1 / §2.1.
+    //
+    // Missing-default-entry-point counterpart to T-API-65h (missing
+    // workflow) and T-API-65i (missing script under qualified target).
+    // The bare target `"ralph"` resolves to `ralph:index`, which fails
+    // with a distinct error path when no `index.*` exists. SPEC §7.1
+    // step 3 enumerates this as the third sub-path of target resolution.
+    //
+    // Setup: `.loopx/ralph/check.sh` only (no `index.*`). Target `"ralph"`.
+    // The error path comes from runInternal's index-presence check at
+    // run.ts:708-713 (`Workflow 'X' has no default entry point ('index'
+    // script)`).
+    //
+    // Together T-API-65h/65i/65j pin abort-precedence across all three
+    // SPEC §7.1 step 3 target-resolution sub-paths on the runPromise()
+    // surface.
+    // ------------------------------------------------------------------------
+    it("T-API-65j: runPromise() pre-aborted signal beats missing default entry point", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65j");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "check",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with abort error, not missing-default-entry error.
+      expect(parsed.rejected).toBe(true);
+      expect(
+        parsed.name === "AbortError" || /abort/i.test(parsed.message),
+      ).toBe(true);
+      expect(parsed.message).not.toMatch(
+        /default entry|no.*index|index.*script/i,
+      );
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65o: run() — pre-aborted signal beats target-resolution
+    // failures. Generator-surface counterpart to T-API-65h / 65i / 65j.
+    // SPEC §9.3 / §9.5 / §9.1 / §7.1.
+    //
+    // Parameterized over the three target-resolution sub-paths enumerated
+    // in SPEC §7.1 step 3:
+    //   (a) missing workflow            (counterpart to T-API-65h)
+    //   (b) missing script              (counterpart to T-API-65i)
+    //   (c) missing default entry point (counterpart to T-API-65j)
+    //
+    // For each fixture, assert the first next() throws the abort error,
+    // not the target-resolution error.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      {
+        id: "a",
+        label: "missing workflow",
+        targetExpr: '"nonexistent-workflow"',
+        scriptName: "index",
+        notMatch: /workflow.*not.*found|not.*found.*workflow|nonexistent-workflow/i,
+      },
+      {
+        id: "b",
+        label: "missing script",
+        targetExpr: '"ralph:check"',
+        scriptName: "index",
+        notMatch: /script.*not.*found|not.*found.*script|'check'/i,
+      },
+      {
+        id: "c",
+        label: "missing default entry point",
+        targetExpr: '"ralph"',
+        scriptName: "check",
+        notMatch: /default entry|no.*index|index.*script/i,
+      },
+    ]) {
+      it(`T-API-65o (${variant.id} ${variant.label}): run() pre-aborted signal beats target-resolution failure`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(
+          `api65o-${variant.id}`,
+        );
+        const marker = join(project.dir, "child-ran.txt");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          variant.scriptName,
+          `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+        );
+
+        const before = listLoopxEntries(tmpdirParent);
+        const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run(${variant.targetExpr}, {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First next() threw abort error, not target-resolution error.
+        expect(parsed.threw).toBe(true);
+        expect(
+          parsed.name === "AbortError" || /abort/i.test(parsed.message),
+        ).toBe(true);
+        expect(parsed.message).not.toMatch(variant.notMatch);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) No loopx-* tmpdir was created.
+        const after = listLoopxEntries(tmpdirParent);
+        expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-API-65v: runPromise() — invalid `options` WRAPPER (array) does NOT
+    // enter the abort pathway, even when the wrapper carries an aborted
+    // AbortSignal. SPEC §9.3 carve-out (i): "An invalid options value …
+    // captures no signal and does not enter this pathway." T-API-65e covers
+    // carve-out (ii) (invalid signal shape on a valid options object); this
+    // test covers carve-out (i) on the runPromise() surface — array wrapper
+    // (excluded by SPEC §9.5 "non-array" clause) with an aborted signal
+    // attached as an own property. A buggy implementation that read
+    // `opts.signal` before validating wrapper shape, observed the aborted
+    // state, and routed through abort precedence would surface an abort
+    // error here instead of the invalid-options error (matching T-API-61e).
+    // SPEC §9.3, §9.5, §9.2.
+    // ------------------------------------------------------------------------
+    it("T-API-65v: runPromise() invalid options wrapper with aborted signal does not enter abort pathway", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65v-wrapper");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      // Build the invalid wrapper field-by-field (no `{...}` spread of an
+      // accessor-bearing object) so no harness-side accessor is invoked
+      // before the call. The wrapper is an array (SPEC §9.5 "non-array"
+      // violation) with `signal` attached as an own property.
+      const driverCode = `
+import { runPromise } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const c = new AbortController();
+c.abort();
+const opts = [];
+opts.signal = c.signal;
+let synchronousThrew = false, callTimeMessage = "";
+let p;
+try {
+  p = runPromise("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e && e.message ? e.message : String(e);
+}
+let rejected = false, message = "", name = "", looksLikeAbort = false;
+if (!synchronousThrew) {
+  try {
+    await p;
+  } catch (e) {
+    rejected = true;
+    message = e && e.message ? e.message : String(e);
+    name = e && e.name ? e.name : "";
+    // Anchored "abort"/"aborted" word match — same predicate as T-API-65e.
+    looksLikeAbort = (name === "AbortError") || /\\babort(ed)?\\b/i.test(message);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, rejected, message, name, looksLikeAbort }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // SPEC §9.2: runPromise() always returns a promise; option-shape
+      // errors surface as promise rejections, never synchronous throws.
+      expect(parsed.synchronousThrew).toBe(false);
+      // (a) The promise rejected with the invalid-options error class
+      //     (matching T-API-61e) — NOT an abort error per SPEC §9.3
+      //     carve-out (i).
+      expect(parsed.rejected).toBe(true);
+      expect(parsed.looksLikeAbort).toBe(false);
+      expect(parsed.message).toMatch(/options|RunOptions/i);
+      // (b) No child was spawned.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65w: run() — invalid `options` WRAPPER (array) does NOT enter
+    // the abort pathway, even when the wrapper carries an aborted
+    // AbortSignal. Generator-surface counterpart to T-API-65v. Together
+    // with T-API-65v, closes SPEC §9.3 carve-out (i) ("invalid options
+    // value … captures no signal") across both API surfaces, complementing
+    // T-API-65e (carve-out (ii) on run()). The expected error class
+    // matches T-API-61a (run() with `options: []`). SPEC §9.3, §9.5, §9.1.
+    // ------------------------------------------------------------------------
+    it("T-API-65w: run() invalid options wrapper with aborted signal does not enter abort pathway", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65w-wrapper");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+process.chdir(${JSON.stringify(project.dir)});
+const c = new AbortController();
+c.abort();
+const opts = [];
+opts.signal = c.signal;
+let synchronousThrew = false, callTimeMessage = "";
+let gen;
+try {
+  gen = run("ralph", opts);
+} catch (e) {
+  synchronousThrew = true;
+  callTimeMessage = e && e.message ? e.message : String(e);
+}
+let threw = false, message = "", name = "", looksLikeAbort = false;
+if (!synchronousThrew) {
+  try {
+    await gen.next();
+  } catch (e) {
+    threw = true;
+    message = e && e.message ? e.message : String(e);
+    name = e && e.name ? e.name : "";
+    looksLikeAbort = (name === "AbortError") || /\\babort(ed)?\\b/i.test(message);
+  }
+}
+console.log(JSON.stringify({ synchronousThrew, callTimeMessage, threw, message, name, looksLikeAbort }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // SPEC §9.1: option-shape errors do not throw at the call site;
+      // they surface lazily on first next().
+      expect(parsed.synchronousThrew).toBe(false);
+      // (a) First next() threw the invalid-options error class (matching
+      //     T-API-61a) — NOT an abort error per SPEC §9.3 carve-out (i).
+      expect(parsed.threw).toBe(true);
+      expect(parsed.looksLikeAbort).toBe(false);
+      expect(parsed.message).toMatch(/options|RunOptions/i);
+      // (b) No child was spawned.
+      expect(existsSync(marker)).toBe(false);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65x: runPromise() — pre-aborted signal does not compete with the
+    // workflow-level version warning. ADR-0004 §1: "Version checking is not a
+    // failure mode per SPEC §3.2, so it does not compete." The version-mismatch
+    // warning sits OUTSIDE the SPEC §9.3 abort-precedence dispatch entirely
+    // — it is not displaced by an aborted signal because it is not a competing
+    // failure, but it also does not block abort from surfacing as the run's
+    // terminal outcome.
+    //
+    // T-API-08s / T-API-08t / T-API-14j establish that version warnings fire
+    // under normal runPromise() execution; T-API-65 / 65a / 65b / 65d / 65h /
+    // 65i / 65j / 65q / 65r / 65t / 65u / 65v / 65w establish that pre-aborted
+    // signals displace pre-iteration FAILURES. The combined intersection —
+    // pre-aborted signal PLUS unsatisfied workflow-level loopx semver range —
+    // is otherwise uncovered. A buggy implementation could (a) route version-
+    // warning emission through the abort-precedence pathway and incorrectly
+    // SUPPRESS the warning under abort (treating it as a competing failure
+    // that abort displaces), (b) treat the version-mismatch state as a fatal
+    // pre-iteration failure that abort precedence then displaces (still
+    // disrupting the surfaced outcome compared to a no-version-warning
+    // fixture), or (c) spawn a child or create a tmpdir on the version-check
+    // path before abort precedence is observed.
+    //
+    // Per TEST-SPEC, the test deliberately does NOT assert whether the
+    // version-mismatch warning appears on stderr — SPEC does not pin the
+    // relative ordering between abort precedence and version-warning emission,
+    // and the ADR-0004 wording places version checking outside the abort-
+    // precedence dispatch entirely; an implementation that emits the warning,
+    // suppresses it, or partially writes it before abort surfaces is all
+    // conforming under the current SPEC. SPEC §9.2, §9.3, §9.5, §3.2.
+    // ------------------------------------------------------------------------
+    it("T-API-65x: runPromise() pre-aborted signal does not compete with workflow-level version warning", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65x");
+      const marker = join(project.dir, "child-ran.txt");
+      // Valid script that would emit `{"result":"ok"}` if it ran.
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"result":"ok"}'`,
+      );
+      // Workflow-level package.json with an unsatisfied loopx semver range
+      // — same fixture pattern as T-VER-02 / T-API-08s.
+      await createWorkflowPackageJson(project, "ralph", {
+        name: "ralph",
+        version: "1.0.0",
+        dependencies: { loopx: UNSATISFIED_RANGE },
+      });
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+const c = new AbortController();
+c.abort();
+let rejected = false, message = "", name = "", looksLikeAbort = false, captured = "";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: c.signal,
+    maxIterations: 1,
+  });
+  // If the run somehow resolved (buggy impl: version warning suppressed
+  // abort and let the run complete), capture the outputs so the test fails
+  // loudly on assertion (b) — no child should have spawned.
+  captured = JSON.stringify(outputs);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+  looksLikeAbort = (name === "AbortError") || /\\babort(ed)?\\b/i.test(message);
+}
+console.log(JSON.stringify({ rejected, message, name, looksLikeAbort, captured }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with the abort error class — matching T-API-65 /
+      //     T-API-64d. The rejection MUST be the abort error; an
+      //     implementation that surfaced the version-mismatch state as a
+      //     fatal failure would either resolve normally (failing here) or
+      //     reject with a non-abort error (also failing here).
+      expect(parsed.rejected).toBe(true);
+      expect(parsed.looksLikeAbort).toBe(true);
+      // (b) No child was spawned: no marker file written, no `result: "ok"`
+      //     output captured anywhere (stdout from the driver or the run).
+      expect(existsSync(marker)).toBe(false);
+      expect(parsed.captured).toBe("");
+      expect(result.stdout).not.toMatch(/result.*ok/);
+      // (c) No loopx-* tmpdir was created under the isolated parent — the
+      //     version-check path must not have created LOOPX_TMPDIR before
+      //     abort precedence was observed.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      // Per TEST-SPEC: deliberately NOT asserting on stderr version-warning
+      // emission. SPEC does not pin that ordering; the ADR-0004 wording
+      // places version checking outside the abort-precedence dispatch.
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65y: run() — pre-aborted signal does not compete with the
+    // workflow-level version warning. Generator-surface counterpart to
+    // T-API-65x. Same fixture: `.loopx/ralph/index.sh` (a valid script) +
+    // `.loopx/ralph/package.json` declaring an unsatisfied loopx semver range.
+    //
+    // Together with T-API-65x, this closes the abort-precedence × version-
+    // warning intersection across both API surfaces, complementing T-API-08s
+    // / T-API-08t (normal-execution version warnings) and the broader
+    // T-API-65 series (abort-precedence over true pre-iteration FAILURES).
+    // The SPEC-quoted disclaimer in the rationale ("Version checking is not
+    // a failure mode") makes the bug class precise: any implementation that
+    // surfaced the version-mismatch state to displace abort, that suppressed
+    // abort to emit the warning, or that performed a child spawn / tmpdir
+    // creation step on the version-check path before abort precedence is
+    // observed would fail at least one of (a)–(c).
+    //
+    // As in T-API-65x, the test deliberately does NOT assert on the stderr
+    // version-warning emission. SPEC §9.1, §9.3, §9.5, §3.2.
+    // ------------------------------------------------------------------------
+    it("T-API-65y: run() pre-aborted signal does not compete with workflow-level version warning", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("api65y");
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"result":"ok"}'`,
+      );
+      await createWorkflowPackageJson(project, "ralph", {
+        name: "ralph",
+        version: "1.0.0",
+        dependencies: { loopx: UNSATISFIED_RANGE },
+      });
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const c = new AbortController();
+c.abort();
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: c.signal,
+  maxIterations: 1,
+});
+let threw = false, message = "", name = "", looksLikeAbort = false, firstYield = "";
+try {
+  const r = await gen.next();
+  // If the first next() resolved (buggy impl: version warning suppressed
+  // abort and produced a yield), capture the yielded value so the test
+  // fails loudly on assertion (b) — no child should have spawned.
+  firstYield = JSON.stringify(r);
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+  looksLikeAbort = (name === "AbortError") || /\\babort(ed)?\\b/i.test(message);
+}
+console.log(JSON.stringify({ threw, message, name, looksLikeAbort, firstYield }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() threw the abort error class.
+      expect(parsed.threw).toBe(true);
+      expect(parsed.looksLikeAbort).toBe(true);
+      // (b) No child was spawned.
+      expect(existsSync(marker)).toBe(false);
+      expect(parsed.firstYield).toBe("");
+      expect(result.stdout).not.toMatch(/result.*ok/);
+      // (c) No loopx-* tmpdir was created under the isolated parent.
+      const after = listLoopxEntries(tmpdirParent);
+      expect(after.filter((e) => !before.includes(e))).toEqual([]);
+      // Per TEST-SPEC: deliberately NOT asserting on stderr version-warning.
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-65u / 65u2 / 65u3: Reentrant or already-aborted DUCK signal beats
+    // a separately-configured later pre-iteration failure on the same call.
+    // SPEC §9.3, §9.5, §9.1, §9.2.
+    //
+    // SPEC §9.5 names two abort-treatment disjuncts for duck-typed signals:
+    //   (1) listener invoked synchronously during addEventListener, and/or
+    //   (2) `aborted` observed as `true` at call-time capture.
+    // Once a usable signal is captured and observed as aborted, SPEC §9.3
+    // displaces all other pre-iteration failure modes on the same call.
+    // T-API-64b / 64b2 / 64c cover each disjunct in ISOLATION (no competing
+    // failure); T-API-65 / 65a / 65b / 65c / 65d / 65h–65j cover abort
+    // precedence over individual pre-iteration failures using REAL
+    // pre-aborted AbortSignal instances. The combination — duck signal
+    // satisfying §9.5 PLUS a separately-configured later pre-iteration
+    // failure on the same call — is uncovered.
+    //
+    // T-API-65u  — conjunction (listener fires reentrantly + `aborted`
+    //              transitions to true during the same addEventListener call)
+    // T-API-65u2 — first-disjunct only (listener fires reentrantly while
+    //              `aborted` stays false)
+    // T-API-65u3 — second-disjunct only (already-`aborted: true` duck signal;
+    //              addEventListener stores the listener but does NOT fire it)
+    //
+    // Variants per test (later pre-iteration failure modes — option-snapshot
+    // failures intentionally excluded per fix_plan rationale: SPEC §9.5 leaves
+    // intra-snapshot ordering implementation-defined for duck signals, so an
+    // option-snapshot failure surfacing before listener registration would
+    // not satisfy the "treats the signal as aborted" precondition; the
+    // option-snapshot axis is covered exhaustively for REAL pre-aborted
+    // signals at T-API-65p / 65q):
+    //   (i)  missing local env file (envFile: "nonexistent.env")
+    //   (ii) target-resolution failure (workflow "ralph" missing — only
+    //        `.loopx/other/index.sh` exists)
+    //
+    // Surfaces: runPromise() and run().
+    //
+    // Per-variant assertions:
+    //   (a) the surfaced rejection / throw is the abort error — NOT the
+    //       configured later pre-iteration failure (env-file-missing or
+    //       missing-workflow);
+    //   (b) no child was spawned (marker file absent);
+    //   (c) no `loopx-*` tmpdir was created under the test-isolated parent.
+    // ------------------------------------------------------------------------
+    type DuckVariant = {
+      id: "u" | "u2" | "u3";
+      label: string;
+      // Driver-side JS expression evaluating to the duck signal object. Each
+      // duck satisfies one (or both) of the two SPEC §9.5 abort-treatment
+      // disjuncts when passed to addEventListener.
+      duckExpr: string;
+    };
+
+    type LaterFailureVariant = {
+      id: "i" | "ii";
+      label: string;
+      // Sets up the .loopx/ tree. The marker is wired into the ONLY workflow
+      // in each fixture so that a buggy spawn — regardless of which target
+      // would have been selected on the non-abort path — would touch it.
+      setup: (project: TempProject, marker: string) => Promise<void>;
+      target: string;
+      // Extra options merged into the driver call (e.g. envFile).
+      extraOptsExpr: string;
+      // Pattern that the displaced later-pre-iteration error message would
+      // mention; the abort error must NOT match it.
+      negativePattern: RegExp;
+    };
+
+    const DUCK_VARIANTS: DuckVariant[] = [
+      {
+        id: "u",
+        label: "conjunction (listener fires + aborted=true)",
+        duckExpr: `{
+      aborted: false,
+      addEventListener(type, fn) {
+        if (type === "abort") { this.aborted = true; fn(); }
+      }
+    }`,
+      },
+      {
+        id: "u2",
+        label: "isolated reentrant (listener fires; aborted stays false)",
+        duckExpr: `{
+      aborted: false,
+      addEventListener(type, fn) {
+        if (type === "abort") fn();
+        /* deliberately do NOT mutate this.aborted */
+      }
+    }`,
+      },
+      {
+        id: "u3",
+        label: "already-aborted (aborted:true at capture; no listener firing)",
+        duckExpr: `{
+      aborted: true,
+      addEventListener(type, fn) { if (type === "abort") this._listener = fn; }
+    }`,
+      },
+    ];
+
+    const LATER_FAILURE_VARIANTS: LaterFailureVariant[] = [
+      {
+        id: "i",
+        label: "missing envFile",
+        setup: async (project, marker) => {
+          await createBashWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+          );
+        },
+        target: "ralph",
+        extraOptsExpr: `, envFile: "nonexistent.env"`,
+        negativePattern: /env.*file|nonexistent\.env|ENOENT/i,
+      },
+      {
+        id: "ii",
+        label: "missing workflow (target ralph; only .loopx/other/ exists)",
+        setup: async (project, marker) => {
+          await createBashWorkflowScript(
+            project,
+            "other",
+            "index",
+            `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+          );
+        },
+        target: "ralph",
+        extraOptsExpr: ``,
+        negativePattern: /workflow.*not.*found|not.*found.*workflow/i,
+      },
+    ];
+
+    for (const duck of DUCK_VARIANTS) {
+      for (const lf of LATER_FAILURE_VARIANTS) {
+        it(`T-API-65${duck.id}-promise (${lf.id}): runPromise() duck signal — ${duck.label} — beats ${lf.label}`, async () => {
+          project = await createTempProject();
+          const tmpdirParent = await makeIsolatedTmpdirParent(
+            `api65${duck.id}-promise-${lf.id}`,
+          );
+          const marker = join(project.dir, "child-ran.txt");
+          await lf.setup(project, marker);
+
+          const before = listLoopxEntries(tmpdirParent);
+          const driverCode = `
+import { runPromise } from "loopx";
+const duck = ${duck.duckExpr};
+let rejected = false, message = "", name = "", looksLikeAbort = false;
+try {
+  await runPromise(${JSON.stringify(lf.target)}, {
+    cwd: ${JSON.stringify(project.dir)},
+    signal: duck,
+    maxIterations: 1${lf.extraOptsExpr}
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+  looksLikeAbort = (name === "AbortError") || /abort/i.test(message);
+}
+console.log(JSON.stringify({ rejected, message, name, looksLikeAbort }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: { TMPDIR: tmpdirParent },
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          // (a) Promise rejected with the abort error, not the later
+          //     pre-iteration failure.
+          expect(parsed.rejected).toBe(true);
+          expect(parsed.looksLikeAbort).toBe(true);
+          expect(parsed.message).not.toMatch(lf.negativePattern);
+          // (b) No script spawned.
+          expect(existsSync(marker)).toBe(false);
+          // (c) No loopx-* tmpdir was created under the isolated parent.
+          const after = listLoopxEntries(tmpdirParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        });
+
+        it(`T-API-65${duck.id}-generator (${lf.id}): run() duck signal — ${duck.label} — beats ${lf.label}`, async () => {
+          project = await createTempProject();
+          const tmpdirParent = await makeIsolatedTmpdirParent(
+            `api65${duck.id}-generator-${lf.id}`,
+          );
+          const marker = join(project.dir, "child-ran.txt");
+          await lf.setup(project, marker);
+
+          const before = listLoopxEntries(tmpdirParent);
+          const driverCode = `
+import { run } from "loopx";
+const duck = ${duck.duckExpr};
+const gen = run(${JSON.stringify(lf.target)}, {
+  cwd: ${JSON.stringify(project.dir)},
+  signal: duck,
+  maxIterations: 1${lf.extraOptsExpr}
+});
+let threw = false, message = "", name = "", looksLikeAbort = false;
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+  looksLikeAbort = (name === "AbortError") || /abort/i.test(message);
+}
+console.log(JSON.stringify({ threw, message, name, looksLikeAbort }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: { TMPDIR: tmpdirParent },
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          // (a) First next() threw the abort error, not the later
+          //     pre-iteration failure.
+          expect(parsed.threw).toBe(true);
+          expect(parsed.looksLikeAbort).toBe(true);
+          expect(parsed.message).not.toMatch(lf.negativePattern);
+          // (b) No script spawned.
+          expect(existsSync(marker)).toBe(false);
+          // (c) No loopx-* tmpdir was created under the isolated parent.
+          const after = listLoopxEntries(tmpdirParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        });
+      }
+    }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════
+// §4.9 — Pinned Pre-Iteration Priority (TEST-SPEC §4.9 → "Pinned Priority")
+//
+// SPEC §9.3 names two pinned-priority option-snapshot fields whose
+// validation must surface BEFORE the four project-root-dependent failures:
+//   • options.cwd  (non-string type or throwing getter)
+//   • options.envFile  (non-string type or throwing getter)
+//
+// The four downstream failures, per SPEC §9.3 / §7.1:
+//   (a) `.loopx/` discovery error
+//   (b) env-file loading error
+//   (c) target-resolution error
+//   (d) tmpdir-creation error
+//
+// T-API-65 series pinned ABORT precedence over these failures; T-API-67*
+// pins the cwd/envFile validation precedence over the same set. Each test
+// parameterizes over the four downstream-failure variants — the variant
+// configures a fixture under which the named downstream failure WOULD fire
+// in a buggy implementation that bypassed pinned cwd/envFile validation.
+// ═════════════════════════════════════════════════════════════
+
+describe("SPEC: Pinned Pre-Iteration Priority", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    if (project) {
+      restorePerms(project.dir);
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    for (const cleanup of cleanups.splice(0)) {
+      await cleanup().catch(() => {});
+    }
+  });
+
+  // Creates a writable test-isolated TMPDIR parent under the system tmpdir.
+  async function makeIsolatedTmpdirParent(label: string): Promise<string> {
+    const dir = await mkdtemp(join(osTmpdir(), `loopx-test-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  // List `loopx-*` entries directly under `parent`, filtering implementation-
+  // internal helpers (per AGENT.md / SPEC §7.4).
+  function listLoopxEntries(parent: string): string[] {
+    try {
+      return readdirSync(parent)
+        .filter((e) => e.startsWith("loopx-"))
+        .filter(
+          (e) =>
+            !e.startsWith("loopx-nodepath-shim-") &&
+            !e.startsWith("loopx-bun-jsx-") &&
+            !e.startsWith("loopx-install-") &&
+            !e.startsWith("loopx-test-"),
+        );
+    } catch {
+      return [];
+    }
+  }
+
+  interface VariantContext {
+    /** Workflow target to pass to run/runPromise. */
+    target: string;
+    /** Extra env variables to inject into the driver process. */
+    extraEnv: Record<string, string>;
+    /** Path to scan for new loopx-* entries (the configured TMPDIR). */
+    tmpdirCheckParent: string;
+    /** Path to the marker file the workflow script (if any) writes. */
+    marker: string;
+    /** Negative-assertion pattern: error message must NOT match this. */
+    negativePattern: RegExp;
+  }
+
+  interface VariantSpec {
+    id: string;
+    label: string;
+    /** Skip under root (mode-000 / mode-0o500 setups don't block uid 0). */
+    skipUnderRoot: boolean;
+    setup: () => Promise<VariantContext>;
+  }
+
+  // Build the four variant specs. Each variant configures a fixture under
+  // which the named downstream failure WOULD fire in a buggy implementation
+  // that bypassed pinned cwd/envFile validation.
+  function makeVariants(testLabel: string): VariantSpec[] {
+    return [
+      {
+        // Variant (a): project lacks `.loopx/`. With a valid cwd pointing at
+        // project.dir, discovery would fail with no-`.loopx/` error.
+        id: "a",
+        label: "discovery",
+        skipUnderRoot: false,
+        setup: async () => {
+          project = await createTempProject({ withLoopxDir: false });
+          const tmpdirParent = await makeIsolatedTmpdirParent(`${testLabel}-a`);
+          const marker = join(project.dir, "child-ran.txt");
+          return {
+            target: "ralph",
+            extraEnv: { TMPDIR: tmpdirParent },
+            tmpdirCheckParent: tmpdirParent,
+            marker,
+            negativePattern: /\.loopx|discover|no.*such.*directory|ENOENT/i,
+          };
+        },
+      },
+      {
+        // Variant (b): project has `.loopx/ralph` and a mode-000 global env
+        // file at $XDG_CONFIG_HOME/loopx/env. Env-file loading would fail
+        // with EACCES. Skipped under root (mode-000 doesn't block uid 0).
+        // Mirrors T-API-65r-promise / T-API-65r-generator setup.
+        id: "b",
+        label: "env-file loading",
+        skipUnderRoot: true,
+        setup: async () => {
+          project = await createTempProject();
+          await createBashWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            `printf '{"stop":true}'`,
+          );
+          const tmpdirParent = await makeIsolatedTmpdirParent(`${testLabel}-b`);
+          const xdg = join(project.dir, "xdg-config");
+          await mkdir(join(xdg, "loopx"), { recursive: true });
+          const globalEnv = join(xdg, "loopx", "env");
+          await writeFile(globalEnv, "FOO=bar\n", "utf-8");
+          await chmod(globalEnv, 0o000);
+          cleanups.push(async () => {
+            await chmod(globalEnv, 0o644).catch(() => {});
+          });
+          const marker = join(project.dir, "child-ran.txt");
+          return {
+            target: "ralph",
+            extraEnv: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdg },
+            tmpdirCheckParent: tmpdirParent,
+            marker,
+            negativePattern: /xdg|global.*env|loopx\/env|EACCES|permission/i,
+          };
+        },
+      },
+      {
+        // Variant (c): project has `.loopx/other/index.sh` but no `ralph`
+        // workflow. Target `ralph` would fail with missing-workflow error.
+        // Mirrors T-API-65h pattern.
+        id: "c",
+        label: "target-resolution",
+        skipUnderRoot: false,
+        setup: async () => {
+          project = await createTempProject();
+          await createBashWorkflowScript(
+            project,
+            "other",
+            "index",
+            `printf '{"stop":true}'`,
+          );
+          const tmpdirParent = await makeIsolatedTmpdirParent(`${testLabel}-c`);
+          const marker = join(project.dir, "child-ran.txt");
+          return {
+            target: "ralph",
+            extraEnv: { TMPDIR: tmpdirParent },
+            tmpdirCheckParent: tmpdirParent,
+            marker,
+            negativePattern:
+              /workflow.*not.*found|not.*found.*workflow|workflow.*'ralph'|'ralph'.*not.*found/i,
+          };
+        },
+      },
+      {
+        // Variant (d): project has `.loopx/ralph/index.sh`; TMPDIR is
+        // mode-0o500 (read+execute only — `mkdtemp` blocked). Skipped under
+        // root. Mirrors T-API-65d / T-API-65n setup.
+        id: "d",
+        label: "tmpdir-creation",
+        skipUnderRoot: true,
+        setup: async () => {
+          project = await createTempProject();
+          await createBashWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            `printf '{"stop":true}'`,
+          );
+          const unwritableParent = await mkdtemp(
+            join(osTmpdir(), `loopx-test-${testLabel}-d-unwritable-`),
+          );
+          cleanups.push(async () => {
+            await chmod(unwritableParent, 0o700).catch(() => {});
+            await rm(unwritableParent, { recursive: true, force: true }).catch(
+              () => {},
+            );
+          });
+          await chmod(unwritableParent, 0o500);
+          const marker = join(project.dir, "child-ran.txt");
+          return {
+            target: "ralph",
+            extraEnv: { TMPDIR: unwritableParent },
+            tmpdirCheckParent: unwritableParent,
+            marker,
+            negativePattern: /EACCES|mkdtemp|tmpdir.*creat/i,
+          };
+        },
+      },
+    ];
+  }
+
+  // Positive-assertion patterns — the captured error must match one of these
+  // to confirm the cwd/envFile snapshot-error surfaced as the failure.
+  const POSITIVE_CWD_INVALID = /RunOptions\.cwd|cwd must|cwd.*string/i;
+  const POSITIVE_CWD_GETTER = /cwd-getter-boom/i;
+  const POSITIVE_ENVFILE_INVALID =
+    /RunOptions\.envFile|envFile must|envFile.*string/i;
+  const POSITIVE_ENVFILE_GETTER = /envFile-getter-boom/i;
+
+  forEachRuntime((runtime) => {
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67: run() — invalid options.cwd (non-string) surfaces before
+    //                   each of the four project-root-dependent failures.
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67 (${variant.id}): run() invalid options.cwd surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { run } from "loopx";
+const opts: any = { cwd: 42 as any, maxIterations: 1 };
+const gen = run(${JSON.stringify(ctx.target)}, opts);
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          // (a) First next() throws the cwd-validation error.
+          expect(parsed.threw).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_CWD_INVALID);
+          // The downstream failure pattern must NOT appear.
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          // (b) No workflow script ran.
+          expect(existsSync(ctx.marker)).toBe(false);
+          // (c) No loopx-* tmpdir was created under the configured TMPDIR.
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67a: run() — throwing options.cwd getter surfaces before each
+    //                    of the four project-root-dependent failures.
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67a")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67a (${variant.id}): run() throwing options.cwd getter surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { run } from "loopx";
+const opts: any = { maxIterations: 1 };
+Object.defineProperty(opts, "cwd", { enumerable: true, get() { throw new Error("cwd-getter-boom"); } });
+const gen = run(${JSON.stringify(ctx.target)}, opts);
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.threw).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_CWD_GETTER);
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          expect(existsSync(ctx.marker)).toBe(false);
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67b: run() — invalid options.envFile (non-string) surfaces
+    //                    before each of the four project-root-dependent
+    //                    failures. Variant (b) "env-file loading" is
+    //                    exercised via an INDEPENDENT global env file
+    //                    (mode-000 $XDG_CONFIG_HOME/loopx/env), so the
+    //                    snapshot-validation pinning is observable against
+    //                    a real env-file-load failure (not just the invalid
+    //                    envFile path's own deferred load).
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67b")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67b (${variant.id}): run() invalid options.envFile surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { run } from "loopx";
+const opts: any = { cwd: ${JSON.stringify(project!.dir)}, envFile: 42 as any, maxIterations: 1 };
+const gen = run(${JSON.stringify(ctx.target)}, opts);
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.threw).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_ENVFILE_INVALID);
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          expect(existsSync(ctx.marker)).toBe(false);
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67c: run() — throwing options.envFile getter surfaces before
+    //                    each of the four project-root-dependent failures.
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67c")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67c (${variant.id}): run() throwing options.envFile getter surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { run } from "loopx";
+const opts: any = { cwd: ${JSON.stringify(project!.dir)}, maxIterations: 1 };
+Object.defineProperty(opts, "envFile", { enumerable: true, get() { throw new Error("envFile-getter-boom"); } });
+const gen = run(${JSON.stringify(ctx.target)}, opts);
+let threw = false, message = "", name = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ threw, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.threw).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_ENVFILE_GETTER);
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          expect(existsSync(ctx.marker)).toBe(false);
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67d: runPromise() — invalid options.cwd (non-string) surfaces
+    //                            before each downstream failure. Promise-
+    //                            surface counterpart to T-API-67.
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67d")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67d (${variant.id}): runPromise() invalid options.cwd surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { runPromise } from "loopx";
+const opts: any = { cwd: 42 as any, maxIterations: 1 };
+let rejected = false, message = "", name = "";
+try {
+  await runPromise(${JSON.stringify(ctx.target)}, opts);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.rejected).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_CWD_INVALID);
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          expect(existsSync(ctx.marker)).toBe(false);
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67e: runPromise() — throwing options.cwd getter surfaces before
+    //                            each downstream failure. Promise-surface
+    //                            counterpart to T-API-67a.
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67e")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67e (${variant.id}): runPromise() throwing options.cwd getter surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { runPromise } from "loopx";
+const opts: any = { maxIterations: 1 };
+Object.defineProperty(opts, "cwd", { enumerable: true, get() { throw new Error("cwd-getter-boom"); } });
+let rejected = false, message = "", name = "";
+try {
+  await runPromise(${JSON.stringify(ctx.target)}, opts);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.rejected).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_CWD_GETTER);
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          expect(existsSync(ctx.marker)).toBe(false);
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67f: runPromise() — invalid options.envFile (non-string)
+    //                            surfaces before each downstream failure.
+    //                            Promise-surface counterpart to T-API-67b.
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67f")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67f (${variant.id}): runPromise() invalid options.envFile surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { runPromise } from "loopx";
+const opts: any = { cwd: ${JSON.stringify(project!.dir)}, envFile: 42 as any, maxIterations: 1 };
+let rejected = false, message = "", name = "";
+try {
+  await runPromise(${JSON.stringify(ctx.target)}, opts);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.rejected).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_ENVFILE_INVALID);
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          expect(existsSync(ctx.marker)).toBe(false);
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-API-67g: runPromise() — throwing options.envFile getter surfaces
+    //                            before each downstream failure. Promise-
+    //                            surface counterpart to T-API-67c.
+    // SPEC §9.3, §9.5.
+    // ─────────────────────────────────────────────────────────────────────
+    for (const variant of makeVariants("api67g")) {
+      const itFn = variant.skipUnderRoot ? it.skipIf(IS_ROOT) : it;
+      itFn(
+        `T-API-67g (${variant.id}): runPromise() throwing options.envFile getter surfaces before ${variant.label} failure`,
+        async () => {
+          const ctx = await variant.setup();
+          const before = listLoopxEntries(ctx.tmpdirCheckParent);
+          const driverCode = `
+import { runPromise } from "loopx";
+const opts: any = { cwd: ${JSON.stringify(project!.dir)}, maxIterations: 1 };
+Object.defineProperty(opts, "envFile", { enumerable: true, get() { throw new Error("envFile-getter-boom"); } });
+let rejected = false, message = "", name = "";
+try {
+  await runPromise(${JSON.stringify(ctx.target)}, opts);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+  name = e && e.name ? e.name : "";
+}
+console.log(JSON.stringify({ rejected, message, name }));
+`;
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: ctx.extraEnv,
+          });
+          expect(result.exitCode).toBe(0);
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.rejected).toBe(true);
+          expect(parsed.message).toMatch(POSITIVE_ENVFILE_GETTER);
+          expect(parsed.message).not.toMatch(ctx.negativePattern);
+          expect(existsSync(ctx.marker)).toBe(false);
+          const after = listLoopxEntries(ctx.tmpdirCheckParent);
+          expect(after.filter((e) => !before.includes(e))).toEqual([]);
+        },
+      );
+    }
   });
 });

@@ -2,12 +2,14 @@
  * Custom module resolve and load hooks.
  * - Intercepts bare specifier "loopx" and "loopx/internal"
  *   and resolves them to the running CLI's package exports.
- * - Forces .js files executed as entry points by loopx to be loaded as ESM,
- *   ensuring CommonJS require() fails per Spec 6.3.
+ * - Forces .js / .ts / .tsx / .jsx files executed as entry points by loopx
+ *   to be loaded as ESM, ensuring CommonJS syntax (require, module.exports,
+ *   exports.foo) fails at execution time per SPEC 6.3.
  */
 
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import esbuild from "esbuild";
 
 interface ResolveContext {
   conditions: string[];
@@ -80,21 +82,68 @@ type NextLoad = (
   context: LoadContext
 ) => Promise<LoadResult>;
 
+const SCRIPT_EXTENSIONS: ReadonlyArray<{ ext: string; loader: "ts" | "tsx" | "jsx" }> = [
+  { ext: ".ts", loader: "ts" },
+  { ext: ".tsx", loader: "tsx" },
+  { ext: ".jsx", loader: "jsx" },
+];
+
 /**
- * Force .js files in .loopx/ directories to be loaded as ESM.
- * This ensures CommonJS require() is not available (Spec 6.3).
+ * Force .js / .ts / .tsx / .jsx files in .loopx/ directories to be loaded as
+ * ESM. This ensures CommonJS syntax (require, module.exports, exports.foo) is
+ * not available per SPEC 6.3 — any reference to those bindings throws a
+ * ReferenceError at execution time.
+ *
+ * For .js: read source directly (no transform needed) and force ESM.
+ * For .ts / .tsx / .jsx: type-strip via esbuild WITHOUT a `format` option so
+ * esbuild does not auto-wrap the body in a __commonJS() factory (which would
+ * provide `module` / `exports` as function parameters and defeat the SPEC 6.3
+ * rejection contract). The output is plain JS with TS / JSX stripped; Node
+ * then evaluates it as a true ES module, where `module` / `exports` are not
+ * in scope.
+ *
+ * Exclude node_modules/ to avoid breaking CJS dependencies imported by
+ * workflow scripts.
  */
 export async function load(
   url: string,
   context: LoadContext,
   nextLoad: NextLoad
 ): Promise<LoadResult> {
-  // For .js files in .loopx/: read source directly and force ESM.
-  // Exclude node_modules/ to avoid breaking CJS dependencies in directory scripts.
-  if (url.endsWith(".js") && url.includes("/.loopx/") && !url.includes("/node_modules/")) {
-    const filePath = fileURLToPath(url);
-    const source = await readFile(filePath, "utf-8");
-    return { format: "module", source, shortCircuit: true };
+  if (url.includes("/.loopx/") && !url.includes("/node_modules/")) {
+    if (url.endsWith(".js")) {
+      const filePath = fileURLToPath(url);
+      const source = await readFile(filePath, "utf-8");
+      return { format: "module", source, shortCircuit: true };
+    }
+    for (const { ext, loader } of SCRIPT_EXTENSIONS) {
+      if (url.endsWith(ext)) {
+        const filePath = fileURLToPath(url);
+        const rawSource = await readFile(filePath, "utf-8");
+        const result = await esbuild.transform(rawSource, {
+          loader,
+          // Deliberately NO `format` option: with `format: "esm"` esbuild
+          // wraps any module containing CJS-style assignments in a
+          // __commonJS factory that exposes `module` / `exports` as
+          // function parameters, defeating SPEC 6.3 rejection. With no
+          // format, esbuild emits plain transformed JS (types stripped,
+          // JSX transformed) with the original CJS references intact;
+          // Node then sees them as undeclared bindings under ESM and
+          // throws ReferenceError at evaluation time.
+          target: "esnext",
+          sourcefile: filePath,
+          jsx: "transform",
+          jsxFactory: "React.createElement",
+          jsxFragment: "React.Fragment",
+          sourcemap: "inline",
+        });
+        return {
+          format: "module",
+          source: result.code,
+          shortCircuit: true,
+        };
+      }
+    }
   }
 
   return nextLoad(url, context);

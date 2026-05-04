@@ -55,6 +55,41 @@ export async function withGlobalEnv(
 }
 
 /**
+ * Sets XDG_CONFIG_HOME to a temp directory, writes a global env file with
+ * raw verbatim content (no key/value transformation), runs fn, then cleans up.
+ *
+ * Use this when the test needs to seed the global env file with
+ * intentionally-malformed content (invalid keys, lines without `=`, etc.) to
+ * exercise parser-warning paths. Plain `withGlobalEnv` writes through
+ * `createEnvFile` which composes well-formed `KEY=VALUE` lines from a record.
+ */
+export async function withGlobalEnvRawContent(
+  rawContent: string,
+  fn: () => Promise<void>
+): Promise<void> {
+  const tempConfigHome = await mkdtemp(join(tmpdir(), "loopx-config-"));
+  const loopxConfigDir = join(tempConfigHome, "loopx");
+  await mkdir(loopxConfigDir, { recursive: true });
+
+  const envFilePath = join(loopxConfigDir, "env");
+  await writeEnvFileRaw(envFilePath, rawContent);
+
+  const originalXdg = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = tempConfigHome;
+
+  try {
+    await fn();
+  } finally {
+    if (originalXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = originalXdg;
+    }
+    await rm(tempConfigHome, { recursive: true, force: true });
+  }
+}
+
+/**
  * Sets HOME to a temp directory and optionally unsets XDG_CONFIG_HOME,
  * then runs fn, then restores.
  */

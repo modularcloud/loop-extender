@@ -67,9 +67,14 @@ export function writeEnvToFile(varname: string, markerPath: string): string {
   return `#!/bin/bash\nprintf '%s' "\$${varname}" > "${markerPath}"\n`;
 }
 
-/** Writes $PWD to a marker file using printf. */
+/**
+ * Writes the script's actual kernel cwd (`/bin/pwd -P`) to a marker file.
+ * Per SPEC 6.1, `$PWD` is shell-maintained and is not authoritative for the
+ * spawn cwd loopx chose; tests that need the loopx-chosen cwd must use
+ * `/bin/pwd -P`.
+ */
 export function writeCwdToFile(markerPath: string): string {
-  return `#!/bin/bash\nprintf '%s' "$PWD" > "${markerPath}"\n`;
+  return `#!/bin/bash\nprintf '%s' "$(/bin/pwd -P)" > "${markerPath}"\n`;
 }
 
 /** Writes a literal value to a marker file using printf. */

@@ -12,6 +12,8 @@ import {
 } from "node:fs";
 import type { ScriptFile } from "./discovery.js";
 import { makeAbortError } from "./abort.js";
+import type { FirstObservedRef } from "./loop.js";
+import { maybePauseAtTerminalTriggerWindow } from "./test-seams.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -84,6 +86,10 @@ const LOOPX_WORKSPACE_NODE_MODULES = resolve(
 // loop-extender package root (one level above __dirname, since __dirname is
 // the compiled dist/ dir and package.json with `exports` lives at the parent)
 // and prepend it to NODE_PATH.
+//
+// Lazy: created on first executeScript() call. Doing this at module-load time
+// would crash loopx whenever TMPDIR points at an unwritable parent — which
+// the SPEC §7.1 step-5-before-step-6 ordering tests deliberately exercise.
 let loopxShimDir: string | null = null;
 function getLoopxShimDir(): string {
   if (loopxShimDir && existsSync(join(loopxShimDir, "loopx"))) {
@@ -105,7 +111,9 @@ function getLoopxShimDir(): string {
   return dir;
 }
 
-const LOOPX_NODE_PATH = `${getLoopxShimDir()}:${LOOPX_NODE_MODULES}:${LOOPX_PACKAGE_PARENT}:${LOOPX_WORKSPACE_NODE_MODULES}`;
+function buildLoopxNodePath(): string {
+  return `${getLoopxShimDir()}:${LOOPX_NODE_MODULES}:${LOOPX_PACKAGE_PARENT}:${LOOPX_WORKSPACE_NODE_MODULES}`;
+}
 
 export interface ExecResult {
   stdout: string;
@@ -117,9 +125,19 @@ export interface ExecOptions {
   workflowDir: string;
   projectRoot: string;
   loopxBin: string;
+  tmpdir: string;
   env: Record<string, string>;
   input?: string;
   signal?: AbortSignal;
+  /**
+   * SPEC §7.2 first-observed-trigger tracking. When set, executeScript pins
+   * `trigger = "iteration"` (only if currently null) on a spawn failure
+   * (sync throw from `spawn()` or async `'error'` event) before pausing at
+   * the TEST-SPEC §1.4 `child-spawn-failure` seam and propagating the
+   * failure. This makes spawn failures classify as iteration-level errors
+   * for the wrapper's first-observed-wins logic.
+   */
+  firstObservedRef?: FirstObservedRef;
 }
 
 function killProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
@@ -134,7 +152,7 @@ function killProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
   }
 }
 
-export function executeScript(
+export async function executeScript(
   script: ScriptFile,
   options: ExecOptions
 ): Promise<ExecResult> {
@@ -143,22 +161,28 @@ export function executeScript(
     workflowDir,
     projectRoot,
     loopxBin,
+    tmpdir: loopxTmpdir,
     env,
     input,
     signal,
+    firstObservedRef,
   } = options;
 
-  // SPEC §6.1: scripts always run with the workflow directory as cwd.
-  const cwd = workflowDir;
+  // SPEC §6.1 (ADR-0004): scripts always run with the project root as cwd.
+  // The workflow directory is exposed via LOOPX_WORKFLOW_DIR.
+  const cwd = projectRoot;
 
   const currentPath = env.PATH ?? process.env.PATH ?? "";
   const currentNodePath = env.NODE_PATH ?? "";
+  const loopxNodePath = buildLoopxNodePath();
 
   const scriptEnv: Record<string, string> = {
     ...env,
     LOOPX_BIN: loopxBin,
     LOOPX_PROJECT_ROOT: projectRoot,
     LOOPX_WORKFLOW: workflowName,
+    LOOPX_WORKFLOW_DIR: workflowDir,
+    LOOPX_TMPDIR: loopxTmpdir,
     PATH: (() => {
       const pathEntries = currentPath.split(":");
       const prepend: string[] = [];
@@ -174,8 +198,8 @@ export function executeScript(
         : `${prepend.join(":")}:${currentPath}`;
     })(),
     NODE_PATH: currentNodePath
-      ? `${LOOPX_NODE_PATH}:${currentNodePath}`
-      : LOOPX_NODE_PATH,
+      ? `${loopxNodePath}:${currentNodePath}`
+      : loopxNodePath,
   };
 
   let command: string;
@@ -212,33 +236,66 @@ export function executeScript(
     args = ["--import", LOADER_REGISTER_PATH, script.path];
   }
 
-  return new Promise<ExecResult>((resolvePromise, reject) => {
-    if (signal?.aborted) {
-      reject(makeAbortError(signal));
-      return;
-    }
+  if (signal?.aborted) {
+    throw makeAbortError(signal);
+  }
 
-    const child = spawn(command, args, {
+  // TEST-SPEC §1.4 `child-spawn-attempt` seam: pause AFTER deciding to spawn
+  // (and entering the spawn-attempt path) but BEFORE actually invoking
+  // `spawn()` and observing its outcome. The seam fires only when the env
+  // var matches; otherwise it is a no-op. Used by T-TERM-04 variant b /
+  // T-TMP-38e variant b to race an abort into the spawn-attempt window so
+  // the abort listener pins first-observed before the spawn outcome is
+  // observed. We deliberately do NOT recheck `signal.aborted` after the
+  // pause — re-checking would short-circuit the spawn under the explicit
+  // "abort wins over pre-iteration failures" rule and prevent the genuine
+  // race the seam is designed to expose.
+  await maybePauseAtTerminalTriggerWindow("child-spawn-attempt");
+
+  let child: ChildProcess;
+  try {
+    child = spawn(command, args, {
       cwd,
       env: scriptEnv,
       stdio: ["pipe", "pipe", "inherit"],
       detached: true,
     });
+  } catch (err) {
+    // SPEC §7.2 first-observed-trigger: spawn-failure is an iteration-level
+    // terminal trigger. Pin BEFORE pausing at the seam so a racing abort
+    // delivered during the bounded pause sees the slot occupied and does
+    // not displace the spawn-failure outcome (T-TERM-04 variant a /
+    // T-TMP-38e variant a).
+    if (firstObservedRef && firstObservedRef.trigger === null) {
+      firstObservedRef.trigger = "iteration";
+    }
+    // TEST-SPEC §1.4 `child-spawn-failure` seam: pause AFTER observing the
+    // spawn-failure (and pinning first-observed) but BEFORE propagating the
+    // error to the caller. Used by T-TERM-04 variant a / T-TMP-38e variant a
+    // to race an abort into the post-observation window.
+    await maybePauseAtTerminalTriggerWindow("child-spawn-failure");
+    throw err;
+  }
 
+  return new Promise<ExecResult>((resolvePromise, reject) => {
     let stdout = "";
     let aborted = false;
     let settled = false;
     let graceTimer: ReturnType<typeof setTimeout> | null = null;
 
-    child.stdout.on("data", (chunk: Buffer) => {
+    // stdio: ["pipe", "pipe", "inherit"] guarantees stdin/stdout pipes.
+    const childStdout = child.stdout!;
+    const childStdin = child.stdin!;
+
+    childStdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
 
-    child.stdin.on("error", () => {});
+    childStdin.on("error", () => {});
     if (input !== undefined && input !== "") {
-      child.stdin.write(input);
+      childStdin.write(input);
     }
-    child.stdin.end();
+    childStdin.end();
 
     const onAbort = () => {
       aborted = true;
@@ -255,6 +312,13 @@ export function executeScript(
 
     if (signal) {
       signal.addEventListener("abort", onAbort, { once: true });
+      // If abort was raced into during the `child-spawn-attempt` seam pause
+      // (variant b of T-TMP-38e / T-TERM-04), the listener won't auto-fire
+      // on an already-aborted signal. Synthetically dispatch so the active
+      // child is terminated promptly.
+      if (signal.aborted) {
+        onAbort();
+      }
     }
 
     child.on("close", (code) => {
@@ -275,7 +339,16 @@ export function executeScript(
       settled = true;
       if (graceTimer) clearTimeout(graceTimer);
       if (signal) signal.removeEventListener("abort", onAbort);
-      reject(err);
+      // Async `'error'` path: the spawn-failure was observed asynchronously
+      // (e.g., ENOENT). Mirror the sync-throw path: pin first-observed and
+      // pause at the `child-spawn-failure` seam before propagating.
+      void (async () => {
+        if (firstObservedRef && firstObservedRef.trigger === null) {
+          firstObservedRef.trigger = "iteration";
+        }
+        await maybePauseAtTerminalTriggerWindow("child-spawn-failure");
+        reject(err);
+      })();
     });
   });
 }

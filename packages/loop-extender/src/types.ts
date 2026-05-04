@@ -9,4 +9,5 @@ export interface RunOptions {
   envFile?: string;
   signal?: AbortSignal;
   cwd?: string;
+  env?: Record<string, string>;
 }

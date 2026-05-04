@@ -9,10 +9,14 @@ import {
 } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawnSync, type ChildProcess } from "node:child_process";
 import { constants } from "node:os";
 import { discoverScripts } from "./discovery.js";
-import { runLoop, type LoopStartingTarget } from "./loop.js";
+import {
+  runLoop,
+  type LoopStartingTarget,
+  type FirstObservedRef,
+} from "./loop.js";
 import {
   loadGlobalEnv,
   loadLocalEnv,
@@ -21,7 +25,10 @@ import {
   envRemove,
   envList,
 } from "./env.js";
-import { installCommand } from "./install.js";
+import {
+  installCommand,
+  type InstallSignalContext,
+} from "./install.js";
 import { parseTarget } from "./target-validation.js";
 import { getLoopxBin, ensureLoopxPackageJson } from "./bin-path.js";
 
@@ -214,6 +221,7 @@ Sources:
 Options:
   -w <name>, --workflow <name>   Install only the named workflow (multi-workflow source)
   -y                             Override version mismatch and workflow collision checks
+  --no-install                   Skip auto-install of workflow dependencies (Spec 10.10)
   -h, --help                     Print this help message`);
 }
 
@@ -273,14 +281,32 @@ function handleEnvSubcommand(subArgs: string[]): void {
       process.stderr.write("Error: loopx env set requires <name> <value>\n");
       process.exit(1);
     }
+    if (subArgs.length > 3) {
+      process.stderr.write(
+        `Error: loopx env set: unexpected extra positional '${subArgs[3]}'\n`
+      );
+      process.exit(1);
+    }
     envSet(subArgs[1], subArgs[2]);
   } else if (action === "remove") {
     if (subArgs.length < 2) {
       process.stderr.write("Error: loopx env remove requires <name>\n");
       process.exit(1);
     }
+    if (subArgs.length > 2) {
+      process.stderr.write(
+        `Error: loopx env remove: unexpected extra positional '${subArgs[2]}'\n`
+      );
+      process.exit(1);
+    }
     envRemove(subArgs[1]);
   } else if (action === "list") {
+    if (subArgs.length > 1) {
+      process.stderr.write(
+        `Error: loopx env list: unexpected extra positional '${subArgs[1]}'\n`
+      );
+      process.exit(1);
+    }
     envList();
   } else {
     process.stderr.write(
@@ -295,18 +321,20 @@ interface InstallArgs {
   help: boolean;
   selectedWorkflow?: string | null;
   override: boolean;
+  noInstall: boolean;
   source?: string;
 }
 
 function parseInstallArgs(argv: string[]): InstallArgs {
   // Short-circuit: `-h` / `--help` anywhere ignores all validation.
   if (argv.includes("-h") || argv.includes("--help")) {
-    return { help: true, override: false };
+    return { help: true, override: false, noInstall: false };
   }
 
-  const result: InstallArgs = { help: false, override: false };
+  const result: InstallArgs = { help: false, override: false, noInstall: false };
   let sawW = false;
   let sawY = false;
+  let sawNoInstall = false;
   let i = 0;
 
   while (i < argv.length) {
@@ -330,6 +358,13 @@ function parseInstallArgs(argv: string[]): InstallArgs {
       }
       sawY = true;
       result.override = true;
+    } else if (arg === "--no-install") {
+      if (sawNoInstall) {
+        process.stderr.write(`Error: duplicate --no-install flag\n`);
+        process.exit(1);
+      }
+      sawNoInstall = true;
+      result.noInstall = true;
     } else if (arg.startsWith("-")) {
       process.stderr.write(`Error: unknown install flag '${arg}'\n`);
       process.exit(1);
@@ -369,6 +404,17 @@ function parseRunArgs(argv: string[]): RunArgs {
   while (i < argv.length) {
     const arg = argv[i];
 
+    // SPEC §4.1: `--` is rejected wherever it appears. The rejection cites
+    // `--` as the offending token — including when `--` would otherwise be
+    // consumed as the operand of `-n` or `-e` (covered by the operand-slot
+    // checks below before they read `argv[i]` as a value).
+    if (arg === "--") {
+      process.stderr.write(
+        "Error: unrecognized token '--' (loopx run does not accept '--' as an end-of-options marker)\n"
+      );
+      process.exit(1);
+    }
+
     if (arg === "-n") {
       if (sawN) {
         process.stderr.write("Error: duplicate -n flag\n");
@@ -381,6 +427,14 @@ function parseRunArgs(argv: string[]): RunArgs {
         process.exit(1);
       }
       const val = argv[i];
+      // SPEC §4.1: `--` in the `-n` operand slot is rejected as `--`
+      // itself, not as a non-integer operand value.
+      if (val === "--") {
+        process.stderr.write(
+          "Error: unrecognized token '--' (loopx run does not accept '--' as an end-of-options marker)\n"
+        );
+        process.exit(1);
+      }
       const num = Number(val);
       if (!Number.isInteger(num) || num < 0 || val.trim() === "") {
         process.stderr.write(
@@ -400,22 +454,16 @@ function parseRunArgs(argv: string[]): RunArgs {
         process.stderr.write("Error: -e requires a value\n");
         process.exit(1);
       }
-      result.envFile = argv[i];
-    } else if (arg === "--") {
-      i++;
-      if (i < argv.length) {
-        if (result.target) {
-          process.stderr.write(`Error: unexpected argument '${argv[i]}'\n`);
-          process.exit(1);
-        }
-        result.target = argv[i];
-        i++;
-      }
-      if (i < argv.length) {
-        process.stderr.write(`Error: unexpected argument '${argv[i]}'\n`);
+      const val = argv[i];
+      // SPEC §4.1: `--` in the `-e` operand slot is rejected as `--`
+      // itself, not loaded as the env-file path.
+      if (val === "--") {
+        process.stderr.write(
+          "Error: unrecognized token '--' (loopx run does not accept '--' as an end-of-options marker)\n"
+        );
         process.exit(1);
       }
-      break;
+      result.envFile = val;
     } else if (arg.startsWith("-")) {
       process.stderr.write(`Error: unknown flag '${arg}'\n`);
       process.exit(1);
@@ -490,6 +538,20 @@ async function main(): Promise<void> {
   }
 
   if (firstArg === "version") {
+    // SPEC §4.3 defines `loopx version` as a no-argument subcommand; SPEC §11
+    // documents top-level / run / install help forms only — there is no
+    // version-scoped help. Per SPEC §12's non-exhaustive usage-error list and
+    // the consistent grammar pattern (`loopx run ralph bar` is a usage error),
+    // any extra positional after `version` — including `--help` / `-h` — is a
+    // usage error. The version short-circuit must not fire when extra args
+    // are present (covers T-CLI-01a / T-CLI-01b).
+    if (argv.length > 1) {
+      const extra = argv[1];
+      process.stderr.write(
+        `Error: loopx version takes no arguments (got '${extra}'). Run 'loopx -h' for usage.\n`
+      );
+      process.exit(1);
+    }
     console.log(getVersion());
     process.exit(0);
   }
@@ -516,13 +578,95 @@ async function main(): Promise<void> {
       );
       process.exit(1);
     }
-    await installCommand({
-      source: installArgs.source,
-      cwd,
-      selectedWorkflow: installArgs.selectedWorkflow ?? null,
-      override: installArgs.override,
-      runningVersion: getVersion(),
-    });
+
+    // SPEC §10.10 "Signals during `npm install`" / "Signals during the
+    // auto-install pass when no npm child is active": install SIGINT /
+    // SIGTERM handlers BEFORE entering the install pipeline. When a signal
+    // arrives:
+    //   - If an `npm install` child is currently active, forward the same
+    //     signal to its process group via `process.kill(-pid, sig)` and
+    //     start a SPEC §7.3 5-second grace timer that escalates to SIGKILL
+    //     on the process group if the child has not exited.
+    //   - Whether or not a child is active, pin `installReceivedSignal` so
+    //     the auto-install loop aborts at the next safe checkpoint and
+    //     suppresses the aggregate failure report.
+    // After `installCommand` returns, if a signal was received, exit with
+    // `128 + sigNum` per SPEC §12.
+    let installReceivedSignal: NodeJS.Signals | null = null;
+    let installActiveNpmChild: ChildProcess | null = null;
+    let installSigKillTimer: ReturnType<typeof setTimeout> | null = null;
+    const installSignalHandler = (sig: NodeJS.Signals) => {
+      if (installReceivedSignal === null) {
+        installReceivedSignal = sig;
+      }
+      const child = installActiveNpmChild;
+      if (child && child.pid && installSigKillTimer === null) {
+        try {
+          process.kill(-child.pid, sig);
+        } catch {
+          try {
+            child.kill(sig);
+          } catch {
+            // already exited
+          }
+        }
+        installSigKillTimer = setTimeout(() => {
+          const stillActive = installActiveNpmChild;
+          if (stillActive && stillActive.pid) {
+            try {
+              process.kill(-stillActive.pid, "SIGKILL");
+            } catch {
+              try {
+                stillActive.kill("SIGKILL");
+              } catch {
+                // already exited
+              }
+            }
+          }
+        }, 5000);
+        installSigKillTimer.unref();
+      }
+    };
+    process.on("SIGINT", installSignalHandler);
+    process.on("SIGTERM", installSignalHandler);
+
+    const installSignalContext: InstallSignalContext = {
+      receivedSignal: () => installReceivedSignal,
+      setActiveNpmChild: (child) => {
+        installActiveNpmChild = child;
+        if (child === null && installSigKillTimer !== null) {
+          clearTimeout(installSigKillTimer);
+          installSigKillTimer = null;
+        }
+      },
+    };
+
+    try {
+      await installCommand({
+        source: installArgs.source,
+        cwd,
+        selectedWorkflow: installArgs.selectedWorkflow ?? null,
+        override: installArgs.override,
+        noInstall: installArgs.noInstall,
+        runningVersion: getVersion(),
+        signalContext: installSignalContext,
+      });
+    } finally {
+      process.removeListener("SIGINT", installSignalHandler);
+      process.removeListener("SIGTERM", installSignalHandler);
+      if (installSigKillTimer !== null) {
+        clearTimeout(installSigKillTimer);
+        installSigKillTimer = null;
+      }
+    }
+
+    if (installReceivedSignal !== null) {
+      const sigNum =
+        constants.signals[
+          installReceivedSignal as keyof typeof constants.signals
+        ] ?? 15;
+      process.exit(128 + sigNum);
+    }
     process.exit(0);
   }
 
@@ -545,18 +689,83 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // SPEC §7.3 — install pre-iteration signal handlers BEFORE any pre-iteration
+  // step (discovery, env-file loading, target resolution, tmpdir creation).
+  // A signal observed by these handlers wins over non-signal pre-iteration
+  // failures: every pre-iteration failure site below checks `receivedSignal`
+  // first and exits via `exitWithSignal()` so the signal exit code (128+N) is
+  // surfaced and the displaced failure error is not.
+  const ac = new AbortController();
+  let receivedSignal: NodeJS.Signals | null = null;
+
+  // SPEC §7.2 first-observed-wins: shared between the signal handlers,
+  // `runLoop`, and the post-loop dispatch logic. Pinned to "abort" by the
+  // signal handlers (only when null), pinned to "iteration" by `runLoop`
+  // before throwing iteration-level errors. The post-loop catch consults this
+  // slot to decide whether a late signal should displace an iteration error
+  // (T-TERM-05): if the iteration error was first-observed, surface it; only
+  // if the signal arrived first do we exit with the signal's code.
+  const firstObservedRef: FirstObservedRef = { trigger: null };
+
+  function exitWithSignal(): never {
+    const sigNum =
+      constants.signals[receivedSignal as keyof typeof constants.signals] ?? 15;
+    process.exit(128 + sigNum);
+  }
+
+  // SPEC §7.2 first-observed-wins: a second signal arriving after the first
+  // (e.g. SIGTERM during cleanup of a prior SIGINT) does not displace the
+  // first signal's exit code. The AbortController is already aborted on the
+  // second call (no-op), so we still propagate but leave `receivedSignal`
+  // anchored at the first observation. We also pin `firstObservedRef.trigger`
+  // to "abort" so a downstream iteration-level error observed AFTER the
+  // signal cannot displace the signal's exit code at dispatch time.
+  const signalHandler = (sig: NodeJS.Signals) => {
+    if (receivedSignal === null) {
+      receivedSignal = sig;
+    }
+    if (firstObservedRef.trigger === null) {
+      firstObservedRef.trigger = "abort";
+    }
+    ac.abort(sig);
+  };
+  process.on("SIGINT", signalHandler);
+  process.on("SIGTERM", signalHandler);
+
+  // TEST-SPEC §1.4 — pre-iteration sentinel seam. Emit a marker line on
+  // stderr after handler installation but before any pre-iteration step so a
+  // parent harness can deterministically synchronize signal delivery into the
+  // pre-iteration window (T-SIG-20..T-SIG-31). After emission, hold the
+  // pre-iteration window open with a bounded sleep so the harness has a
+  // deterministic interval to deliver the signal before pre-iteration
+  // proceeds — without this, fast pre-iteration paths (small `.loopx/`,
+  // valid targets) finish before the signal arrives, defeating the
+  // signal-wins precedence assertion. Gated on NODE_ENV=test AND
+  // LOOPX_TEST_PREITERATION_SENTINEL=1 so production behavior is
+  // unaffected.
+  if (
+    process.env.NODE_ENV === "test" &&
+    process.env.LOOPX_TEST_PREITERATION_SENTINEL
+  ) {
+    process.stderr.write("LOOPX_PREITERATION_READY\n");
+    await new Promise<void>((r) => setTimeout(r, 300));
+  }
+
   // Discovery (global validation per SPEC §5.4).
   const discovery = discoverScripts(loopxDir, "run");
+  if (receivedSignal) exitWithSignal();
   for (const w of discovery.warnings) {
     process.stderr.write(w + "\n");
   }
   if (discovery.errors.length > 0) {
+    if (receivedSignal) exitWithSignal();
     for (const err of discovery.errors) {
       process.stderr.write(`Error: ${err}\n`);
     }
     process.exit(1);
   }
 
+  if (receivedSignal) exitWithSignal();
   ensureLoopxPackageJson(loopxDir);
 
   let globalEnv: Record<string, string> = {};
@@ -569,6 +778,7 @@ async function main(): Promise<void> {
       process.stderr.write(`Warning: ${w}\n`);
     }
   } catch (err: unknown) {
+    if (receivedSignal) exitWithSignal();
     process.stderr.write(
       `Error: ${err instanceof Error ? err.message : String(err)}\n`
     );
@@ -584,6 +794,7 @@ async function main(): Promise<void> {
         process.stderr.write(`Warning: ${w}\n`);
       }
     } catch (err: unknown) {
+      if (receivedSignal) exitWithSignal();
       process.stderr.write(
         `Error: ${err instanceof Error ? err.message : String(err)}\n`
       );
@@ -593,15 +804,19 @@ async function main(): Promise<void> {
 
   const mergedEnv = mergeEnv(globalEnv, localEnv);
 
+  if (receivedSignal) exitWithSignal();
+
   // Target resolution
   const parsed = parseTarget(runArgs.target);
   if (!parsed.ok) {
+    if (receivedSignal) exitWithSignal();
     process.stderr.write(`Error: ${parsed.error}\n`);
     process.exit(1);
   }
 
   const workflow = discovery.workflows.get(parsed.workflow);
   if (!workflow) {
+    if (receivedSignal) exitWithSignal();
     process.stderr.write(
       `Error: workflow '${parsed.workflow}' not found in .loopx/\n`
     );
@@ -611,6 +826,7 @@ async function main(): Promise<void> {
   let scriptName: string;
   if (parsed.script === null) {
     if (!workflow.hasIndex || !workflow.scripts.has("index")) {
+      if (receivedSignal) exitWithSignal();
       process.stderr.write(
         `Error: workflow '${parsed.workflow}' has no default entry point ('index' script)\n`
       );
@@ -623,6 +839,7 @@ async function main(): Promise<void> {
 
   const scriptFile = workflow.scripts.get(scriptName);
   if (!scriptFile) {
+    if (receivedSignal) exitWithSignal();
     process.stderr.write(
       `Error: script '${scriptName}' not found in workflow '${parsed.workflow}'\n`
     );
@@ -631,25 +848,14 @@ async function main(): Promise<void> {
 
   // -n 0: validate then exit (SPEC §3.2 — no workflow-level version check).
   if (runArgs.maxIterations === 0) {
+    if (receivedSignal) exitWithSignal();
     process.exit(0);
   }
 
-  // Signal handling
-  const ac = new AbortController();
-  let receivedSignal: NodeJS.Signals | null = null;
-
-  function exitWithSignal(): never {
-    const sigNum =
-      constants.signals[receivedSignal as keyof typeof constants.signals] ?? 15;
-    process.exit(128 + sigNum);
-  }
-
-  const signalHandler = (sig: NodeJS.Signals) => {
-    receivedSignal = sig;
-    ac.abort(sig);
-  };
-  process.on("SIGINT", signalHandler);
-  process.on("SIGTERM", signalHandler);
+  // SPEC §7.3 — final pre-iteration signal check before iteration begins.
+  // Covers T-SIG-31 (fully valid pre-iteration with signal observed by the
+  // installed handler — the run would otherwise have proceeded).
+  if (receivedSignal) exitWithSignal();
 
   const starting: LoopStartingTarget = { workflow, script: scriptFile };
 
@@ -661,6 +867,7 @@ async function main(): Promise<void> {
       loopxBin,
       runningVersion: getVersion(),
       signal: ac.signal,
+      firstObservedRef,
     });
 
     for await (const _output of loop) {
@@ -671,7 +878,17 @@ async function main(): Promise<void> {
 
     process.exit(0);
   } catch (err: unknown) {
-    if (receivedSignal) exitWithSignal();
+    // SPEC §7.2 first-observed-wins. If an iteration-level error (script
+    // non-zero exit, invalid goto, etc.) was observed BEFORE any signal, the
+    // iteration outcome (Error: ... + exit 1) is the surfaced terminal
+    // outcome — a signal received during the post-observation
+    // `child-exit-handler` seam pause (T-TERM-05) or otherwise after
+    // `pinIterationFirstObserved` does not displace it. Only when the signal
+    // was first-observed (or no iteration error was pinned) do we exit with
+    // the signal's code.
+    if (receivedSignal && firstObservedRef.trigger !== "iteration") {
+      exitWithSignal();
+    }
     const msg = err instanceof Error ? err.message : String(err);
     process.stderr.write(`Error: ${msg}\n`);
     process.exit(1);

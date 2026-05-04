@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, accessSync, constants } from "node:fs";
+import { readFileSync, accessSync, constants, lstatSync } from "node:fs";
 import { join } from "node:path";
 import { isValidRange, satisfies } from "./semver.js";
 
@@ -12,6 +12,9 @@ import { isValidRange, satisfies } from "./semver.js";
 // Failure modes (all non-blocking at runtime; emit a warning and skip the
 // check):
 //   - no-package-json:     file doesn't exist → silent (not a warning)
+//   - non-regular:         entry is a directory / symlink / FIFO / socket /
+//                          other non-regular type, observed via `lstat`
+//                          (symlinks NOT followed) → warning
 //   - unreadable:          EACCES/EPERM reading the file → warning
 //   - invalid-json:        JSON.parse failed → warning
 //   - no-loopx-declared:   file parsed but no loopx in dep/devDep → silent
@@ -21,6 +24,7 @@ import { isValidRange, satisfies } from "./semver.js";
 
 export type VersionCheckResult =
   | { kind: "no-package-json" }
+  | { kind: "non-regular" }
   | { kind: "unreadable" }
   | { kind: "invalid-json" }
   | { kind: "no-loopx-declared" }
@@ -38,8 +42,20 @@ export function checkWorkflowVersion(
 ): VersionCheckResult {
   const pkgPath = join(workflowDir, "package.json");
 
-  if (!existsSync(pkgPath)) {
-    return { kind: "no-package-json" };
+  // Per SPEC §3.2: detect non-regular `package.json` paths via `lstat`
+  // (directory, symlink, FIFO, socket, or other non-regular entry).
+  // Symlinks are NOT followed.
+  let pkgLstat: ReturnType<typeof lstatSync>;
+  try {
+    pkgLstat = lstatSync(pkgPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { kind: "no-package-json" };
+    }
+    return { kind: "unreadable" };
+  }
+  if (!pkgLstat.isFile()) {
+    return { kind: "non-regular" };
   }
 
   try {
@@ -67,11 +83,16 @@ export function checkWorkflowVersion(
   }
 
   const obj = pkg as Record<string, unknown>;
-  const range = extractLoopxRange(obj);
-  if (range === null) {
+  const entry = extractLoopxValue(obj);
+  if (entry === null) {
     return { kind: "no-loopx-declared" };
   }
-
+  // Per SPEC §3.2: any value that is not a valid semver range — including
+  // non-string types — is treated as "invalid semver range".
+  if (typeof entry.value !== "string") {
+    return { kind: "invalid-semver", range: String(entry.value) };
+  }
+  const range = entry.value;
   if (!isValidRange(range)) {
     return { kind: "invalid-semver", range };
   }
@@ -83,20 +104,30 @@ export function checkWorkflowVersion(
 }
 
 /**
- * Workflow-level: extract loopx version range from dependencies (wins if
- * both) then devDependencies. Per SPEC §3.2, optionalDependencies is NOT
- * checked at the workflow level.
+ * Workflow-level: locate the `loopx` entry in `dependencies` (wins if both
+ * are present) then `devDependencies`. Returns the raw value (preserving
+ * type so the caller can distinguish a non-string value from a missing
+ * declaration). Per SPEC §3.2, `optionalDependencies` is NOT checked at
+ * the workflow level.
  */
-function extractLoopxRange(pkg: Record<string, unknown>): string | null {
+function extractLoopxValue(
+  pkg: Record<string, unknown>
+): { value: unknown } | null {
   const deps = pkg.dependencies;
   if (typeof deps === "object" && deps !== null && !Array.isArray(deps)) {
-    const v = (deps as Record<string, unknown>).loopx;
-    if (typeof v === "string") return v;
+    if (Object.prototype.hasOwnProperty.call(deps, "loopx")) {
+      return { value: (deps as Record<string, unknown>).loopx };
+    }
   }
   const devDeps = pkg.devDependencies;
-  if (typeof devDeps === "object" && devDeps !== null && !Array.isArray(devDeps)) {
-    const v = (devDeps as Record<string, unknown>).loopx;
-    if (typeof v === "string") return v;
+  if (
+    typeof devDeps === "object" &&
+    devDeps !== null &&
+    !Array.isArray(devDeps)
+  ) {
+    if (Object.prototype.hasOwnProperty.call(devDeps, "loopx")) {
+      return { value: (devDeps as Record<string, unknown>).loopx };
+    }
   }
   return null;
 }
@@ -115,6 +146,8 @@ export function formatWarning(
     case "no-loopx-declared":
     case "satisfied":
       return null;
+    case "non-regular":
+      return `Warning: workflow '${workflowName}' package.json is not a regular file; skipping check`;
     case "unreadable":
       return `Warning: workflow '${workflowName}' package.json is unreadable (permission denied); skipping check`;
     case "invalid-json":

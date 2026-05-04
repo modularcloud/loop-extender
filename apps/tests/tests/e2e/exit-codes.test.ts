@@ -222,6 +222,40 @@ describe("SPEC: Exit Codes", () => {
         expect(result.exitCode).toBe(1);
         expect(result.stderr.length).toBeGreaterThan(0);
       });
+
+      // T-EXIT-17: Invalid target string (e.g., ":script") → exit 1.
+      // SPEC §12: "Invalid target strings ... are also exit code 1 but are
+      // not usage errors — they are rejected after discovery, at the same
+      // point as a missing workflow or missing script (section 4.1)."
+      //
+      // This is the non-signal counterpart to T-SIG-22 (which exercises the
+      // same `:script` invalid-target shape on the signal-wins precedence
+      // path). Setup mirrors T-SIG-22: a valid .loopx/ tree with at least
+      // one workflow exists so discovery succeeds, ensuring the rejection
+      // really happens at the post-discovery target-resolution checkpoint
+      // (parseTarget at bin.ts target resolution), not earlier.
+      it("T-EXIT-17: invalid target ':script' -> exit 1", async () => {
+        project = await createTempProject();
+        // Provide a valid workflow so discovery succeeds; the invalid target
+        // must still be rejected with exit 1 at the post-discovery checkpoint.
+        await createWorkflowScript(project, "ralph", "index", ".sh", emitStop());
+
+        const result = await runCLI(["run", ":script"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+        // Per SPEC §12 this is not a usage error; the implementation surfaces
+        // a single-line "Invalid target ':script': leading ':' (empty
+        // workflow)" diagnostic on stderr.
+        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr).toMatch(/[Ii]nvalid target/);
+        expect(result.stderr).toContain(":script");
+        // Stdout must remain silent on the error path (CLI never echoes
+        // structured output / raw result on failure — SPEC §7.1 / T-LOOP-46).
+        expect(result.stdout).toBe("");
+      });
     });
   });
 

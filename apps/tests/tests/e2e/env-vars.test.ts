@@ -1,8 +1,9 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { readFileSync, existsSync, unlinkSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { readFileSync, existsSync, unlinkSync, realpathSync, readdirSync } from "node:fs";
 import { mkdir, chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   createTempProject,
   createWorkflowScript,
@@ -15,6 +16,7 @@ import {
   createEnvFile,
   writeEnvFileRaw,
   withGlobalEnv,
+  withGlobalEnvRawContent,
   withIsolatedHome,
 } from "../helpers/env.js";
 import {
@@ -1215,6 +1217,1693 @@ fi
         }
         await rm(tempConfigHome, { recursive: true, force: true });
       }
+    });
+  });
+});
+
+// ============================================================================
+// SPEC: Env File NUL in Value -> Spawn Failure
+//   (T-ENV-26 / T-ENV-26a / T-ENV-26b / T-ENV-26c / T-ENV-26f / T-ENV-26g
+//    T-ENV-27 / T-ENV-27a / T-ENV-27b / T-ENV-27c / T-ENV-27d / T-ENV-27e)
+//
+// SPEC §7.2 / §9.5 — "the runtime does not distinguish tiers": runtime-level
+// rejections of env entries (most reliably an embedded NUL byte in a value)
+// surface as child launch / spawn failures at spawn time, regardless of which
+// env tier (RunOptions.env / local env-file / global env-file / inherited)
+// supplied the entry. T-API-57 series covers the RunOptions.env tier; this
+// block closes the gap for the local env-file (-e / envFile) and global env-
+// file tiers across all three run surfaces (CLI, runPromise(), run()).
+//
+// SPEC §8.1 / §8.2 — env-file parsers split content on '\n' and read the
+// value from after the first '=' to end of line; NUL bytes in values are
+// preserved verbatim (no parser-side validation). The parser-accepted entry
+// reaches mergeEnv unchanged, propagates through child_process.spawn, and
+// the Node runtime rejects it as ERR_INVALID_ARG_VALUE.
+//
+// SPEC §7.4 cleanup-trigger list ("Child launch / spawn failure after tmpdir
+// creation") + SPEC §9.3 ("Cleanup ordering is observable. When LOOPX_TMPDIR
+// cleanup runs as part of an error path ... it runs before the generator
+// throws or the promise rejects"): LOOPX_TMPDIR is created before spawn,
+// and best-effort cleanup runs in runLoop's finally block before the error
+// surfaces to the caller. The "no residue under TMPDIR parent" assertion
+// pins the cleanup-before-throw contract on the programmatic surfaces and
+// the cleanup-before-exit contract on the CLI surface.
+//
+// Coverage matrix (12 IDs):
+//   Tier         | maxIter | CLI         | runPromise()  | run() generator
+//   -------------|---------|-------------|---------------|-----------------
+//   local -e     | 1       | T-ENV-26    | T-ENV-26a     | T-ENV-26f
+//   local -e     | 0       | T-ENV-26b   | T-ENV-26c     | T-ENV-26g
+//   global       | 1       | T-ENV-27    | T-ENV-27a     | T-ENV-27d
+//   global       | 0       | T-ENV-27b   | T-ENV-27c     | T-ENV-27e
+//
+// All tests run under a test-isolated TMPDIR parent (TEST-SPEC §4.7 suite-
+// wide isolation guidance) so concurrent test workers do not race on
+// `/tmp`'s `loopx-*` entries.
+// ============================================================================
+
+describe("SPEC: Env File NUL in Value -> Spawn Failure", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    while (cleanups.length > 0) {
+      const cleanup = cleanups.shift();
+      if (cleanup) await cleanup().catch(() => {});
+    }
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  async function makeIsolatedTmpdirParent(label: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), `loopx-test-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  async function makeIsolatedXdgConfigHome(label: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), `loopx-test-xdg-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  // List `loopx-*` entries directly under `parent`, filtering implementation-
+  // internal helpers (per AGENT.md / SPEC §7.4 — nodepath-shim, bun-jsx, and
+  // install staging are NOT LOOPX_TMPDIR) and the test-isolation prefixes.
+  function listLoopxEntries(parent: string): string[] {
+    try {
+      return readdirSync(parent)
+        .filter((e) => e.startsWith("loopx-"))
+        .filter(
+          (e) =>
+            !e.startsWith("loopx-nodepath-shim-") &&
+            !e.startsWith("loopx-bun-jsx-") &&
+            !e.startsWith("loopx-install-") &&
+            !e.startsWith("loopx-test-"),
+        );
+    } catch {
+      return [];
+    }
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-ENV-26: CLI -e local env-file NUL byte in value -> spawn failure.
+    //   The parser preserves the NUL, mergeEnv passes it to spawn, and Node
+    //   rejects the env value (ERR_INVALID_ARG_VALUE). loopx exits 1 with a
+    //   child-launch / spawn-failure stderr (NOT a parser-shape warning).
+    //   LOOPX_TMPDIR cleanup ran before exit (no residue under the test-
+    //   isolated TMPDIR parent). SPEC §7.2 / §7.4 / §8.2.
+    // ------------------------------------------------------------------------
+    it("T-ENV-26: CLI -e — NUL in env-file value rejects with spawn failure and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("env26");
+      const marker = join(project.dir, "child-ran.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await writeEnvFileRaw(envFilePath, `MYVAR=bad\x00val\n`);
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const result = await runCLI(
+        ["run", "-e", envFilePath, "-n", "1", "ralph"],
+        {
+          cwd: project.dir,
+          runtime,
+          env: { TMPDIR: tmpdirParent },
+        },
+      );
+
+      // (a) Exit code 1 — child launch / spawn failure surfaces non-zero.
+      expect(result.exitCode).toBe(1);
+      // (b) Stderr contains a child-launch / spawn-failure error (not a
+      //     parser-shape warning about an invalid key).
+      expect(result.stderr.length).toBeGreaterThan(0);
+      expect(result.stderr).not.toMatch(/invalid key/i);
+      // (c) Workflow script did not run (spawn rejected before child started).
+      expect(existsSync(marker)).toBe(false);
+      // (d) Cleanup ran before exit — no loopx-* residue under TMPDIR parent.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-26a: runPromise() local envFile NUL -> rejection + cleanup.
+    //   Programmatic-API counterpart to T-ENV-26. SPEC §9.3's cleanup-before-
+    //   rejection ordering is asserted via the residue check.
+    //   SPEC §7.2 / §7.4 / §8.2 / §9.3 / §9.5.
+    // ------------------------------------------------------------------------
+    it("T-ENV-26a: runPromise() — NUL in local envFile value rejects with spawn failure and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env26a");
+      const marker = join(projectDir, "child-ran.txt");
+      const envFilePath = join(projectDir, "local.env");
+      await writeEnvFileRaw(envFilePath, `MYVAR=bad\x00val\n`);
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(projectDir)},
+    envFile: ${JSON.stringify(envFilePath)},
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ rejected, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise rejected with a spawn-failure error (not an envFile
+      //     shape-validation error — the file exists, is readable, and
+      //     the parser accepts the NUL value).
+      expect(parsed.rejected).toBe(true);
+      expect(parsed.message).not.toMatch(/envFile.*not.*found/i);
+      expect(parsed.message).not.toMatch(/options\.envFile/i);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) Cleanup ran before rejection — no loopx-* residue.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-26b: CLI -n 0 + local envFile NUL -> exit 0 (no spawn, no
+    //   spawn-failure surface). The env-file is read and parsed (validating
+    //   readability + key shape), but the runtime's environment-building
+    //   step never executes, so the NUL value silently survives.
+    //   SPEC §4.2 / §7.1 / §7.4 / §8.1 / §8.2.
+    // ------------------------------------------------------------------------
+    it("T-ENV-26b: CLI -e -n 0 — NUL in env-file value silently survives (no spawn)", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("env26b");
+      const marker = join(project.dir, "child-ran.txt");
+      const envFilePath = join(project.dir, "local.env");
+      await writeEnvFileRaw(envFilePath, `MYVAR=bad\x00val\n`);
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const result = await runCLI(
+        ["run", "-e", envFilePath, "-n", "0", "ralph"],
+        {
+          cwd: project.dir,
+          runtime,
+          env: { TMPDIR: tmpdirParent },
+        },
+      );
+
+      // (a) Exit code 0 (per SPEC §4.2 -n 0 exits 0 on success).
+      expect(result.exitCode).toBe(0);
+      // (b) No spawn-failure error and no parser warning about NUL.
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      expect(result.stderr).not.toMatch(/invalid key/i);
+      // (c) Workflow script did not run (no spawn under -n 0).
+      expect(existsSync(marker)).toBe(false);
+      // (d) No LOOPX_TMPDIR was created (per SPEC §7.4 — tmpdir creation
+      //     is skipped under -n 0).
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-26c: runPromise() maxIterations:0 + local envFile NUL ->
+    //   resolves []. Programmatic-API counterpart to T-ENV-26b.
+    //   SPEC §9.2 / §9.5 / §7.1 / §7.4 / §8.2.
+    // ------------------------------------------------------------------------
+    it("T-ENV-26c: runPromise() — maxIterations:0 + NUL in local envFile silently survives (no spawn)", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env26c");
+      const marker = join(projectDir, "child-ran.txt");
+      const envFilePath = join(projectDir, "local.env");
+      await writeEnvFileRaw(envFilePath, `MYVAR=bad\x00val\n`);
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "", value = "<not-set>";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(projectDir)},
+    envFile: ${JSON.stringify(envFilePath)},
+    maxIterations: 0,
+  });
+  value = JSON.stringify(outputs);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ rejected, message, value }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) Promise resolved (no rejection).
+      expect(parsed.rejected).toBe(false);
+      // (b) Resolved value is [].
+      expect(parsed.value).toBe("[]");
+      // (c) No spawn-failure error.
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      // (d) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (e) No LOOPX_TMPDIR was created.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-26f: run() generator local envFile NUL -> throws on first next()
+    //   + cleanup. Generator-surface counterpart to T-ENV-26a.
+    //   SPEC §7.2 / §7.4 / §8.2 / §9.1 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-ENV-26f: run() — NUL in local envFile value throws on first next() and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env26f");
+      const marker = join(projectDir, "child-ran.txt");
+      const envFilePath = join(projectDir, "local.env");
+      await writeEnvFileRaw(envFilePath, `MYVAR=bad\x00val\n`);
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(projectDir)},
+  envFile: ${JSON.stringify(envFilePath)},
+  maxIterations: 1,
+});
+let threw = false, message = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() rejected with a spawn-failure error.
+      expect(parsed.threw).toBe(true);
+      expect(parsed.message).not.toMatch(/envFile.*not.*found/i);
+      expect(parsed.message).not.toMatch(/options\.envFile/i);
+      // (b) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (c) Cleanup ran before throw — no loopx-* residue.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-26g: run() maxIterations:0 + local envFile NUL -> first next()
+    //   returns { done: true, value: undefined }. Generator-surface
+    //   counterpart to T-ENV-26c.
+    //   SPEC §9.1 / §9.5 / §7.1 / §7.4 / §8.2.
+    // ------------------------------------------------------------------------
+    it("T-ENV-26g: run() — maxIterations:0 + NUL in local envFile completes immediately (no spawn)", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env26g");
+      const marker = join(projectDir, "child-ran.txt");
+      const envFilePath = join(projectDir, "local.env");
+      await writeEnvFileRaw(envFilePath, `MYVAR=bad\x00val\n`);
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(projectDir)},
+  envFile: ${JSON.stringify(envFilePath)},
+  maxIterations: 0,
+});
+let threw = false, message = "", firstDone = null, firstValue = "<not-set>";
+try {
+  const first = await gen.next();
+  firstDone = first.done;
+  firstValue = first.value === undefined ? "undefined" : JSON.stringify(first.value);
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message, firstDone, firstValue }));
+`;
+      const result = await runAPIDriver(runtime, driverCode, {
+        env: { TMPDIR: tmpdirParent },
+      });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      // (a) First next() returned { done: true, value: undefined }.
+      expect(parsed.threw).toBe(false);
+      expect(parsed.firstDone).toBe(true);
+      expect(parsed.firstValue).toBe("undefined");
+      // (b) No spawn-failure error.
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      // (c) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (d) No LOOPX_TMPDIR was created.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-27: CLI global env-file NUL byte in value -> spawn failure.
+    //   Global-env-file tier counterpart to T-ENV-26 (local -e). The
+    //   isolated XDG_CONFIG_HOME is provisioned via runCLI's `env` option;
+    //   the global env file at <xdg>/loopx/env contains `MYVAR=bad\x00val`,
+    //   which the parser preserves verbatim. SPEC §7.2 / §8.1 / §8.3.
+    // ------------------------------------------------------------------------
+    it("T-ENV-27: CLI — NUL in global env-file value rejects with spawn failure and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("env27");
+      const xdgDir = await makeIsolatedXdgConfigHome("env27");
+      const loopxConfigDir = join(xdgDir, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const globalEnvFilePath = join(loopxConfigDir, "env");
+      await writeEnvFileRaw(globalEnvFilePath, `MYVAR=bad\x00val\n`);
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdgDir },
+      });
+
+      // (a) Exit code 1 — child launch / spawn failure.
+      expect(result.exitCode).toBe(1);
+      // (b) Stderr contains a child-launch / spawn-failure error (not a
+      //     parser-shape warning).
+      expect(result.stderr.length).toBeGreaterThan(0);
+      expect(result.stderr).not.toMatch(/invalid key/i);
+      // (c) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (d) Cleanup ran before exit — no loopx-* residue under TMPDIR parent.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-27a: runPromise() global env-file NUL -> rejection + cleanup.
+    //   Programmatic-API counterpart to T-ENV-27. Uses
+    //   `withGlobalEnvRawContent` to set XDG_CONFIG_HOME on process.env so
+    //   the api-driver subprocess inherits it via the standard env merge.
+    //   SPEC §7.2 / §7.4 / §8.1 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-ENV-27a: runPromise() — NUL in global env-file value rejects with spawn failure and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env27a");
+      const marker = join(projectDir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      await withGlobalEnvRawContent(`MYVAR=bad\x00val\n`, async () => {
+        const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "";
+try {
+  await runPromise("ralph", {
+    cwd: ${JSON.stringify(projectDir)},
+    maxIterations: 1,
+  });
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ rejected, message }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) Promise rejected.
+        expect(parsed.rejected).toBe(true);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) Cleanup ran before rejection — no loopx-* residue.
+        const after = listLoopxEntries(tmpdirParent);
+        const newEntries = after.filter((e) => !before.includes(e));
+        expect(newEntries).toEqual([]);
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-27b: CLI -n 0 + global env-file NUL -> exit 0.
+    //   SPEC §4.2 / §7.1 / §7.4 / §8.1.
+    // ------------------------------------------------------------------------
+    it("T-ENV-27b: CLI -n 0 — NUL in global env-file value silently survives (no spawn)", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("env27b");
+      const xdgDir = await makeIsolatedXdgConfigHome("env27b");
+      const loopxConfigDir = join(xdgDir, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const globalEnvFilePath = join(loopxConfigDir, "env");
+      await writeEnvFileRaw(globalEnvFilePath, `MYVAR=bad\x00val\n`);
+      const marker = join(project.dir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      const result = await runCLI(["run", "-n", "0", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdgDir },
+      });
+
+      // (a) Exit code 0.
+      expect(result.exitCode).toBe(0);
+      // (b) No spawn-failure error and no parser warning about NUL.
+      expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+      expect(result.stderr).not.toMatch(/invalid key/i);
+      // (c) Workflow script did not run.
+      expect(existsSync(marker)).toBe(false);
+      // (d) No LOOPX_TMPDIR was created.
+      const after = listLoopxEntries(tmpdirParent);
+      const newEntries = after.filter((e) => !before.includes(e));
+      expect(newEntries).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-27c: runPromise() maxIterations:0 + global env-file NUL ->
+    //   resolves []. SPEC §9.2 / §9.5 / §7.1 / §7.4 / §8.1.
+    // ------------------------------------------------------------------------
+    it("T-ENV-27c: runPromise() — maxIterations:0 + NUL in global env-file silently survives (no spawn)", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env27c");
+      const marker = join(projectDir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      await withGlobalEnvRawContent(`MYVAR=bad\x00val\n`, async () => {
+        const driverCode = `
+import { runPromise } from "loopx";
+let rejected = false, message = "", value = "<not-set>";
+try {
+  const outputs = await runPromise("ralph", {
+    cwd: ${JSON.stringify(projectDir)},
+    maxIterations: 0,
+  });
+  value = JSON.stringify(outputs);
+} catch (e) {
+  rejected = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ rejected, message, value }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.rejected).toBe(false);
+        expect(parsed.value).toBe("[]");
+        expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+        expect(existsSync(marker)).toBe(false);
+        const after = listLoopxEntries(tmpdirParent);
+        const newEntries = after.filter((e) => !before.includes(e));
+        expect(newEntries).toEqual([]);
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-27d: run() generator global env-file NUL -> throws + cleanup.
+    //   Generator-surface counterpart to T-ENV-27a.
+    //   SPEC §7.2 / §7.4 / §8.1 / §9.1 / §9.3.
+    // ------------------------------------------------------------------------
+    it("T-ENV-27d: run() — NUL in global env-file value throws on first next() and cleans tmpdir", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env27d");
+      const marker = join(projectDir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      await withGlobalEnvRawContent(`MYVAR=bad\x00val\n`, async () => {
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(projectDir)},
+  maxIterations: 1,
+});
+let threw = false, message = "";
+try {
+  await gen.next();
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        // (a) First next() rejected.
+        expect(parsed.threw).toBe(true);
+        // (b) Workflow script did not run.
+        expect(existsSync(marker)).toBe(false);
+        // (c) Cleanup ran before throw — no loopx-* residue.
+        const after = listLoopxEntries(tmpdirParent);
+        const newEntries = after.filter((e) => !before.includes(e));
+        expect(newEntries).toEqual([]);
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-27e: run() generator maxIterations:0 + global env-file NUL ->
+    //   first next() returns { done: true }. Generator-surface counterpart
+    //   to T-ENV-27c. SPEC §9.1 / §9.5 / §7.1 / §7.4 / §8.1.
+    // ------------------------------------------------------------------------
+    it("T-ENV-27e: run() — maxIterations:0 + NUL in global env-file completes immediately (no spawn)", async () => {
+      project = await createTempProject();
+      const projectDir = project.dir;
+      const tmpdirParent = await makeIsolatedTmpdirParent("env27e");
+      const marker = join(projectDir, "child-ran.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf 'spawned' > "${marker}"
+printf '{"stop":true}'`,
+      );
+
+      const before = listLoopxEntries(tmpdirParent);
+      await withGlobalEnvRawContent(`MYVAR=bad\x00val\n`, async () => {
+        const driverCode = `
+import { run } from "loopx";
+const gen = run("ralph", {
+  cwd: ${JSON.stringify(projectDir)},
+  maxIterations: 0,
+});
+let threw = false, message = "", firstDone = null, firstValue = "<not-set>";
+try {
+  const first = await gen.next();
+  firstDone = first.done;
+  firstValue = first.value === undefined ? "undefined" : JSON.stringify(first.value);
+} catch (e) {
+  threw = true;
+  message = e && e.message ? e.message : String(e);
+}
+console.log(JSON.stringify({ threw, message, firstDone, firstValue }));
+`;
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: { TMPDIR: tmpdirParent },
+        });
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.threw).toBe(false);
+        expect(parsed.firstDone).toBe(true);
+        expect(parsed.firstValue).toBe("undefined");
+        expect(result.stderr).not.toMatch(/spawn|ENOENT|EINVAL|ERR_INVALID/i);
+        expect(existsSync(marker)).toBe(false);
+        const after = listLoopxEntries(tmpdirParent);
+        const newEntries = after.filter((e) => !before.includes(e));
+        expect(newEntries).toEqual([]);
+      });
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC: CLI Env File LOOPX_* NUL Override
+//   (T-ENV-28 / T-ENV-28a — CLI local env file `-e`,
+//    T-ENV-29 / T-ENV-29a — CLI global env file)
+//
+// Closes the SPEC §8.3 protocol-variable override × SPEC §9.5 / §7.2 NUL-
+// runtime-rejection merge-order contract on the CLI surface across both
+// env-file tiers (tier 3 local `-e`, tier 4 global) and all five script-
+// protocol-protected names (LOOPX_BIN, LOOPX_PROJECT_ROOT, LOOPX_WORKFLOW,
+// LOOPX_WORKFLOW_DIR, LOOPX_TMPDIR).
+//
+// SPEC §8.1: env-file values may contain embedded NUL bytes — the parser
+// splits content on '\n' and reads from after the first '=' to end of line,
+// with no NUL-byte filtering. The NUL byte therefore reaches mergeEnv
+// unchanged from the env-file-loaded vars. The protocol-tier overlay in
+// execution.ts (lines 179-185) applies AFTER the merged env is computed in
+// run.ts (lines 661-664), so for the five script-protocol-protected names
+// the user-supplied NUL value is replaced before the merged env reaches
+// child_process.spawn — no spawn failure surfaces.
+//
+// CLI counterpart of T-API-58f / T-API-58f2 (programmatic local envFile)
+// and T-API-58g / T-API-58g2 (programmatic global env file). A buggy
+// implementation that wired the protocol-tier-overlay-after-merge contract
+// correctly on the programmatic env-file paths but routed CLI env-file
+// loading through a separate, merge-order-broken code path would pass
+// T-API-58f / T-API-58f2 / T-API-58g / T-API-58g2 yet fail these tests.
+//
+// All tests run under a test-isolated TMPDIR parent (TEST-SPEC §4.7) — the
+// suite-wide isolation guidance avoids races on /tmp `loopx-*` entries
+// between concurrent test workers. XDG_CONFIG_HOME is supplied via runCLI's
+// `env` option (extraEnv) rather than mutating process.env, so concurrent
+// tests within the same worker remain isolated.
+// ---------------------------------------------------------------------------
+
+describe("SPEC: CLI Env File LOOPX_* NUL Override", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    while (cleanups.length > 0) {
+      const cleanup = cleanups.shift();
+      if (cleanup) await cleanup().catch(() => {});
+    }
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  async function makeIsolatedTmpdirParent(label: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), `loopx-test-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  async function makeIsolatedXdgConfigHome(label: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), `loopx-test-xdg-${label}-`));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return dir;
+  }
+
+  function assertObservedRealProtocolValue(
+    name: string,
+    observed: string,
+    projectRoot: string,
+    realTmpdirParent: string,
+    tmpdirStatMarker: string,
+  ): void {
+    expect(observed).not.toBe("bad value");
+    if (name === "LOOPX_WORKFLOW") {
+      expect(observed).toBe("ralph");
+    } else if (name === "LOOPX_TMPDIR") {
+      // Real loopx-created tmpdir per SPEC §7.4 mkdtemp naming convention.
+      expect(observed).toMatch(/\/loopx-[^/]+$/);
+      expect(observed.startsWith(realTmpdirParent)).toBe(true);
+      // During-run stat marker proves real loopx-created directory (not a
+      // substituted string). SPEC §7.4 cleanup removes the dir AFTER the
+      // script exits, so a post-run stat would observe absence even if the
+      // value were a real path.
+      expect(readFileSync(tmpdirStatMarker, "utf-8")).toBe("is-dir");
+    } else if (name === "LOOPX_BIN") {
+      // LOOPX_BIN is the resolved realpath of the loopx binary.
+      expect(existsSync(observed)).toBe(true);
+    } else if (name === "LOOPX_PROJECT_ROOT") {
+      expect(observed).toBe(projectRoot);
+    } else if (name === "LOOPX_WORKFLOW_DIR") {
+      expect(observed).toBe(join(projectRoot, ".loopx", "ralph"));
+    }
+  }
+
+  function tmpdirStatBlock(name: string, marker: string): string {
+    if (name !== "LOOPX_TMPDIR") return "";
+    return `if [ -d "$LOOPX_TMPDIR" ]; then
+  printf 'is-dir' > "${marker}"
+else
+  printf 'not-dir' > "${marker}"
+fi
+`;
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-ENV-28: CLI — local env file (`-e`) supplying a NUL-containing value
+    //   for LOOPX_TMPDIR is silently overridden by protocol injection. The
+    //   CLI run succeeds, no spawn failure surfaces, and the script observes
+    //   the real protocol value (a real loopx-created tmpdir under the test-
+    //   isolated parent). Tests the dynamically-computed-protocol-injection
+    //   axis (LOOPX_TMPDIR per SPEC §7.4) on the CLI's local env-file tier.
+    //   Companion to T-ENV-26 (NUL in non-protocol env-file value, surfaces
+    //   as spawn failure) — together they pin down that the env-file tier's
+    //   NUL-rejection path applies only when the entry is **not** about to be
+    //   overridden by protocol injection. SPEC §7.2 / §8.1 / §8.3 / §9.5 /
+    //   §13.
+    // ------------------------------------------------------------------------
+    it("T-ENV-28: CLI -e — NUL in LOOPX_TMPDIR silently overridden by protocol injection", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("env28");
+      const realTmpdirParent = realpathSync(tmpdirParent);
+      const projectRoot = realpathSync(project.dir);
+      const obsMarker = join(project.dir, "loopx_tmpdir.txt");
+      const tmpdirStatMarker = join(project.dir, "loopx_tmpdir_stat.txt");
+      const ranMarker = join(project.dir, "child-ran.txt");
+      const envFilePath = join(project.dir, "local.env");
+      // SPEC §8.1: env-file parser splits on '\n' and reads value from
+      // after the first '=' to end of line — NUL bytes within the value
+      // are preserved verbatim and reach mergeEnv unchanged.
+      await writeEnvFileRaw(envFilePath, `LOOPX_TMPDIR=bad\x00value\n`);
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_TMPDIR" > "${obsMarker}"
+${tmpdirStatBlock("LOOPX_TMPDIR", tmpdirStatMarker)}printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const result = await runCLI(
+        ["run", "-e", envFilePath, "-n", "1", "ralph"],
+        {
+          cwd: project.dir,
+          runtime,
+          env: { TMPDIR: tmpdirParent },
+        },
+      );
+
+      // (a) Exit code 0 (no spawn-failure rejection — protocol-tier overlay
+      //     replaced the NUL value before the runtime saw it). Load-bearing —
+      //     a buggy implementation that merged the env-file tier into the
+      //     inherited env BEFORE applying protocol injection would surface a
+      //     child launch / spawn failure on the NUL byte and fail this.
+      expect(result.exitCode).toBe(0);
+      // (b) Marker records a real absolute path under the test-isolated
+      //     tmpdir parent (matching the per-spawn dynamically-computed tmpdir
+      //     from SPEC §7.4) — not "bad\x00value".
+      const observed = readFileSync(obsMarker, "utf-8");
+      assertObservedRealProtocolValue(
+        "LOOPX_TMPDIR",
+        observed,
+        projectRoot,
+        realTmpdirParent,
+        tmpdirStatMarker,
+      );
+      // (c) Stderr contains no spawn-failure error and no parser warning
+      //     about NUL (per SPEC §8.1 the parser does not validate NUL).
+      expect(result.stderr).not.toMatch(/exited with code/);
+      expect(result.stderr).not.toMatch(/spawn/i);
+      expect(result.stderr).not.toMatch(/nul|\\x00/i);
+      // (d) Stderr contains no override-warning for LOOPX_TMPDIR (per SPEC
+      //     §13 protocol-variable override is silent on the env-file tier
+      //     as well — same contract as T-WFDIR-07 with ordinary fake values).
+      expect(result.stderr).not.toMatch(
+        /loopx_tmpdir.*(override|overrid|ignored|warning|notice)/i,
+      );
+      // (e) Workflow script ran exactly once.
+      expect(existsSync(ranMarker)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-28a (i)–(iv): CLI — local env file (`-e`) — parameterized over the
+    //   remaining four script-protocol-protected names (LOOPX_BIN,
+    //   LOOPX_PROJECT_ROOT, LOOPX_WORKFLOW, LOOPX_WORKFLOW_DIR). T-ENV-28
+    //   covers LOOPX_TMPDIR (the dynamically-computed name); together they
+    //   bring the CLI local env-file tier to all-five-name coverage matching
+    //   the RunOptions.env tier (T-API-58b/58c/58d/58e/58e2/58d2) and the
+    //   programmatic local-env-file tier (T-API-58f / T-API-58f2). A buggy
+    //   implementation that special-cased LOOPX_TMPDIR into one merge-order-
+    //   correct code path while routing the call-time-derived names through a
+    //   separate, merge-order-broken path on the env-file tier would pass
+    //   T-ENV-28 and fail this test. SPEC §7.2 / §8.1 / §8.3 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      { name: "LOOPX_BIN", id: "i", marker: "loopx_bin" },
+      { name: "LOOPX_PROJECT_ROOT", id: "ii", marker: "loopx_project_root" },
+      { name: "LOOPX_WORKFLOW", id: "iii", marker: "loopx_workflow" },
+      { name: "LOOPX_WORKFLOW_DIR", id: "iv", marker: "loopx_workflow_dir" },
+    ]) {
+      it(`T-ENV-28a (${variant.id} ${variant.name}): CLI -e — NUL in ${variant.name} silently overridden by protocol injection`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`env28a-${variant.id}`);
+        const realTmpdirParent = realpathSync(tmpdirParent);
+        const projectRoot = realpathSync(project.dir);
+        const obsMarker = join(project.dir, `${variant.marker}.txt`);
+        const tmpdirStatMarker = join(project.dir, "loopx_tmpdir_stat.txt");
+        const ranMarker = join(project.dir, "child-ran.txt");
+        const envFilePath = join(project.dir, "local.env");
+        await writeEnvFileRaw(
+          envFilePath,
+          `${variant.name}=bad\x00value\n`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '%s' "\$${variant.name}" > "${obsMarker}"
+${tmpdirStatBlock(variant.name, tmpdirStatMarker)}printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+        );
+
+        const result = await runCLI(
+          ["run", "-e", envFilePath, "-n", "1", "ralph"],
+          {
+            cwd: project.dir,
+            runtime,
+            env: { TMPDIR: tmpdirParent },
+          },
+        );
+
+        // (a) Exit code 0 — no spawn failure (protocol-tier override replaced
+        //     the NUL value before the runtime observed it).
+        expect(result.exitCode).toBe(0);
+        // (b) Marker records the real protocol value for the variant.
+        const observed = readFileSync(obsMarker, "utf-8");
+        assertObservedRealProtocolValue(
+          variant.name,
+          observed,
+          projectRoot,
+          realTmpdirParent,
+          tmpdirStatMarker,
+        );
+        // (c) Stderr contains no spawn-failure error and no parser warning.
+        expect(result.stderr).not.toMatch(/exited with code/);
+        expect(result.stderr).not.toMatch(/spawn/i);
+        expect(result.stderr).not.toMatch(/nul|\\x00/i);
+        // (d) No override-warning on stderr for the variant's name.
+        expect(result.stderr).not.toMatch(
+          new RegExp(
+            `${variant.name.toLowerCase()}.*(override|overrid|ignored|warning|notice)`,
+            "i",
+          ),
+        );
+        // (e) Workflow script ran exactly once.
+        expect(existsSync(ranMarker)).toBe(true);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // T-ENV-29: CLI — global env file (§8.3 tier 4) supplying a NUL-containing
+    //   value for LOOPX_TMPDIR is silently overridden by protocol injection.
+    //   Global-env-file counterpart to T-ENV-28 (local env-file tier 3).
+    //   XDG_CONFIG_HOME is supplied via runCLI's env option (extraEnv) rather
+    //   than mutating process.env, so concurrent tests remain isolated.
+    //   SPEC §7.2 / §8.1 / §8.3 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    it("T-ENV-29: CLI global env file — NUL in LOOPX_TMPDIR silently overridden by protocol injection", async () => {
+      project = await createTempProject();
+      const tmpdirParent = await makeIsolatedTmpdirParent("env29");
+      const realTmpdirParent = realpathSync(tmpdirParent);
+      const projectRoot = realpathSync(project.dir);
+      const obsMarker = join(project.dir, "loopx_tmpdir.txt");
+      const tmpdirStatMarker = join(project.dir, "loopx_tmpdir_stat.txt");
+      const ranMarker = join(project.dir, "child-ran.txt");
+      // Provision an isolated XDG_CONFIG_HOME with <xdg>/loopx/env containing
+      // the NUL-bearing protocol-name line.
+      const xdgDir = await makeIsolatedXdgConfigHome("env29");
+      const loopxConfigDir = join(xdgDir, "loopx");
+      await mkdir(loopxConfigDir, { recursive: true });
+      const globalEnvFilePath = join(loopxConfigDir, "env");
+      await writeEnvFileRaw(globalEnvFilePath, `LOOPX_TMPDIR=bad\x00value\n`);
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_TMPDIR" > "${obsMarker}"
+${tmpdirStatBlock("LOOPX_TMPDIR", tmpdirStatMarker)}printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdgDir },
+      });
+
+      // (a) Exit code 0 (no spawn failure).
+      expect(result.exitCode).toBe(0);
+      // (b) Marker records a real absolute path under the test-isolated
+      //     tmpdir parent — not "bad\x00value".
+      const observed = readFileSync(obsMarker, "utf-8");
+      assertObservedRealProtocolValue(
+        "LOOPX_TMPDIR",
+        observed,
+        projectRoot,
+        realTmpdirParent,
+        tmpdirStatMarker,
+      );
+      // (c) No spawn-failure error or NUL parser warning on stderr.
+      expect(result.stderr).not.toMatch(/exited with code/);
+      expect(result.stderr).not.toMatch(/spawn/i);
+      expect(result.stderr).not.toMatch(/nul|\\x00/i);
+      // (d) No override-warning on stderr for LOOPX_TMPDIR.
+      expect(result.stderr).not.toMatch(
+        /loopx_tmpdir.*(override|overrid|ignored|warning|notice)/i,
+      );
+      // (e) Workflow script ran.
+      expect(existsSync(ranMarker)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // T-ENV-29a (i)–(iv): CLI — global env file — parameterized hardening over
+    //   the remaining four script-protocol-protected names. T-ENV-29 covers
+    //   LOOPX_TMPDIR; together they bring the CLI global env-file tier to
+    //   all-five-name coverage matching the local env-file tier (T-ENV-28 /
+    //   T-ENV-28a) and the RunOptions.env tier (T-API-58b/58c/58d/58e/58e2/
+    //   58d2). A buggy implementation that special-cased LOOPX_TMPDIR into
+    //   one merge-order-correct path while routing the call-time-derived
+    //   names through a separate, merge-order-broken path on the global env-
+    //   file tier would pass T-ENV-29 and fail this test. SPEC §7.2 / §8.1 /
+    //   §8.3 / §9.5 / §13.
+    // ------------------------------------------------------------------------
+    for (const variant of [
+      { name: "LOOPX_BIN", id: "i", marker: "loopx_bin" },
+      { name: "LOOPX_PROJECT_ROOT", id: "ii", marker: "loopx_project_root" },
+      { name: "LOOPX_WORKFLOW", id: "iii", marker: "loopx_workflow" },
+      { name: "LOOPX_WORKFLOW_DIR", id: "iv", marker: "loopx_workflow_dir" },
+    ]) {
+      it(`T-ENV-29a (${variant.id} ${variant.name}): CLI global env file — NUL in ${variant.name} silently overridden by protocol injection`, async () => {
+        project = await createTempProject();
+        const tmpdirParent = await makeIsolatedTmpdirParent(`env29a-${variant.id}`);
+        const realTmpdirParent = realpathSync(tmpdirParent);
+        const projectRoot = realpathSync(project.dir);
+        const obsMarker = join(project.dir, `${variant.marker}.txt`);
+        const tmpdirStatMarker = join(project.dir, "loopx_tmpdir_stat.txt");
+        const ranMarker = join(project.dir, "child-ran.txt");
+        const xdgDir = await makeIsolatedXdgConfigHome(`env29a-${variant.id}`);
+        const loopxConfigDir = join(xdgDir, "loopx");
+        await mkdir(loopxConfigDir, { recursive: true });
+        const globalEnvFilePath = join(loopxConfigDir, "env");
+        await writeEnvFileRaw(
+          globalEnvFilePath,
+          `${variant.name}=bad\x00value\n`,
+        );
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `printf '%s' "\$${variant.name}" > "${obsMarker}"
+${tmpdirStatBlock(variant.name, tmpdirStatMarker)}printf 'spawned' > "${ranMarker}"
+printf '{"stop":true}'`,
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: { TMPDIR: tmpdirParent, XDG_CONFIG_HOME: xdgDir },
+        });
+
+        // (a) Exit code 0 — no spawn failure.
+        expect(result.exitCode).toBe(0);
+        // (b) Marker records the real protocol value.
+        const observed = readFileSync(obsMarker, "utf-8");
+        assertObservedRealProtocolValue(
+          variant.name,
+          observed,
+          projectRoot,
+          realTmpdirParent,
+          tmpdirStatMarker,
+        );
+        // (c) No spawn-failure error and no NUL parser warning.
+        expect(result.stderr).not.toMatch(/exited with code/);
+        expect(result.stderr).not.toMatch(/spawn/i);
+        expect(result.stderr).not.toMatch(/nul|\\x00/i);
+        // (d) No override-warning on stderr.
+        expect(result.stderr).not.toMatch(
+          new RegExp(
+            `${variant.name.toLowerCase()}.*(override|overrid|ignored|warning|notice)`,
+            "i",
+          ),
+        );
+        // (e) Workflow script ran.
+        expect(existsSync(ranMarker)).toBe(true);
+      });
+    }
+  });
+});
+
+// ============================================================================
+// SPEC: CLI -e file does NOT redirect global env-file lookup
+//   (T-API-59f / T-API-59g — CLI-surface counterparts to T-API-59d / T-API-59e
+//   for the local env-file tier). SPEC §8.1: "Global env file path resolution
+//   reads XDG_CONFIG_HOME / HOME from the inherited environment on the same
+//   schedule." A local env file containing XDG_CONFIG_HOME=fake or HOME=fake
+//   reaches the spawned child but does not redirect WHERE loopx looks for
+//   its own global env file.
+// ============================================================================
+
+describe("SPEC: CLI Env File Does Not Affect Loopx's Own Lookups", () => {
+  let project: TempProject | null = null;
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    while (cleanups.length > 0) {
+      const cleanup = cleanups.shift();
+      if (cleanup) await cleanup().catch(() => {});
+    }
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  async function setupRealAndFakeXdg(label: string): Promise<{
+    realXdg: string;
+    fakeXdg: string;
+  }> {
+    const realXdg = await mkdtemp(join(tmpdir(), `loopx-test-real-xdg-${label}-`));
+    cleanups.push(async () => {
+      await rm(realXdg, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(realXdg, "loopx"), { recursive: true });
+    await createEnvFile(join(realXdg, "loopx", "env"), { MARKER: "real" });
+
+    const fakeXdg = await mkdtemp(join(tmpdir(), `loopx-test-fake-xdg-${label}-`));
+    cleanups.push(async () => {
+      await rm(fakeXdg, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(fakeXdg, "loopx"), { recursive: true });
+    await createEnvFile(join(fakeXdg, "loopx", "env"), { MARKER: "fake" });
+
+    return { realXdg, fakeXdg };
+  }
+
+  async function setupRealAndFakeHome(label: string): Promise<{
+    realHome: string;
+    fakeHome: string;
+  }> {
+    const realHome = await mkdtemp(join(tmpdir(), `loopx-test-real-home-${label}-`));
+    cleanups.push(async () => {
+      await rm(realHome, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(realHome, ".config", "loopx"), { recursive: true });
+    await createEnvFile(join(realHome, ".config", "loopx", "env"), {
+      MARKER: "real",
+    });
+
+    const fakeHome = await mkdtemp(join(tmpdir(), `loopx-test-fake-home-${label}-`));
+    cleanups.push(async () => {
+      await rm(fakeHome, { recursive: true, force: true }).catch(() => {});
+    });
+    await mkdir(join(fakeHome, ".config", "loopx"), { recursive: true });
+    await createEnvFile(join(fakeHome, ".config", "loopx", "env"), {
+      MARKER: "fake",
+    });
+
+    return { realHome, fakeHome };
+  }
+
+  forEachRuntime((runtime) => {
+    // ------------------------------------------------------------------------
+    // T-API-59f: CLI -e file does NOT redirect global env-file lookup via
+    //   XDG_CONFIG_HOME. CLI-surface parity for T-API-59d (programmatic
+    //   RunOptions.envFile). The CLI argv-parsing path for -e is structurally
+    //   distinct from the programmatic envFile field. SPEC §8.1, §8.2, §8.3,
+    //   §4.2.
+    // ------------------------------------------------------------------------
+    it("T-API-59f: CLI -e file does NOT redirect global env-file lookup via XDG_CONFIG_HOME", async () => {
+      project = await createTempProject();
+      const xdgMarker = join(project.dir, "xdg.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${XDG_CONFIG_HOME:-UNSET}" > "${xdgMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realXdg, fakeXdg } = await setupRealAndFakeXdg("api59f");
+
+      const localEnvFile = join(project.dir, "local.env");
+      await createEnvFile(localEnvFile, { XDG_CONFIG_HOME: fakeXdg });
+
+      // Pass real XDG_CONFIG_HOME via runCLI's extraEnv (inherited env in the
+      // spawned loopx process). The local env file supplied via -e contains
+      // XDG_CONFIG_HOME=fakeXdg — that value reaches the script, but loopx
+      // resolves the global env file from its OWN inherited XDG_CONFIG_HOME.
+      const result = await runCLI(["run", "-e", localEnvFile, "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { XDG_CONFIG_HOME: realXdg },
+      });
+
+      // (a) Exit code 0.
+      expect(result.exitCode).toBe(0);
+      // (b) Child observed XDG_CONFIG_HOME from -e file (the fake path).
+      expect(readFileSync(xdgMarker, "utf-8")).toBe(fakeXdg);
+      // (c) loopx loaded global env file using inherited XDG_CONFIG_HOME
+      //     (real path) — so MARKER=real.
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+
+    // ------------------------------------------------------------------------
+    // T-API-59g: CLI -e file does NOT redirect global env-file lookup via
+    //   HOME. CLI-surface, HOME-fallback parity for T-API-59e. SPEC §8.1,
+    //   §8.2, §8.3, §4.2.
+    // ------------------------------------------------------------------------
+    it("T-API-59g: CLI -e file does NOT redirect global env-file lookup via HOME", async () => {
+      project = await createTempProject();
+      const homeMarker = join(project.dir, "home.txt");
+      const markerMarker = join(project.dir, "marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        `printf '%s' "\${HOME:-UNSET}" > "${homeMarker}"
+printf '%s' "\${MARKER:-UNSET}" > "${markerMarker}"
+printf '{"stop":true}'`,
+      );
+
+      const { realHome, fakeHome } = await setupRealAndFakeHome("api59g");
+
+      const localEnvFile = join(project.dir, "local.env");
+      await createEnvFile(localEnvFile, { HOME: fakeHome });
+
+      // Strategy: pass HOME=realHome via runCLI's extraEnv. Also explicitly
+      // unset XDG_CONFIG_HOME in the spawned loopx's inherited env (otherwise
+      // loopx might consult an unrelated $XDG_CONFIG_HOME inherited from the
+      // test runner and the HOME fallback path wouldn't be exercised).
+      // runCLI's `env` option SPREADS over process.env (line 56-59 of cli.ts).
+      // Setting XDG_CONFIG_HOME to undefined in the spread does not delete
+      // it. We need a value that loopx will treat as unset. Empty string
+      // (per env.ts line 24: `env.XDG_CONFIG_HOME || ...`) is treated as
+      // falsy and triggers the HOME fallback.
+      const result = await runCLI(["run", "-e", localEnvFile, "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { HOME: realHome, XDG_CONFIG_HOME: "" },
+      });
+
+      // (a) Exit code 0.
+      expect(result.exitCode).toBe(0);
+      // (b) Child observed HOME from -e file (the fake path).
+      expect(readFileSync(homeMarker, "utf-8")).toBe(fakeHome);
+      // (c) loopx loaded global env file using inherited HOME (real path)
+      //     via the fallback — so MARKER=real.
+      expect(readFileSync(markerMarker, "utf-8")).toBe("real");
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC: PWD Non-Protocol Behavior  (T-PWD-01 / 02 / 03 / 04a / 04b / 06 / 07
+// / 08; T-PWD-05 is non-normative per TEST-SPEC §4.7 and is intentionally
+// not implemented.)
+//
+// SPEC §6.1 / §8.3 / §13 explicitly declare PWD outside the
+// script-protocol-protected tier. These tests pin down that loopx neither
+// reserves nor synthesizes PWD and that user-supplied PWD reaches spawned
+// scripts unchanged through every supply tier (inherited env, RunOptions.env,
+// global env file, local -e env file).
+//
+// All exact-value PWD assertions use a TS fixture reading process.env.PWD
+// (via observeEnv) rather than Bash $PWD, because Bash performs shell-level
+// PWD rewriting at startup which is outside the loopx contract per the
+// TEST-SPEC §4.7 fixture note.
+// ---------------------------------------------------------------------------
+
+describe("SPEC: PWD Non-Protocol Behavior", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    // ----------------------------------------------------------------------
+    // T-PWD-01: loopx does not reserve/protect PWD; inherited PWD reaches
+    // the spawned script byte-for-byte unchanged. SPEC §6.1, §8.3, §13.
+    // ----------------------------------------------------------------------
+    it("T-PWD-01: inherited PWD reaches the spawned script unchanged (loopx does not reserve/protect PWD)", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "pwd-marker.json");
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          observeEnv("PWD", markerPath),
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: { PWD: "/some/inherited/value" },
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(markerPath)).toBe(true);
+        const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+        expect(observed).toEqual({
+          present: true,
+          value: "/some/inherited/value",
+        });
+      });
+    });
+
+    // ----------------------------------------------------------------------
+    // T-PWD-02: RunOptions.env.PWD reaches spawned scripts. SPEC §6.1, §8.3,
+    // §9.5. RunOptions.env is tier 2 — it overrides inherited env, global
+    // env file, and local env file, and is overridden only by protocol vars
+    // (which do not include PWD).
+    // ----------------------------------------------------------------------
+    it("T-PWD-02: RunOptions.env.PWD reaches spawned scripts via runPromise()", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "pwd-marker.json");
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          observeEnv("PWD", markerPath),
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  env: { PWD: "/value-from-run-options" },
+  maxIterations: 1,
+});
+console.log(JSON.stringify({ count: outputs.length }));
+`;
+        const result = await runAPIDriver(runtime, driverCode);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout).count).toBe(1);
+        expect(existsSync(markerPath)).toBe(true);
+        const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+        expect(observed).toEqual({
+          present: true,
+          value: "/value-from-run-options",
+        });
+      });
+    });
+
+    // ----------------------------------------------------------------------
+    // T-PWD-03: Inherited PWD propagates unchanged when neither env file
+    // nor RunOptions.env sets it. SPEC §6.1, §8.3.
+    // ----------------------------------------------------------------------
+    it("T-PWD-03: inherited PWD propagates unchanged when no env file or RunOptions.env sets PWD", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "pwd-marker.json");
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          observeEnv("PWD", markerPath),
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: { PWD: "/inherited" },
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(markerPath)).toBe(true);
+        const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+        expect(observed).toEqual({ present: true, value: "/inherited" });
+      });
+    });
+
+    // ----------------------------------------------------------------------
+    // T-PWD-04a: PWD propagates from inherited env AND all five LOOPX_*
+    // protocol variables are injected (SPEC §8.3 table). The TS fixture
+    // enumerates process.env's keys to assert membership of all protocol
+    // vars and reads the inherited PWD value to assert byte-for-byte
+    // passthrough. SPEC §6.1, §8.3, §13.
+    // ----------------------------------------------------------------------
+    it("T-PWD-04a: when loopx is spawned with PWD in its env, the script sees PWD passed through and all five LOOPX_* protocol vars injected", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "env-keys.json");
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          `import { writeFileSync } from "node:fs";
+const keys = Object.keys(process.env).sort();
+const data = {
+  keys,
+  pwd: process.env.PWD === undefined ? null : process.env.PWD,
+};
+writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify(data));
+`,
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: { PWD: "/inherited-pwd-value" },
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(markerPath)).toBe(true);
+        const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+        // (a) all five LOOPX_* protocol vars injected per SPEC §8.3 table.
+        expect(observed.keys).toContain("LOOPX_BIN");
+        expect(observed.keys).toContain("LOOPX_PROJECT_ROOT");
+        expect(observed.keys).toContain("LOOPX_WORKFLOW");
+        expect(observed.keys).toContain("LOOPX_WORKFLOW_DIR");
+        expect(observed.keys).toContain("LOOPX_TMPDIR");
+        // (b) PWD reached the child unchanged from the inherited tier (loopx
+        // did not synthesize, override, or rewrite it).
+        expect(observed.pwd).toBe("/inherited-pwd-value");
+      });
+    });
+
+    // ----------------------------------------------------------------------
+    // T-PWD-04b: When loopx is spawned without PWD in its environment
+    // (env -i style), the script's PWD must NOT be present — proving loopx
+    // does not synthesize a PWD value when none is inherited. The five
+    // LOOPX_* protocol vars must still be injected. SPEC §6.1, §8.3, §13.
+    //
+    // This test cannot use runCLI (which spreads process.env). Instead it
+    // performs an explicit child_process.spawn with a minimal env: PATH (to
+    // resolve tsx / bun) and an empty XDG_CONFIG_HOME (so loopx does not
+    // attempt to load a global env file that could supply PWD via tier 4).
+    // ----------------------------------------------------------------------
+    it("T-PWD-04b: when loopx is spawned without PWD in its environment, the child has no PWD (loopx does not synthesize PWD)", async () => {
+      project = await createTempProject();
+      const markerPath = join(project.dir, "env-keys.json");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".ts",
+        `import { writeFileSync } from "node:fs";
+const keys = Object.keys(process.env).sort();
+const data = {
+  keys,
+  pwdPresent: Object.prototype.hasOwnProperty.call(process.env, "PWD"),
+  pwdValue: process.env.PWD === undefined ? null : process.env.PWD,
+};
+writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify(data));
+`,
+      );
+
+      // Empty XDG_CONFIG_HOME so loopx finds no global env file (preventing
+      // a stray PWD entry from tier 4).
+      const emptyXdg = await mkdtemp(join(tmpdir(), "loopx-pwd04b-xdg-"));
+      try {
+        // Resolve loopx's actual bin path from its package.json (mirrors
+        // runCLI's getLoopxBinPath helper). The bin field points at
+        // dist/bin.js relative to the loopx package root, not bin.js at the
+        // package root.
+        const loopxPkgPath = resolve(
+          process.cwd(),
+          "node_modules/loopx/package.json",
+        );
+        const loopxPkg = JSON.parse(readFileSync(loopxPkgPath, "utf-8"));
+        const binRel =
+          typeof loopxPkg.bin === "string"
+            ? loopxPkg.bin
+            : loopxPkg.bin?.loopx;
+        const loopxBinPath = resolve(
+          process.cwd(),
+          "node_modules/loopx",
+          binRel,
+        );
+        const command = runtime === "bun" ? "bun" : "node";
+        const args = [loopxBinPath, "run", "-n", "1", "ralph"];
+        // Minimal env: PATH (for tsx / bun discovery) and XDG_CONFIG_HOME
+        // (set to empty dir to suppress global env loading). No PWD.
+        const minimalEnv: Record<string, string> = {
+          PATH: process.env.PATH ?? "",
+          XDG_CONFIG_HOME: emptyXdg,
+        };
+        const result = await new Promise<{
+          exitCode: number;
+          stdout: string;
+          stderr: string;
+        }>((resolvePromise, reject) => {
+          const child = spawn(command, args, {
+            cwd: project!.dir,
+            env: minimalEnv,
+            stdio: ["pipe", "pipe", "pipe"],
+          });
+          let stdout = "";
+          let stderr = "";
+          child.stdout.on("data", (chunk: Buffer) => {
+            stdout += chunk.toString();
+          });
+          child.stderr.on("data", (chunk: Buffer) => {
+            stderr += chunk.toString();
+          });
+          child.stdin.end();
+          const timer = setTimeout(() => {
+            child.kill("SIGKILL");
+            reject(new Error("T-PWD-04b CLI timed out after 30s"));
+          }, 30_000);
+          child.on("close", (code) => {
+            clearTimeout(timer);
+            resolvePromise({ exitCode: code ?? 1, stdout, stderr });
+          });
+          child.on("error", (err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(markerPath)).toBe(true);
+        const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+        // (a) all five LOOPX_* protocol vars still injected even with a
+        // minimal inherited env.
+        expect(observed.keys).toContain("LOOPX_BIN");
+        expect(observed.keys).toContain("LOOPX_PROJECT_ROOT");
+        expect(observed.keys).toContain("LOOPX_WORKFLOW");
+        expect(observed.keys).toContain("LOOPX_WORKFLOW_DIR");
+        expect(observed.keys).toContain("LOOPX_TMPDIR");
+        // (b) PWD is NOT present in the child env when not inherited — the
+        // load-bearing assertion of T-PWD-04: loopx does not synthesize PWD.
+        expect(observed.pwdPresent).toBe(false);
+        expect(observed.pwdValue).toBeNull();
+        // Defensive: PWD must not appear in the enumerated keys either.
+        expect(observed.keys).not.toContain("PWD");
+      } finally {
+        await rm(emptyXdg, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+
+    // ----------------------------------------------------------------------
+    // T-PWD-06: CLI project root derives from process.cwd() (loopx's own
+    // kernel cwd at invocation), NOT from the inherited PWD env var. SPEC
+    // §3.2 / §6.1 explicitly say "loopx does not consult $PWD" for
+    // project-root derivation. Inherited PWD still passes through unchanged
+    // to the child per T-PWD-01. SPEC §3.2, §6.1, §13.
+    // ----------------------------------------------------------------------
+    it("T-PWD-06: CLI project root derives from process.cwd(), not inherited PWD; PWD still passes through to the child", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "cwd-and-pwd.json");
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          `import { writeFileSync } from "node:fs";
+const data = {
+  loopxProjectRoot: process.env.LOOPX_PROJECT_ROOT ?? null,
+  cwd: process.cwd(),
+  pwd: process.env.PWD === undefined ? null : process.env.PWD,
+};
+writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify(data));
+`,
+        );
+
+        const bogusPwd = "/bogus-value-that-does-not-exist";
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: { PWD: bogusPwd },
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(markerPath)).toBe(true);
+        const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+
+        // (a) LOOPX_PROJECT_ROOT equals the kernel cwd (real project), NOT
+        // the bogus PWD value. POSIX getcwd(3) typically canonicalizes via
+        // the kernel, so the canonical project path equals
+        // realpathSync(project.dir). The load-bearing assertion is the
+        // negative form (not bogusPwd) — the realpath equality is the
+        // common-POSIX positive form.
+        expect(observed.loopxProjectRoot).not.toBe(bogusPwd);
+        expect(observed.loopxProjectRoot).toBe(realpathSync(project.dir));
+        // (b) process.cwd() likewise reports the real project (directory
+        // identity matches; the canonical spelling under getcwd(3)
+        // equals realpathSync(project.dir) on the common POSIX
+        // configuration).
+        expect(observed.cwd).not.toBe(bogusPwd);
+        expect(observed.cwd).toBe(realpathSync(project.dir));
+        // (c) Inherited PWD passes through to the child unchanged (per
+        // T-PWD-01) — loopx itself did not consume or rewrite it.
+        expect(observed.pwd).toBe(bogusPwd);
+      });
+    });
+
+    // ----------------------------------------------------------------------
+    // T-PWD-07: PWD supplied via the global env file reaches spawned
+    // scripts. SPEC §6.1, §8.1, §8.3, §13. PWD is not protocol-protected,
+    // so the global env-file value at tier 4 reaches the child unchanged
+    // (overriding the inherited PWD at tier 5).
+    // ----------------------------------------------------------------------
+    it("T-PWD-07: PWD supplied via global env file reaches the spawned script unchanged", async () => {
+      await withGlobalEnv(
+        { PWD: "/value-from-global-env-file" },
+        async () => {
+          project = await createTempProject();
+          const markerPath = join(project.dir, "pwd-marker.json");
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".ts",
+            observeEnv("PWD", markerPath),
+          );
+
+          const result = await runCLI(["run", "-n", "1", "ralph"], {
+            cwd: project.dir,
+            runtime,
+          });
+
+          expect(result.exitCode).toBe(0);
+          expect(existsSync(markerPath)).toBe(true);
+          const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+          expect(observed).toEqual({
+            present: true,
+            value: "/value-from-global-env-file",
+          });
+        },
+      );
+    });
+
+    // ----------------------------------------------------------------------
+    // T-PWD-08: PWD supplied via the local (-e) env file reaches spawned
+    // scripts. SPEC §6.1, §8.2, §8.3, §13. Local env file (tier 3) wins
+    // over global env file (tier 4) and inherited env (tier 5); only
+    // RunOptions.env (tier 2) and protocol vars (tier 1) outrank it, and
+    // PWD is at none of those higher tiers.
+    // ----------------------------------------------------------------------
+    it("T-PWD-08: PWD supplied via local (-e) env file reaches the spawned script unchanged", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        const localEnvFile = join(project.dir, "local.env");
+        await createEnvFile(localEnvFile, {
+          PWD: "/value-from-local-env-file",
+        });
+        const markerPath = join(project.dir, "pwd-marker.json");
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          observeEnv("PWD", markerPath),
+        );
+
+        const result = await runCLI(
+          ["run", "-e", localEnvFile, "-n", "1", "ralph"],
+          { cwd: project.dir, runtime },
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(markerPath)).toBe(true);
+        const observed = JSON.parse(readFileSync(markerPath, "utf-8"));
+        expect(observed).toEqual({
+          present: true,
+          value: "/value-from-local-env-file",
+        });
+      });
     });
   });
 });

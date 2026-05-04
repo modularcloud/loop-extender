@@ -1,16 +1,235 @@
-import { join, resolve } from "node:path";
+import { join, resolve, isAbsolute, dirname } from "node:path";
 import { readFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { tmpdir as osTmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import type { Output, RunOptions } from "./types.js";
 import { discoverScripts } from "./discovery.js";
-import { runLoop, type LoopStartingTarget } from "./loop.js";
-import { loadGlobalEnv, loadLocalEnv, mergeEnv } from "./env.js";
+import {
+  runLoop,
+  type LoopStartingTarget,
+  type FirstObservedRef,
+} from "./loop.js";
+import {
+  getGlobalEnvPath,
+  loadGlobalEnv,
+  loadLocalEnv,
+  mergeEnv,
+} from "./env.js";
 import { parseTarget } from "./target-validation.js";
 import { makeAbortError } from "./abort.js";
 import { getLoopxBin, ensureLoopxPackageJson } from "./bin-path.js";
+import { maybePauseAtTerminalTriggerWindow } from "./test-seams.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+interface InternalRunOptions {
+  tmpdirParent?: string;
+  /**
+   * Eagerly captured snapshot of `process.env` (SPEC §9.2). When set, the
+   * inherited environment used in `mergeEnv` is read from this snapshot
+   * rather than the live `process.env`, pinning observed values to the
+   * runPromise() call site.
+   */
+  inheritedEnv?: Record<string, string>;
+  /**
+   * Eagerly resolved global loopx env file path (SPEC §9.2). When set,
+   * `loadGlobalEnv` consults this path verbatim instead of re-resolving from
+   * `XDG_CONFIG_HOME` / `HOME` at iteration time.
+   */
+  globalEnvPath?: string;
+}
+
+interface OptionSnapshot {
+  error?: unknown;
+  signal?: AbortSignal;
+  env?: Record<string, string>;
+  cwd?: string;
+  envFile?: string;
+  maxIterations?: number;
+}
+
+function isAbortSignalCompatible(signal: unknown): boolean {
+  if (signal === null) return false;
+  const t = typeof signal;
+  if (t !== "object" && t !== "function") return false;
+  let aborted: unknown;
+  try {
+    aborted = (signal as { aborted?: unknown }).aborted;
+  } catch {
+    return false;
+  }
+  if (typeof aborted !== "boolean") return false;
+  let ael: unknown;
+  try {
+    ael = (signal as { addEventListener?: unknown }).addEventListener;
+  } catch {
+    return false;
+  }
+  if (typeof ael !== "function") return false;
+  return true;
+}
+
+function snapshotEnv(envRaw: unknown): Record<string, string> {
+  if (envRaw === null) {
+    throw new TypeError("RunOptions.env must not be null");
+  }
+  if (Array.isArray(envRaw)) {
+    throw new TypeError("RunOptions.env must not be an array");
+  }
+  const t = typeof envRaw;
+  if (t === "function") {
+    throw new TypeError("RunOptions.env must not be a function");
+  }
+  if (t !== "object") {
+    throw new TypeError(`RunOptions.env must be an object, got ${t}`);
+  }
+
+  const out: Record<string, string> = {};
+  // Object.keys() returns own enumerable string-keyed properties; for Proxy
+  // it invokes the ownKeys + getOwnPropertyDescriptor traps, which may throw
+  // and propagate naturally to the caller (captured into snap.error).
+  const keys = Object.keys(envRaw as object);
+  for (const key of keys) {
+    // [[Get]] — invokes any accessor getter or proxy get trap (may throw).
+    const value = (envRaw as Record<string, unknown>)[key];
+    if (typeof value !== "string") {
+      throw new TypeError(
+        `RunOptions.env[${JSON.stringify(key)}] must be a string, got ${typeof value}`
+      );
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+function snapshotOptions(options: unknown): OptionSnapshot {
+  const snap: OptionSnapshot = {};
+
+  if (options === undefined) return snap;
+  if (options === null) {
+    snap.error = new TypeError("RunOptions must not be null");
+    return snap;
+  }
+  if (Array.isArray(options)) {
+    snap.error = new TypeError("RunOptions must not be an array");
+    return snap;
+  }
+  const ot = typeof options;
+  if (ot === "function") {
+    snap.error = new TypeError("RunOptions must not be a function");
+    return snap;
+  }
+  if (ot !== "object") {
+    snap.error = new TypeError(`RunOptions must be an object, got ${ot}`);
+    return snap;
+  }
+
+  const opts = options as Record<string, unknown>;
+
+  // SPEC §9.1: signal is read FIRST before any other field, so an
+  // already-aborted signal is captured before any other option-field read
+  // can produce a snapshot exception.
+  let signalRaw: unknown;
+  try {
+    signalRaw = opts.signal;
+  } catch (e) {
+    snap.error = e;
+    return snap;
+  }
+  if (signalRaw !== undefined) {
+    if (!isAbortSignalCompatible(signalRaw)) {
+      snap.error = new TypeError(
+        "RunOptions.signal must be an AbortSignal-compatible object"
+      );
+      return snap;
+    }
+    snap.signal = signalRaw as AbortSignal;
+  }
+
+  // Order among remaining fields is implementation-defined per SPEC §9.1.
+  // We do cwd before envFile so envFile can be resolved against the snapshot
+  // cwd at call time per SPEC §9.5.
+  let cwdRaw: unknown;
+  try {
+    cwdRaw = opts.cwd;
+  } catch (e) {
+    snap.error = e;
+    return snap;
+  }
+  if (cwdRaw !== undefined) {
+    if (typeof cwdRaw !== "string") {
+      snap.error = new TypeError(
+        `RunOptions.cwd must be a string, got ${typeof cwdRaw}`
+      );
+      return snap;
+    }
+    try {
+      snap.cwd = isAbsolute(cwdRaw)
+        ? cwdRaw
+        : resolve(process.cwd(), cwdRaw);
+    } catch (e) {
+      snap.error = e;
+      return snap;
+    }
+  }
+
+  let envFileRaw: unknown;
+  try {
+    envFileRaw = opts.envFile;
+  } catch (e) {
+    snap.error = e;
+    return snap;
+  }
+  if (envFileRaw !== undefined) {
+    if (typeof envFileRaw !== "string") {
+      snap.error = new TypeError(
+        `RunOptions.envFile must be a string, got ${typeof envFileRaw}`
+      );
+      return snap;
+    }
+    snap.envFile = envFileRaw;
+  }
+
+  let envRaw: unknown;
+  try {
+    envRaw = opts.env;
+  } catch (e) {
+    snap.error = e;
+    return snap;
+  }
+  if (envRaw !== undefined) {
+    try {
+      snap.env = snapshotEnv(envRaw);
+    } catch (e) {
+      snap.error = e;
+      return snap;
+    }
+  }
+
+  let maxIterRaw: unknown;
+  try {
+    maxIterRaw = opts.maxIterations;
+  } catch (e) {
+    snap.error = e;
+    return snap;
+  }
+  if (maxIterRaw !== undefined) {
+    if (
+      typeof maxIterRaw !== "number" ||
+      !Number.isInteger(maxIterRaw) ||
+      maxIterRaw < 0 ||
+      Number.isNaN(maxIterRaw)
+    ) {
+      snap.error = new Error(
+        `Invalid maxIterations: must be a non-negative integer, got ${String(maxIterRaw)}`
+      );
+      return snap;
+    }
+    snap.maxIterations = maxIterRaw as number;
+  }
+
+  return snap;
+}
 
 function getRunningVersion(): string {
   try {
@@ -27,10 +246,9 @@ function getRunningVersion(): string {
  * Run a loopx target and yield Output for each iteration.
  *
  * Per SPEC §9.1/9.5:
- *   - RunOptions.cwd is snapshotted at call time; it specifies the project
- *     root (for `.loopx/` resolution and LOOPX_PROJECT_ROOT), NOT the script
- *     execution cwd. Scripts always execute with their workflow directory
- *     as cwd (§6.1).
+ *   - Options are snapshotted at call time. Throwing getters / proxy traps
+ *     are captured rather than escaping at the call site, and surface via
+ *     the standard pre-iteration error path on first next().
  *   - target is a required string of shape `workflow[:script]`.
  *   - Errors are surfaced lazily on first iteration.
  */
@@ -38,58 +256,414 @@ export function run(
   target: string,
   options?: RunOptions
 ): AsyncGenerator<Output> {
-  const cwd = options?.cwd ?? process.cwd();
-  const maxIterations = options?.maxIterations;
-  const envFile = options?.envFile;
-  const externalSignal = options?.signal;
+  return runWithInternal(target, options, undefined);
+}
+
+function runWithInternal(
+  target: unknown,
+  options: RunOptions | undefined,
+  internal: InternalRunOptions | undefined
+): AsyncGenerator<Output> {
+  const snap = snapshotOptions(options);
+
+  // Default cwd to process.cwd() at call time per SPEC §9.5.
+  if (snap.error === undefined && snap.cwd === undefined) {
+    try {
+      snap.cwd = process.cwd();
+    } catch (e) {
+      snap.error = e;
+    }
+  }
+
   const loopxBin = getLoopxBin();
 
   const internalAc = new AbortController();
-  const effectiveSignal: AbortSignal = externalSignal
-    ? AbortSignal.any([externalSignal, internalAc.signal])
-    : internalAc.signal;
+
+  // SPEC §7.2 first-observed-trigger tracking — shared between this wrapper
+  // and `runLoop`. The abort listener pins `"abort"`; runLoop pins
+  // `"iteration"` before throwing iteration-level errors; the wrapper's
+  // consumer cancellation pins `"consumer"` when it acts as the first
+  // observed trigger. Each pin is only applied when currently null, so
+  // racing later observations do not displace the first.
+  const firstObservedRef: FirstObservedRef = { trigger: null };
+
+  // SPEC §7.2 abort propagation. Without the test seam, the listener fires
+  // synchronously and propagates the user signal into `internalAc` (which in
+  // turn fans out to `loop.ts` and `execution.ts`). With the
+  // TEST-SPEC §1.4 `abort-listener` seam active, the listener still records
+  // abort as first-observed AT ENTRY, but defers the `internalAc.abort()`
+  // dispatch onto a microtask and intentionally pauses for the bounded
+  // §1.4 interval first. This keeps the active child alive during the pause
+  // (qualified form (a): mid-loop / active-child) so a parent harness can
+  // race a second terminal trigger (e.g. SIGUSR1 → script `exit 1`) before
+  // loopx kills the child or rejects the abort promise.
+  const dispatchInternalAbort = (): void => {
+    try {
+      internalAc.abort(snap.signal?.reason);
+    } catch {
+      /* ignore */
+    }
+  };
+  const onUserSignalAbort = (): void => {
+    if (firstObservedRef.trigger === null) {
+      firstObservedRef.trigger = "abort";
+    }
+    const seamActive =
+      process.env.NODE_ENV === "test" &&
+      process.env.LOOPX_TEST_TERMINAL_TRIGGER_PAUSE === "abort-listener";
+    if (seamActive) {
+      void (async () => {
+        await maybePauseAtTerminalTriggerWindow("abort-listener");
+        dispatchInternalAbort();
+      })();
+    } else {
+      dispatchInternalAbort();
+    }
+  };
+
+  // Wire user signal → internal abort propagation. SPEC §9.5: addEventListener
+  // must return without throwing; if it throws, capture as a snapshot error.
+  // We always invoke addEventListener — even when aborted:true at capture —
+  // because per SPEC §9.3 / T-API-64p, the addEventListener-half of the
+  // §9.5 contract must be verified before the call enters the abort
+  // pathway. A duck signal whose addEventListener throws is non-compatible
+  // regardless of `aborted`, and must surface as an option-snapshot error
+  // rather than as an abort error.
+  if (snap.error === undefined && snap.signal) {
+    try {
+      snap.signal.addEventListener("abort", onUserSignalAbort, {
+        once: true,
+      });
+    } catch (e) {
+      snap.error = e;
+      // SPEC §9.3 / T-API-64p: a signal whose addEventListener throws is
+      // NOT a usable AbortSignal — clear snap.signal so the abort-precedence
+      // pathway in runInternal does not mistake `aborted: true` on such a
+      // non-compatible signal as grounds to surface an abort error.
+      snap.signal = undefined;
+    }
+    const usableSignal = snap.error === undefined ? snap.signal : undefined;
+    if (usableSignal && usableSignal.aborted) {
+      // Already aborted at call-time (and addEventListener registered
+      // cleanly) — record first-observed and propagate synchronously. The
+      // `abort-listener` seam fires only from the listener path, not the
+      // eager-aborted path, so we dispatch directly. Real AbortSignals do
+      // not fire newly-registered listeners on already-aborted signals; the
+      // explicit `aborted` check is the only way to observe that case for
+      // both real and duck-typed signals.
+      if (firstObservedRef.trigger === null) {
+        firstObservedRef.trigger = "abort";
+      }
+      try {
+        internalAc.abort(usableSignal.reason);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  const effectiveSignal: AbortSignal = internalAc.signal;
 
   const gen = runInternal(
     target,
-    cwd,
-    maxIterations,
-    envFile,
+    snap,
     effectiveSignal,
-    loopxBin
+    loopxBin,
+    internal?.tmpdirParent,
+    internal?.inheritedEnv,
+    internal?.globalEnvPath,
+    firstObservedRef
   );
 
   let returnCalled = false;
+  let settled = false;
+  let yieldCount = 0;
+  // SPEC §9.3 abort-after-final-yield: tracks whether the most recently
+  // yielded Output was final (stop:true or maxIterations reached). When set,
+  // an abort observed before the next consumer interaction surfaces the
+  // abort error (with cleanup first) rather than allowing silent completion.
+  let postFinalYield = false;
+  // SPEC §9.1 pre-first-`next()` consumer-cancellation carve-out: tracks
+  // whether the inner generator body has been driven via a wrapper.next()
+  // call. When false, a `.return()` / `.throw()` / `[Symbol.asyncDispose]`
+  // settles per standard async-generator semantics — the loop body never
+  // runs, no pre-iteration step executes, no captured signal is consulted,
+  // and no captured option-snapshot / discovery / env-file / tmpdir-creation
+  // error surfaces. Set true the moment wrapper.next() is dispatched (before
+  // awaiting the inner gen.next()) so a concurrent .return() / .throw() that
+  // arrives while wrapper.next() is in-flight follows the post-first-`next()`
+  // consumer-cancellation path, not the carve-out.
+  let bodyEntered = false;
+
+  const surfacePostFinalYieldAbort = async (): Promise<never> => {
+    // Drive inner gen to settlement so its `finally` runs cleanupTmpdir
+    // before the abort error reaches the consumer (SPEC §9.3 / §7.4 ordering).
+    try {
+      await gen.return(undefined as unknown as Output);
+    } catch {
+      // Cleanup-time errors are swallowed; abort error takes precedence.
+    }
+    throw makeAbortError(snap.signal ?? internalAc.signal);
+  };
 
   const wrapper: AsyncGenerator<Output> = {
     next: async () => {
+      if (settled) {
+        return { done: true, value: undefined } as IteratorResult<Output>;
+      }
+      // SPEC §9.3 abort-after-final-yield: an AbortSignal that aborts after
+      // the final Output but before settlement surfaces the abort error on
+      // the next interaction. The first-observed-wins guard (!returnCalled)
+      // ensures a prior consumer .return()/.throw() retains its silent
+      // completion outcome. We key on `firstObservedRef.trigger === "abort"`
+      // (set by the user-signal listener BEFORE the abort-listener seam
+      // pause) rather than `internalAc.signal.aborted` (which the seam
+      // delays) so the post-final-yield abort branch fires regardless of
+      // whether the seam is active.
+      if (
+        postFinalYield &&
+        firstObservedRef.trigger === "abort" &&
+        !returnCalled
+      ) {
+        settled = true;
+        await surfacePostFinalYieldAbort();
+      }
+      // SPEC §9.1 pre-first-`next()` carve-out boundary: the consumer's first
+      // interaction is `.next()`, so the body is now entered. Pin BEFORE
+      // dispatching to gen.next() so a racing `.return()` / `.throw()` that
+      // arrives while gen.next() is in flight observes bodyEntered=true and
+      // routes through the post-first-`next()` consumer-cancellation path.
+      bodyEntered = true;
       try {
-        return await gen.next();
+        const result = await gen.next();
+        if (!result.done && result.value !== undefined) {
+          yieldCount++;
+          if (
+            result.value.stop === true ||
+            (snap.maxIterations !== undefined &&
+              yieldCount === snap.maxIterations)
+          ) {
+            postFinalYield = true;
+          }
+        }
+        if (result.done) settled = true;
+        return result;
       } catch (err) {
+        settled = true;
         if (returnCalled) {
           return { done: true, value: undefined } as IteratorResult<Output>;
+        }
+        // SPEC §7.2 first-observed-wins. When abort was the first trigger
+        // observed by loopx (via the user-signal listener) but a racing
+        // iteration-level error reached the wrapper first (e.g. the
+        // abort-listener seam paused the abort dispatch while a SIGUSR1 →
+        // `exit 1` race played out — T-TMP-38b2 / T-TMP-38b2-run), the
+        // surfaced terminal outcome must be the abort error, not the
+        // iteration error. Conversely, when iteration-error or consumer
+        // cancellation pinned the slot first, we surface the original `err`
+        // unchanged (T-TMP-38b / T-TMP-38b-run).
+        if (firstObservedRef.trigger === "abort") {
+          throw makeAbortError(snap.signal ?? internalAc.signal);
         }
         throw err;
       }
     },
     return: async (value?: Output) => {
-      returnCalled = true;
+      if (settled) {
+        returnCalled = true;
+        return { done: true, value: undefined } as IteratorResult<Output>;
+      }
+      // SPEC §9.1 pre-first-`next()` consumer-cancellation carve-out: when
+      // .return() is the consumer's first interaction (no prior wrapper.next()
+      // has driven the inner generator body), settle per standard async-
+      // generator semantics. The loop body is never entered, no pre-iteration
+      // step runs, no captured signal is consulted (even an already-aborted
+      // signal does not surface an abort error), and every captured pre-
+      // iteration error (option-snapshot, target validation, discovery,
+      // env-file load, target resolution, tmpdir creation) is suppressed.
+      // gen.return(value) on a not-yet-started async generator returns
+      // `{ value, done: true }` per ES semantics without entering the body.
+      if (!bodyEntered) {
+        settled = true;
+        returnCalled = true;
+        try {
+          return await gen.return(value as Output);
+        } catch {
+          return { done: true, value: undefined } as IteratorResult<Output>;
+        }
+      }
+      // SPEC §9.3 abort-after-final-yield: abort observed before this
+      // .return() displaces silent completion; abort error surfaces (with
+      // cleanup first). We key on `firstObservedRef.trigger === "abort"`
+      // rather than `internalAc.signal.aborted` so the branch fires
+      // correctly even when the abort-listener seam is delaying the
+      // internalAc.abort() dispatch.
+      if (
+        postFinalYield &&
+        firstObservedRef.trigger === "abort" &&
+        !returnCalled
+      ) {
+        settled = true;
+        returnCalled = true;
+        await surfacePostFinalYieldAbort();
+      }
+      // SPEC §7.2 first-observed-wins: if an abort was observed before this
+      // .return() arrived (mid-loop), abort wins as the surfaced terminal
+      // outcome. Do NOT pin `returnCalled` — leave the in-flight wrapper.next()
+      // free to surface the abort error rather than being silenced via the
+      // consumer-cancellation contract. The inner gen.return() is still
+      // driven so the runLoop `finally` (cleanupTmpdir) runs once and the
+      // inner gen settles.
+      const abortObservedFirst = firstObservedRef.trigger === "abort";
+      if (!abortObservedFirst) {
+        // SPEC §7.2: pin .return() as first-observed when no other trigger
+        // has done so yet. A subsequent abort-listener firing will then see
+        // the slot occupied and not displace the consumer-cancellation
+        // outcome (preserves the abort-second / consumer-first half of the
+        // T-TMP-38a2 contract).
+        if (firstObservedRef.trigger === null) {
+          firstObservedRef.trigger = "consumer";
+        }
+        returnCalled = true;
+        // TEST-SPEC §1.4 `consumer-return-observed` seam — fires only when
+        // .return() is the first-observed terminal trigger (i.e., abort had
+        // not been observed before this .return() arrived). Pauses AFTER
+        // recording first-observed status (the `returnCalled` pin above) and
+        // BEFORE dispatch (internalAc.abort() / gen.return() below), so a
+        // parent harness can race a second terminal trigger into the window
+        // and assert SPEC §7.2 first-observed-wins + SPEC §7.4 cleanup-
+        // idempotence + at-most-one-warning across racing triggers. The seam
+        // fires on any post-first-`next()` `.return()` — both mid-loop and
+        // post-final-yield (the abort-already-observed post-final-yield case
+        // takes the `surfacePostFinalYieldAbort` branch above and never
+        // reaches this block).
+        await maybePauseAtTerminalTriggerWindow("consumer-return-observed");
+      }
       internalAc.abort();
       try {
-        return await gen.return(value as Output);
+        const result = await gen.return(value as Output);
+        settled = true;
+        return result;
       } catch {
+        settled = true;
         return { done: true, value: undefined } as IteratorResult<Output>;
       }
     },
-    throw: (err: unknown) => gen.throw(err),
+    // SPEC §9.1 consumer-driven cancellation: `.throw()` after first `next()`
+    // terminates the active child process group (via abort) and ensures no
+    // further iterations start. When no child is active (between iterations,
+    // after final yield, post-yield), this produces silent clean completion
+    // — the consumer-supplied error is not surfaced. For the active-child
+    // case the settlement form is implementation-defined; we choose silent
+    // completion for symmetry with `.return()`.
+    //
+    // SPEC §9.3 abort-after-final-yield carve-out: when an abort has already
+    // been observed in the post-final-yield window before this .throw()
+    // arrives, the abort error displaces both silent completion AND the
+    // consumer-supplied error.
+    throw: async (err: unknown) => {
+      if (settled) {
+        returnCalled = true;
+        return { done: true, value: undefined } as IteratorResult<Output>;
+      }
+      // SPEC §9.1 pre-first-`next()` consumer-cancellation carve-out: when
+      // .throw() is the consumer's first interaction, settle per standard
+      // async-generator semantics — the consumer-supplied `err` surfaces
+      // (rather than the post-first-`next()` silent-completion contract that
+      // swallows consumer errors). The loop body is never entered, no pre-
+      // iteration step runs, no captured signal is consulted, and every
+      // captured pre-iteration error is suppressed in favor of `err`.
+      // gen.throw(err) on a not-yet-started async generator rejects with
+      // `err` per ES semantics without entering the body; `await` propagates
+      // that rejection up through this async function so the consumer sees
+      // a rejected promise carrying their original error.
+      if (!bodyEntered) {
+        settled = true;
+        returnCalled = true;
+        return await gen.throw(err);
+      }
+      if (
+        postFinalYield &&
+        firstObservedRef.trigger === "abort" &&
+        !returnCalled
+      ) {
+        settled = true;
+        returnCalled = true;
+        await surfacePostFinalYieldAbort();
+      }
+      // SPEC §7.2 first-observed-wins (mirror of .return()): if an abort was
+      // observed before this .throw() arrived, abort wins. Do NOT pin
+      // `returnCalled` — leave the in-flight wrapper.next() free to surface
+      // the abort error rather than being silenced. The consumer-supplied
+      // `_err` is intentionally not surfaced (consumer-cancellation contract);
+      // when abort is first-observed, the abort error displaces both the
+      // consumer error AND silent completion.
+      const abortObservedFirst = firstObservedRef.trigger === "abort";
+      if (!abortObservedFirst) {
+        // Pin .throw() as first-observed when nothing else has claimed the
+        // slot, so a subsequent abort-listener firing does not retroactively
+        // displace the silent-completion outcome (mirror of .return()).
+        if (firstObservedRef.trigger === null) {
+          firstObservedRef.trigger = "consumer";
+        }
+        returnCalled = true;
+        // TEST-SPEC §1.4 `consumer-throw-observed` seam — fires only when
+        // .throw() is the first-observed terminal trigger (i.e., abort had
+        // not been observed before this .throw() arrived). Pauses AFTER
+        // recording first-observed status (the `returnCalled` pin above)
+        // and BEFORE dispatch (internalAc.abort() / gen.return() below), so
+        // a parent harness can race a second terminal trigger into the
+        // window and assert SPEC §7.2 first-observed-wins + SPEC §7.4
+        // cleanup-idempotence + at-most-one-warning across racing triggers.
+        await maybePauseAtTerminalTriggerWindow("consumer-throw-observed");
+      }
+      internalAc.abort();
+      try {
+        const result = await gen.return(undefined as unknown as Output);
+        settled = true;
+        return result;
+      } catch {
+        settled = true;
+        return { done: true, value: undefined } as IteratorResult<Output>;
+      }
+    },
     [Symbol.asyncIterator]() {
       return this;
     },
     async [Symbol.asyncDispose](): Promise<void> {
-      returnCalled = true;
+      if (settled) {
+        returnCalled = true;
+        return;
+      }
+      // SPEC §9.1 pre-first-`next()` consumer-cancellation carve-out applies
+      // to async dispose: standard async-generator semantics drive
+      // gen.return() on a not-yet-started body without surfacing any
+      // captured pre-iteration error.
+      if (!bodyEntered) {
+        settled = true;
+        returnCalled = true;
+        try {
+          await gen.return(undefined as unknown as Output);
+        } catch {
+          // Swallow errors during dispose
+        }
+        return;
+      }
+      // SPEC §7.2 first-observed-wins (mirror of .return()): if an abort was
+      // observed before dispose ran, abort wins; do not pin `returnCalled`.
+      const abortObservedFirst = firstObservedRef.trigger === "abort";
+      if (!abortObservedFirst) {
+        if (firstObservedRef.trigger === null) {
+          firstObservedRef.trigger = "consumer";
+        }
+        returnCalled = true;
+      }
       internalAc.abort();
       try {
         await gen.return(undefined as unknown as Output);
+        settled = true;
       } catch {
+        settled = true;
         // Swallow errors during dispose
       }
     },
@@ -98,30 +672,34 @@ export function run(
 }
 
 async function* runInternal(
-  target: string | undefined,
-  cwd: string,
-  maxIterations: number | undefined,
-  envFile: string | undefined,
+  target: unknown,
+  snap: OptionSnapshot,
   signal: AbortSignal,
-  loopxBin: string
+  loopxBin: string,
+  tmpdirParent: string | undefined,
+  inheritedEnv: Record<string, string> | undefined,
+  globalEnvPath: string | undefined,
+  firstObservedRef: FirstObservedRef
 ): AsyncGenerator<Output> {
-  if (maxIterations !== undefined) {
-    if (
-      typeof maxIterations !== "number" ||
-      !Number.isInteger(maxIterations) ||
-      maxIterations < 0 ||
-      Number.isNaN(maxIterations)
-    ) {
-      throw new Error(
-        `Invalid maxIterations: must be a non-negative integer, got ${maxIterations}`
-      );
-    }
+  // SPEC §9.3 abort precedence: if a usable signal was captured and is
+  // aborted (or aborts later), it displaces all other pre-iteration failures.
+  // "Usable" per SPEC §9.5 + T-API-64p: addEventListener must have been
+  // successfully registered. When registration throws, the call site clears
+  // `snap.signal` so a non-compatible signal cannot enter this pathway.
+  if (snap.signal?.aborted) {
+    throw makeAbortError(snap.signal);
+  }
+
+  // Surface any captured option-snapshot error.
+  if (snap.error !== undefined) {
+    throw snap.error;
   }
 
   if (signal.aborted) {
     throw makeAbortError(signal);
   }
 
+  const cwd = snap.cwd!;
   const loopxDir = join(cwd, ".loopx");
 
   // Discovery (global validation per SPEC §5.4)
@@ -133,16 +711,21 @@ async function* runInternal(
     process.stderr.write(w + "\n");
   }
 
-  // Load env (SPEC §8)
-  const globalResult = loadGlobalEnv();
+  // Load env (SPEC §8). globalEnvPath / inheritedEnv (when supplied) are the
+  // eager snapshots threaded down from runPromise() per SPEC §9.2; for run()
+  // and the CLI they remain undefined and process.env is read lazily here on
+  // the first next() call (SPEC §9.1).
+  const globalResult = loadGlobalEnv(globalEnvPath);
   const globalEnv = globalResult.vars;
   for (const w of globalResult.warnings) {
     process.stderr.write(`Warning: ${w}\n`);
   }
 
   let localEnv: Record<string, string> = {};
-  if (envFile) {
-    const envFilePath = resolve(cwd, envFile);
+  if (snap.envFile !== undefined) {
+    const envFilePath = isAbsolute(snap.envFile)
+      ? snap.envFile
+      : resolve(cwd, snap.envFile);
     const localResult = loadLocalEnv(envFilePath);
     localEnv = localResult.vars;
     for (const w of localResult.warnings) {
@@ -150,7 +733,19 @@ async function* runInternal(
     }
   }
 
-  const mergedEnv = mergeEnv(globalEnv, localEnv);
+  // SPEC §8.3 precedence (highest wins):
+  //   1. protocol vars (LOOPX_*) — applied in execution.ts
+  //   2. RunOptions.env
+  //   3. local env file (-e / RunOptions.envFile)
+  //   4. global loopx env
+  //   5. inherited process.env
+  //
+  // mergeEnv yields tiers 5→4→3 (process.env, global, local). RunOptions.env
+  // overlays tier 2 here. Protocol vars overlay tier 1 in executeScript.
+  const mergedEnv: Record<string, string> = {
+    ...mergeEnv(globalEnv, localEnv, inheritedEnv),
+    ...(snap.env ?? {}),
+  };
 
   ensureLoopxPackageJson(loopxDir);
 
@@ -196,19 +791,21 @@ async function* runInternal(
 
   // -n 0 / maxIterations: 0 — validates but does not enter the loop
   // (workflow-level version checking is skipped per SPEC §3.2).
-  if (maxIterations === 0) {
+  if (snap.maxIterations === 0) {
     return;
   }
 
   const starting: LoopStartingTarget = { workflow, script: scriptFile };
 
   yield* runLoop(starting, discovery.workflows, {
-    maxIterations,
+    maxIterations: snap.maxIterations,
     env: mergedEnv,
     projectRoot: cwd,
     loopxBin,
     runningVersion: getRunningVersion(),
     signal,
+    tmpdirParent,
+    firstObservedRef,
   });
 }
 
@@ -220,41 +817,49 @@ export async function runPromise(
   target: string,
   options?: RunOptions
 ): Promise<Output[]> {
-  const signal = options?.signal;
-  if (signal?.aborted) {
-    throw makeAbortError(signal);
-  }
+  // SPEC §9.2: tmpdir-parent snapshot is EAGER under runPromise — captured
+  // synchronously at the call site. Mutations to process.env.TMPDIR after
+  // runPromise() returns must not affect the tmpdir parent for this run.
+  const eagerTmpdirParent = osTmpdir();
 
-  const gen = run(target, options);
+  // SPEC §9.2: the inherited `process.env` snapshot is EAGER under
+  // runPromise — captured synchronously at the call site as a shallow copy.
+  // Mutations to process.env after runPromise() returns are not observed by
+  // the spawned scripts. The shallow copy is reused for every iteration of
+  // the run (T-API-72 / T-API-72a).
+  const eagerInheritedEnv: Record<string, string> = {
+    ...(process.env as Record<string, string>),
+  };
+
+  // SPEC §9.2: global env file path resolution (XDG_CONFIG_HOME / HOME) also
+  // uses the eager schedule. We resolve the path here against the just-taken
+  // process.env snapshot so that XDG_CONFIG_HOME / HOME mutations after
+  // runPromise() returns do not redirect the global env file lookup.
+  const eagerGlobalEnvPath = getGlobalEnvPath(eagerInheritedEnv);
+
+  // SPEC §9.5 / §9.2: option snapshot (incl. cwd, env, envFile, signal,
+  // maxIterations) is also eager at call site. runWithInternal() runs
+  // snapshotOptions() and captures the cwd default synchronously, so calling
+  // it here — before the microtask boundary below — pins those values to
+  // their call-site values (T-API-14c, T-API-14d).
+  const gen = runWithInternal(target, options, {
+    tmpdirParent: eagerTmpdirParent,
+    inheritedEnv: eagerInheritedEnv,
+    globalEnvPath: eagerGlobalEnvPath,
+  });
+
+  // SPEC §9.2: "LOOPX_TMPDIR itself is created asynchronously after return,
+  // during the same pre-iteration sequence used by the CLI and run()." The
+  // first await suspends runPromise and yields control back to the caller
+  // before any iteration work runs. Without this microtask boundary,
+  // evaluating `for await (const output of gen)` would synchronously call
+  // the wrapper's `next()`, which synchronously runs runInternal + runLoop
+  // bodies up to the first internal await — invoking createTmpdir before
+  // runPromise() has returned and violating the SPEC §9.2 contract
+  // (T-TMP-27a verifies this).
+  await Promise.resolve();
+
   const outputs: Output[] = [];
-
-  if (signal) {
-    const abortPromise = new Promise<IteratorResult<Output>>((_, reject) => {
-      if (signal.aborted) {
-        reject(makeAbortError(signal));
-        return;
-      }
-      signal.addEventListener(
-        "abort",
-        () => reject(makeAbortError(signal)),
-        { once: true }
-      );
-    });
-    abortPromise.catch(() => {});
-
-    try {
-      while (true) {
-        const iterResult = await Promise.race([gen.next(), abortPromise]);
-        if (iterResult.done) break;
-        outputs.push(iterResult.value);
-      }
-      return outputs;
-    } catch (err) {
-      await gen.return(undefined as unknown as Output).catch(() => {});
-      throw err;
-    }
-  }
-
   for await (const output of gen) {
     outputs.push(output);
   }

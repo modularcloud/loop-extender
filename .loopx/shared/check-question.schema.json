@@ -2,7 +2,7 @@
   "type": "object",
   "properties": {
     "has_question": {
-      "description": "true if the text contains a question or request for clarification directed at the user, false otherwise",
+      "description": "true only if the text contains an actual pending question that blocks completion of the work (the agent needs an answer before proceeding); false for sign-offs that report work as complete and invite post-hoc corrections",
       "type": "boolean"
     }
   },
