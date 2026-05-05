@@ -57,6 +57,11 @@ mkdir -p "$TMP_DIR"
 sed "s|{{ADR_NUM}}|${ADR_NUM}|g" "$PROMPT_TEMPLATE" > "$TMP_DIR/PROMPT.md"
 sed "s|{{ADR_NUM}}|${ADR_NUM}|g" "$PLANNING_TEMPLATE" > "$TMP_DIR/PLANNING-PROMPT.md"
 
+if ! command -v codex >/dev/null 2>&1; then
+  echo "Error: codex CLI not found on PATH" >&2
+  exit 1
+fi
+
 if [[ -f "$ITER_FILE" ]]; then
   ITER=$(($(cat "$ITER_FILE") + 1))
 else
@@ -74,6 +79,33 @@ curl -s -X POST "${TELEGRAM_API}/sendMessage" \
 
 echo "=== Ralph iteration ${ITER} (stage=${STAGE}${ADR_NUM:+, ADR=${ADR_NUM}}) ===" >&2
 
-RALPH_OUTPUT=$(cd "$ROOT" && claude -p --dangerously-skip-permissions < "$TMP_DIR/PROMPT.md" 2>/dev/null)
+RALPH_OUTPUT_FILE="$TMP_DIR/ralph-output.tmp"
+RALPH_STDERR_FILE="$TMP_DIR/ralph-codex-stderr.tmp"
+rm -f "$RALPH_OUTPUT_FILE" "$RALPH_STDERR_FILE"
+
+set +e
+codex exec - \
+  --cd "$ROOT" \
+  --skip-git-repo-check \
+  --dangerously-bypass-approvals-and-sandbox \
+  --color never \
+  --output-last-message "$RALPH_OUTPUT_FILE" \
+  < "$TMP_DIR/PROMPT.md" >/dev/null 2>"$RALPH_STDERR_FILE"
+CODEX_STATUS=$?
+set -e
+
+if [[ $CODEX_STATUS -ne 0 || ! -s "$RALPH_OUTPUT_FILE" ]]; then
+  echo "Error: codex exec failed (exit=$CODEX_STATUS) or produced no Ralph output" >&2
+  if [[ -s "$RALPH_STDERR_FILE" ]]; then
+    echo "--- codex stderr ---" >&2
+    cat "$RALPH_STDERR_FILE" >&2
+    echo "--- end codex stderr ---" >&2
+  fi
+  rm -f "$RALPH_OUTPUT_FILE" "$RALPH_STDERR_FILE"
+  exit 1
+fi
+
+RALPH_OUTPUT=$(cat "$RALPH_OUTPUT_FILE")
+rm -f "$RALPH_OUTPUT_FILE" "$RALPH_STDERR_FILE"
 
 $LOOPX_BIN output --result "$RALPH_OUTPUT" --goto "check-ready"
