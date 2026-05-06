@@ -1,8 +1,15 @@
 # Implementation Plan for loopx Test Harness
 
-**Status: spec-conformant as of 2026-04-17. No open P0/P1.**
+**Status: open P0 harness gaps as of 2026-05-05.**
 
 The 2026-04-17 breadth audit of `tests/` against TEST-SPEC.md found 0 unconditional skips of spec-required tests, 0 placeholder assertions, and 0 TODO/FIXME markers; all 42 conditional skips map to spec-documented conditions; 30/30 sampled spec IDs were located in test files. Per-file ADR-0003 migration state is recorded in git history and does not need to live here.
+
+## P0 — Open
+
+- **`LOOPX_WORKFLOW_DIR` coverage.** `apps/tests/tests/e2e/execution.test.ts` is missing T-WFDIR-01..14, including T-WFDIR-13a.
+- **Bash execution edges.** Missing T-EXEC-07a and T-EXEC-07b.
+- **CJS rejection matrix.** Missing T-EXEC-13c..13m.
+- **No runtime auto-install.** Missing T-EXEC-15a/T-EXEC-15b/T-EXEC-15c.
 
 ## P2 — Follow-ups (non-blocking)
 

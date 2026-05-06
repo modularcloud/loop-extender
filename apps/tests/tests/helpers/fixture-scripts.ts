@@ -67,9 +67,9 @@ export function writeEnvToFile(varname: string, markerPath: string): string {
   return `#!/bin/bash\nprintf '%s' "\$${varname}" > "${markerPath}"\n`;
 }
 
-/** Writes $PWD to a marker file using printf. */
+/** Writes the physical cwd to a marker file using /bin/pwd -P. */
 export function writeCwdToFile(markerPath: string): string {
-  return `#!/bin/bash\nprintf '%s' "$PWD" > "${markerPath}"\n`;
+  return `#!/bin/bash\n/bin/pwd -P | tr -d '\\n' > "${markerPath}"\n`;
 }
 
 /** Writes a literal value to a marker file using printf. */
