@@ -9,6 +9,7 @@ import {
   symlinkSync,
   lstatSync,
   unlinkSync,
+  rmSync,
 } from "node:fs";
 import type { ScriptFile } from "./discovery.js";
 import { makeAbortError } from "./abort.js";
@@ -42,6 +43,47 @@ function getBunClassicJsxConfig(): string {
     "utf-8"
   );
   bunClassicJsxConfigPath = path;
+  return path;
+}
+
+let bunLoopxResolverPreloadPath: string | null = null;
+function getBunLoopxResolverPreload(): string {
+  if (bunLoopxResolverPreloadPath && existsSync(bunLoopxResolverPreloadPath)) {
+    return bunLoopxResolverPreloadPath;
+  }
+  const dir = join(tmpdir(), `loopx-bun-resolver-${process.pid}`);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, "preload.mjs");
+  writeFileSync(
+    path,
+    `import { createRequire } from "node:module";
+import { dirname } from "node:path";
+import { pathToFileURL } from "node:url";
+
+Bun.plugin({
+  name: "loopx-resolver",
+  setup(build) {
+    build.onResolve({ filter: /^loopx(?:\\/internal)?$/ }, (args) => {
+      try {
+        const importer = args.importer
+          ? pathToFileURL(args.importer).href
+          : pathToFileURL(process.cwd() + "/index.js").href;
+        const req = createRequire(importer);
+        return { path: req.resolve(args.path) };
+      } catch {
+        return {
+          path: args.path === "loopx/internal"
+            ? process.env.LOOPX_INTERNAL_ENTRY
+            : process.env.LOOPX_PACKAGE_ENTRY,
+        };
+      }
+    });
+  },
+});
+`,
+    "utf-8"
+  );
+  bunLoopxResolverPreloadPath = path;
   return path;
 }
 
@@ -148,8 +190,9 @@ export function executeScript(
     signal,
   } = options;
 
-  // SPEC §6.1: scripts always run with the workflow directory as cwd.
-  const cwd = workflowDir;
+  // SPEC §6.1: scripts always run with the project root as cwd; the workflow
+  // directory is exposed separately through LOOPX_WORKFLOW_DIR.
+  const cwd = projectRoot;
 
   const currentPath = env.PATH ?? process.env.PATH ?? "";
   const currentNodePath = env.NODE_PATH ?? "";
@@ -159,6 +202,7 @@ export function executeScript(
     LOOPX_BIN: loopxBin,
     LOOPX_PROJECT_ROOT: projectRoot,
     LOOPX_WORKFLOW: workflowName,
+    LOOPX_WORKFLOW_DIR: workflowDir,
     PATH: (() => {
       const pathEntries = currentPath.split(":");
       const prepend: string[] = [];
@@ -176,6 +220,8 @@ export function executeScript(
     NODE_PATH: currentNodePath
       ? `${LOOPX_NODE_PATH}:${currentNodePath}`
       : LOOPX_NODE_PATH,
+    LOOPX_PACKAGE_ENTRY: resolve(__dirname, "index.js"),
+    LOOPX_INTERNAL_ENTRY: resolve(__dirname, "internal.js"),
   };
 
   let command: string;
@@ -190,7 +236,12 @@ export function executeScript(
     // ESM. Substitute `require` with `null` at parse time so any CJS-style
     // `require("fs")` call fails with a TypeError — matching the SPEC
     // requirement that CJS syntax "fail at execution time".
-    const commonFlags = ["--define", "require:null"];
+    const commonFlags = [
+      "--preload",
+      getBunLoopxResolverPreload(),
+      "--define",
+      "require:null",
+    ];
     if (script.ext === ".tsx" || script.ext === ".jsx") {
       // Configure Bun to use the classic JSX transform against a user-supplied
       // `React.createElement` factory. This runs JSX through the same path as
@@ -217,6 +268,46 @@ export function executeScript(
       reject(makeAbortError(signal));
       return;
     }
+
+    let bunProjectRootShim: string | null = null;
+    let bunCreatedNodeModulesDir: string | null = null;
+    if (
+      isBun &&
+      (script.ext === ".js" ||
+        script.ext === ".jsx" ||
+        script.ext === ".ts" ||
+        script.ext === ".tsx")
+    ) {
+      const nodeModulesDir = join(projectRoot, "node_modules");
+      const linkPath = join(nodeModulesDir, "loopx");
+      try {
+        if (!existsSync(linkPath)) {
+          const hadNodeModulesDir = existsSync(nodeModulesDir);
+          mkdirSync(nodeModulesDir, { recursive: true });
+          symlinkSync(resolve(__dirname, ".."), linkPath);
+          bunProjectRootShim = linkPath;
+          if (!hadNodeModulesDir) {
+            bunCreatedNodeModulesDir = nodeModulesDir;
+          }
+        }
+      } catch {
+        // The Bun preload resolver remains the primary fallback. If a project
+        // root cannot accept a temporary shim, continue without changing the
+        // user-visible execution outcome here.
+      }
+    }
+
+    const cleanupBunProjectRootShim = () => {
+      if (!bunProjectRootShim) return;
+      try {
+        rmSync(bunProjectRootShim, { recursive: true, force: true });
+        if (bunCreatedNodeModulesDir) {
+          rmSync(bunCreatedNodeModulesDir, { recursive: false, force: true });
+        }
+      } catch {
+        // best effort only
+      }
+    };
 
     const child = spawn(command, args, {
       cwd,
@@ -260,6 +351,7 @@ export function executeScript(
     child.on("close", (code) => {
       if (settled) return;
       settled = true;
+      cleanupBunProjectRootShim();
       if (graceTimer) clearTimeout(graceTimer);
       if (signal) signal.removeEventListener("abort", onAbort);
 
@@ -273,6 +365,7 @@ export function executeScript(
     child.on("error", (err) => {
       if (settled) return;
       settled = true;
+      cleanupBunProjectRootShim();
       if (graceTimer) clearTimeout(graceTimer);
       if (signal) signal.removeEventListener("abort", onAbort);
       reject(err);

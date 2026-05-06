@@ -323,9 +323,8 @@ console.log(JSON.stringify(results));
       expect(readFileSync(markerPath, "utf-8")).toBe(project.dir);
     });
 
-    // T-API-07a: RunOptions.cwd does not control script execution cwd — scripts run with
-    //            the workflow directory as their cwd, not the provided RunOptions.cwd.
-    it("T-API-07a: RunOptions.cwd does not control script execution cwd", async () => {
+    // T-API-07a: RunOptions.cwd controls the project root and script execution cwd.
+    it("T-API-07a: RunOptions.cwd controls script execution cwd", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cwd-marker.txt");
       await createBashWorkflowScript(
@@ -336,8 +335,6 @@ console.log(JSON.stringify(results));
 printf '{"stop":true}'`,
       );
 
-      const workflowDir = join(project.loopxDir, "ralph");
-
       const driverCode = `
 import { run } from "loopx";
 for await (const _ of run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })) {}
@@ -346,11 +343,9 @@ console.log("done");
       const result = await runAPIDriver(runtime, driverCode);
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
-      // Script's cwd must be the workflow dir (.loopx/ralph), NOT projectA.
-      // Use realpath-tolerant comparison: resolve both sides.
       const actualCwd = readFileSync(markerPath, "utf-8");
-      expect(resolve(actualCwd)).toBe(resolve(workflowDir));
-      expect(resolve(actualCwd)).not.toBe(resolve(project.dir));
+      expect(resolve(actualCwd)).toBe(resolve(project.dir));
+      expect(resolve(actualCwd)).not.toBe(resolve(join(project.loopxDir, "ralph")));
     });
 
     // T-API-08: maxIterations: 0 → completes immediately, no yields, no child spawn.
@@ -2111,8 +2106,8 @@ console.log(JSON.stringify(outputs));
       expect(outputs[0].result).toBe("no-index-ok");
     });
 
-    // T-API-47b: RunOptions.cwd sets LOOPX_PROJECT_ROOT; script still runs with workflow dir as cwd.
-    it("T-API-47b: runPromise — cwd sets LOOPX_PROJECT_ROOT, script cwd is workflow dir", async () => {
+    // T-API-47b: RunOptions.cwd sets both LOOPX_PROJECT_ROOT and script cwd.
+    it("T-API-47b: runPromise — cwd sets LOOPX_PROJECT_ROOT and script cwd", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cwd-marker.txt");
       await createBashWorkflowScript(
@@ -2122,8 +2117,6 @@ console.log(JSON.stringify(outputs));
         `printf '{"cwd":"%s","root":"%s"}' "$PWD" "$LOOPX_PROJECT_ROOT" > "${markerPath}"
 printf '{"stop":true}'`,
       );
-      const workflowDir = join(project.loopxDir, "ralph");
-
       const driverCode = `
 import { runPromise } from "loopx";
 await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
@@ -2133,7 +2126,7 @@ console.log("done");
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
       const parsed = JSON.parse(readFileSync(markerPath, "utf-8"));
-      expect(resolve(parsed.cwd)).toBe(resolve(workflowDir));
+      expect(resolve(parsed.cwd)).toBe(resolve(project.dir));
       expect(resolve(parsed.root)).toBe(resolve(project.dir));
     });
   });

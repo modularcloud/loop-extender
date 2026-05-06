@@ -28,9 +28,9 @@ function getRunningVersion(): string {
  *
  * Per SPEC §9.1/9.5:
  *   - RunOptions.cwd is snapshotted at call time; it specifies the project
- *     root (for `.loopx/` resolution and LOOPX_PROJECT_ROOT), NOT the script
- *     execution cwd. Scripts always execute with their workflow directory
- *     as cwd (§6.1).
+ *     root (for `.loopx/` resolution, LOOPX_PROJECT_ROOT, and script
+ *     execution cwd). Scripts receive their workflow path through
+ *     LOOPX_WORKFLOW_DIR (§6.1).
  *   - target is a required string of shape `workflow[:script]`.
  *   - Errors are surfaced lazily on first iteration.
  */
