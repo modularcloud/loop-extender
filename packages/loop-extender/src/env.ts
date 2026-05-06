@@ -60,8 +60,7 @@ export function mergeEnv(
   localEnv: Record<string, string>
 ): Record<string, string> {
   // Per SPEC §8.3 precedence (highest wins):
-  //   loopx-injected protocol vars (LOOPX_BIN / LOOPX_PROJECT_ROOT /
-  //   LOOPX_WORKFLOW / LOOPX_WORKFLOW_DIR / LOOPX_TMPDIR)
+  //   loopx-injected (LOOPX_BIN / LOOPX_PROJECT_ROOT / LOOPX_WORKFLOW)
   //   > local env file (-e)
   //   > global loopx env
   //   > inherited system environment

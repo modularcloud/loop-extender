@@ -4174,17 +4174,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
             'import { output } from "loopx";\noutput({ stop: true });\n';
           await writeFile(join(ralphDir, "index.ts"), indexTs, "utf-8");
 
-          const installedLoopxPkg = JSON.parse(
-            readFileSync(join(installedPkgRoot, "package.json"), "utf-8"),
-          ) as { bin?: string | Record<string, string> };
-          const binEntry =
-            typeof installedLoopxPkg.bin === "string"
-              ? installedLoopxPkg.bin
-              : installedLoopxPkg.bin?.loopx;
-          if (typeof binEntry !== "string") {
-            throw new Error("installed loopx package is missing bin.loopx");
-          }
-          const binJsPath = resolve(installedPkgRoot, binEntry);
+          const binJsPath = join(installedPkgRoot, "bin.js");
 
           // Resolve the Bun interpreter's directory so we can scrub PATH
           // without losing the ability to spawn `bun` from the installed

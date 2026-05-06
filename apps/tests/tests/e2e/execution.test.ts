@@ -1,7 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
-import { chmod, mkdir, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   createTempProject,
@@ -9,7 +8,6 @@ import {
   createBashWorkflowScript,
   type TempProject,
 } from "../helpers/fixtures.js";
-import { createEnvFile } from "../helpers/env.js";
 import {
   emitResult,
   writeCwdToFile,
@@ -20,31 +18,15 @@ import { runCLI } from "../helpers/cli.js";
 import { runAPIDriver } from "../helpers/api-driver.js";
 import { forEachRuntime, isRuntimeAvailable } from "../helpers/runtime.js";
 
-function readJsonFile<T>(path: string): T {
-  return JSON.parse(readFileSync(path, "utf-8")) as T;
-}
-
-function bashJsonString(value: string): string {
-  return JSON.stringify(value);
-}
-
-function observeEnvJsonBash(varname: string, markerPath: string): string {
-  return `if [[ -v ${varname} ]]; then
-  node -e 'require("node:fs").writeFileSync(process.argv[1], JSON.stringify({ present: true, value: process.env[process.argv[2]] }))' ${bashJsonString(markerPath)} ${bashJsonString(varname)}
-else
-  printf '{"present":false}' > ${bashJsonString(markerPath)}
-fi`;
-}
-
 // ============================================================================
 // TEST-SPEC §4.4 — Script Execution (ADR-0003 workflow model)
 // Spec refs: 6.1–6.5, 8.3, 2.1, 2.2
 //
 // Under the workflow model, all scripts live in workflow subdirectories of
-// .loopx/ (e.g. .loopx/ralph/index.sh). Scripts execute with the project root
-// as cwd. LOOPX_PROJECT_ROOT points to that same directory; LOOPX_WORKFLOW and
-// LOOPX_WORKFLOW_DIR are refreshed on every cross-workflow transition
-// (including loop reset).
+// .loopx/ (e.g. .loopx/ralph/index.sh). Scripts execute with the workflow
+// directory as cwd. LOOPX_PROJECT_ROOT always points to the invocation
+// directory; LOOPX_WORKFLOW always contains the current workflow's name and
+// is refreshed on every cross-workflow transition (including loop reset).
 // ============================================================================
 
 // ----------------------------------------------------------------------------
@@ -62,7 +44,7 @@ describe("TEST-SPEC §4.4 Working Directory", () => {
   });
 
   forEachRuntime((runtime) => {
-    it("T-EXEC-01: script in ralph workflow runs with cwd = project root", async () => {
+    it("T-EXEC-01: script in ralph workflow runs with $PWD = .loopx/ralph/", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cwd-marker.txt");
 
@@ -83,11 +65,11 @@ describe("TEST-SPEC §4.4 Working Directory", () => {
       expect(existsSync(markerPath)).toBe(true);
       const recordedCwd = readFileSync(markerPath, "utf-8");
       const workflowDir = join(project.loopxDir, "ralph");
-      expect(recordedCwd).toBe(project.dir);
-      expect(recordedCwd).not.toBe(workflowDir);
+      expect(recordedCwd).toBe(workflowDir);
+      expect(recordedCwd).not.toBe(project.dir);
     });
 
-    it("T-EXEC-02: script in other workflow also runs with cwd = project root", async () => {
+    it("T-EXEC-02: script in 'other' workflow runs with $PWD = .loopx/other/", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cwd-other.txt");
 
@@ -108,8 +90,7 @@ describe("TEST-SPEC §4.4 Working Directory", () => {
       expect(existsSync(markerPath)).toBe(true);
       const recordedCwd = readFileSync(markerPath, "utf-8");
       const otherDir = join(project.loopxDir, "other");
-      expect(recordedCwd).toBe(project.dir);
-      expect(recordedCwd).not.toBe(otherDir);
+      expect(recordedCwd).toBe(otherDir);
     });
 
     it("T-EXEC-03: $LOOPX_PROJECT_ROOT equals invocation directory, not workflow directory", async () => {
@@ -170,41 +151,6 @@ printf '{"stop":true}'
       // points at the project root (invocation cwd), not the target workflow dir.
       expect(recordedRoot).toBe(project.dir);
       expect(recordedRoot).not.toBe(join(project.loopxDir, "other"));
-    });
-
-    it("T-EXEC-03b: child cd does not leak across intra-workflow goto", async () => {
-      project = await createTempProject();
-      const markerPath = join(project.dir, "cwd-after-cd-goto.txt");
-      const outsideDir = tmpdir();
-
-      await createBashWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        `cd ${JSON.stringify(outsideDir)}
-printf '{"goto":"check"}'`,
-      );
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "check",
-        ".sh",
-        `${writeCwdToFile(markerPath)}
-printf '{"stop":true}'
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "2", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(existsSync(markerPath)).toBe(true);
-      const recordedCwd = readFileSync(markerPath, "utf-8");
-      expect(recordedCwd).toBe(project.dir);
-      expect(recordedCwd).not.toBe(outsideDir);
-      expect(recordedCwd).not.toBe(join(project.loopxDir, "ralph"));
     });
 
     it("T-EXEC-04: $LOOPX_WORKFLOW is injected and equals the workflow name", async () => {
@@ -324,669 +270,6 @@ printf '%s' "$LOOPX_WORKFLOW" > "${betaMarker}"
       expect(readFileSync(betaMarker, "utf-8")).toBe("beta");
       // alpha-marker: writes on iteration 1 and iteration 3 (post-reset).
       expect(readFileSync(alphaMarker, "utf-8")).toBe("alphaalpha");
-    });
-
-    it("T-EXEC-03c: child cd does not leak across loop reset", async () => {
-      project = await createTempProject();
-      const markerPath = join(project.dir, "cwd-after-cd-reset.txt");
-      const outsideDir = tmpdir();
-
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        ".sh",
-        `#!/bin/bash
-ITER_FILE="${project.dir}/iter-bash-reset"
-if [[ -f "$ITER_FILE" ]]; then
-  ITER=$(cat "$ITER_FILE")
-else
-  ITER=0
-fi
-ITER=$((ITER + 1))
-printf '%s' "$ITER" > "$ITER_FILE"
-
-if [[ "$ITER" == "1" ]]; then
-  cd ${JSON.stringify(outsideDir)}
-  exit 0
-fi
-
-/bin/pwd -P | tr -d '\\n' > "${markerPath}"
-printf '{"stop":true}'
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "2", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(existsSync(markerPath)).toBe(true);
-      const recordedCwd = readFileSync(markerPath, "utf-8");
-      expect(recordedCwd).toBe(project.dir);
-      expect(recordedCwd).not.toBe(outsideDir);
-      expect(recordedCwd).not.toBe(join(project.loopxDir, "ralph"));
-    });
-  });
-});
-
-// ----------------------------------------------------------------------------
-// LOOPX_WORKFLOW_DIR (T-WFDIR-01..14)
-// ----------------------------------------------------------------------------
-
-describe("TEST-SPEC §4.4 LOOPX_WORKFLOW_DIR", () => {
-  let project: TempProject | null = null;
-
-  afterEach(async () => {
-    if (project) {
-      await project.cleanup().catch(() => {});
-      project = null;
-    }
-  });
-
-  forEachRuntime((runtime) => {
-    it("T-WFDIR-01: injected value equals discovery-time workflow dir and dirname $0", async () => {
-      project = await createTempProject();
-      const envMarker = join(project.dir, "wfdir-env.json");
-      const dirnameMarker = join(project.dir, "wfdir-dirname.txt");
-
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        ".sh",
-        `#!/bin/bash
-${observeEnvJsonBash("LOOPX_WORKFLOW_DIR", envMarker)}
-printf '%s' "$(dirname "$0")" > ${bashJsonString(dirnameMarker)}
-printf '{"stop":true}'
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "1", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      expect(result.exitCode).toBe(0);
-      const observed = readJsonFile<{ present: boolean; value?: string }>(
-        envMarker,
-      );
-      const expected = join(project.loopxDir, "ralph");
-      expect(observed).toEqual({ present: true, value: expected });
-      expect(readFileSync(dirnameMarker, "utf-8")).toBe(expected);
-    });
-
-    it("T-WFDIR-02: value equals project root plus .loopx workflow path", async () => {
-      project = await createTempProject();
-      const markerPath = join(project.dir, "wfdir-project-root.txt");
-
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        ".sh",
-        `#!/bin/bash
-printf '%s\n%s' "$LOOPX_WORKFLOW_DIR" "$LOOPX_PROJECT_ROOT" > ${bashJsonString(markerPath)}
-printf '{"stop":true}'
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "1", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      expect(result.exitCode).toBe(0);
-      const [wfdir, root] = readFileSync(markerPath, "utf-8").split("\n");
-      expect(root).toBe(project.dir);
-      expect(wfdir).toBe(join(root, ".loopx", "ralph"));
-    });
-
-    it("T-WFDIR-03: value is refreshed on intra-workflow goto", async () => {
-      project = await createTempProject();
-      const indexMarker = join(project.dir, "wfdir-index.txt");
-      const checkMarker = join(project.dir, "wfdir-check.txt");
-
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        ".sh",
-        `#!/bin/bash
-printf '%s' "$LOOPX_WORKFLOW_DIR" > ${bashJsonString(indexMarker)}
-printf '{"goto":"check"}'
-`,
-      );
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "check",
-        ".sh",
-        `#!/bin/bash
-printf '%s' "$LOOPX_WORKFLOW_DIR" > ${bashJsonString(checkMarker)}
-printf '{"stop":true}'
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "2", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      const expected = join(project.loopxDir, "ralph");
-      expect(result.exitCode).toBe(0);
-      expect(readFileSync(indexMarker, "utf-8")).toBe(expected);
-      expect(readFileSync(checkMarker, "utf-8")).toBe(expected);
-    });
-
-    it("T-WFDIR-04: value changes on cross-workflow goto", async () => {
-      project = await createTempProject();
-      const ralphMarker = join(project.dir, "wfdir-ralph.txt");
-      const otherMarker = join(project.dir, "wfdir-other.txt");
-      const workflowMarker = join(project.dir, "workflow-other.txt");
-
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        ".sh",
-        `#!/bin/bash
-printf '%s' "$LOOPX_WORKFLOW_DIR" > ${bashJsonString(ralphMarker)}
-printf '{"goto":"other:check"}'
-`,
-      );
-      await createWorkflowScript(
-        project,
-        "other",
-        "check",
-        ".sh",
-        `#!/bin/bash
-printf '%s' "$LOOPX_WORKFLOW_DIR" > ${bashJsonString(otherMarker)}
-printf '%s' "$LOOPX_WORKFLOW" > ${bashJsonString(workflowMarker)}
-printf '{"stop":true}'
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "2", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(readFileSync(ralphMarker, "utf-8")).toBe(
-        join(project.loopxDir, "ralph"),
-      );
-      expect(readFileSync(otherMarker, "utf-8")).toBe(
-        join(project.loopxDir, "other"),
-      );
-      expect(readFileSync(workflowMarker, "utf-8")).toBe("other");
-    });
-
-    it("T-WFDIR-04a: deeper cross-workflow chain observes each workflow dir", async () => {
-      project = await createTempProject();
-      const alphaMarker = join(project.dir, "wfdir-alpha.txt");
-      const betaMarker = join(project.dir, "wfdir-beta.txt");
-      const gammaMarker = join(project.dir, "wfdir-gamma.txt");
-
-      await createWorkflowScript(
-        project,
-        "alpha",
-        "index",
-        ".sh",
-        `#!/bin/bash
-printf '%s' "$LOOPX_WORKFLOW_DIR" > ${bashJsonString(alphaMarker)}
-printf '{"goto":"beta:step"}'
-`,
-      );
-      await createWorkflowScript(
-        project,
-        "beta",
-        "step",
-        ".sh",
-        `#!/bin/bash
-printf '%s' "$LOOPX_WORKFLOW_DIR" > ${bashJsonString(betaMarker)}
-printf '{"goto":"gamma:step"}'
-`,
-      );
-      await createWorkflowScript(
-        project,
-        "gamma",
-        "step",
-        ".sh",
-        `#!/bin/bash
-printf '%s' "$LOOPX_WORKFLOW_DIR" > ${bashJsonString(gammaMarker)}
-printf '{"stop":true}'
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "3", "alpha"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(readFileSync(alphaMarker, "utf-8")).toBe(
-        join(project.loopxDir, "alpha"),
-      );
-      expect(readFileSync(betaMarker, "utf-8")).toBe(
-        join(project.loopxDir, "beta"),
-      );
-      expect(readFileSync(gammaMarker, "utf-8")).toBe(
-        join(project.loopxDir, "gamma"),
-      );
-    });
-
-    it("T-WFDIR-05: value resets to starting workflow after loop reset", async () => {
-      project = await createTempProject();
-      const alphaLog = join(project.dir, "wfdir-alpha.log");
-      const betaLog = join(project.dir, "wfdir-beta.log");
-
-      await createWorkflowScript(
-        project,
-        "alpha",
-        "index",
-        ".sh",
-        `#!/bin/bash
-printf '%s\n' "$LOOPX_WORKFLOW_DIR" >> ${bashJsonString(alphaLog)}
-printf '{"goto":"beta:step"}'
-`,
-      );
-      await createWorkflowScript(
-        project,
-        "beta",
-        "step",
-        ".sh",
-        `#!/bin/bash
-printf '%s\n' "$LOOPX_WORKFLOW_DIR" >> ${bashJsonString(betaLog)}
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "3", "alpha"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(readFileSync(alphaLog, "utf-8").trim().split("\n")).toEqual([
-        join(project.loopxDir, "alpha"),
-        join(project.loopxDir, "alpha"),
-      ]);
-      expect(readFileSync(betaLog, "utf-8").trim()).toBe(
-        join(project.loopxDir, "beta"),
-      );
-    });
-
-    it("T-WFDIR-06: value silently overrides inherited env", async () => {
-      project = await createTempProject();
-      const markerPath = join(project.dir, "wfdir-inherited.txt");
-
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        ".sh",
-        `${writeEnvToFile("LOOPX_WORKFLOW_DIR", markerPath)}
-printf '{"stop":true}'
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "1", "ralph"], {
-        cwd: project.dir,
-        runtime,
-        env: { LOOPX_WORKFLOW_DIR: "/tmp/fake-dir" },
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(readFileSync(markerPath, "utf-8")).toBe(
-        join(project.loopxDir, "ralph"),
-      );
-      expect(result.stderr).not.toContain("LOOPX_WORKFLOW_DIR");
-    });
-
-    it("T-WFDIR-07: value silently overrides local env file", async () => {
-      project = await createTempProject();
-      const markerPath = join(project.dir, "wfdir-local-env.txt");
-      const envFilePath = join(project.dir, "local.env");
-      await createEnvFile(envFilePath, { LOOPX_WORKFLOW_DIR: "/tmp/fake-dir" });
-
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        ".sh",
-        `${writeEnvToFile("LOOPX_WORKFLOW_DIR", markerPath)}
-printf '{"stop":true}'
-`,
-      );
-
-      const result = await runCLI(
-        ["run", "-e", "local.env", "-n", "1", "ralph"],
-        {
-          cwd: project.dir,
-          runtime,
-        },
-      );
-
-      expect(result.exitCode).toBe(0);
-      expect(readFileSync(markerPath, "utf-8")).toBe(
-        join(project.loopxDir, "ralph"),
-      );
-      expect(result.stderr).not.toContain("LOOPX_WORKFLOW_DIR");
-    });
-
-    it("T-WFDIR-08: value overrides RunOptions.env", async () => {
-      project = await createTempProject();
-      const markerPath = join(project.dir, "wfdir-api-env.txt");
-
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        ".sh",
-        `${writeEnvToFile("LOOPX_WORKFLOW_DIR", markerPath)}
-printf '{"stop":true}'
-`,
-      );
-
-      const driverCode = `
-import { runPromise } from "loopx";
-await runPromise("ralph", {
-  cwd: ${JSON.stringify(project.dir)},
-  maxIterations: 1,
-  env: { LOOPX_WORKFLOW_DIR: "/tmp/fake-dir" }
-});
-`;
-
-      const result = await runAPIDriver(runtime, driverCode, {
-        cwd: project.dir,
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(readFileSync(markerPath, "utf-8")).toBe(
-        join(project.loopxDir, "ralph"),
-      );
-    });
-
-    it("T-WFDIR-09: dirname $0 equals LOOPX_WORKFLOW_DIR", async () => {
-      project = await createTempProject();
-      const wfdirMarker = join(project.dir, "wfdir-09.txt");
-      const dirnameMarker = join(project.dir, "dirname-09.txt");
-
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        ".sh",
-        `#!/bin/bash
-printf '%s' "$LOOPX_WORKFLOW_DIR" > ${bashJsonString(wfdirMarker)}
-printf '%s' "$(dirname "$0")" > ${bashJsonString(dirnameMarker)}
-printf '{"stop":true}'
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "1", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(readFileSync(dirnameMarker, "utf-8")).toBe(
-        readFileSync(wfdirMarker, "utf-8"),
-      );
-    });
-
-    it("T-WFDIR-09a: bash $0 equals absolute discovery-time script path", async () => {
-      project = await createTempProject();
-      const zeroMarker = join(project.dir, "zero-09a.txt");
-      const expectedMarker = join(project.dir, "expected-09a.txt");
-
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        ".sh",
-        `#!/bin/bash
-printf '%s' "$0" > ${bashJsonString(zeroMarker)}
-printf '%s/index.sh' "$LOOPX_WORKFLOW_DIR" > ${bashJsonString(expectedMarker)}
-printf '{"stop":true}'
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "1", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(readFileSync(zeroMarker, "utf-8")).toBe(
-        readFileSync(expectedMarker, "utf-8"),
-      );
-    });
-
-    it("T-WFDIR-09b/T-WFDIR-10: symlinked workflow dir preserves symlink spelling", async () => {
-      project = await createTempProject();
-      const realWorkflowDir = join(project.dir, "real-workflows", "ralph");
-      await mkdir(realWorkflowDir, { recursive: true });
-      const zeroMarker = join(project.dir, "zero-09b.txt");
-      const wfdirMarker = join(project.dir, "wfdir-10.txt");
-      const scriptPath = join(realWorkflowDir, "index.sh");
-      await writeFile(
-        scriptPath,
-        `#!/bin/bash
-printf '%s' "$0" > ${bashJsonString(zeroMarker)}
-printf '%s' "$LOOPX_WORKFLOW_DIR" > ${bashJsonString(wfdirMarker)}
-printf '{"stop":true}'
-`,
-        "utf-8",
-      );
-      await chmod(scriptPath, 0o755);
-      await symlink(realWorkflowDir, join(project.loopxDir, "ralph"));
-
-      const result = await runCLI(["run", "-n", "1", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      const expectedWfdir = join(project.loopxDir, "ralph");
-      expect(result.exitCode).toBe(0);
-      expect(readFileSync(zeroMarker, "utf-8")).toBe(
-        join(expectedWfdir, "index.sh"),
-      );
-      expect(readFileSync(zeroMarker, "utf-8")).not.toBe(scriptPath);
-      expect(readFileSync(wfdirMarker, "utf-8")).toBe(expectedWfdir);
-      expect(readFileSync(wfdirMarker, "utf-8")).not.toBe(realWorkflowDir);
-    });
-
-    it("T-WFDIR-09c/T-WFDIR-12: symlinked entry script preserves script-path spelling", async () => {
-      project = await createTempProject();
-      const workflowDir = join(project.loopxDir, "ralph");
-      await mkdir(workflowDir, { recursive: true });
-      const realScript = join(project.dir, "real-script.sh");
-      const zeroMarker = join(project.dir, "zero-09c.txt");
-      const dirnameMarker = join(project.dir, "dirname-12.txt");
-      const wfdirMarker = join(project.dir, "wfdir-12.txt");
-      await writeFile(
-        realScript,
-        `#!/bin/bash
-printf '%s' "$0" > ${bashJsonString(zeroMarker)}
-printf '%s' "$(dirname "$0")" > ${bashJsonString(dirnameMarker)}
-printf '%s' "$LOOPX_WORKFLOW_DIR" > ${bashJsonString(wfdirMarker)}
-printf '{"stop":true}'
-`,
-        "utf-8",
-      );
-      await chmod(realScript, 0o755);
-      await symlink(realScript, join(workflowDir, "index.sh"));
-
-      const result = await runCLI(["run", "-n", "1", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(readFileSync(zeroMarker, "utf-8")).toBe(
-        join(workflowDir, "index.sh"),
-      );
-      expect(readFileSync(zeroMarker, "utf-8")).not.toBe(realScript);
-      expect(readFileSync(dirnameMarker, "utf-8")).toBe(
-        readFileSync(wfdirMarker, "utf-8"),
-      );
-      expect(readFileSync(wfdirMarker, "utf-8")).toBe(workflowDir);
-    });
-
-    it("T-WFDIR-09d/T-WFDIR-11: symlinked .loopx dir preserves symlink spelling", async () => {
-      project = await createTempProject({ withLoopxDir: false });
-      const realLoopxDir = join(project.dir, "real-loopx");
-      const realWorkflowDir = join(realLoopxDir, "ralph");
-      await mkdir(realWorkflowDir, { recursive: true });
-      const zeroMarker = join(project.dir, "zero-09d.txt");
-      const dirnameMarker = join(project.dir, "dirname-09d.txt");
-      const wfdirMarker = join(project.dir, "wfdir-11.txt");
-      const scriptPath = join(realWorkflowDir, "index.sh");
-      await writeFile(
-        scriptPath,
-        `#!/bin/bash
-printf '%s' "$0" > ${bashJsonString(zeroMarker)}
-printf '%s' "$(dirname "$0")" > ${bashJsonString(dirnameMarker)}
-printf '%s' "$LOOPX_WORKFLOW_DIR" > ${bashJsonString(wfdirMarker)}
-printf '{"stop":true}'
-`,
-        "utf-8",
-      );
-      await chmod(scriptPath, 0o755);
-      await symlink(realLoopxDir, project.loopxDir);
-
-      const result = await runCLI(["run", "-n", "1", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      const expectedWfdir = join(project.loopxDir, "ralph");
-      expect(result.exitCode).toBe(0);
-      expect(readFileSync(zeroMarker, "utf-8")).toBe(
-        join(expectedWfdir, "index.sh"),
-      );
-      expect(readFileSync(zeroMarker, "utf-8")).not.toBe(scriptPath);
-      expect(readFileSync(dirnameMarker, "utf-8")).toBe(expectedWfdir);
-      expect(readFileSync(wfdirMarker, "utf-8")).toBe(expectedWfdir);
-      expect(readFileSync(wfdirMarker, "utf-8")).not.toBe(realWorkflowDir);
-    });
-
-    it("T-WFDIR-13: sourced bash helper observes same value as top-level script", async () => {
-      project = await createTempProject();
-      const workflowDir = join(project.loopxDir, "ralph");
-      const libDir = join(workflowDir, "lib");
-      await mkdir(libDir, { recursive: true });
-      const topMarker = join(project.dir, "wfdir-top-bash.txt");
-      const helperMarker = join(project.dir, "wfdir-helper-bash.txt");
-      await writeFile(
-        join(libDir, "helper.sh"),
-        `printf '%s' "$LOOPX_WORKFLOW_DIR" > ${bashJsonString(helperMarker)}
-`,
-        "utf-8",
-      );
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        ".sh",
-        `#!/bin/bash
-printf '%s' "$LOOPX_WORKFLOW_DIR" > ${bashJsonString(topMarker)}
-source "$LOOPX_WORKFLOW_DIR/lib/helper.sh"
-printf '{"stop":true}'
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "1", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(readFileSync(helperMarker, "utf-8")).toBe(
-        readFileSync(topMarker, "utf-8"),
-      );
-    });
-
-    it("T-WFDIR-13a: imported TS helper observes same value as top-level script", async () => {
-      project = await createTempProject();
-      const workflowDir = join(project.loopxDir, "ralph");
-      const libDir = join(workflowDir, "lib");
-      await mkdir(libDir, { recursive: true });
-      const topMarker = join(project.dir, "wfdir-top-ts.txt");
-      const helperMarker = join(project.dir, "wfdir-helper-ts.txt");
-      await writeFile(
-        join(libDir, "helper.ts"),
-        `import { writeFileSync } from "node:fs";
-writeFileSync(${JSON.stringify(helperMarker)}, process.env.LOOPX_WORKFLOW_DIR ?? "");
-`,
-        "utf-8",
-      );
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        ".ts",
-        `import { writeFileSync } from "node:fs";
-import { output } from "loopx";
-import "./lib/helper.ts";
-writeFileSync(${JSON.stringify(topMarker)}, process.env.LOOPX_WORKFLOW_DIR ?? "");
-output({ stop: true });
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "1", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(readFileSync(helperMarker, "utf-8")).toBe(
-        readFileSync(topMarker, "utf-8"),
-      );
-    });
-
-    it("T-WFDIR-14: cross-workflow rendezvous through workflow dirs does not work", async () => {
-      project = await createTempProject();
-
-      await createWorkflowScript(
-        project,
-        "alpha",
-        "index",
-        ".sh",
-        `#!/bin/bash
-printf 'alpha-state' > "$LOOPX_WORKFLOW_DIR/shared.tmp"
-printf '{"goto":"beta:index"}'
-`,
-      );
-      await createWorkflowScript(
-        project,
-        "beta",
-        "index",
-        ".sh",
-        `#!/bin/bash
-if [[ -f "$LOOPX_WORKFLOW_DIR/shared.tmp" ]]; then
-  VALUE=$(cat "$LOOPX_WORKFLOW_DIR/shared.tmp")
-  printf '{"result":"%s","stop":true}' "$VALUE"
-else
-  printf '{"result":"missing","stop":true}'
-fi
-`,
-      );
-
-      const driverCode = `
-import { runPromise } from "loopx";
-const outputs = await runPromise("alpha", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 2 });
-process.stdout.write(JSON.stringify(outputs));
-`;
-      const result = await runAPIDriver(runtime, driverCode, {
-        cwd: project.dir,
-      });
-
-      expect(result.exitCode).toBe(0);
-      const outputs = JSON.parse(result.stdout);
-      expect(outputs.at(-1)?.result).toBe("missing");
     });
   });
 });
@@ -1364,7 +647,7 @@ process.stdout.write(JSON.stringify({ result: greeting }));
       );
 
       // Install a local ESM dep in the workflow's node_modules. Node/tsx/bun
-      // resolve bare specifiers from the importing script's file location.
+      // all resolve bare specifiers starting from cwd (= workflow dir).
       const depDir = join(
         project.loopxDir,
         "with-deps",
@@ -1397,7 +680,7 @@ process.stdout.write(JSON.stringify({ result: greeting }));
       expect(readFileSync(markerPath, "utf-8")).toBe("hello-from-local-dep");
     });
 
-    it("T-EXEC-16: JS/TS script cwd equals the project root", async () => {
+    it("T-EXEC-16: workflow cwd equals the workflow directory (TS, via process.cwd())", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "ts-cwd-marker.txt");
 
@@ -1420,9 +703,7 @@ process.stdout.write(JSON.stringify({ result: "ok" }));
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
       const workflowDir = join(project.loopxDir, "ralph");
-      const recordedCwd = readFileSync(markerPath, "utf-8");
-      expect(recordedCwd).toBe(project.dir);
-      expect(recordedCwd).not.toBe(workflowDir);
+      expect(readFileSync(markerPath, "utf-8")).toBe(workflowDir);
     });
 
     it("T-EXEC-16a: workflow importing a package not present in its node_modules fails with exit 1", async () => {
@@ -1448,10 +729,9 @@ process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
       expect(result.exitCode).toBe(1);
     });
 
-    it("T-EXEC-16b: cross-workflow goto preserves project-root cwd", async () => {
+    it("T-EXEC-16b: cross-workflow goto switches cwd to the target workflow's directory", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cross-cwd-marker.txt");
-      const workflowDirMarkerPath = join(project.dir, "cross-wfdir-marker.txt");
 
       // ralph:index transitions into other:check
       await createBashWorkflowScript(
@@ -1460,15 +740,14 @@ process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
         "index",
         `printf '{"goto":"other:check"}'`,
       );
-      // other:check records cwd and workflow-dir, then stops so the chain ends.
+      // other:check records its own $PWD, then stops so the chain ends.
       await createWorkflowScript(
         project,
         "other",
         "check",
         ".sh",
         `#!/bin/bash
-/bin/pwd -P | tr -d '\\n' > "${markerPath}"
-printf '%s' "$LOOPX_WORKFLOW_DIR" > "${workflowDirMarkerPath}"
+printf '%s' "$PWD" > "${markerPath}"
 printf '{"stop":true}'
 `,
       );
@@ -1480,93 +759,13 @@ printf '{"stop":true}'
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
-      expect(existsSync(workflowDirMarkerPath)).toBe(true);
       const recordedCwd = readFileSync(markerPath, "utf-8");
       const otherDir = join(project.loopxDir, "other");
       const ralphDir = join(project.loopxDir, "ralph");
-      expect(recordedCwd).toBe(project.dir);
+      // After crossing into 'other', the script must execute in .loopx/other/,
+      // not in ralph's directory.
+      expect(recordedCwd).toBe(otherDir);
       expect(recordedCwd).not.toBe(ralphDir);
-      expect(recordedCwd).not.toBe(otherDir);
-      expect(readFileSync(workflowDirMarkerPath, "utf-8")).toBe(otherDir);
-    });
-
-    it("T-EXEC-16c: JS/TS process.chdir() does not leak across intra-workflow goto", async () => {
-      project = await createTempProject();
-      const markerPath = join(project.dir, "ts-cwd-after-chdir-goto.txt");
-      const outsideDir = tmpdir();
-
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        ".ts",
-        `import { output } from "loopx";
-process.chdir(${JSON.stringify(outsideDir)});
-output({ goto: "check" });
-`,
-      );
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "check",
-        ".ts",
-        `import { writeFileSync } from "node:fs";
-import { output } from "loopx";
-writeFileSync(${JSON.stringify(markerPath)}, process.cwd());
-output({ stop: true });
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "2", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(existsSync(markerPath)).toBe(true);
-      const recordedCwd = readFileSync(markerPath, "utf-8");
-      expect(recordedCwd).toBe(project.dir);
-      expect(recordedCwd).not.toBe(outsideDir);
-      expect(recordedCwd).not.toBe(join(project.loopxDir, "ralph"));
-    });
-
-    it("T-EXEC-16d: JS/TS process.chdir() does not leak across loop reset", async () => {
-      project = await createTempProject();
-      const markerPath = join(project.dir, "ts-cwd-after-chdir-reset.txt");
-      const outsideDir = tmpdir();
-
-      await createWorkflowScript(
-        project,
-        "ralph",
-        "index",
-        ".ts",
-        `import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { output } from "loopx";
-
-const iterFile = ${JSON.stringify(join(project.dir, "iter-ts-reset"))};
-const iter = existsSync(iterFile) ? Number(readFileSync(iterFile, "utf-8")) + 1 : 1;
-writeFileSync(iterFile, String(iter));
-
-if (iter === 1) {
-  process.chdir(${JSON.stringify(outsideDir)});
-} else {
-  writeFileSync(${JSON.stringify(markerPath)}, process.cwd());
-  output({ stop: true });
-}
-`,
-      );
-
-      const result = await runCLI(["run", "-n", "2", "ralph"], {
-        cwd: project.dir,
-        runtime,
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(existsSync(markerPath)).toBe(true);
-      const recordedCwd = readFileSync(markerPath, "utf-8");
-      expect(recordedCwd).toBe(project.dir);
-      expect(recordedCwd).not.toBe(outsideDir);
-      expect(recordedCwd).not.toBe(join(project.loopxDir, "ralph"));
     });
   });
 });
