@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { chmod, mkdir, readFile } from "node:fs/promises";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import {
   createTempProject,
@@ -1644,6 +1644,39 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       expect(existsSync(markerFile)).toBe(true);
       expect(result.stderr).toMatch(/package\.json|regular|directory|version/i);
     });
+
+    it.skipIf(process.env.CI || process.env.LOOPX_RUN_PRIVILEGED_LOCAL_TESTS !== "1")(
+      "T-VER-28-block: block/character device workflow package.json warns and execution continues",
+      async () => {
+        for (const kind of ["char", "block"] as const) {
+          project = await createTempProject();
+          const markerFile = join(project.dir, `nonregular-package-${kind}.marker`);
+          await createBashWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            bashMarker(markerFile),
+          );
+          const packagePath = join(project.loopxDir, "ralph", "package.json");
+          execFileSync(
+            "mknod",
+            kind === "char" ? [packagePath, "c", "1", "7"] : [packagePath, "b", "7", "0"],
+          );
+
+          const result = await runCLI(["run", "-n", "1", "ralph"], {
+            cwd: project.dir,
+            runtime,
+          });
+
+          expect(result.exitCode).toBe(0);
+          expect(existsSync(markerFile)).toBe(true);
+          expect(result.stderr).toMatch(/package\.json|regular|version/i);
+
+          await project.cleanup().catch(() => {});
+          project = null;
+        }
+      },
+    );
   });
 
   // ═════════════════════════════════════════════════════════════

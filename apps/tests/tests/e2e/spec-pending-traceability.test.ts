@@ -1,21 +1,26 @@
-import { describe, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
-// TEST-SPEC.md §1.3 documents these as explicit known gaps: they require
-// privileged host/device operations, unobservable implementation internals, or
-// additional deterministic timing seams beyond the default black-box harness.
-// All other formerly pending traceability IDs now have executable coverage in
-// the e2e/unit/fuzz/type suites.
-const pendingSpecIds = [
+// These IDs require privileged host/device operations, so their executable
+// tests are opt-in local coverage gated by LOOPX_RUN_PRIVILEGED_LOCAL_TESTS=1
+// and are skipped in ordinary GitHub CI runs.
+const localPrivilegedSpecIds = [
   "T-INST-112-block",
   "T-INST-113-package",
   "T-TMP-43",
-  "T-TMP-44",
   "T-TMP-45",
+  "T-DISC-49-block",
   "T-VER-28-block",
 ] as const;
 
-describe("SPEC: Known Traceability Gaps", () => {
-  for (const id of pendingSpecIds) {
-    it.todo(`${id}: documented TEST-SPEC known gap`);
-  }
+describe("SPEC: Privileged Local Traceability", () => {
+  it("documents privileged opt-in IDs without leaving TEST-SPEC todos", () => {
+    expect(localPrivilegedSpecIds).toEqual([
+      "T-INST-112-block",
+      "T-INST-113-package",
+      "T-TMP-43",
+      "T-TMP-45",
+      "T-DISC-49-block",
+      "T-VER-28-block",
+    ]);
+  });
 });

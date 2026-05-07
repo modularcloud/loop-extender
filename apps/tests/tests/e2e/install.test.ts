@@ -7247,6 +7247,65 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         },
       );
 
+      it.skipIf(process.env.CI || process.env.LOOPX_RUN_PRIVILEGED_LOCAL_TESTS !== "1")(
+        "T-INST-112-block: block/character device .gitignore is a safeguard failure",
+        async () => {
+          for (const [fault, statMethod] of [
+            ["gitignore-replace-with-char-device:alpha", "isCharacterDevice"],
+            ["gitignore-replace-with-block-device:alpha", "isBlockDevice"],
+          ] as const) {
+            project = await createTempProject();
+            gitServer = await startLocalGitServer([
+              {
+                name: "multi",
+                files: {
+                  "alpha/index.sh": BASH_STOP,
+                  "alpha/package.json": JSON.stringify({
+                    name: "alpha",
+                    version: "1.0.0",
+                  }),
+                  "beta/index.sh": BASH_STOP,
+                  "beta/package.json": JSON.stringify({
+                    name: "beta",
+                    version: "1.0.0",
+                  }),
+                },
+              },
+            ]);
+
+            await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+              const result = await runCLI(
+                ["install", `${gitServer!.url}/multi.git`],
+                {
+                  cwd: project!.dir,
+                  runtime,
+                  env: {
+                    ...env,
+                    NODE_ENV: "test",
+                    LOOPX_TEST_AUTOINSTALL_FAULT: fault,
+                  },
+                },
+              );
+
+              expect(result.exitCode).toBe(1);
+              expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+                join(project!.loopxDir, "beta"),
+              ]);
+              expect(result.stderr).toMatch(/alpha/i);
+              expect(result.stderr).toMatch(/gitignore/i);
+              expect(lstatSync(join(project!.loopxDir, "alpha", ".gitignore"))[statMethod]()).toBe(
+                true,
+              );
+            });
+
+            await gitServer.close().catch(() => {});
+            gitServer = null;
+            await project.cleanup().catch(() => {});
+            project = null;
+          }
+        },
+      );
+
       it("T-INST-112k: unreadable regular .gitignore is not inspected or chmodded", async () => {
         if (IS_ROOT) {
           expect(IS_ROOT).toBe(true);
@@ -7806,6 +7865,69 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
             );
             expectNoAutoInstallFailureReport(result.stderr);
           });
+        },
+      );
+
+      it.skipIf(process.env.CI || process.env.LOOPX_RUN_PRIVILEGED_LOCAL_TESTS !== "1")(
+        "T-INST-113-package: block/character device committed package.json skips auto-install",
+        async () => {
+          for (const [fault, statMethod] of [
+            ["package-json-replace-with-char-device:alpha", "isCharacterDevice"],
+            ["package-json-replace-with-block-device:alpha", "isBlockDevice"],
+          ] as const) {
+            project = await createTempProject();
+            gitServer = await startLocalGitServer([
+              {
+                name: "multi",
+                files: {
+                  "alpha/index.sh": BASH_STOP,
+                  "alpha/package.json": JSON.stringify({
+                    name: "alpha",
+                    version: "1.0.0",
+                  }),
+                  "beta/index.sh": BASH_STOP,
+                  "beta/package.json": JSON.stringify({
+                    name: "beta",
+                    version: "1.0.0",
+                  }),
+                },
+              },
+            ]);
+
+            await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+              const result = await runCLI(
+                ["install", `${gitServer!.url}/multi.git`],
+                {
+                  cwd: project!.dir,
+                  runtime,
+                  env: {
+                    ...env,
+                    NODE_ENV: "test",
+                    LOOPX_TEST_AUTOINSTALL_FAULT: fault,
+                  },
+                },
+              );
+
+              expect(result.exitCode).toBe(0);
+              expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+                join(project!.loopxDir, "beta"),
+              ]);
+              expect(lstatSync(join(project!.loopxDir, "alpha", "package.json"))[statMethod]()).toBe(
+                true,
+              );
+              expect(result.stderr).toMatch(/alpha/i);
+              expect(result.stderr).toMatch(/package\.json/i);
+              expect(existsSync(join(project!.loopxDir, "alpha", ".gitignore"))).toBe(
+                false,
+              );
+              expectNoAutoInstallFailureReport(result.stderr);
+            });
+
+            await gitServer.close().catch(() => {});
+            gitServer = null;
+            await project.cleanup().catch(() => {});
+            project = null;
+          }
         },
       );
 

@@ -21,6 +21,7 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+      - uses: oven-sh/setup-bun@v2
       - run: npm ci
       - run: npm run test:unit
 
@@ -35,6 +36,7 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+      - uses: oven-sh/setup-bun@v2
       - run: npm ci
       - run: npm run test:harness
 
@@ -49,6 +51,7 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+      - uses: oven-sh/setup-bun@v2
       - run: npm ci
       - run: npm run test:e2e
 
@@ -63,6 +66,7 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+      - uses: oven-sh/setup-bun@v2
       - run: npm ci
       - run: npm run test:fuzz
 
@@ -77,5 +81,6 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+      - uses: oven-sh/setup-bun@v2
       - run: npm ci
       - run: npm run test:typecheck

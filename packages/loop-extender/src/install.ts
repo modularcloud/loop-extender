@@ -750,15 +750,24 @@ function removeFsEntry(path: string): void {
 function applySourceTargetFaults(sourceRoot: string): void {
   if (process.env.NODE_ENV !== "test") return;
   const raw = process.env.LOOPX_TEST_INSTALL_FAULT;
-  const match = raw?.match(/source-target-replace-with-fifo:([^;]+)/);
-  if (!match) return;
-  for (const rel of match[1].split(",").map((v) => v.trim()).filter(Boolean)) {
-    const target = join(sourceRoot, rel);
-    try {
-      rmSync(target, { recursive: true, force: true });
-      execFileSync("mkfifo", [target]);
-    } catch {
-      // best-effort seam
+  if (!raw) return;
+  for (const part of raw.split(";")) {
+    const match = /^(source-target-replace-with-fifo|source-target-replace-with-char-device|source-target-replace-with-block-device):(.+)$/.exec(part.trim());
+    if (!match) continue;
+    for (const rel of match[2].split(",").map((v) => v.trim()).filter(Boolean)) {
+      const target = join(sourceRoot, rel);
+      try {
+        rmSync(target, { recursive: true, force: true });
+        if (match[1] === "source-target-replace-with-fifo") {
+          execFileSync("mkfifo", [target]);
+        } else if (match[1] === "source-target-replace-with-char-device") {
+          execFileSync("mknod", [target, "c", "1", "7"]);
+        } else {
+          execFileSync("mknod", [target, "b", "7", "0"]);
+        }
+      } catch {
+        // best-effort seam
+      }
     }
   }
 }
@@ -1078,6 +1087,8 @@ function getAutoInstallFault(): {
   packageJsonMakeUnreadable: Set<string>;
   gitignoreReplaceWithFifo: Set<string>;
   gitignoreReplaceWithSocket: Set<string>;
+  gitignoreReplaceWithCharDevice: Set<string>;
+  gitignoreReplaceWithBlockDevice: Set<string>;
   gitignoreLstatFail: Set<string>;
   gitignorePartialWriteFail: Set<string>;
   gitignoreMakeUnreadable: Set<string>;
@@ -1085,6 +1096,8 @@ function getAutoInstallFault(): {
   packageJsonReplaceWithSymlink: Map<string, string>;
   packageJsonReplaceWithFifo: Set<string>;
   packageJsonReplaceWithSocket: Set<string>;
+  packageJsonReplaceWithCharDevice: Set<string>;
+  packageJsonReplaceWithBlockDevice: Set<string>;
   packageJsonReplaceWithValid: Set<string>;
   packageJsonRemove: Set<string>;
 } {
@@ -1096,6 +1109,8 @@ function getAutoInstallFault(): {
     packageJsonMakeUnreadable: new Set<string>(),
     gitignoreReplaceWithFifo: new Set<string>(),
     gitignoreReplaceWithSocket: new Set<string>(),
+    gitignoreReplaceWithCharDevice: new Set<string>(),
+    gitignoreReplaceWithBlockDevice: new Set<string>(),
     gitignoreLstatFail: new Set<string>(),
     gitignorePartialWriteFail: new Set<string>(),
     gitignoreMakeUnreadable: new Set<string>(),
@@ -1103,6 +1118,8 @@ function getAutoInstallFault(): {
     packageJsonReplaceWithSymlink: new Map<string, string>(),
     packageJsonReplaceWithFifo: new Set<string>(),
     packageJsonReplaceWithSocket: new Set<string>(),
+    packageJsonReplaceWithCharDevice: new Set<string>(),
+    packageJsonReplaceWithBlockDevice: new Set<string>(),
     packageJsonReplaceWithValid: new Set<string>(),
     packageJsonRemove: new Set<string>(),
   };
@@ -1117,6 +1134,8 @@ function getAutoInstallFault(): {
     packageJsonMakeUnreadable: new Set<string>(),
     gitignoreReplaceWithFifo: new Set<string>(),
     gitignoreReplaceWithSocket: new Set<string>(),
+    gitignoreReplaceWithCharDevice: new Set<string>(),
+    gitignoreReplaceWithBlockDevice: new Set<string>(),
     gitignoreLstatFail: new Set<string>(),
     gitignorePartialWriteFail: new Set<string>(),
     gitignoreMakeUnreadable: new Set<string>(),
@@ -1124,6 +1143,8 @@ function getAutoInstallFault(): {
     packageJsonReplaceWithSymlink: new Map<string, string>(),
     packageJsonReplaceWithFifo: new Set<string>(),
     packageJsonReplaceWithSocket: new Set<string>(),
+    packageJsonReplaceWithCharDevice: new Set<string>(),
+    packageJsonReplaceWithBlockDevice: new Set<string>(),
     packageJsonReplaceWithValid: new Set<string>(),
     packageJsonRemove: new Set<string>(),
   };
@@ -1149,7 +1170,7 @@ function getAutoInstallFault(): {
       }
       continue;
     }
-    const match = /^(gitignore-write-fail|npm-spawn-fail|package-json-make-unreadable|gitignore-replace-with-fifo|gitignore-replace-with-socket|gitignore-lstat-fail|gitignore-partial-write-fail|gitignore-make-unreadable|package-json-replace-with-fifo|package-json-replace-with-socket|package-json-replace-with-valid|package-json-remove):(.+)$/.exec(trimmed);
+    const match = /^(gitignore-write-fail|npm-spawn-fail|package-json-make-unreadable|gitignore-replace-with-fifo|gitignore-replace-with-socket|gitignore-replace-with-char-device|gitignore-replace-with-block-device|gitignore-lstat-fail|gitignore-partial-write-fail|gitignore-make-unreadable|package-json-replace-with-fifo|package-json-replace-with-socket|package-json-replace-with-char-device|package-json-replace-with-block-device|package-json-replace-with-valid|package-json-remove):(.+)$/.exec(trimmed);
     if (!match) continue;
     const names = match[2].split(/[,+]/).map((name) => name.trim()).filter(Boolean);
     const target =
@@ -1160,11 +1181,15 @@ function getAutoInstallFault(): {
           : match[1] === "package-json-make-unreadable" ? result.packageJsonMakeUnreadable
           : match[1] === "gitignore-replace-with-fifo" ? result.gitignoreReplaceWithFifo
           : match[1] === "gitignore-replace-with-socket" ? result.gitignoreReplaceWithSocket
+          : match[1] === "gitignore-replace-with-char-device" ? result.gitignoreReplaceWithCharDevice
+          : match[1] === "gitignore-replace-with-block-device" ? result.gitignoreReplaceWithBlockDevice
           : match[1] === "gitignore-lstat-fail" ? result.gitignoreLstatFail
           : match[1] === "gitignore-partial-write-fail" ? result.gitignorePartialWriteFail
           : match[1] === "gitignore-make-unreadable" ? result.gitignoreMakeUnreadable
           : match[1] === "package-json-replace-with-fifo" ? result.packageJsonReplaceWithFifo
           : match[1] === "package-json-replace-with-socket" ? result.packageJsonReplaceWithSocket
+          : match[1] === "package-json-replace-with-char-device" ? result.packageJsonReplaceWithCharDevice
+          : match[1] === "package-json-replace-with-block-device" ? result.packageJsonReplaceWithBlockDevice
           : match[1] === "package-json-remove" ? result.packageJsonRemove
           : result.packageJsonReplaceWithValid;
     for (const name of names) target.add(name);
@@ -1310,6 +1335,14 @@ function applyPackageJsonFaults(
     rmSync(pkg, { recursive: true, force: true });
     createSocketFile(pkg);
   }
+  if (fault.packageJsonReplaceWithCharDevice.has(workflow)) {
+    rmSync(pkg, { recursive: true, force: true });
+    createDeviceFile(pkg, "char");
+  }
+  if (fault.packageJsonReplaceWithBlockDevice.has(workflow)) {
+    rmSync(pkg, { recursive: true, force: true });
+    createDeviceFile(pkg, "block");
+  }
   const symlinkKind = fault.packageJsonReplaceWithSymlink.get(workflow);
   if (symlinkKind) {
     rmSync(pkg, { recursive: true, force: true });
@@ -1354,6 +1387,25 @@ function applyGitignoreFaultsBeforeLstat(
   if (fault.gitignoreReplaceWithSocket.has(workflow)) {
     rmSync(gitignore, { recursive: true, force: true });
     createSocketFile(gitignore);
+  }
+  if (fault.gitignoreReplaceWithCharDevice.has(workflow)) {
+    rmSync(gitignore, { recursive: true, force: true });
+    createDeviceFile(gitignore, "char");
+  }
+  if (fault.gitignoreReplaceWithBlockDevice.has(workflow)) {
+    rmSync(gitignore, { recursive: true, force: true });
+    createDeviceFile(gitignore, "block");
+  }
+}
+
+function createDeviceFile(path: string, kind: "char" | "block"): void {
+  try {
+    execFileSync(
+      "mknod",
+      kind === "char" ? [path, "c", "1", "7"] : [path, "b", "7", "0"],
+    );
+  } catch {
+    mkdirSync(path, { recursive: true });
   }
 }
 

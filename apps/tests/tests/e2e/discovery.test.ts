@@ -2436,6 +2436,13 @@ try {
       execFileSync("mkfifo", [path]);
     }
 
+    function createDevice(path: string, kind: "char" | "block"): void {
+      execFileSync(
+        "mknod",
+        kind === "char" ? [path, "c", "1", "7"] : [path, "b", "7", "0"],
+      );
+    }
+
     it("T-DISC-49a: project-root .loopx broken symlink is missing or unusable across run surfaces", async () => {
       project = await createTempProject({ withLoopxDir: false });
       symlinkSync(join(project.dir, "missing-loopx"), project.loopxDir);
@@ -2678,7 +2685,20 @@ try {
       },
     );
 
-    it.todo("T-DISC-49-block: block/character device .loopx entries require mknod/CAP_MKNOD");
+    it.skipIf(process.env.CI || process.env.LOOPX_RUN_PRIVILEGED_LOCAL_TESTS !== "1")(
+      "T-DISC-49-block: project-root .loopx block/character device is missing or unusable",
+      async () => {
+        for (const kind of ["char", "block"] as const) {
+          project = await createTempProject({ withLoopxDir: false });
+          createDevice(project.loopxDir, kind);
+
+          await assertRootLoopxUnusable();
+
+          await project.cleanup().catch(() => {});
+          project = null;
+        }
+      },
+    );
   });
 
   // =========================================================================

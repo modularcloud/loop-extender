@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { existsSync, readdirSync, readFileSync, statSync, symlinkSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, statSync, symlinkSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -2314,6 +2315,77 @@ process.stdout.write(JSON.stringify(results));
         }
       }
     });
+
+    it.skipIf(process.env.CI || process.env.LOOPX_RUN_PRIVILEGED_LOCAL_TESTS !== "1")(
+      "T-TMP-45: cleanup safety leaves block/character device replacements in place",
+      async () => {
+        project = await createTempProject();
+        const parent = await createTmpParent();
+        for (const [workflow, mknodArgs, statMethod] of [
+          ["char-device", "c 1 7", "isCharacterDevice"],
+          ["block-device", "b 7 0", "isBlockDevice"],
+        ] as const) {
+          await createWorkflowScript(
+            project,
+            workflow,
+            "index",
+            ".sh",
+            `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "$OBSERVED_TMPDIR_MARKER"
+rm -rf "$LOOPX_TMPDIR"
+mknod "$LOOPX_TMPDIR" ${mknodArgs}
+printf '{"stop":true}'
+`,
+          );
+          const marker = join(project.dir, `tmp-device-${workflow}.txt`);
+          const result = await runCLI(["run", "-n", "1", workflow], {
+            cwd: project.dir,
+            runtime,
+            env: { TMPDIR: parent, OBSERVED_TMPDIR_MARKER: marker },
+          });
+
+          expect(result.exitCode).toBe(0);
+          const tmpdirPath = readFileSync(marker, "utf-8");
+          expect(lstatSync(tmpdirPath)[statMethod]()).toBe(true);
+          await rm(tmpdirPath, { force: true }).catch(() => {});
+        }
+      },
+    );
+
+    it.skipIf(process.env.CI || process.env.LOOPX_RUN_PRIVILEGED_LOCAL_TESTS !== "1")(
+      "T-TMP-43: mounted content under LOOPX_TMPDIR is not specially detected or unmounted",
+      async () => {
+        project = await createTempProject();
+        const parent = await createTmpParent();
+        const marker = join(project.dir, "tmp-mountpoint.txt");
+        await createWorkflowScript(
+          project,
+          "mountpoint",
+          "index",
+          ".sh",
+          `#!/bin/bash
+set -e
+printf '%s' "$LOOPX_TMPDIR" > "$OBSERVED_TMPDIR_MARKER"
+mkdir "$LOOPX_TMPDIR/mnt"
+mount -t tmpfs -o size=64k tmpfs "$LOOPX_TMPDIR/mnt"
+printf '{"stop":true}'
+`,
+        );
+
+        const result = await runCLI(["run", "-n", "1", "mountpoint"], {
+          cwd: project.dir,
+          runtime,
+          env: { TMPDIR: parent, OBSERVED_TMPDIR_MARKER: marker },
+        });
+
+        expect(result.exitCode).toBe(0);
+        const tmpdirPath = readFileSync(marker, "utf-8");
+        expect(existsSync(join(tmpdirPath, "mnt"))).toBe(true);
+        expect(result.stderr).toMatch(/LOOPX_TEST_CLEANUP_WARNING|cleanup|remove|EBUSY|busy/i);
+        execFileSync("umount", [join(tmpdirPath, "mnt")]);
+        await rm(tmpdirPath, { recursive: true, force: true });
+      },
+    );
 
     it("T-TMP-38/T-TMP-38a/T-TMP-38a2/T-TMP-38b/T-TMP-38b2/T-TMP-38c/T-TMP-38c2/T-TMP-38d/T-TMP-38d2/T-TMP-38d3/T-TMP-38d4/T-TMP-38e/T-TMP-38f/T-TMP-39/T-TMP-40/T-TMP-41/T-TMP-42/T-TMP-42a/T-TMP-42b/T-TMP-42c: cleanup faults emit bounded warnings without changing the terminal outcome", async () => {
       project = await createTempProject();
