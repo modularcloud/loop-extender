@@ -4899,7 +4899,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(existsSync(join(project.loopxDir, "other"))).toBe(beforeOther);
       });
 
-      it.skipIf(IS_ROOT)(
+      it(
         "T-INST-79: staging failure leaves .loopx/ unchanged (tarball)",
         async () => {
           project = await createTempProject();
@@ -4907,7 +4907,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
             {
               "ralph/index.sh": BASH_STOP,
               "broken/index.sh": BASH_STOP,
-              "broken/data.txt": { content: "secret", mode: 0o000 },
+              "broken/data.txt": "secret",
             },
             { wrapperDir: "multi" },
           );
@@ -4916,13 +4916,54 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           ]);
           const result = await runCLI(
             ["install", `${httpServer.url}/multi.tar.gz`],
-            { cwd: project.dir, runtime },
+            {
+              cwd: project.dir,
+              runtime,
+              env: {
+                NODE_ENV: "test",
+                LOOPX_TEST_INSTALL_FAULT: "staging-fail:broken",
+              },
+            },
           );
           expect(result.exitCode).toBe(1);
           expect(existsSync(join(project.loopxDir, "ralph"))).toBe(false);
           expect(existsSync(join(project.loopxDir, "broken"))).toBe(false);
         },
       );
+
+      it("T-INST-79a: staging failure removes the temporary staging directory", async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "stage-marker.json");
+        const tarball = await makeTarball(
+          {
+            "ralph/index.sh": BASH_STOP,
+            "broken/index.sh": BASH_STOP,
+            "broken/data.txt": "secret",
+          },
+          { wrapperDir: "multi" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/multi.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/multi.tar.gz`],
+          {
+            cwd: project.dir,
+            runtime,
+            env: {
+              NODE_ENV: "test",
+              LOOPX_TEST_INSTALL_FAULT: "staging-fail:broken",
+              LOOPX_TEST_INSTALL_STAGE_MARKER: markerPath,
+            },
+          },
+        );
+        expect(result.exitCode).toBe(1);
+        const marker = JSON.parse(readFileSync(markerPath, "utf-8"));
+        expect(marker.stageDir).toContain("loopx-install-stage-");
+        expect(existsSync(marker.stageDir)).toBe(false);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "broken"))).toBe(false);
+      });
 
       it("T-INST-80: -y succeeds despite collisions and version mismatches", async () => {
         project = await createTempProject();
@@ -4996,7 +5037,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(alphaContent).not.toContain('{"new":true}');
       });
 
-      it.skipIf(IS_ROOT)(
+      it(
         "T-INST-80b: -y replacement preserves existing workflow when staging fails (tarball)",
         async () => {
           project = await createTempProject();
@@ -5011,7 +5052,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
               "ralph/index.sh":
                 '#!/bin/bash\nprintf \'{"new":true}\'\n',
               "other/index.sh": BASH_STOP,
-              "other/data.txt": { content: "secret", mode: 0o000 },
+              "other/data.txt": "secret",
             },
             { wrapperDir: "multi" },
           );
@@ -5020,7 +5061,14 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           ]);
           const result = await runCLI(
             ["install", "-y", `${httpServer.url}/multi.tar.gz`],
-            { cwd: project.dir, runtime },
+            {
+              cwd: project.dir,
+              runtime,
+              env: {
+                NODE_ENV: "test",
+                LOOPX_TEST_INSTALL_FAULT: "staging-fail:other",
+              },
+            },
           );
           expect(result.exitCode).toBe(1);
           const ralphContent = readFileSync(
@@ -9081,6 +9129,70 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
               expect(marker.window).toBe("child-active-after-failure");
               expect(marker.current).not.toBeNull();
               expect(marker.processed.length).toBeGreaterThanOrEqual(1);
+              expect(marker.activeChildPid).toEqual(expect.any(Number));
+              expectWorkflowNamesCoverMarker(marker, names);
+              handle.sendSignal(signal);
+
+              const result = await handle.result;
+              expect(result.exitCode).toBe(expectedExit);
+              expect(isProcessAlive(marker.activeChildPid!)).toBe(false);
+              expectCommittedWorkflows(project!.loopxDir, names);
+              expectNoAutoInstallFailureReport(result.stderr);
+            },
+          );
+        },
+      );
+
+      it.each([
+        [
+          "T-INST-116o3",
+          "gitignore safeguard failure",
+          "gitignore-write-fail-first",
+          "SIGINT",
+          130,
+        ],
+        [
+          "T-INST-116o4",
+          "npm spawn failure",
+          "npm-spawn-fail-first",
+          "SIGTERM",
+          143,
+        ],
+      ] as const)(
+        "%s: signal during active npm child after prior %s suppresses aggregate report",
+        async (_id, _kind, fault, signal, expectedExit) => {
+          const names = ["alpha", "beta", "gamma"];
+          project = await createTempProject();
+          const markerPath = join(
+            project.dir,
+            `${signal}-${_id}-active-after-failure.json`,
+          );
+          gitServer = await startLocalGitServer([
+            { name: "multi", files: packageJsonWorkflowFiles(names) },
+          ]);
+
+          await withFakeNpm(
+            { exitCode: 0, sleepByInvocation: { 1: 30, 2: 30 } },
+            async (env) => {
+              const handle = runCLIWithSignal(
+                ["install", `${gitServer!.url}/multi.git`],
+                {
+                  cwd: project!.dir,
+                  runtime,
+                  env: {
+                    ...env,
+                    NODE_ENV: "test",
+                    LOOPX_TEST_AUTOINSTALL_FAULT: fault,
+                    LOOPX_TEST_AUTOINSTALL_PAUSE: "child-active-after-failure",
+                    LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+                  },
+                  timeout: 15_000,
+                },
+              );
+              const marker = await waitForAutoInstallPauseMarker(markerPath);
+              expect(marker.window).toBe("child-active-after-failure");
+              expect(marker.current).not.toBeNull();
+              expect(marker.processed).toHaveLength(1);
               expect(marker.activeChildPid).toEqual(expect.any(Number));
               expectWorkflowNamesCoverMarker(marker, names);
               handle.sendSignal(signal);

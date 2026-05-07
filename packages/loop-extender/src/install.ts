@@ -58,13 +58,35 @@ interface AutoInstallSignalState {
 }
 
 // Fault-injection seam (TEST-SPEC §1.4). Only honored when NODE_ENV=test.
-function getInstallFault(): { kind: "commit-fail-after"; n: number } | null {
+function getInstallFault():
+  | { kind: "commit-fail-after"; n: number; stagingFail: Set<string> }
+  | { kind: "staging-only"; stagingFail: Set<string> }
+  | null {
   if (process.env.NODE_ENV !== "test") return null;
   const raw = process.env.LOOPX_TEST_INSTALL_FAULT;
   if (!raw) return null;
-  const match = /^commit-fail-after:(\d+)$/.exec(raw);
-  if (match) {
-    return { kind: "commit-fail-after", n: Number(match[1]) };
+  const stagingFail = new Set<string>();
+  let commitAfter: number | null = null;
+  for (const part of raw.split(";")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const commitMatch = /^commit-fail-after:(\d+)$/.exec(trimmed);
+    if (commitMatch) {
+      commitAfter = Number(commitMatch[1]);
+      continue;
+    }
+    const stagingMatch = /^staging-fail:(.+)$/.exec(trimmed);
+    if (stagingMatch) {
+      for (const name of stagingMatch[1].split(/[,+]/).map((v) => v.trim()).filter(Boolean)) {
+        stagingFail.add(name);
+      }
+    }
+  }
+  if (commitAfter !== null) {
+    return { kind: "commit-fail-after", n: commitAfter, stagingFail };
+  }
+  if (stagingFail.size > 0) {
+    return { kind: "staging-only", stagingFail };
   }
   return null;
 }
@@ -308,10 +330,21 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
 
   // Stage phase
   const stageDir = mkTempDir("loopx-install-stage-", loopxDir);
+  const fault = getInstallFault();
+  if (process.env.NODE_ENV === "test" && process.env.LOOPX_TEST_INSTALL_STAGE_MARKER) {
+    writeFileSync(
+      process.env.LOOPX_TEST_INSTALL_STAGE_MARKER,
+      JSON.stringify({ stageDir }),
+      "utf-8"
+    );
+  }
   try {
     for (const wf of selected) {
       const stagedPath = join(stageDir, wf.name);
       try {
+        if (fault?.stagingFail.has(wf.name)) {
+          throw new Error("LOOPX_TEST_INSTALL_FAULT: simulated staging failure");
+        }
         copyWorkflow(wf.sourceDir, stagedPath);
       } catch (err) {
         throw new Error(
@@ -329,7 +362,6 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
   }
 
   // Commit phase
-  const fault = getInstallFault();
   const committed: string[] = [];
   const uncommitted: string[] = [];
   let commitError: Error | null = null;
@@ -337,7 +369,7 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
   for (let i = 0; i < selected.length; i++) {
     const wf = selected[i];
 
-    if (fault && fault.kind === "commit-fail-after" && i >= fault.n) {
+    if (fault?.kind === "commit-fail-after" && i >= fault.n) {
       uncommitted.push(wf.name);
       commitError = new Error(
         `LOOPX_TEST_INSTALL_FAULT: simulated commit failure after workflow #${fault.n}`
@@ -840,7 +872,11 @@ async function runPostCommitInstall(
       continue;
     }
 
-    const gitignoreFailure = ensureNodeModulesGitignore(workflowDir, workflow);
+    const gitignoreFailure = ensureNodeModulesGitignore(
+      workflowDir,
+      workflow,
+      workflow === workflows[0]
+    );
     if (gitignoreFailure) {
       failures.push(gitignoreFailure);
       await maybePauseAutoInstall("post-safeguard-failure-first", {
@@ -865,7 +901,7 @@ async function runPostCommitInstall(
     });
     exitIfSignaled(signalState);
 
-    if (fault.npmSpawnFail.has(workflow)) {
+    if (fault.npmSpawnFail.has(workflow) || (workflow === workflows[0] && fault.npmSpawnFailFirst)) {
       failures.push({
         workflow,
         message: "npm install failed to start: simulated spawn failure",
@@ -963,7 +999,8 @@ function normalizeTestNpmOutput(output: string): string {
 
 function ensureNodeModulesGitignore(
   workflowDir: string,
-  workflow: string
+  workflow: string,
+  isFirstWorkflow = false
 ): PreflightFailure | null {
   const gitignorePath = join(workflowDir, ".gitignore");
   const fault = getAutoInstallFault();
@@ -985,7 +1022,7 @@ function ensureNodeModulesGitignore(
       }
     }
   }
-  if (fault.gitignoreWriteFail.has(workflow)) {
+  if (fault.gitignoreWriteFail.has(workflow) || (isFirstWorkflow && fault.gitignoreWriteFailFirst)) {
     return {
       workflow,
       message: ".gitignore safeguard failed: simulated write failure",
@@ -1035,7 +1072,9 @@ function ensureNodeModulesGitignore(
 
 function getAutoInstallFault(): {
   gitignoreWriteFail: Set<string>;
+  gitignoreWriteFailFirst: boolean;
   npmSpawnFail: Set<string>;
+  npmSpawnFailFirst: boolean;
   packageJsonMakeUnreadable: Set<string>;
   gitignoreReplaceWithFifo: Set<string>;
   gitignoreReplaceWithSocket: Set<string>;
@@ -1051,7 +1090,9 @@ function getAutoInstallFault(): {
 } {
   const empty = {
     gitignoreWriteFail: new Set<string>(),
+    gitignoreWriteFailFirst: false,
     npmSpawnFail: new Set<string>(),
+    npmSpawnFailFirst: false,
     packageJsonMakeUnreadable: new Set<string>(),
     gitignoreReplaceWithFifo: new Set<string>(),
     gitignoreReplaceWithSocket: new Set<string>(),
@@ -1070,7 +1111,9 @@ function getAutoInstallFault(): {
   if (!raw) return empty;
   const result = {
     gitignoreWriteFail: new Set<string>(),
+    gitignoreWriteFailFirst: false,
     npmSpawnFail: new Set<string>(),
+    npmSpawnFailFirst: false,
     packageJsonMakeUnreadable: new Set<string>(),
     gitignoreReplaceWithFifo: new Set<string>(),
     gitignoreReplaceWithSocket: new Set<string>(),
@@ -1087,6 +1130,14 @@ function getAutoInstallFault(): {
   for (const part of raw.split(";")) {
     const trimmed = part.trim();
     if (!trimmed) continue;
+    if (trimmed === "gitignore-write-fail-first") {
+      result.gitignoreWriteFailFirst = true;
+      continue;
+    }
+    if (trimmed === "npm-spawn-fail-first") {
+      result.npmSpawnFailFirst = true;
+      continue;
+    }
     const kv = /^(gitignore-replace-with-symlink|package-json-replace-with-symlink):([^=]+)=(.+)$/.exec(trimmed);
     if (kv) {
       const target =

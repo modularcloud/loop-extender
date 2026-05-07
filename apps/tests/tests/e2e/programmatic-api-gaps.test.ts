@@ -90,13 +90,150 @@ printf '{"stop":true,"id":"%s","marker":"%s"}' ${JSON.stringify(id)} "$MARKER_VA
     );
   }
 
-  it.todo(
-    "T-API-10i: known gap - deterministic abort during pre-iteration before first child spawn requires a pre-iteration sentinel seam",
-  );
+  it("T-API-10i: abort during pre-iteration before first child spawn wins and cleans tmpdir", async () => {
+    project = await createTempProject();
+    const scriptMarker = join(project.dir, "should-not-run");
+    await createStopWorkflow(scriptMarker);
 
-  it.todo(
-    "T-API-10j: known gap - deterministic abort concurrent with partial tmpdir creation failure requires a tmpdir creation pause seam",
-  );
+    const driverCode = `
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
+import { run, runPromise } from "loopx";
+const projectDir = ${JSON.stringify(project.dir)};
+const marker = ${JSON.stringify(join(project.dir, "pre-first-spawn.json"))};
+async function waitForMarker() {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    if (existsSync(marker)) return JSON.parse(readFileSync(marker, "utf-8"));
+    await delay(20);
+  }
+  throw new Error("timed out waiting for pre-iteration marker");
+}
+async function runCase(surface) {
+  rmSync(marker, { force: true });
+  const controller = new AbortController();
+  let operation;
+  if (surface === "run") {
+    const gen = run("ralph", { cwd: projectDir, signal: controller.signal });
+    operation = gen.next();
+  } else {
+    operation = runPromise("ralph", { cwd: projectDir, signal: controller.signal });
+  }
+  const pause = await waitForMarker();
+  controller.abort();
+  let rejected = false;
+  let message = "";
+  try {
+    await operation;
+  } catch (err) {
+    rejected = true;
+    message = err?.name || err?.message || String(err);
+  }
+  return {
+    surface,
+    rejected,
+    message,
+    tmpExistsAfter: existsSync(pause.tmpDir),
+  };
+}
+const first = await runCase("run");
+await delay(50);
+const second = await runCase("promise");
+console.log(JSON.stringify({ first, second, scriptRan: existsSync(${JSON.stringify(scriptMarker)}) }));
+`;
+    const result = await runAPIDriver("node", driverCode, {
+      env: {
+        NODE_ENV: "test",
+        LOOPX_TEST_PREITERATION_PAUSE: "pre-first-child-spawn",
+        LOOPX_TEST_PREITERATION_PAUSE_MARKER: join(
+          project.dir,
+          "pre-first-spawn.json",
+        ),
+      },
+      timeout: 10_000,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    for (const entry of [parsed.first, parsed.second]) {
+      expect(entry.rejected).toBe(true);
+      expect(entry.message).toMatch(/abort/i);
+      expect(entry.tmpExistsAfter).toBe(false);
+    }
+    expect(parsed.scriptRan).toBe(false);
+  });
+
+  it("T-API-10j: abort concurrent with partial tmpdir creation failure wins on API surfaces", async () => {
+    project = await createTempProject();
+    await createStopWorkflow();
+
+    const driverCode = `
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
+import { run, runPromise } from "loopx";
+const projectDir = ${JSON.stringify(project.dir)};
+const marker = ${JSON.stringify(join(project.dir, "tmpdir-fault-pause.json"))};
+async function waitForMarker() {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    if (existsSync(marker)) return JSON.parse(readFileSync(marker, "utf-8"));
+    await delay(20);
+  }
+  throw new Error("timed out waiting for tmpdir fault marker");
+}
+async function runCase(surface) {
+  rmSync(marker, { force: true });
+  const controller = new AbortController();
+  let operation;
+  if (surface === "run") {
+    const gen = run("ralph", { cwd: projectDir, signal: controller.signal });
+    operation = gen.next();
+  } else {
+    operation = runPromise("ralph", { cwd: projectDir, signal: controller.signal });
+  }
+  const pause = await waitForMarker();
+  controller.abort();
+  let rejected = false;
+  let message = "";
+  try {
+    await operation;
+  } catch (err) {
+    rejected = true;
+    message = err?.name || err?.message || String(err);
+  }
+  return {
+    surface,
+    rejected,
+    message,
+    tmpExistsAfter: existsSync(pause.tmpDir),
+  };
+}
+const first = await runCase("run");
+const second = await runCase("promise");
+console.log(JSON.stringify({ first, second }));
+`;
+    const result = await runAPIDriver("node", driverCode, {
+      env: {
+        NODE_ENV: "test",
+        LOOPX_TEST_TMPDIR_FAULT: "mode-secure-fail",
+        LOOPX_TEST_PREITERATION_PAUSE: "tmpdir-created-before-fault",
+        LOOPX_TEST_PREITERATION_PAUSE_MARKER: join(
+          project.dir,
+          "tmpdir-fault-pause.json",
+        ),
+      },
+      timeout: 10_000,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    for (const entry of [parsed.first, parsed.second]) {
+      expect(entry.rejected).toBe(true);
+      expect(entry.message).toMatch(/abort/i);
+      expect(entry.message).not.toMatch(/mode-secure-fail/);
+      expect(entry.tmpExistsAfter).toBe(false);
+    }
+  });
 
   it("T-API-24c/T-API-24d/T-API-24e/T-API-24f/T-API-24g/T-API-24h: invalid maxIterations values reject on both API surfaces", async () => {
     project = await createTempProject();

@@ -8,9 +8,6 @@ import { describe, it } from "vitest";
 const pendingSpecIds = [
   "T-INST-112-block",
   "T-INST-113-package",
-  "T-INST-116o3",
-  "T-INST-116o4",
-  "T-INST-79a",
   "T-TMP-43",
   "T-TMP-44",
   "T-TMP-45",

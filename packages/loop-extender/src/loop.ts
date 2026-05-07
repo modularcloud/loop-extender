@@ -1,5 +1,16 @@
 import { setTimeout as setTimeoutPromise } from "node:timers/promises";
-import { lstatSync, mkdtempSync, readFileSync, rmSync, rmdirSync, unlinkSync } from "node:fs";
+import {
+  closeSync,
+  fsyncSync,
+  lstatSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  rmdirSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Output } from "./types.js";
@@ -71,6 +82,13 @@ export async function* runLoop(
   const tmpParent = options.tmpParent ?? process.env.TMPDIR ?? tmpdir();
   const loopTmpDir = mkdtempSync(join(tmpParent, "loopx-"));
   const tmpIdentity = lstatSync(loopTmpDir);
+  await maybePausePreIteration("tmpdir-created-before-fault", signal, {
+    tmpDir: loopTmpDir,
+  });
+  if (signal?.aborted) {
+    rmSync(loopTmpDir, { recursive: true, force: true });
+    throw makeAbortError(signal);
+  }
   if (process.env.NODE_ENV === "test") {
     const fault = process.env.LOOPX_TEST_TMPDIR_FAULT;
     if (fault === "identity-capture-fail" || fault === "identity-capture-fail-rmdir-fail") {
@@ -165,6 +183,14 @@ export async function* runLoop(
     }
 
     let result: ExecResult;
+    if (iteration === 0) {
+      await maybePausePreIteration("pre-first-child-spawn", signal, {
+        tmpDir: loopTmpDir,
+      });
+      if (signal?.aborted) {
+        throw makeAbortError(signal);
+      }
+    }
     const execPromise = executeScript(currentScript, {
       workflowName: currentWorkflow.name,
       workflowDir: currentWorkflow.dir,
@@ -288,4 +314,39 @@ export async function* runLoop(
   } finally {
     cleanupTmpDir();
   }
+}
+
+async function maybePausePreIteration(
+  window: string,
+  signal: AbortSignal | undefined,
+  payload: Record<string, unknown>
+): Promise<void> {
+  if (process.env.NODE_ENV !== "test") return;
+  if (process.env.LOOPX_TEST_PREITERATION_PAUSE !== window) return;
+  const marker = process.env.LOOPX_TEST_PREITERATION_PAUSE_MARKER;
+  if (marker) {
+    writeFileSync(marker, JSON.stringify({ window, ...payload }), "utf-8");
+    try {
+      const fd = openSync(marker, "r");
+      try {
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      // The marker is best-effort; the pause still executes for the seam.
+    }
+  }
+  const timeoutMs = Number(process.env.LOOPX_TEST_PREITERATION_PAUSE_MS ?? 500);
+  await Promise.race([
+    setTimeoutPromise(Number.isFinite(timeoutMs) ? timeoutMs : 500),
+    new Promise<void>((resolve) => {
+      if (!signal) return;
+      if (signal.aborted) {
+        resolve();
+        return;
+      }
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    }),
+  ]);
 }
