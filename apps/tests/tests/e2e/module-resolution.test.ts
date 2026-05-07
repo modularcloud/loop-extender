@@ -1,8 +1,10 @@
 import { describe, it, expect, afterEach } from "vitest";
+import { spawn } from "node:child_process";
 import {
   existsSync,
   readFileSync,
   statSync,
+  symlinkSync,
   unlinkSync,
 } from "node:fs";
 import {
@@ -44,6 +46,43 @@ function getExpectedVersion(): string {
   const pkgPath = resolve(process.cwd(), "node_modules/loopx/package.json");
   const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
   return pkg.version as string;
+}
+
+async function createLoopxStubPackage(
+  packageDir: string,
+  markerPath: string,
+  sentinel: string,
+  options: { passThrough?: boolean; topLevelMarker?: boolean } = {},
+): Promise<void> {
+  await mkdir(packageDir, { recursive: true });
+  await writeFile(
+    join(packageDir, "package.json"),
+    JSON.stringify({
+      name: "loopx",
+      type: "module",
+      main: "./index.js",
+      exports: { ".": "./index.js" },
+    }),
+    "utf-8",
+  );
+  await writeFile(
+    join(packageDir, "index.js"),
+    `import { writeFileSync } from "node:fs";
+${options.topLevelMarker ? `writeFileSync(${JSON.stringify(markerPath)}, ${JSON.stringify(sentinel)});\n` : ""}
+export function output(data) {
+  writeFileSync(${JSON.stringify(markerPath)}, ${JSON.stringify(sentinel)});
+  const body = ${
+    options.passThrough
+      ? "typeof data === \"object\" && data !== null ? data : { result: String(data) }"
+      : JSON.stringify({ stop: true, result: sentinel })
+  };
+  process.stdout.write(JSON.stringify(body) + "\\n");
+  process.exit(0);
+}
+export async function input() { return ""; }
+`,
+    "utf-8",
+  );
 }
 
 /**
@@ -458,6 +497,183 @@ output({ result: value });
     const out = outputs[0] as Record<string, unknown>;
     expect(out.result).toBe("esm-resolved");
   });
+
+  it("T-MOD-03d: symlinked JS/TS entry path runs without relying on logical workflow-local loopx [Node]", async () => {
+    project = await createTempProject();
+    const workflowDir = await createWorkflow(project, "ralph");
+    const markerPath = join(project.dir, "marker-local-stub-imported.txt");
+    const realEntryDir = await mkdtemp(join(tmpdir(), "loopx-mod03d-entry-"));
+
+    try {
+      await createLoopxStubPackage(
+        join(workflowDir, "node_modules", "loopx"),
+        markerPath,
+        "from-workflow-local",
+        { passThrough: true, topLevelMarker: true },
+      );
+      await writeFile(
+        join(realEntryDir, "index.ts"),
+        `import { output } from "loopx";
+output({ result: "ran", stop: true });
+`,
+        "utf-8",
+      );
+      symlinkSync(join(realEntryDir, "index.ts"), join(workflowDir, "index.ts"));
+
+      const { outputs, exitCode, stderr } = await runOutputTest(project, "ralph", {
+        runtime: "node",
+      });
+
+      expect(exitCode).toBe(0);
+      expect(outputs).toHaveLength(1);
+      expect((outputs[0] as Record<string, unknown>).result).toBe("ran");
+      expect(stderr).not.toMatch(/workflow-local|shadow|bypass|warning/i);
+    } finally {
+      await rm(realEntryDir, { recursive: true, force: true });
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    it.skipIf(runtime === "bun" && !isRuntimeAvailable("bun"))(
+      `T-MOD-03e${runtime === "bun" ? "-bun" : ""}: project-root node_modules/loopx wins for scripts without delegation [${runtime}]`,
+      async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "marker-resolved-stub.txt");
+        await createLoopxStubPackage(
+          join(project.dir, "node_modules", "loopx"),
+          markerPath,
+          "from-project-root-stub",
+        );
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          `import { output } from "loopx";
+output({ result: "from-stub" });
+`,
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(readFileSync(markerPath, "utf-8")).toBe("from-project-root-stub");
+      },
+    );
+
+    it.skipIf(runtime === "bun" && !isRuntimeAvailable("bun"))(
+      `T-MOD-03f${runtime === "bun" ? "-bun" : ""}: intermediate ancestor node_modules/loopx wins for scripts [${runtime}]`,
+      async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "marker-resolved-stub.txt");
+        await createLoopxStubPackage(
+          join(project.loopxDir, "node_modules", "loopx"),
+          markerPath,
+          "from-intermediate-stub",
+        );
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          `import { output } from "loopx";
+output({ result: "from-stub" });
+`,
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(readFileSync(markerPath, "utf-8")).toBe("from-intermediate-stub");
+      },
+    );
+
+    it.skipIf(runtime === "bun" && !isRuntimeAvailable("bun"))(
+      `T-MOD-03g${runtime === "bun" ? "-bun" : ""}: runtime cwd does not redirect import("loopx") resolution [${runtime}]`,
+      async () => {
+        project = await createTempProject();
+        const decoyDir = await mkdtemp(join(tmpdir(), "loopx-mod03g-decoy-"));
+        const markerPath = join(project.dir, "marker-resolved-stub.txt");
+
+        try {
+          await createLoopxStubPackage(
+            join(decoyDir, "node_modules", "loopx"),
+            markerPath,
+            "from-decoy-stub",
+          );
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".ts",
+            `process.chdir(${JSON.stringify(decoyDir)});
+const { output } = await import("loopx");
+output({ result: "from-stub", stop: true });
+`,
+          );
+
+          const result = await runCLI(["run", "-n", "1", "ralph"], {
+            cwd: project.dir,
+            runtime,
+          });
+
+          expect(result.exitCode).toBe(0);
+          if (existsSync(markerPath)) {
+            expect(readFileSync(markerPath, "utf-8")).not.toBe("from-decoy-stub");
+          }
+        } finally {
+          await rm(decoyDir, { recursive: true, force: true });
+        }
+      },
+    );
+
+    it.skipIf(runtime === "bun" && !isRuntimeAvailable("bun"))(
+      `T-MOD-03h${runtime === "bun" ? "-bun" : ""}: nested helper import resolves from helper path [${runtime}]`,
+      async () => {
+        project = await createTempProject();
+        const workflowDir = await createWorkflow(project, "ralph");
+        const helperDir = join(workflowDir, "lib");
+        const markerPath = join(project.dir, "marker-resolved-stub.txt");
+        await mkdir(helperDir, { recursive: true });
+        await createLoopxStubPackage(
+          join(helperDir, "node_modules", "loopx"),
+          markerPath,
+          "from-nested-helper-stub",
+        );
+        await writeFile(
+          join(helperDir, "helper.ts"),
+          `import { output } from "loopx";
+output({ stop: true, result: "from-nested-helper-stub" });
+`,
+          "utf-8",
+        );
+        await writeFile(
+          join(workflowDir, "index.ts"),
+          `import "./lib/helper.ts";
+import { output } from "loopx";
+output({ result: "from-entry" });
+`,
+          "utf-8",
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(readFileSync(markerPath, "utf-8")).toBe(
+          "from-nested-helper-stub",
+        );
+      },
+    );
+  });
 });
 
 // ═════════════════════════════════════════════════════════════
@@ -707,6 +923,34 @@ output({ stop: true });
       expect(out).not.toHaveProperty("goto");
     });
 
+    it("T-MOD-13q: output({ result: undefined, goto }) drops undefined result and follows goto", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "test",
+        "index",
+        ".ts",
+        `import { output } from "loopx";\noutput({ result: undefined, goto: "next" });\n`,
+      );
+      await createWorkflowScript(
+        project,
+        "test",
+        "next",
+        ".ts",
+        `import { output } from "loopx";\noutput({ result: "arrived", stop: true });\n`,
+      );
+
+      const { outputs, exitCode } = await runOutputTest(project, "test", {
+        runtime,
+        maxIterations: 2,
+      });
+      expect(exitCode).toBe(0);
+      expect(outputs).toHaveLength(2);
+      expect(outputs[0]).toHaveProperty("goto", "next");
+      expect(outputs[0] as Record<string, unknown>).not.toHaveProperty("result");
+      expect(outputs[1]).toHaveProperty("result", "arrived");
+    });
+
     it("T-MOD-13a: output([1,2,3]) crashes (array, no known fields)", async () => {
       project = await createTempProject();
       await createWorkflowScript(
@@ -721,6 +965,24 @@ output({ stop: true });
         runtime,
       });
       expect(threwError).toBe(true);
+    });
+
+    it("T-MOD-13a2: output(array with result property) is accepted", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".ts",
+        `import { output } from "loopx";\nconst value: any[] = [];\nvalue.result = "ok";\noutput(value);\n`,
+      );
+
+      const { outputs, exitCode } = await runOutputTest(project, "ralph", {
+        runtime,
+      });
+      expect(exitCode).toBe(0);
+      expect(outputs).toHaveLength(1);
+      expect((outputs[0] as Record<string, unknown>).result).toBe("ok");
     });
 
     it("T-MOD-13b: output({ result, goto, stop }) all undefined — equivalent to {} — crashes", async () => {
@@ -1348,6 +1610,75 @@ describe("SPEC: LOOPX_BIN in Bash Scripts", () => {
     expect(stats.mode & 0o111).not.toBe(0);
   });
 
+  it("T-MOD-20a: non-delegated LOOPX_BIN resolves symlinked launcher to its realpath", async () => {
+    const baseDir = await mkdtemp(join(tmpdir(), "loopx-mod20a-"));
+    const projectDir = join(baseDir, "project");
+    const realBinDir = join(baseDir, "real-prefix", "bin");
+    const linkBinDir = join(baseDir, "link-prefix", "bin");
+
+    try {
+      await mkdir(join(projectDir, ".loopx"), { recursive: true });
+      await mkdir(realBinDir, { recursive: true });
+      await mkdir(linkBinDir, { recursive: true });
+
+      const realLauncher = join(realBinDir, "loopx-real");
+      const symlinkLauncher = join(linkBinDir, "loopx");
+      await writeFile(
+        realLauncher,
+        `#!/usr/bin/env node
+import ${JSON.stringify(fixture?.loopxBinJs ?? resolve(process.cwd(), "node_modules/loopx/bin.js"))};
+`,
+        "utf-8",
+      );
+      await chmod(realLauncher, 0o755);
+      symlinkSync(realLauncher, symlinkLauncher);
+
+      const proj: TempProject = {
+        dir: projectDir,
+        loopxDir: join(projectDir, ".loopx"),
+        cleanup: async () => {},
+      };
+      const markerPath = join(projectDir, "loopx-bin-realpath.txt");
+      await createBashWorkflowScript(
+        proj,
+        "ralph",
+        "index",
+        `printf '%s' "$LOOPX_BIN" > "${markerPath}"
+printf '{"stop":true}'`,
+      );
+
+      const result = await new Promise<{
+        exitCode: number;
+        stdout: string;
+        stderr: string;
+      }>((resolvePromise, reject) => {
+        const child = spawn(symlinkLauncher, ["run", "-n", "1", "ralph"], {
+          cwd: projectDir,
+          env: process.env,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk: Buffer) => {
+          stdout += chunk.toString();
+        });
+        child.stderr.on("data", (chunk: Buffer) => {
+          stderr += chunk.toString();
+        });
+        child.on("error", reject);
+        child.on("close", (code) => {
+          resolvePromise({ exitCode: code ?? 1, stdout, stderr });
+        });
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(markerPath, "utf-8")).toBe(realLauncher);
+      expect(readFileSync(markerPath, "utf-8")).not.toBe(symlinkLauncher);
+    } finally {
+      await rm(baseDir, { recursive: true, force: true });
+    }
+  });
+
   it("T-MOD-21: $LOOPX_BIN version matches the package version", async () => {
     fixture = await withDelegationSetup();
     const proj: TempProject = {
@@ -1417,6 +1748,25 @@ describe("SPEC: LOOPX_BIN in Bash Scripts", () => {
 // ═════════════════════════════════════════════════════════════
 
 describe("SPEC: ESM-Only Package Contract", () => {
+  it("T-MOD-22a: package metadata name is exactly loopx", () => {
+    const pkgPath = resolve(process.cwd(), "node_modules/loopx/package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+    expect(pkg.name).toBe("loopx");
+  });
+
+  it("T-MOD-22b: package metadata engines.node, when present, advertises Node >=20.6", () => {
+    const pkgPath = resolve(process.cwd(), "node_modules/loopx/package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+    const range = pkg.engines?.node;
+    if (range === undefined) {
+      expect(range).toBeUndefined();
+      return;
+    }
+    expect(typeof range).toBe("string");
+    expect(range).toMatch(/20\.6|2[1-9]|[3-9][0-9]|>=\s*20(?:\.6)?/);
+    expect(range).not.toMatch(/>=\s*(?:18|19|20\.?[0-5]\b)/);
+  });
+
   it("T-MOD-22: require(\"loopx\") fails with ERR_REQUIRE_ESM [Node]", async () => {
     // Drive a separate CJS consumer: a new tmp dir without `type: "module"`,
     // with its own node_modules/loopx symlinked to the real package.

@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { readFileSync, existsSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createTempProject, type TempProject } from "../helpers/fixtures.js";
 import { runCLI } from "../helpers/cli.js";
@@ -229,6 +230,18 @@ forEachRuntime((runtime) => {
       expect(result.exitCode).toBe(1);
     });
 
+    it('T-SUB-05a: output --result "" treats the empty string as a provided flag', async () => {
+      project = await createTempProject();
+      const result = await runCLI(["output", "--result", ""], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.result).toBe("");
+    });
+
     // T-SUB-06
     it("T-SUB-06: output --result 'x' works without .loopx/ directory", async () => {
       project = await createTempProject({ withLoopxDir: false });
@@ -268,6 +281,24 @@ forEachRuntime((runtime) => {
       expect(result.exitCode).toBe(0);
       const parsed = JSON.parse(result.stdout);
       expect(parsed.result).toBe("line1\nline2");
+    });
+
+    it.each([
+      ["T-SUB-06c", ["output", "--result"], /result|operand|value|usage/i],
+      ["T-SUB-06d", ["output", "--goto"], /goto|operand|target|usage/i],
+      ["T-SUB-06e", ["output", "--unknown"], /unknown|unrecognized|usage/i],
+      [
+        "T-SUB-06f",
+        ["output", "--unknown", "--result", "x"],
+        /unknown|unrecognized|usage/i,
+      ],
+    ] as const)("%s: output parser usage errors", async (_id, args, message) => {
+      project = await createTempProject();
+      const result = await runCLI(args, { cwd: project.dir, runtime });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toMatch(message);
+      expect(result.stdout).not.toMatch(/^\s*\{/);
     });
   });
 
@@ -329,6 +360,35 @@ forEachRuntime((runtime) => {
       await withIsolatedHome(async () => {
         const result = await runCLI(["env", "set", "-DASH", "val"], { runtime });
         expect(result.exitCode).toBe(1);
+      });
+    });
+
+    it("T-SUB-11a: env set accepts lowercase keys", async () => {
+      await withIsolatedHome(async () => {
+        const setResult = await runCLI(["env", "set", "mykey", "myval"], {
+          runtime,
+        });
+        expect(setResult.exitCode).toBe(0);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).toContain("mykey=myval");
+      });
+    });
+
+    it.each([
+      ["T-SUB-11b", "FOO-BAR"],
+      ["T-SUB-11c", "FOO.BAR"],
+      ["T-SUB-11d", "FOO BAR"],
+      ["T-SUB-11e", ""],
+    ] as const)("%s: env set rejects invalid key %j", async (_id, key) => {
+      await withIsolatedHome(async () => {
+        const result = await runCLI(["env", "set", key, "val"], { runtime });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/name|key|invalid|usage/i);
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.stdout).not.toContain("val");
       });
     });
 
@@ -476,6 +536,29 @@ forEachRuntime((runtime) => {
         expect(result.exitCode).toBe(1);
       });
     });
+
+    it("T-SUB-14l: env set preserves literal backslashes through file storage and env list", async () => {
+      await withIsolatedHome(async () => {
+        const value = "val\\with\\backslash";
+        const setResult = await runCLI(["env", "set", "KEY", value], {
+          runtime,
+        });
+        expect(setResult.exitCode).toBe(0);
+
+        const envFile = join(
+          process.env.XDG_CONFIG_HOME ?? join(process.env.HOME!, ".config"),
+          "loopx",
+          "env",
+        );
+        expect(readFileSync(envFile, "utf-8")).toContain(
+          'KEY="val\\with\\backslash"\n',
+        );
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        expect(listResult.exitCode).toBe(0);
+        expect(listResult.stdout).toContain(`KEY=${value}`);
+      });
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -620,6 +703,131 @@ forEachRuntime((runtime) => {
           expect(result.stderr).not.toMatch(/warn|validat/i);
         } finally {
           await project.cleanup();
+        }
+      });
+    });
+
+    it("T-SUB-19a: env list drops malformed global env lines and reports parser warnings", async () => {
+      await withIsolatedHome(async () => {
+        const envFile = join(
+          process.env.XDG_CONFIG_HOME ?? join(process.env.HOME!, ".config"),
+          "loopx",
+          "env",
+        );
+        await mkdir(join(envFile, ".."), { recursive: true });
+        await writeFile(envFile, '1BAD="val"\nGOOD="ok"\n', "utf-8");
+
+        const result = await runCLI(["env", "list"], { runtime });
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout.trim()).toBe("GOOD=ok");
+        expect(result.stdout).not.toContain("1BAD");
+        expect(result.stderr).toMatch(/1BAD|invalid|warning|parse/i);
+      });
+    });
+
+    it("T-SUB-20: output ignores a broken .loopx tree", async () => {
+      project = await createTempProject();
+      await writeFile(join(project.loopxDir, "-bad.sh"), "echo bad\n", "utf-8");
+
+      const result = await runCLI(["output", "--result", "x"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).result).toBe("x");
+      expect(result.stderr).not.toMatch(/warn|validat|-bad/i);
+    });
+
+    it("T-SUB-21: env list ignores a broken .loopx tree", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        await writeFile(join(project.loopxDir, "-bad.sh"), "echo bad\n", "utf-8");
+
+        const result = await runCLI(["env", "list"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toBe("");
+        expect(result.stderr).not.toMatch(/warn|validat|-bad/i);
+      });
+    });
+
+    it("T-SUB-22: env set ignores a broken .loopx tree", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        await writeFile(join(project.loopxDir, "-bad.sh"), "echo bad\n", "utf-8");
+
+        const setResult = await runCLI(["env", "set", "FOO", "bar"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(setResult.exitCode).toBe(0);
+        expect(setResult.stderr).not.toMatch(/warn|validat|-bad/i);
+
+        const listResult = await runCLI(["env", "list"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(listResult.stdout).toContain("FOO=bar");
+      });
+    });
+
+    it("T-SUB-23: env remove ignores a broken .loopx tree", async () => {
+      await withIsolatedHome(async () => {
+        project = await createTempProject();
+        await writeFile(join(project.loopxDir, "-bad.sh"), "echo bad\n", "utf-8");
+        await runCLI(["env", "set", "FOO", "bar"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        const removeResult = await runCLI(["env", "remove", "FOO"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(removeResult.exitCode).toBe(0);
+        expect(removeResult.stderr).not.toMatch(/warn|validat|-bad/i);
+
+        const listResult = await runCLI(["env", "list"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(listResult.stdout).not.toContain("FOO=");
+      });
+    });
+
+    it.each([
+      ["T-SUB-24", ["env"], /env|subcommand|usage/i],
+      ["T-SUB-25", ["env", "set"], /name|value|operand|usage/i],
+      ["T-SUB-26", ["env", "set", "FOO"], /value|operand|usage/i],
+      ["T-SUB-27", ["env", "remove"], /name|operand|usage/i],
+      ["T-SUB-28", ["env", "unknown"], /unknown|subcommand|usage/i],
+      ["T-SUB-29", ["env", "list", "extra"], /extra|argument|usage/i],
+      ["T-SUB-29a", ["env", "set", "FOO", "bar", "extra"], /extra|argument|usage/i],
+      ["T-SUB-29b", ["env", "remove", "FOO", "extra"], /extra|argument|usage/i],
+      ["T-SUB-29c", ["output", "--result", "x", "extra"], /extra|argument|usage/i],
+      ["T-SUB-29d", ["output", "--stop", "extra"], /extra|argument|usage/i],
+    ] as const)("%s: subcommand grammar rejects invalid operands", async (_id, args, message) => {
+      await withIsolatedHome(async () => {
+        if (_id === "T-SUB-29b") {
+          await runCLI(["env", "set", "FOO", "bar"], { runtime });
+        }
+        const result = await runCLI(args, { runtime });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(message);
+        if (args[0] === "output") {
+          expect(result.stdout).toBe("");
+        }
+
+        const listResult = await runCLI(["env", "list"], { runtime });
+        if (_id === "T-SUB-26" || _id === "T-SUB-29a") {
+          expect(listResult.stdout).not.toContain("FOO=");
+        }
+        if (_id === "T-SUB-29b") {
+          expect(listResult.stdout).toContain("FOO=bar");
         }
       });
     });

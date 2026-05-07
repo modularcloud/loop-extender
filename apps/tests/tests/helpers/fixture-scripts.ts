@@ -67,9 +67,16 @@ export function writeEnvToFile(varname: string, markerPath: string): string {
   return `#!/bin/bash\nprintf '%s' "\$${varname}" > "${markerPath}"\n`;
 }
 
-/** Writes $PWD to a marker file using printf. */
+/** Writes the kernel cwd to a marker file using /bin/pwd -P. */
 export function writeCwdToFile(markerPath: string): string {
-  return `#!/bin/bash\nprintf '%s' "$PWD" > "${markerPath}"\n`;
+  return `#!/bin/bash\n/bin/pwd -P | tr -d '\\n' > "${markerPath}"\n`;
+}
+
+/** TS fixture: writes process.cwd() to a marker file. */
+export function observeCwdTs(markerPath: string): string {
+  return `import { writeFileSync } from "node:fs";
+writeFileSync("${markerPath}", process.cwd());
+`;
 }
 
 /** Writes a literal value to a marker file using printf. */

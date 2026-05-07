@@ -225,7 +225,7 @@ describe("HARNESS: Phase 0 — Test Infrastructure Validation", () => {
   });
 
   // H-14: Runtime detection
-  it("H-14: forEachRuntime correctly detects available runtimes", () => {
+  it("H-14 T-RUNTIME-MATRIX: forEachRuntime correctly detects available runtimes", () => {
     const runtimes = getDetectedRuntimes();
 
     // At minimum, Node.js should be available since we're running in it

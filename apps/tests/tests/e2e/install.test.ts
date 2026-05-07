@@ -7,6 +7,7 @@ import {
   lstatSync,
   symlinkSync,
   chmodSync,
+  readlinkSync,
 } from "node:fs";
 import { writeFile, mkdir, rm, chmod, mkdtemp } from "node:fs/promises";
 import { join, resolve, dirname } from "node:path";
@@ -20,7 +21,7 @@ import {
   createWorkflow,
   type TempProject,
 } from "../helpers/fixtures.js";
-import { runCLI } from "../helpers/cli.js";
+import { runCLI, runCLIWithSignal } from "../helpers/cli.js";
 import {
   startLocalHTTPServer,
   startLocalGitServer,
@@ -128,11 +129,24 @@ function countUnreadableWarnings(stderr: string, workflow: string): number {
   ).length;
 }
 
+function countNonRegularPackageJsonWarnings(
+  stderr: string,
+  workflow: string,
+): number {
+  return splitLines(stderr).filter(
+    (line) =>
+      line.includes(workflow) &&
+      /package\.json/i.test(line) &&
+      /(non[- ]?regular|directory|not.*file|expected.*file)/i.test(line),
+  ).length;
+}
+
 function hasAnyPackageJsonWarning(stderr: string, workflow: string): boolean {
   return (
     hasInvalidJsonWarning(stderr, workflow) ||
     hasInvalidSemverWarning(stderr, workflow) ||
-    hasUnreadableWarning(stderr, workflow)
+    hasUnreadableWarning(stderr, workflow) ||
+    countNonRegularPackageJsonWarnings(stderr, workflow) > 0
   );
 }
 
@@ -289,6 +303,359 @@ function tarballRoute(path: string, body: Buffer) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// npm shim helpers — observe post-commit auto-install without npm
+// ─────────────────────────────────────────────────────────────
+
+interface FakeNpmOptions {
+  exitCode?: number;
+  exitCodeByWorkflow?: Record<string, number>;
+  stdout?: string;
+  stderr?: string;
+  sleepSeconds?: number;
+  sleepByInvocation?: Record<number, number>;
+  recordGitignoreAtStart?: boolean;
+  createFiles?: string[];
+  pidFile?: string;
+  trapSignals?: Array<"INT" | "TERM">;
+  spawnGrandchild?: boolean;
+  grandchildPidFile?: string;
+}
+
+interface NpmInvocation {
+  pid: string;
+  cwd: string;
+  argv: string[];
+  start: number;
+  end: number;
+  gitignoreAtStart?: {
+    existed: boolean;
+    content?: string;
+  };
+}
+
+async function withFakeNpm<T>(
+  options: FakeNpmOptions,
+  fn: (env: Record<string, string>, logFile: string) => Promise<T>,
+): Promise<T> {
+  const fakeBin = await mkdtemp(join(tmpdir(), "loopx-fake-npm-"));
+  const logFile = join(fakeBin, "npm.log");
+  const npmPath = join(fakeBin, "npm");
+  const counterFile = join(fakeBin, "npm.count");
+  const timestamp = 'date +%s%3N 2>/dev/null || node -e "console.log(Date.now())"';
+  const script = [
+    "#!/bin/bash",
+    "set -u",
+    ...(options.trapSignals?.length
+      ? [`trap '' ${options.trapSignals.join(" ")}`]
+      : []),
+    `start=$(${timestamp})`,
+    'cwd="$(pwd)"',
+    'workflow="$(basename "$cwd")"',
+    options.pidFile
+      ? `printf '%s' "$$" > ${JSON.stringify(options.pidFile)}`
+      : ":",
+    options.spawnGrandchild && options.grandchildPidFile
+      ? `sleep 300 & printf '%s' "$!" > ${JSON.stringify(options.grandchildPidFile)}`
+      : ":",
+    `count=0`,
+    `if [ -f ${JSON.stringify(counterFile)} ]; then count="$(cat ${JSON.stringify(counterFile)})"; fi`,
+    `count=$((count + 1))`,
+    `printf '%s' "$count" > ${JSON.stringify(counterFile)}`,
+    `exit_code=${options.exitCode ?? 0}`,
+    ...Object.entries(options.exitCodeByWorkflow ?? {}).map(
+      ([workflow, exitCode]) =>
+        `if [ "$workflow" = ${JSON.stringify(workflow)} ]; then exit_code=${exitCode}; fi`,
+    ),
+    `sleep_seconds=${options.sleepSeconds ?? 0}`,
+    ...Object.entries(options.sleepByInvocation ?? {}).map(
+      ([invocation, seconds]) =>
+        `if [ "$count" = ${JSON.stringify(invocation)} ]; then sleep_seconds=${seconds}; fi`,
+    ),
+    'args=""',
+    'for arg in "$@"; do',
+    '  if [ -z "$args" ]; then args="$arg"; else args="$args|$arg"; fi',
+    "done",
+    `printf 'start\\t%s\\t%s\\t%s\\t%s\\n' "$$" "$start" "$cwd" "$args" >> ${JSON.stringify(
+      logFile,
+    )}`,
+    options.recordGitignoreAtStart
+      ? [
+          'if [ -e ".gitignore" ]; then',
+          '  gitignore_content="$(cat .gitignore 2>/dev/null || true)"',
+          `  printf 'gitignore\\t%s\\ttrue\\t%s\\n' "$$" "$gitignore_content" >> ${JSON.stringify(
+            logFile,
+          )}`,
+          "else",
+          `  printf 'gitignore\\t%s\\tfalse\\t\\n' "$$" >> ${JSON.stringify(
+            logFile,
+          )}`,
+          "fi",
+        ].join("\n")
+      : ":",
+    ...(options.createFiles ?? []).flatMap((filePath) => [
+      `mkdir -p "$(dirname ${JSON.stringify(filePath)})"`,
+      `printf 'created by fake npm' > ${JSON.stringify(filePath)}`,
+    ]),
+    options.stdout
+      ? `printf '%s\\n' ${JSON.stringify(options.stdout)}`
+      : ":",
+    options.stderr
+      ? `printf '%s\\n' ${JSON.stringify(options.stderr)} >&2`
+      : ":",
+    `if [ "$sleep_seconds" -gt 0 ]; then sleep "$sleep_seconds"; fi`,
+    `end=$(${timestamp})`,
+    `printf 'end\\t%s\\t%s\\t%s\\t%s\\n' "$$" "$end" "$cwd" "$args" >> ${JSON.stringify(
+      logFile,
+    )}`,
+    "exit $exit_code",
+    "",
+  ].join("\n");
+
+  await writeFile(npmPath, script, "utf-8");
+  await chmod(npmPath, 0o755);
+
+  try {
+    return await fn(
+      {
+        PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+      },
+      logFile,
+    );
+  } finally {
+    await rm(fakeBin, { recursive: true, force: true });
+  }
+}
+
+function readNpmInvocations(logFile: string): NpmInvocation[] {
+  if (!existsSync(logFile)) return [];
+  const records = new Map<
+    string,
+    {
+      cwd: string;
+      argv: string[];
+      start?: number;
+      end?: number;
+      gitignoreAtStart?: { existed: boolean; content?: string };
+    }
+  >();
+
+  for (const line of readFileSync(logFile, "utf-8").trim().split("\n")) {
+    if (!line) continue;
+    const [kind, pid, stamp, cwd, rawArgs = ""] = line.split("\t");
+    const current = records.get(pid) ?? {
+      cwd,
+      argv: rawArgs ? rawArgs.split("|") : [],
+    };
+    if (kind === "start") current.start = Number(stamp);
+    if (kind === "end") current.end = Number(stamp);
+    if (kind === "gitignore") {
+      current.gitignoreAtStart = {
+        existed: stamp === "true",
+        content: cwd || undefined,
+      };
+    }
+    records.set(pid, current);
+  }
+
+  return [...records.entries()].map(([pid, record]) => ({
+    pid,
+    cwd: record.cwd,
+    argv: record.argv,
+    start: record.start ?? 0,
+    end: record.end ?? 0,
+    gitignoreAtStart: record.gitignoreAtStart,
+  }));
+}
+
+function expectNoAutoInstallFailureReport(stderr: string): void {
+  expect(stderr).not.toMatch(/auto.?install.*fail|npm install.*fail|failed.*npm/i);
+}
+
+async function createManualGitSource(
+  baseDir: string,
+  repoName: string,
+  setup: (workDir: string) => Promise<void>,
+): Promise<string> {
+  const bareDir = join(baseDir, `${repoName}.git`);
+  const workDir = join(baseDir, `${repoName}-work`);
+  execSync(`git init --bare "${bareDir}"`, { stdio: "pipe" });
+  execSync(`git clone "${bareDir}" "${workDir}"`, { stdio: "pipe" });
+  await setup(workDir);
+  execSync(
+    `cd "${workDir}" && git add -A && git -c user.email="test@test.com" -c user.name="Test" commit -m "initial"`,
+    { stdio: "pipe" },
+  );
+  execSync(`cd "${workDir}" && git push origin HEAD`, { stdio: "pipe" });
+  return `file://${bareDir}`;
+}
+
+interface EnvRecordingInvocation {
+  cwd: string;
+  argv: string[];
+  env: Record<string, string | undefined>;
+}
+
+async function withEnvRecordingFakeNpm<T>(
+  keys: string[],
+  fn: (env: Record<string, string>, logFile: string) => Promise<T>,
+): Promise<T> {
+  const fakeBin = await mkdtemp(join(tmpdir(), "loopx-env-npm-"));
+  const logFile = join(fakeBin, "npm-env.jsonl");
+  const npmPath = join(fakeBin, "npm");
+  const script = [
+    `#!${process.execPath}`,
+    "const fs = require('node:fs');",
+    `const logFile = ${JSON.stringify(logFile)};`,
+    `const keys = ${JSON.stringify(keys)};`,
+    "const env = {};",
+    "for (const key of keys) env[key] = process.env[key];",
+    "fs.appendFileSync(logFile, JSON.stringify({ cwd: process.cwd(), argv: process.argv.slice(2), env }) + '\\n');",
+    "process.exit(0);",
+    "",
+  ].join("\n");
+
+  await writeFile(npmPath, script, "utf-8");
+  await chmod(npmPath, 0o755);
+  try {
+    return await fn(
+      { PATH: `${fakeBin}:${process.env.PATH ?? ""}` },
+      logFile,
+    );
+  } finally {
+    await rm(fakeBin, { recursive: true, force: true });
+  }
+}
+
+function readEnvRecordingInvocations(logFile: string): EnvRecordingInvocation[] {
+  if (!existsSync(logFile)) return [];
+  return readFileSync(logFile, "utf-8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as EnvRecordingInvocation);
+}
+
+async function withScrubbedLoopxProcessEnv<T>(fn: () => Promise<T>): Promise<T> {
+  const saved = new Map<string, string | undefined>();
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("LOOPX_")) {
+      saved.set(key, process.env[key]);
+      delete process.env[key];
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+type GitignoreStateAtPause =
+  | { exists: false }
+  | { exists: true; type: "regular-file"; content: string }
+  | { exists: true; type: string };
+
+interface AutoInstallPauseMarker {
+  window: string;
+  current: string | null;
+  processed: string[];
+  remaining: string[];
+  activeChildPid?: number;
+  gitignoreStateAtPause?: GitignoreStateAtPause;
+}
+
+async function waitForAutoInstallPauseMarker(
+  markerPath: string,
+  timeoutMs = 5_000,
+): Promise<AutoInstallPauseMarker> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(markerPath)) {
+      return JSON.parse(
+        readFileSync(markerPath, "utf-8"),
+      ) as AutoInstallPauseMarker;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for auto-install pause marker: ${markerPath}`);
+}
+
+function expectWorkflowNamesCoverMarker(
+  marker: AutoInstallPauseMarker,
+  expectedNames: string[],
+): void {
+  const observed = [
+    ...marker.processed,
+    ...(marker.current === null ? [] : [marker.current]),
+    ...marker.remaining,
+  ].sort();
+  expect(observed).toEqual([...expectedNames].sort());
+}
+
+function expectCommittedWorkflows(loopxDir: string, names: string[]): void {
+  for (const name of names) {
+    expect(existsSync(join(loopxDir, name, "index.sh"))).toBe(true);
+    expect(existsSync(join(loopxDir, name, "package.json"))).toBe(true);
+  }
+}
+
+function expectGitignoreMatchesPauseState(
+  loopxDir: string,
+  workflow: string,
+  state: GitignoreStateAtPause,
+): void {
+  const gitignorePath = join(loopxDir, workflow, ".gitignore");
+  if (!state.exists) {
+    expect(existsSync(gitignorePath)).toBe(false);
+    return;
+  }
+  const stat = lstatSync(gitignorePath);
+  if (state.type === "regular-file") {
+    expect(stat.isFile()).toBe(true);
+    expect(readFileSync(gitignorePath).toString("base64")).toBe(state.content);
+  } else if (state.type === "symlink") {
+    expect(stat.isSymbolicLink()).toBe(true);
+  } else if (state.type === "directory") {
+    expect(stat.isDirectory()).toBe(true);
+  } else if (state.type === "fifo") {
+    expect(stat.isFIFO()).toBe(true);
+  } else if (state.type === "socket") {
+    expect(stat.isSocket()).toBe(true);
+  } else {
+    expect(stat.isFile()).toBe(false);
+  }
+}
+
+function packageJsonWorkflowFiles(
+  names: string[],
+): Record<string, string> {
+  return Object.fromEntries(
+    names.flatMap((name) => [
+      [`${name}/index.sh`, BASH_STOP],
+      [
+        `${name}/package.json`,
+        JSON.stringify({ name, version: "1.0.0" }),
+      ],
+    ]),
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
 // Shared fixture fragments (workflow-model)
 // ─────────────────────────────────────────────────────────────
 
@@ -438,6 +805,19 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         );
       });
 
+      it("T-INST-05a: non-known-host .git URL with trailing slash is rejected", async () => {
+        project = await createTempProject();
+
+        const result = await runCLI(
+          ["install", "https://example.com/repo.git/"],
+          { cwd: project.dir, runtime },
+        );
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/unsupported|invalid|source|url/i);
+        expect(existsSync(join(project.loopxDir, "repo"))).toBe(false);
+      });
+
       it("T-INST-06: http URL ending .tar.gz → tarball", async () => {
         project = await createTempProject();
         const tarball = await makeTarball(
@@ -522,6 +902,68 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         );
       });
 
+      it("T-INST-08g: github URL with query string is classified as git", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          { name: "repo", files: { "index.sh": BASH_STOP } },
+        ]);
+        await withGitURLRewrite(
+          {
+            "https://github.com/org/repo": `${gitServer.url}/repo.git`,
+            "https://github.com/org/repo?x=1": `${gitServer.url}/repo.git`,
+          },
+          async () => {
+            const result = await runCLI(
+              ["install", "https://github.com/org/repo?x=1"],
+              { cwd: project!.dir, runtime },
+            );
+            expect(result.exitCode).toBe(0);
+            expect(existsSync(join(project!.loopxDir, "repo"))).toBe(true);
+          },
+        );
+      });
+
+      it("T-INST-08g2: github URL with fragment is classified as git", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          { name: "repo", files: { "index.sh": BASH_STOP } },
+        ]);
+        await withGitURLRewrite(
+          {
+            "https://github.com/org/repo": `${gitServer.url}/repo.git`,
+            "https://github.com/org/repo#section": `${gitServer.url}/repo.git`,
+          },
+          async () => {
+            const result = await runCLI(
+              ["install", "https://github.com/org/repo#section"],
+              { cwd: project!.dir, runtime },
+            );
+            expect(result.exitCode).toBe(0);
+            expect(existsSync(join(project!.loopxDir, "repo"))).toBe(true);
+          },
+        );
+      });
+
+      it("T-INST-08h: github .git URL with trailing slash is classified as git", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          { name: "repo", files: { "index.sh": BASH_STOP } },
+        ]);
+        await withGitURLRewrite(
+          {
+            "https://github.com/org/repo.git/": `${gitServer.url}/repo.git`,
+          },
+          async () => {
+            const result = await runCLI(
+              ["install", "https://github.com/org/repo.git/"],
+              { cwd: project!.dir, runtime },
+            );
+            expect(result.exitCode).toBe(0);
+            expect(existsSync(join(project!.loopxDir, "repo"))).toBe(true);
+          },
+        );
+      });
+
       it("T-INST-08d: tarball URL with query string → tarball", async () => {
         project = await createTempProject();
         const tarball = await makeTarball(
@@ -558,6 +1000,24 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           { cwd: project.dir, runtime },
         );
         expect(result.exitCode).toBe(1);
+      });
+
+      it.each([
+        ["T-INST-08i", "org/repo/extra"],
+        ["T-INST-08j", "org/repo/"],
+        ["T-INST-08k", "org//repo"],
+        ["T-INST-08l", "https://github.com/org"],
+        ["T-INST-08m", "https://github.com/org/repo.git/extra"],
+      ] as const)("%s: invalid install source %s is rejected", async (_id, source) => {
+        project = await createTempProject();
+
+        const result = await runCLI(["install", source], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/unsupported|invalid|source|url|shorthand/i);
       });
     });
   });
@@ -604,6 +1064,16 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(result.exitCode).toBe(1);
       });
 
+      it("T-INST-40f: --no-install with no source → usage error", async () => {
+        project = await createTempProject();
+        const result = await runCLI(["install", "--no-install"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/usage|source|required/i);
+      });
+
       it("T-INST-40d: two positional sources → usage error", async () => {
         project = await createTempProject();
         const result = await runCLI(
@@ -622,7 +1092,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(result.exitCode).toBe(1);
       });
 
-      it("T-INST-41: -h → install help, no single-file URL advertised", async () => {
+      it("T-INST-41: -h → install help, --no-install advertised with no short alias, no single-file URL advertised", async () => {
         project = await createTempProject();
         const result = await runCLI(["install", "-h"], {
           cwd: project.dir,
@@ -632,6 +1102,8 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         const out = result.stdout + result.stderr;
         expect(out).toMatch(/-w|--workflow/);
         expect(out).toMatch(/-y/);
+        expect(out).toMatch(/--no-install/);
+        expect(out).not.toMatch(/(^|\s)-[A-Za-z],?\s+--no-install\b/);
         // Either git or tarball terminology should appear
         expect(out).toMatch(/git|tarball|repo/i);
         // Single-file URL install is removed — help must NOT advertise it
@@ -840,6 +1312,107 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(readdirSync(project.loopxDir).length).toBe(0);
       });
 
+      it("T-INST-DASHDASH-01: leading -- before valid source is a usage error with no download", async () => {
+        const tarball = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "dashsrc" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/dashsrc.tar.gz", tarball),
+        ]);
+
+        const preverify = await createTempProject();
+        try {
+          const ok = await runCLI(
+            ["install", `${httpServer.url}/dashsrc.tar.gz`],
+            { cwd: preverify.dir, runtime },
+          );
+          expect(ok.exitCode).toBe(0);
+          expect(existsSync(join(preverify.loopxDir, "dashsrc"))).toBe(true);
+        } finally {
+          await preverify.cleanup();
+        }
+
+        const requestCountBefore = httpServer.requests.length;
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "--", `${httpServer.url}/dashsrc.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/--|usage|unknown|unrecognized/i);
+        expect(result.stderr).not.toMatch(/unsupported.*source/i);
+        expect(httpServer.requests).toHaveLength(requestCountBefore);
+        expect(existsSync(join(project.loopxDir, "dashsrc"))).toBe(false);
+        expect(readdirSync(project.loopxDir)).toEqual([]);
+      });
+
+      it("T-INST-DASHDASH-02: trailing -- after valid source is a usage error with no download", async () => {
+        const tarball = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "dashsrc" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/dashsrc.tar.gz", tarball),
+        ]);
+
+        const preverify = await createTempProject();
+        try {
+          const ok = await runCLI(
+            ["install", `${httpServer.url}/dashsrc.tar.gz`],
+            { cwd: preverify.dir, runtime },
+          );
+          expect(ok.exitCode).toBe(0);
+        } finally {
+          await preverify.cleanup();
+        }
+
+        const requestCountBefore = httpServer.requests.length;
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", `${httpServer.url}/dashsrc.tar.gz`, "--"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/--|usage|unknown|unrecognized/i);
+        expect(result.stderr).not.toMatch(/unsupported.*source/i);
+        expect(httpServer.requests).toHaveLength(requestCountBefore);
+        expect(existsSync(join(project.loopxDir, "dashsrc"))).toBe(false);
+        expect(readdirSync(project.loopxDir)).toEqual([]);
+      });
+
+      it("T-INST-DASHDASH-03: -h short-circuits -- before source", async () => {
+        project = await createTempProject();
+        httpServer = await startLocalHTTPServer([
+          { path: "/dashsrc.tar.gz", body: "ignored" },
+        ]);
+        const result = await runCLI(
+          ["install", "-h", "--", `${httpServer.url}/dashsrc.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout + result.stderr).toMatch(/install/i);
+        expect(result.stderr).not.toMatch(/--.*(usage|unknown|unrecognized)/i);
+        expect(httpServer.requests).toHaveLength(0);
+        expect(readdirSync(project.loopxDir)).toEqual([]);
+      });
+
+      it("T-INST-DASHDASH-04: --help short-circuits -- before source", async () => {
+        project = await createTempProject();
+        httpServer = await startLocalHTTPServer([
+          { path: "/dashsrc.tar.gz", body: "ignored" },
+        ]);
+        const result = await runCLI(
+          ["install", "--help", "--", `${httpServer.url}/dashsrc.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout + result.stderr).toMatch(/install/i);
+        expect(result.stderr).not.toMatch(/--.*(usage|unknown|unrecognized)/i);
+        expect(httpServer.requests).toHaveLength(0);
+        expect(readdirSync(project.loopxDir)).toEqual([]);
+      });
+
       it("T-INST-43: -w a -w b <source> → usage error", async () => {
         project = await createTempProject();
         const result = await runCLI(
@@ -876,6 +1449,91 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(result.exitCode).toBe(1);
       });
 
+      it("T-INST-44a / T-INST-44b: duplicate --no-install is a usage error", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "--no-install", "--no-install", "org/repo"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-44c: --help suppresses duplicate --no-install usage errors", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "--help", "--no-install", "--no-install", "org/repo"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toMatch(/usage|install/i);
+        expect(result.stdout).toMatch(/--no-install/);
+        expect(result.stderr).not.toMatch(/duplicate|usage/i);
+      });
+
+      it("T-INST-44d: late -h after --no-install still produces install help", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "--no-install", "-h", "org/repo"],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toMatch(/usage|install/i);
+        expect(result.stdout).toMatch(/--no-install/);
+      });
+
+      it.each([
+        ["-h"],
+        ["--help"],
+      ] as const)(
+        "T-INST-44e: late %s suppresses preceding duplicate --no-install usage errors",
+        async (helpFlag) => {
+          project = await createTempProject();
+          const result = await runCLI(
+            [
+              "install",
+              "--no-install",
+              "--no-install",
+              helpFlag,
+              "org/repo",
+            ],
+            { cwd: project.dir, runtime },
+          );
+          expect(result.exitCode).toBe(0);
+          expect(result.stdout).toMatch(/usage|install/i);
+          expect(result.stdout).toMatch(/--no-install/);
+          expect(result.stderr).not.toMatch(/duplicate|usage/i);
+          expect(readdirSync(project.loopxDir)).toEqual([]);
+        },
+      );
+
+      it.each(["-n", "-N", "-i", "-I"] as const)(
+        "T-INST-44f: %s is not a short alias for --no-install",
+        async (flag) => {
+          project = await createTempProject();
+          gitServer = await startLocalGitServer([
+            {
+              name: "repo",
+              files: {
+                "index.sh": BASH_STOP,
+                "package.json": JSON.stringify({ name: "repo", version: "1.0.0" }),
+              },
+            },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const result = await runCLI(
+              ["install", flag, `${gitServer!.url}/repo.git`],
+              { cwd: project!.dir, runtime, env },
+            );
+
+            expect(result.exitCode).toBe(1);
+            expect(result.stderr).toMatch(/unknown|unrecognized|usage|invalid/i);
+            expect(readNpmInvocations(logFile)).toHaveLength(0);
+            expect(existsSync(join(project!.loopxDir, "repo"))).toBe(false);
+          });
+        },
+      );
+
       it("T-INST-45: --unknown <source> → usage error", async () => {
         project = await createTempProject();
         const result = await runCLI(
@@ -909,6 +1567,18 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           cwd: project.dir,
           runtime,
         });
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("T-INST-47a: -h --no-install --no-install → help, exit 0", async () => {
+        project = await createTempProject();
+        const result = await runCLI(
+          ["install", "-h", "--no-install", "--no-install"],
+          {
+            cwd: project.dir,
+            runtime,
+          },
+        );
         expect(result.exitCode).toBe(0);
       });
 
@@ -1546,6 +2216,604 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
         expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
       });
+
+      it("T-INST-55f / T-INST-55g / T-INST-55j / T-INST-55k / T-INST-55n / T-INST-55q / T-INST-55zb / T-INST-55zc / T-INST-55zh: in-source symlinks are materialized by alias name", async () => {
+        project = await createTempProject();
+        const source = await createManualGitSource(
+          project.dir,
+          "symlink-materialization",
+          async (workDir) => {
+            await mkdir(join(workDir, "internal", "-target-name"), {
+              recursive: true,
+            });
+            await writeFile(
+              join(workDir, "internal", "-target-name", "index.sh"),
+              "#!/bin/bash\nexit 0\n",
+              "utf-8",
+            );
+            await chmod(join(workDir, "internal", "-target-name", "index.sh"), 0o755);
+            symlinkSync("internal/-target-name", join(workDir, "alias"));
+
+            await mkdir(join(workDir, "ralph", "lib"), { recursive: true });
+            await mkdir(join(workDir, "ralph", "docs"), { recursive: true });
+            await mkdir(join(workDir, "ralph", "shared-assets", "icons"), {
+              recursive: true,
+            });
+            await writeFile(
+              join(workDir, "ralph", "lib", "original-entry.sh"),
+              "#!/bin/bash\nexit 0\n",
+              "utf-8",
+            );
+            await chmod(
+              join(workDir, "ralph", "lib", "original-entry.sh"),
+              0o755,
+            );
+            await writeFile(join(workDir, "ralph", "docs", "readme.md"), "docs\n");
+            await writeFile(
+              join(workDir, "ralph", "shared-assets", "icons", "logo.txt"),
+              "logo\n",
+            );
+            symlinkSync("lib/original-entry.sh", join(workDir, "ralph", "index.sh"));
+            symlinkSync("docs/readme.md", join(workDir, "ralph", "readme-link.md"));
+            symlinkSync("shared-assets", join(workDir, "ralph", "assets"));
+            symlinkSync(
+              "icons/logo.txt",
+              join(workDir, "ralph", "shared-assets", "logo-link.txt"),
+            );
+          },
+        );
+
+        const result = await runCLI(["install", "--no-install", source], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(lstatSync(join(project.loopxDir, "alias")).isDirectory()).toBe(true);
+        expect(lstatSync(join(project.loopxDir, "alias")).isSymbolicLink()).toBe(
+          false,
+        );
+        expect(existsSync(join(project.loopxDir, "-target-name"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "internal"))).toBe(false);
+        expect(lstatSync(join(project.loopxDir, "ralph", "index.sh")).isFile()).toBe(
+          true,
+        );
+        expect(
+          lstatSync(join(project.loopxDir, "ralph", "readme-link.md")).isFile(),
+        ).toBe(true);
+        expect(
+          readFileSync(join(project.loopxDir, "ralph", "readme-link.md"), "utf-8"),
+        ).toBe("docs\n");
+        expect(lstatSync(join(project.loopxDir, "ralph", "assets")).isDirectory()).toBe(
+          true,
+        );
+        expect(
+          lstatSync(
+            join(project.loopxDir, "ralph", "shared-assets", "logo-link.txt"),
+          ).isFile(),
+        ).toBe(true);
+        expect(await runCLI(["run", "-n", "1", "alias"], { cwd: project.dir, runtime })).toMatchObject({
+          exitCode: 0,
+        });
+        expect(
+          await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir, runtime }),
+        ).toMatchObject({ exitCode: 0 });
+      });
+
+      it("T-INST-55f2: -w selects a symlinked workflow alias and auto-install runs for the alias only", async () => {
+        project = await createTempProject();
+        const source = await createManualGitSource(
+          project.dir,
+          "symlink-selective",
+          async (workDir) => {
+            await mkdir(join(workDir, "internal", "real-workflow"), {
+              recursive: true,
+            });
+            await writeFile(
+              join(workDir, "internal", "real-workflow", "index.sh"),
+              BASH_STOP,
+            );
+            await chmod(
+              join(workDir, "internal", "real-workflow", "index.sh"),
+              0o755,
+            );
+            await writeFile(
+              join(workDir, "internal", "real-workflow", "package.json"),
+              JSON.stringify({ name: "real-workflow", version: "1.0.0" }),
+            );
+            await mkdir(join(workDir, "other"), { recursive: true });
+            await writeFile(join(workDir, "other", "index.sh"), BASH_STOP);
+            await chmod(join(workDir, "other", "index.sh"), 0o755);
+            symlinkSync("internal/real-workflow", join(workDir, "alias"));
+          },
+        );
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(["install", "-w", "alias", source], {
+            cwd: project!.dir,
+            runtime,
+            env,
+          });
+
+          expect(result.exitCode).toBe(0);
+          expect(lstatSync(join(project!.loopxDir, "alias")).isDirectory()).toBe(
+            true,
+          );
+          expect(existsSync(join(project!.loopxDir, "real-workflow"))).toBe(false);
+          expect(existsSync(join(project!.loopxDir, "other"))).toBe(false);
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "alias"),
+          ]);
+          expect(readFileSync(join(project!.loopxDir, "alias", ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+        });
+      });
+
+      it("T-INST-55z / T-INST-55za: root-level script symlink classification follows file targets but not directory targets", async () => {
+        project = await createTempProject();
+        const positiveSource = await createManualGitSource(
+          project.dir,
+          "root-script-link",
+          async (workDir) => {
+            await mkdir(join(workDir, "scripts"), { recursive: true });
+            await writeFile(
+              join(workDir, "scripts", "real-index.sh"),
+              "#!/bin/bash\nexit 0\n",
+              "utf-8",
+            );
+            await chmod(join(workDir, "scripts", "real-index.sh"), 0o755);
+            symlinkSync("scripts/real-index.sh", join(workDir, "index.sh"));
+          },
+        );
+        const positive = await runCLI(
+          ["install", "--no-install", positiveSource],
+          { cwd: project.dir, runtime },
+        );
+        expect(positive.exitCode).toBe(0);
+        expect(
+          lstatSync(join(project.loopxDir, "root-script-link", "index.sh")).isFile(),
+        ).toBe(true);
+        expect(
+          await runCLI(["run", "-n", "1", "root-script-link"], {
+            cwd: project.dir,
+            runtime,
+          }),
+        ).toMatchObject({ exitCode: 0 });
+
+        const negativeProject = await createTempProject();
+        try {
+          const negativeSource = await createManualGitSource(
+            negativeProject.dir,
+            "root-script-dir-link",
+            async (workDir) => {
+              await mkdir(join(workDir, "dir"), { recursive: true });
+              await writeFile(join(workDir, "dir", "helper.txt"), "not a script");
+              symlinkSync("dir", join(workDir, "index.sh"));
+            },
+          );
+          const negative = await runCLI(
+            ["install", "--no-install", negativeSource],
+            { cwd: negativeProject.dir, runtime },
+          );
+          expect(negative.exitCode).toBe(1);
+          expect(readdirSync(negativeProject.loopxDir)).toEqual([]);
+        } finally {
+          await negativeProject.cleanup();
+        }
+      });
+
+      it("T-INST-55h / T-INST-55l / T-INST-55m / T-INST-55s / T-INST-55zd: selected broken, cyclic, and out-of-source symlinks are rejected atomically", async () => {
+        project = await createTempProject();
+        const outsideDir = await mkdtemp(join(tmpdir(), "loopx-outside-"));
+        try {
+          const outsideFile = join(outsideDir, "outside.sh");
+          await writeFile(outsideFile, "#!/bin/bash\nexit 0\n", "utf-8");
+          await chmod(outsideFile, 0o755);
+          const source = await createManualGitSource(
+            project.dir,
+            "bad-symlinks",
+            async (workDir) => {
+              await mkdir(join(workDir, "broken"), { recursive: true });
+              await writeFile(join(workDir, "broken", "check.sh"), BASH_STOP);
+              await chmod(join(workDir, "broken", "check.sh"), 0o755);
+              symlinkSync("missing-target", join(workDir, "broken", "index.sh"));
+
+              await mkdir(join(workDir, "cycle"), { recursive: true });
+              await writeFile(join(workDir, "cycle", "check.sh"), BASH_STOP);
+              await chmod(join(workDir, "cycle", "check.sh"), 0o755);
+              symlinkSync("a", join(workDir, "cycle", "index.sh"));
+              symlinkSync("b", join(workDir, "cycle", "a"));
+              symlinkSync("a", join(workDir, "cycle", "b"));
+
+              await mkdir(join(workDir, "outside"), { recursive: true });
+              await writeFile(join(workDir, "outside", "check.sh"), BASH_STOP);
+              await chmod(join(workDir, "outside", "check.sh"), 0o755);
+              symlinkSync(outsideFile, join(workDir, "outside", "index.sh"));
+
+              await mkdir(join(workDir, "nested", "lib"), { recursive: true });
+              await writeFile(join(workDir, "nested", "index.sh"), BASH_STOP);
+              await chmod(join(workDir, "nested", "index.sh"), 0o755);
+              symlinkSync("../../missing", join(workDir, "nested", "lib", "asset"));
+
+              symlinkSync("no-such-workflow", join(workDir, "badalias"));
+            },
+          );
+
+          for (const selected of ["broken", "cycle", "outside", "nested", "badalias"]) {
+            const result = await runCLI(
+              ["install", "--no-install", "-w", selected, source],
+              { cwd: project.dir, runtime },
+            );
+            expect(result.exitCode).toBe(1);
+            expect(existsSync(join(project.loopxDir, selected))).toBe(false);
+          }
+          expect(readdirSync(project.loopxDir)).toEqual([]);
+          expect(existsSync(outsideFile)).toBe(true);
+        } finally {
+          await rm(outsideDir, { recursive: true, force: true });
+        }
+      });
+
+      it("T-INST-55i / T-INST-55i2 / T-INST-55i3 / T-INST-55t: -w ignores bad symlinks outside the selected workflow but rejects them when selected", async () => {
+        project = await createTempProject();
+        const source = await createManualGitSource(
+          project.dir,
+          "selective-bad-symlinks",
+          async (workDir) => {
+            await mkdir(join(workDir, "ralph"), { recursive: true });
+            await writeFile(join(workDir, "ralph", "index.sh"), BASH_STOP);
+            await chmod(join(workDir, "ralph", "index.sh"), 0o755);
+            await mkdir(join(workDir, "broken"), { recursive: true });
+            await writeFile(join(workDir, "broken", "check.sh"), BASH_STOP);
+            await chmod(join(workDir, "broken", "check.sh"), 0o755);
+            symlinkSync("missing-target", join(workDir, "broken", "index.sh"));
+            symlinkSync("missing-top-level-target", join(workDir, "badalias"));
+            await mkdir(join(workDir, "support"), { recursive: true });
+            symlinkSync("missing-support-target", join(workDir, "support", "asset"));
+          },
+        );
+
+        const selectedGood = await runCLI(
+          ["install", "--no-install", "-w", "ralph", source],
+          { cwd: project.dir, runtime },
+        );
+        expect(selectedGood.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph", "index.sh"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "broken"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "badalias"))).toBe(false);
+        expect(selectedGood.stderr).not.toMatch(/broken|badalias|support/i);
+
+        const selectedBad = await runCLI(
+          ["install", "--no-install", "-w", "broken", source],
+          { cwd: project.dir, runtime },
+        );
+        expect(selectedBad.exitCode).toBe(1);
+      });
+
+      it("T-INST-55l2 / T-INST-55l3 / T-INST-55ze / T-INST-55zf / T-INST-55zg / T-INST-55zi / T-INST-55zj: source-symlink rejection wins before commit and auto-install", async () => {
+        project = await createTempProject();
+        const source = await createManualGitSource(
+          project.dir,
+          "faulted-symlink-targets",
+          async (workDir) => {
+            await mkdir(join(workDir, "ralph"), { recursive: true });
+            await writeFile(join(workDir, "ralph", "index.sh"), BASH_STOP);
+            await chmod(join(workDir, "ralph", "index.sh"), 0o755);
+            await writeFile(
+              join(workDir, "ralph", "package.json"),
+              JSON.stringify({ name: "ralph", version: "1.0.0" }),
+            );
+            await mkdir(join(workDir, "shared"), { recursive: true });
+            for (const name of [
+              "asset-target",
+              "alias-target",
+              "pkg-target",
+              "inner-target",
+              "gitignore-target",
+              "root-script-target",
+            ]) {
+              await writeFile(join(workDir, "shared", name), "placeholder");
+            }
+            symlinkSync("../shared/asset-target", join(workDir, "ralph", "asset"));
+            symlinkSync("shared/alias-target", join(workDir, "badalias"));
+            symlinkSync("../shared/pkg-target", join(workDir, "ralph", "pkg-link.json"));
+            symlinkSync("../shared/gitignore-target", join(workDir, "ralph", ".gitignore"));
+            await mkdir(join(workDir, "ralph", "materialized-dir"), {
+              recursive: true,
+            });
+            symlinkSync(
+              "../../shared/inner-target",
+              join(workDir, "ralph", "materialized-dir", "inner-link"),
+            );
+            symlinkSync("shared/root-script-target", join(workDir, "check.sh"));
+          },
+        );
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(["install", source], {
+            cwd: project!.dir,
+            runtime,
+            env: {
+              ...env,
+              NODE_ENV: "test",
+              LOOPX_TEST_INSTALL_FAULT:
+                "source-target-replace-with-fifo:shared/asset-target,shared/alias-target,shared/pkg-target,shared/inner-target,shared/gitignore-target,shared/root-script-target",
+            },
+          });
+
+          expect(result.exitCode).toBe(1);
+          expect(readNpmInvocations(logFile)).toHaveLength(0);
+          expect(readdirSync(project!.loopxDir)).toEqual([]);
+          expect(result.stderr).not.toMatch(/auto.?install.*fail|npm install.*fail/i);
+        });
+      });
+
+      it("T-INST-55o / T-INST-55p / T-INST-55r / T-INST-55u: symlink alias names, entry-type policy, and script collisions match runtime discovery", async () => {
+        project = await createTempProject();
+        const invalidAliasSource = await createManualGitSource(
+          project.dir,
+          "invalid-alias",
+          async (workDir) => {
+            await mkdir(join(workDir, "real"), { recursive: true });
+            await writeFile(join(workDir, "real", "index.sh"), BASH_STOP);
+            await chmod(join(workDir, "real", "index.sh"), 0o755);
+            symlinkSync("real", join(workDir, "-bad-alias"));
+          },
+        );
+        const invalidAlias = await runCLI(
+          ["install", "--no-install", invalidAliasSource],
+          { cwd: project.dir, runtime },
+        );
+        expect(invalidAlias.exitCode).toBe(1);
+        expect(existsSync(join(project.loopxDir, "-bad-alias"))).toBe(false);
+
+        const entryPolicyProject = await createTempProject();
+        try {
+          const entryPolicySource = await createManualGitSource(
+            entryPolicyProject.dir,
+            "entry-policy",
+            async (workDir) => {
+              await writeFile(join(workDir, "not-a-workflow-target"), "file");
+              symlinkSync("not-a-workflow-target", join(workDir, "alias"));
+              await mkdir(join(workDir, "ralph", "dir-target"), {
+                recursive: true,
+              });
+              await writeFile(join(workDir, "ralph", "check.sh"), BASH_STOP);
+              await chmod(join(workDir, "ralph", "check.sh"), 0o755);
+              symlinkSync("dir-target", join(workDir, "ralph", "index.sh"));
+              await mkdir(join(workDir, "support-dir"), { recursive: true });
+              await writeFile(join(workDir, "support-dir", "README.md"), "support");
+              symlinkSync("support-dir", join(workDir, "support-alias"));
+            },
+          );
+          const entryPolicy = await runCLI(
+            ["install", "--no-install", entryPolicySource],
+            { cwd: entryPolicyProject.dir, runtime },
+          );
+          expect(entryPolicy.exitCode).toBe(0);
+          expect(existsSync(join(entryPolicyProject.loopxDir, "alias"))).toBe(false);
+          expect(existsSync(join(entryPolicyProject.loopxDir, "support-alias"))).toBe(
+            false,
+          );
+          expect(
+            lstatSync(
+              join(entryPolicyProject.loopxDir, "ralph", "index.sh"),
+            ).isDirectory(),
+          ).toBe(true);
+          const missingIndex = await runCLI(
+            ["run", "-n", "1", "ralph"],
+            { cwd: entryPolicyProject.dir, runtime },
+          );
+          expect(missingIndex.exitCode).toBe(1);
+          const check = await runCLI(["run", "-n", "1", "ralph:check"], {
+            cwd: entryPolicyProject.dir,
+            runtime,
+          });
+          expect(check.exitCode).toBe(0);
+        } finally {
+          await entryPolicyProject.cleanup();
+        }
+
+        const collisionProject = await createTempProject();
+        try {
+          const collisionSource = await createManualGitSource(
+            collisionProject.dir,
+            "symlink-collision",
+            async (workDir) => {
+              await mkdir(join(workDir, "ralph", "lib"), { recursive: true });
+              await writeFile(join(workDir, "ralph", "check.sh"), BASH_STOP);
+              await chmod(join(workDir, "ralph", "check.sh"), 0o755);
+              await writeFile(
+                join(workDir, "ralph", "lib", "real-check.ts"),
+                "console.log('check');\n",
+              );
+              symlinkSync("lib/real-check.ts", join(workDir, "ralph", "check.ts"));
+            },
+          );
+          const collision = await runCLI(
+            ["install", "--no-install", collisionSource],
+            { cwd: collisionProject.dir, runtime },
+          );
+          expect(collision.exitCode).toBe(1);
+          expect(collision.stderr).toMatch(/collision|ambiguous|check/i);
+          expect(existsSync(join(collisionProject.loopxDir, "ralph"))).toBe(false);
+        } finally {
+          await collisionProject.cleanup();
+        }
+      });
+
+      it("T-INST-55v / T-INST-55v2 / T-INST-55v3 / T-INST-55w / T-INST-55x / T-INST-55x2 / T-INST-55y: package.json source symlinks materialize before package dispatch", async () => {
+        project = await createTempProject();
+        const validSource = await createManualGitSource(
+          project.dir,
+          "pkg-symlink-valid",
+          async (workDir) => {
+            await mkdir(join(workDir, "shared"), { recursive: true });
+            await writeFile(
+              join(workDir, "shared", "pkg.json"),
+              JSON.stringify({ name: "ralph", version: "1.0.0" }),
+            );
+            await mkdir(join(workDir, "ralph"), { recursive: true });
+            await writeFile(join(workDir, "ralph", "index.sh"), BASH_STOP);
+            await chmod(join(workDir, "ralph", "index.sh"), 0o755);
+            symlinkSync("../shared/pkg.json", join(workDir, "ralph", "package.json"));
+          },
+        );
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(["install", validSource], {
+            cwd: project!.dir,
+            runtime,
+            env,
+          });
+          expect(result.exitCode).toBe(0);
+          expect(lstatSync(join(project!.loopxDir, "ralph", "package.json")).isFile()).toBe(
+            true,
+          );
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "ralph"),
+          ]);
+        });
+
+        const malformedProject = await createTempProject();
+        try {
+          const malformedSource = await createManualGitSource(
+            malformedProject.dir,
+            "pkg-symlink-malformed",
+            async (workDir) => {
+              await mkdir(join(workDir, "shared"), { recursive: true });
+              await writeFile(join(workDir, "shared", "pkg.json"), "{broken");
+              await mkdir(join(workDir, "ralph"), { recursive: true });
+              await writeFile(join(workDir, "ralph", "index.sh"), BASH_STOP);
+              await chmod(join(workDir, "ralph", "index.sh"), 0o755);
+              symlinkSync(
+                "../shared/pkg.json",
+                join(workDir, "ralph", "package.json"),
+              );
+            },
+          );
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const result = await runCLI(["install", malformedSource], {
+              cwd: malformedProject.dir,
+              runtime,
+              env,
+            });
+            expect(result.exitCode).toBe(0);
+            expect(readNpmInvocations(logFile)).toHaveLength(0);
+            expect(countInvalidJsonWarnings(result.stderr, "ralph")).toBe(1);
+            expect(
+              lstatSync(
+                join(malformedProject.loopxDir, "ralph", "package.json"),
+              ).isFile(),
+            ).toBe(true);
+          });
+        } finally {
+          await malformedProject.cleanup();
+        }
+
+        const mismatchProject = await createTempProject();
+        try {
+          const mismatchSource = await createManualGitSource(
+            mismatchProject.dir,
+            "pkg-symlink-mismatch",
+            async (workDir) => {
+              await mkdir(join(workDir, "shared"), { recursive: true });
+              await writeFile(
+                join(workDir, "shared", "pkg.json"),
+                JSON.stringify({ dependencies: { loopx: unsatisfiedRange() } }),
+              );
+              await mkdir(join(workDir, "ralph"), { recursive: true });
+              await writeFile(join(workDir, "ralph", "index.sh"), BASH_STOP);
+              await chmod(join(workDir, "ralph", "index.sh"), 0o755);
+              symlinkSync(
+                "../shared/pkg.json",
+                join(workDir, "ralph", "package.json"),
+              );
+            },
+          );
+          const refused = await runCLI(["install", mismatchSource], {
+            cwd: mismatchProject.dir,
+            runtime,
+          });
+          expect(refused.exitCode).toBe(1);
+          const forced = await runCLI(
+            ["install", "-y", "--no-install", mismatchSource],
+            { cwd: mismatchProject.dir, runtime },
+          );
+          expect(forced.exitCode).toBe(0);
+          expect(
+            readFileSync(
+              join(mismatchProject.loopxDir, "ralph", "package.json"),
+              "utf-8",
+            ),
+          ).toContain(unsatisfiedRange());
+        } finally {
+          await mismatchProject.cleanup();
+        }
+
+        const directoryProject = await createTempProject();
+        try {
+          const directorySource = await createManualGitSource(
+            directoryProject.dir,
+            "pkg-symlink-dir",
+            async (workDir) => {
+              await mkdir(join(workDir, "shared", "pkg-dir"), { recursive: true });
+              await writeFile(join(workDir, "shared", "pkg-dir", "README"), "dir");
+              await mkdir(join(workDir, "ralph"), { recursive: true });
+              await writeFile(join(workDir, "ralph", "index.sh"), BASH_STOP);
+              await chmod(join(workDir, "ralph", "index.sh"), 0o755);
+              symlinkSync(
+                "../shared/pkg-dir",
+                join(workDir, "ralph", "package.json"),
+              );
+            },
+          );
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const result = await runCLI(["install", directorySource], {
+              cwd: directoryProject.dir,
+              runtime,
+              env,
+            });
+            expect(result.exitCode).toBe(0);
+            expect(readNpmInvocations(logFile)).toHaveLength(0);
+            expect(
+              lstatSync(
+                join(directoryProject.loopxDir, "ralph", "package.json"),
+              ).isDirectory(),
+            ).toBe(true);
+            expect(result.stderr).toMatch(/ralph|package\.json/i);
+          });
+        } finally {
+          await directoryProject.cleanup();
+        }
+
+        const badProject = await createTempProject();
+        try {
+          const badSource = await createManualGitSource(
+            badProject.dir,
+            "pkg-symlink-bad",
+            async (workDir) => {
+              await mkdir(join(workDir, "ralph"), { recursive: true });
+              await writeFile(join(workDir, "ralph", "index.sh"), BASH_STOP);
+              await chmod(join(workDir, "ralph", "index.sh"), 0o755);
+              symlinkSync("missing-pkg", join(workDir, "ralph", "package.json"));
+            },
+          );
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const result = await runCLI(["install", badSource], {
+              cwd: badProject.dir,
+              runtime,
+              env,
+            });
+            expect(result.exitCode).toBe(1);
+            expect(readNpmInvocations(logFile)).toHaveLength(0);
+            expect(readdirSync(badProject.loopxDir)).toEqual([]);
+            expect(result.stderr).not.toMatch(/invalid.*json|semver/i);
+          });
+        } finally {
+          await badProject.cleanup();
+        }
+      });
     });
   });
 
@@ -1664,6 +2932,88 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           { cwd: project.dir, runtime },
         );
         expect(result.exitCode).toBe(1);
+      });
+
+      it("T-INST-56f: root-only uppercase script extension is unsupported", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "uppercase-only",
+            files: { "index.SH": "echo nope\n" },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/uppercase-only.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(readdirSync(project.loopxDir)).toEqual([]);
+      });
+
+      it("T-INST-56g: uppercase-extension subdirectory is skipped as non-workflow", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "other/index.TS": "console.log('nope');\n",
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
+      });
+
+      it("T-INST-56h: uppercase-extension root file is preserved as non-script content in a valid workflow", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "uppercase-content",
+            files: {
+              "index.sh": BASH_STOP,
+              "helper.TS": "export const helper = true;\n",
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/uppercase-content.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          readFileSync(
+            join(project.loopxDir, "uppercase-content", "helper.TS"),
+            "utf-8",
+          ),
+        ).toBe("export const helper = true;\n");
+        const helper = await runCLI(
+          ["run", "-n", "1", "uppercase-content:helper"],
+          { cwd: project.dir, runtime },
+        );
+        expect(helper.exitCode).toBe(1);
+      });
+
+      it("T-INST-56i: root directory named like a script does not classify as a script file", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "script-dir-only",
+            files: { "index.sh/notes.md": "directory, not script" },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/script-dir-only.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).not.toMatch(/invalid.*index/i);
+        expect(readdirSync(project.loopxDir)).toEqual([]);
       });
     });
   });
@@ -2303,6 +3653,65 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(countInvalidSemverWarnings(result.stderr, "ralph")).toBe(1);
         expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
       });
+
+      it("T-INST-60t: -w selected workflow with package.json directory emits one non-fatal warning", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "ralph/package.json/README": "directory package marker",
+              "other/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          [
+            "install",
+            "--no-install",
+            "-w",
+            "ralph",
+            `${gitServer.url}/multi.git`,
+          ],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toMatch(/ralph/i);
+        expect(result.stderr).toMatch(/package\.json/i);
+        expect(
+          lstatSync(join(project.loopxDir, "ralph", "package.json")).isDirectory(),
+        ).toBe(true);
+        expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
+      });
+
+      it("T-INST-60u: -w unselected sibling with package.json directory emits no warning", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "ralph/index.sh": BASH_STOP,
+              "broken/index.sh": BASH_STOP,
+              "broken/package.json/README": "directory package marker",
+            },
+          },
+        ]);
+        const result = await runCLI(
+          [
+            "install",
+            "--no-install",
+            "-w",
+            "ralph",
+            `${gitServer.url}/multi.git`,
+          ],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "ralph", "index.sh"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "broken"))).toBe(false);
+        expect(result.stderr).not.toMatch(/broken|package\.json/i);
+      });
     });
   });
 
@@ -2312,6 +3721,91 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
 
   describe("Install-time Validation", () => {
     forEachRuntime((runtime) => {
+      it("T-INST-42m: unsupported .mjs/.cjs files are copied as workflow content, not scripts", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "unsupported-content",
+            files: {
+              "index.sh": BASH_STOP,
+              "helper.mjs": "export const helper = true;\n",
+              "tool.cjs": "module.exports = { tool: true };\n",
+            },
+          },
+        ]);
+
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/unsupported-content.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          readFileSync(
+            join(project.loopxDir, "unsupported-content", "helper.mjs"),
+            "utf-8",
+          ),
+        ).toBe("export const helper = true;\n");
+        expect(
+          readFileSync(
+            join(project.loopxDir, "unsupported-content", "tool.cjs"),
+            "utf-8",
+          ),
+        ).toBe("module.exports = { tool: true };\n");
+        expect(result.stderr).not.toMatch(/helper\.mjs|tool\.cjs|unsupported/i);
+
+        const indexResult = await runCLI(
+          ["run", "-n", "1", "unsupported-content"],
+          { cwd: project.dir, runtime },
+        );
+        expect(indexResult.exitCode).toBe(0);
+        const helperResult = await runCLI(
+          ["run", "-n", "1", "unsupported-content:helper"],
+          { cwd: project.dir, runtime },
+        );
+        expect(helperResult.exitCode).toBe(1);
+        expect(helperResult.stderr).toMatch(/not found|missing|script/i);
+        const toolResult = await runCLI(
+          ["run", "-n", "1", "unsupported-content:tool"],
+          { cwd: project.dir, runtime },
+        );
+        expect(toolResult.exitCode).toBe(1);
+        expect(toolResult.stderr).toMatch(/not found|missing|script/i);
+      });
+
+      it("T-INST-42n: unsupported same-base .mjs/.cjs siblings do not collide with supported scripts", async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "check-ran");
+        gitServer = await startLocalGitServer([
+          {
+            name: "collision-immune",
+            files: {
+              "check.sh": `#!/bin/bash\nprintf ran > ${JSON.stringify(markerPath)}\n`,
+              "check.mjs": "export const built = true;\n",
+              "check.cjs": "module.exports = { built: true };\n",
+            },
+          },
+        ]);
+
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/collision-immune.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        for (const file of ["check.sh", "check.mjs", "check.cjs"]) {
+          expect(existsSync(join(project.loopxDir, "collision-immune", file))).toBe(
+            true,
+          );
+        }
+        expect(result.stderr).not.toMatch(/collision|ambiguous|check\.mjs|check\.cjs/i);
+
+        const runResult = await runCLI(
+          ["run", "-n", "1", "collision-immune:check"],
+          { cwd: project.dir, runtime },
+        );
+        expect(runResult.exitCode).toBe(0);
+        expect(readFileSync(markerPath, "utf-8")).toBe("ran");
+      });
+
       it("T-INST-61: invalid script name (-bad.sh) → install fails", async () => {
         project = await createTempProject();
         gitServer = await startLocalGitServer([
@@ -2479,6 +3973,60 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(existsSync(join(project.loopxDir, "other"))).toBe(false);
       });
 
+      it("T-INST-63f: uppercase workflow and script names are valid and case-preserved", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "MyWorkflow/index.sh": BASH_STOP,
+              "MyWorkflow/CheckReady.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/multi.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "MyWorkflow"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "myworkflow"))).toBe(false);
+        expect(
+          existsSync(join(project.loopxDir, "MyWorkflow", "CheckReady.sh")),
+        ).toBe(true);
+        const runResult = await runCLI(
+          ["run", "-n", "1", "MyWorkflow:CheckReady"],
+          { cwd: project.dir, runtime },
+        );
+        expect(runResult.exitCode).toBe(0);
+      });
+
+      it("T-INST-63g: underscore-prefix script base name is valid at install time", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "underscore-script",
+            files: {
+              "index.sh": BASH_STOP,
+              "_check.sh": BASH_STOP,
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/underscore-script.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          existsSync(join(project.loopxDir, "underscore-script", "_check.sh")),
+        ).toBe(true);
+        const runResult = await runCLI(
+          ["run", "-n", "1", "underscore-script:_check"],
+          { cwd: project.dir, runtime },
+        );
+        expect(runResult.exitCode).toBe(0);
+      });
+
       it("T-INST-64: missing index script allowed for single-workflow sources", async () => {
         project = await createTempProject();
         gitServer = await startLocalGitServer([
@@ -2594,6 +4142,41 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(
           existsSync(join(project.loopxDir, "ralph", "lib", "-bad.ts")),
         ).toBe(true);
+      });
+
+      it("T-INST-64e: top-level directory with script-extension name is copied as content, not validated as a script", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "script-shaped-dir",
+            files: {
+              "index.sh": BASH_STOP,
+              "bad.name.ts/notes.md": "directory, not script",
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/script-shaped-dir.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(
+          lstatSync(
+            join(project.loopxDir, "script-shaped-dir", "bad.name.ts"),
+          ).isDirectory(),
+        ).toBe(true);
+        expect(
+          readFileSync(
+            join(project.loopxDir, "script-shaped-dir", "bad.name.ts", "notes.md"),
+            "utf-8",
+          ),
+        ).toBe("directory, not script");
+        expect(result.stderr).not.toMatch(/bad\.name\.ts/);
+        const runResult = await runCLI(
+          ["run", "-n", "1", "script-shaped-dir:bad.name"],
+          { cwd: project.dir, runtime },
+        );
+        expect(runResult.exitCode).toBe(1);
       });
 
       it("T-INST-52b: multi-workflow with workflow-internal config-style file fails validation", async () => {
@@ -2744,7 +4327,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(statSync(join(project.loopxDir, "repo")).isFile()).toBe(true);
       });
 
-      it("T-INST-70: symlink to workflow directory → collision error", async () => {
+      it("T-INST-70 T-INST-70-family: symlink to workflow directory → collision error", async () => {
         project = await createTempProject();
         const extDir = await mkdtemp(join(tmpdir(), "loopx-sym-"));
         try {
@@ -2879,6 +4462,34 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         } finally {
           await rm(extDir, { recursive: true, force: true });
         }
+      });
+
+      it("T-INST-70e: broken symlink destination is refused even with -y and preserved", async () => {
+        project = await createTempProject();
+        const target = join(tmpdir(), `loopx-missing-${Date.now()}-${process.pid}`);
+        const dest = join(project.loopxDir, "foo");
+        symlinkSync(target, dest);
+        gitServer = await startLocalGitServer([
+          { name: "foo", files: { "index.sh": BASH_STOP } },
+        ]);
+
+        const first = await runCLI(["install", `${gitServer.url}/foo.git`], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(first.exitCode).toBe(1);
+        expect(lstatSync(dest).isSymbolicLink()).toBe(true);
+        expect(readlinkSync(dest)).toBe(target);
+        expect(existsSync(target)).toBe(false);
+
+        const forced = await runCLI(
+          ["install", "-y", `${gitServer.url}/foo.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(forced.exitCode).toBe(1);
+        expect(lstatSync(dest).isSymbolicLink()).toBe(true);
+        expect(readlinkSync(dest)).toBe(target);
+        expect(existsSync(target)).toBe(false);
       });
 
       it("T-INST-71: broken non-workflow siblings do not affect collision eval", async () => {
@@ -3203,6 +4814,30 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           true,
         );
       });
+
+      it("T-INST-76b: no-index workflow with package.json directory warns and proceeds", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "wf",
+            files: {
+              "check.sh": BASH_STOP,
+              "package.json/README": "directory package marker",
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", "--no-install", `${gitServer.url}/wf.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toMatch(/wf/i);
+        expect(result.stderr).toMatch(/package\.json/i);
+        expect(existsSync(join(project.loopxDir, "wf", "check.sh"))).toBe(true);
+        expect(lstatSync(join(project.loopxDir, "wf", "package.json")).isDirectory()).toBe(
+          true,
+        );
+      });
     });
   });
 
@@ -3427,6 +5062,41 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(names.length).toBe(1);
       });
 
+      it("T-INST-80c2: commit-phase failure skips post-commit auto-install", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: packageJsonWorkflowFiles(["alpha", "beta", "gamma"]),
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              env: {
+                ...env,
+                NODE_ENV: "test",
+                LOOPX_TEST_INSTALL_FAULT: "commit-fail-after:1",
+              },
+            },
+          );
+          expect(result.exitCode).toBe(1);
+
+          const names = readdirSync(project!.loopxDir).filter((name) =>
+            statSync(join(project!.loopxDir, name)).isDirectory(),
+          );
+          expect(names).toHaveLength(1);
+          expect(readNpmInvocations(logFile)).toHaveLength(0);
+          expect(
+            existsSync(join(project!.loopxDir, names[0], ".gitignore")),
+          ).toBe(false);
+        });
+      });
+
       it.skipIf(IS_ROOT)(
         "T-INST-80d: package.json warning is once-per-workflow (tarball)",
         async () => {
@@ -3503,6 +5173,45 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(result.exitCode).toBe(0);
         expect(countInvalidJsonWarnings(result.stderr, "ralph")).toBe(1);
         expect(countInvalidJsonWarnings(result.stderr, "other")).toBe(1);
+      });
+
+      it("T-INST-80f2: package.json directory warning is once-per-workflow and skips auto-install", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json/README": "directory marker",
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json/README": "directory marker",
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+          expect(result.exitCode).toBe(0);
+          expect(lstatSync(join(project!.loopxDir, "alpha", "package.json")).isDirectory()).toBe(
+            true,
+          );
+          expect(lstatSync(join(project!.loopxDir, "beta", "package.json")).isDirectory()).toBe(
+            true,
+          );
+          expect(countNonRegularPackageJsonWarnings(result.stderr, "alpha")).toBe(1);
+          expect(countNonRegularPackageJsonWarnings(result.stderr, "beta")).toBe(1);
+          expect(readNpmInvocations(logFile)).toHaveLength(0);
+          expect(existsSync(join(project!.loopxDir, "alpha", ".gitignore"))).toBe(
+            false,
+          );
+          expect(existsSync(join(project!.loopxDir, "beta", ".gitignore"))).toBe(
+            false,
+          );
+          expectNoAutoInstallFailureReport(result.stderr);
+        });
       });
 
       it("T-INST-80g: -y does not override zero-workflow source", async () => {
@@ -3643,6 +5352,25 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(result.exitCode).toBe(0);
         expect(existsSync(join(project.loopxDir, "ralph"))).toBe(true);
         expect(existsSync(join(project.loopxDir, "other"))).toBe(true);
+      });
+
+      it("T-INST-83b: single directory plus sibling root file does not trigger wrapper stripping", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball({
+          "pkg/index.sh": BASH_STOP,
+          "README.md": "readme",
+        });
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/archive.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/archive.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "pkg", "index.sh"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "archive"))).toBe(false);
+        expect(existsSync(join(project.loopxDir, "README.md"))).toBe(false);
       });
 
       it("T-INST-83a: multi-workflow tarball self-containment", async () => {
@@ -3923,6 +5651,72 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(existsSync(join(project.loopxDir, "pkg"))).toBe(false);
       });
 
+      it("T-INST-92a: HTTP 500 during tarball download → error, no partial directory", async () => {
+        project = await createTempProject();
+        httpServer = await startLocalHTTPServer([
+          { path: "/pkg.tar.gz", status: 500, body: "server error" },
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/pkg.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/download|http|500|tarball|fetch/i);
+        expect(existsSync(join(project.loopxDir, "pkg"))).toBe(false);
+        expect(readdirSync(project.loopxDir)).toEqual([]);
+      });
+
+      it("T-INST-92b: HTTP redirect is not followed and leaves .loopx unchanged", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "real" },
+        );
+        httpServer = await startLocalHTTPServer([
+          {
+            path: "/redirect.tar.gz",
+            body: "",
+            handler(req, res) {
+              res.writeHead(302, {
+                Location: `http://${req.headers.host}/real.tar.gz`,
+              });
+              res.end();
+            },
+          },
+          tarballRoute("/real.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/redirect.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/download|http|302|redirect|fetch/i);
+        expect(existsSync(join(project.loopxDir, "real"))).toBe(false);
+        expect(readdirSync(project.loopxDir)).toEqual([]);
+        expect(httpServer.requests.filter((path) => path === "/real.tar.gz")).toHaveLength(0);
+      });
+
+      it("T-INST-92c: transport reset during tarball download → error, no partial directory", async () => {
+        project = await createTempProject();
+        httpServer = await startLocalHTTPServer([
+          {
+            path: "/reset.tar.gz",
+            body: "",
+            handler(req) {
+              req.socket.destroy();
+            },
+          },
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/reset.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/download|network|socket|reset|fetch/i);
+        expect(existsSync(join(project.loopxDir, "reset"))).toBe(false);
+        expect(readdirSync(project.loopxDir)).toEqual([]);
+      });
+
       it("T-INST-93: git clone failure (non-existent repo) → error, no partial directory", async () => {
         project = await createTempProject();
         const result = await runCLI(
@@ -4001,6 +5795,32 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(existsSync(join(project.loopxDir, "-bad"))).toBe(false);
       });
 
+      it("T-INST-97a2: preflight failure leaves pre-existing .loopx content unchanged", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(project, "keep", "index", 'echo "KEEP"\n');
+        const keepBefore = readFileSync(
+          join(project.loopxDir, "keep", "index.sh"),
+          "utf-8",
+        );
+        const tarball = await makeTarball(
+          { "index.sh": BASH_STOP },
+          { wrapperDir: "pkg" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/bad.name.tar.gz", tarball),
+        ]);
+        const result = await runCLI(
+          ["install", `${httpServer.url}/bad.name.tar.gz`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(1);
+        expect(readdirSync(project.loopxDir)).toEqual(["keep"]);
+        expect(readFileSync(join(project.loopxDir, "keep", "index.sh"), "utf-8")).toBe(
+          keepBefore,
+        );
+        expect(existsSync(join(project.loopxDir, "bad.name"))).toBe(false);
+      });
+
       it("T-INST-97b: successful install does not create .loopx/package.json", async () => {
         project = await createTempProject();
         gitServer = await startLocalGitServer([
@@ -4016,6 +5836,3867 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
         expect(result.exitCode).toBe(0);
         expect(existsSync(join(project.loopxDir, "package.json"))).toBe(false);
       });
+
+      it("T-INST-97c: installing foo succeeds when .loopx/foo.sh exists", async () => {
+        project = await createTempProject();
+        await writeFile(join(project.loopxDir, "foo.sh"), BASH_STOP, "utf-8");
+        gitServer = await startLocalGitServer([
+          { name: "foo", files: { "index.sh": BASH_STOP } },
+        ]);
+        const result = await runCLI(
+          ["install", `${gitServer.url}/foo.git`],
+          { cwd: project.dir, runtime },
+        );
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(join(project.loopxDir, "foo", "index.sh"))).toBe(true);
+        expect(existsSync(join(project.loopxDir, "foo.sh"))).toBe(true);
+      });
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Post-commit auto-install (T-INST-110 … 110h)
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Post-commit Auto-install", () => {
+    forEachRuntime((runtime) => {
+      it("T-INST-110: npm install runs once per package workflow, sequentially", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm(
+          { exitCode: 0, sleepSeconds: 1 },
+          async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/multi.git`],
+              { cwd: project!.dir, runtime, env, timeout: 10_000 },
+            );
+
+            expect(result.exitCode).toBe(0);
+            const invocations = readNpmInvocations(logFile);
+            expect(invocations).toHaveLength(2);
+            expect(invocations.map((i) => i.cwd).sort()).toEqual([
+              join(project!.loopxDir, "alpha"),
+              join(project!.loopxDir, "beta"),
+            ]);
+            expect(invocations.map((i) => i.argv)).toEqual([
+              ["install"],
+              ["install"],
+            ]);
+
+            const ordered = [...invocations].sort((a, b) => a.start - b.start);
+            expect(ordered[1].start).toBeGreaterThanOrEqual(ordered[0].end);
+            expectNoAutoInstallFailureReport(result.stderr);
+          },
+        );
+      });
+
+      it("T-INST-110a: workflows without top-level package.json are skipped silently", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          const invocations = readNpmInvocations(logFile);
+          expect(invocations).toHaveLength(1);
+          expect(invocations[0].cwd).toBe(join(project!.loopxDir, "alpha"));
+          expect(invocations[0].argv).toEqual(["install"]);
+          expect(result.stderr).not.toMatch(/beta.*package\.json/i);
+        });
+      });
+
+      it("T-INST-110b: -w scopes auto-install to the selected workflow", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", "-w", "alpha", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          const invocations = readNpmInvocations(logFile);
+          expect(invocations).toHaveLength(1);
+          expect(invocations[0].cwd).toBe(join(project!.loopxDir, "alpha"));
+          expect(invocations[0].argv).toEqual(["install"]);
+          expect(existsSync(join(project!.loopxDir, "beta"))).toBe(false);
+        });
+      });
+
+      it("T-INST-110c: package.json presence alone triggers auto-install and .gitignore synthesis", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "minimal-workflow",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "minimal-workflow",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/minimal-workflow.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          const invocations = readNpmInvocations(logFile);
+          expect(invocations).toHaveLength(1);
+          expect(invocations[0].cwd).toBe(
+            join(project!.loopxDir, "minimal-workflow"),
+          );
+          expect(invocations[0].argv).toEqual(["install"]);
+          expect(
+            readFileSync(
+              join(project!.loopxDir, "minimal-workflow", ".gitignore"),
+              "utf-8",
+            ),
+          ).toMatch(/^node_modules\s*$/);
+          expectNoAutoInstallFailureReport(result.stderr);
+        });
+      });
+
+      it("T-INST-110d: no-index workflow with package.json still triggers auto-install", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "tools",
+            files: {
+              "check.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "tools",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/tools.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          const invocations = readNpmInvocations(logFile);
+          expect(invocations).toHaveLength(1);
+          expect(invocations[0].cwd).toBe(join(project!.loopxDir, "tools"));
+          expect(invocations[0].argv).toEqual(["install"]);
+          expect(
+            readFileSync(join(project!.loopxDir, "tools", ".gitignore"), "utf-8"),
+          ).toMatch(/^node_modules\s*$/);
+          expect(existsSync(join(project!.loopxDir, "tools", "index.sh"))).toBe(
+            false,
+          );
+        });
+      });
+
+      it("T-INST-110e: nested package.json alone does not trigger auto-install", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "nested-only",
+            files: {
+              "index.sh": BASH_STOP,
+              "lib/package.json": JSON.stringify({
+                name: "nested-lib",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/nested-only.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(readNpmInvocations(logFile)).toHaveLength(0);
+          expect(
+            existsSync(join(project!.loopxDir, "nested-only", ".gitignore")),
+          ).toBe(false);
+          expect(
+            readFileSync(
+              join(project!.loopxDir, "nested-only", "lib", "package.json"),
+              "utf-8",
+            ),
+          ).toBe(JSON.stringify({ name: "nested-lib", version: "1.0.0" }));
+        });
+      });
+
+      it("T-INST-110f: -w selected no-index workflow still triggers auto-install", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "tools/check.sh": BASH_STOP,
+              "tools/package.json": JSON.stringify({
+                name: "tools",
+                version: "1.0.0",
+              }),
+              "other/index.sh": BASH_STOP,
+              "other/package.json": JSON.stringify({
+                name: "other",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", "-w", "tools", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          const invocations = readNpmInvocations(logFile);
+          expect(invocations).toHaveLength(1);
+          expect(invocations[0].cwd).toBe(join(project!.loopxDir, "tools"));
+          expect(invocations[0].argv).toEqual(["install"]);
+          expect(
+            readFileSync(join(project!.loopxDir, "tools", ".gitignore"), "utf-8"),
+          ).toMatch(/^node_modules\s*$/);
+          expect(existsSync(join(project!.loopxDir, "tools", "check.sh"))).toBe(
+            true,
+          );
+          expect(existsSync(join(project!.loopxDir, "tools", "index.sh"))).toBe(
+            false,
+          );
+          expect(existsSync(join(project!.loopxDir, "other"))).toBe(false);
+        });
+      });
+
+      it("T-INST-110g: tarball source with top-level package.json triggers auto-install", async () => {
+        project = await createTempProject();
+        const tarball = await makeTarball(
+          {
+            "index.sh": BASH_STOP,
+            "package.json": JSON.stringify({
+              name: "tarball-workflow",
+              version: "1.0.0",
+            }),
+          },
+          { wrapperDir: "tarball-workflow" },
+        );
+        httpServer = await startLocalHTTPServer([
+          tarballRoute("/tarball-workflow.tar.gz", tarball),
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${httpServer!.url}/tarball-workflow.tar.gz`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          const installed = join(project!.loopxDir, "tarball-workflow");
+          expect(readFileSync(join(installed, "index.sh"), "utf-8")).toBe(
+            BASH_STOP,
+          );
+          expect(readFileSync(join(installed, "package.json"), "utf-8")).toBe(
+            JSON.stringify({ name: "tarball-workflow", version: "1.0.0" }),
+          );
+          const invocations = readNpmInvocations(logFile);
+          expect(invocations).toHaveLength(1);
+          expect(invocations[0].cwd).toBe(installed);
+          expect(invocations[0].argv).toEqual(["install"]);
+          expect(readFileSync(join(installed, ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+        });
+      });
+
+      it("T-INST-110h: symlinked workflow directory with package.json triggers auto-install after materialization", async () => {
+        project = await createTempProject();
+        const bareDir = join(project.dir, "symlinked.git");
+        const workDir = join(project.dir, "symlinked-work");
+        execSync(`git init --bare "${bareDir}"`, { stdio: "pipe" });
+        execSync(`git clone "${bareDir}" "${workDir}"`, { stdio: "pipe" });
+        await mkdir(join(workDir, "internal", "real-workflow"), {
+          recursive: true,
+        });
+        await writeFile(
+          join(workDir, "internal", "real-workflow", "index.sh"),
+          BASH_STOP,
+          "utf-8",
+        );
+        await chmod(join(workDir, "internal", "real-workflow", "index.sh"), 0o755);
+        await writeFile(
+          join(workDir, "internal", "real-workflow", "package.json"),
+          JSON.stringify({ name: "real-workflow", version: "1.0.0" }),
+          "utf-8",
+        );
+        symlinkSync("internal/real-workflow", join(workDir, "alias"));
+        execSync(
+          `cd "${workDir}" && git add -A && git -c user.email="test@test.com" -c user.name="Test" commit -m "initial"`,
+          { stdio: "pipe" },
+        );
+        execSync(`cd "${workDir}" && git push origin HEAD`, { stdio: "pipe" });
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(["install", `file://${bareDir}`], {
+            cwd: project!.dir,
+            runtime,
+            env,
+          });
+
+          expect(result.exitCode).toBe(0);
+          const installed = join(project!.loopxDir, "alias");
+          expect(lstatSync(installed).isSymbolicLink()).toBe(false);
+          expect(lstatSync(join(installed, "index.sh")).isFile()).toBe(true);
+          expect(lstatSync(join(installed, "package.json")).isFile()).toBe(true);
+          const invocations = readNpmInvocations(logFile);
+          expect(invocations).toHaveLength(1);
+          expect(invocations[0].cwd).toBe(installed);
+          expect(invocations[0].argv).toEqual(["install"]);
+          expect(readFileSync(join(installed, ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+          expect(existsSync(join(project!.loopxDir, "internal"))).toBe(false);
+        });
+      });
+
+      it("T-INST-111: --no-install suppresses npm install and .gitignore synthesis only", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "no-install",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "no-install",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", "--no-install", `${gitServer!.url}/no-install.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(readNpmInvocations(logFile)).toHaveLength(0);
+          expect(
+            existsSync(join(project!.loopxDir, "no-install", ".gitignore")),
+          ).toBe(false);
+          expect(
+            existsSync(join(project!.loopxDir, "no-install", "index.sh")),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "no-install", "package.json")),
+          ).toBe(true);
+        });
+      });
+
+      it("T-INST-111a: --no-install preserves a pre-existing .gitignore unchanged", async () => {
+        project = await createTempProject();
+        const gitignore = "dist/\n";
+        gitServer = await startLocalGitServer([
+          {
+            name: "custom-ignore",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "custom-ignore",
+                version: "1.0.0",
+              }),
+              ".gitignore": gitignore,
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", "--no-install", `${gitServer!.url}/custom-ignore.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(readNpmInvocations(logFile)).toHaveLength(0);
+          expect(
+            readFileSync(
+              join(project!.loopxDir, "custom-ignore", ".gitignore"),
+              "utf-8",
+            ),
+          ).toBe(gitignore);
+        });
+      });
+
+      it("T-INST-111b: --no-install does not suppress fatal preflight validation", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "mismatch",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "mismatch",
+                version: "1.0.0",
+                dependencies: { loopx: unsatisfiedRange() },
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", "--no-install", `${gitServer!.url}/mismatch.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(1);
+          expect(hasVersionMismatchWarning(result.stderr, "mismatch")).toBe(
+            true,
+          );
+          expect(readNpmInvocations(logFile)).toHaveLength(0);
+          expect(existsSync(join(project!.loopxDir, "mismatch"))).toBe(false);
+        });
+      });
+
+      it("T-INST-111c: --no-install does not suppress nonfatal package.json parse warnings", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "malformed",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": "{broken",
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", "--no-install", `${gitServer!.url}/malformed.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(readNpmInvocations(logFile)).toHaveLength(0);
+          expect(countInvalidJsonWarnings(result.stderr, "malformed")).toBe(1);
+          expect(
+            existsSync(join(project!.loopxDir, "malformed", ".gitignore")),
+          ).toBe(false);
+          expect(
+            readFileSync(
+              join(project!.loopxDir, "malformed", "package.json"),
+              "utf-8",
+            ),
+          ).toBe("{broken");
+          expect(
+            existsSync(join(project!.loopxDir, "malformed", "index.sh")),
+          ).toBe(true);
+        });
+      });
+
+      it("T-INST-111d: --no-install suppresses auto-install for every workflow in a multi-source", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", "--no-install", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(readNpmInvocations(logFile)).toHaveLength(0);
+          for (const name of ["alpha", "beta", "gamma"]) {
+            expect(existsSync(join(project!.loopxDir, name, "index.sh"))).toBe(
+              true,
+            );
+            expect(
+              existsSync(join(project!.loopxDir, name, "package.json")),
+            ).toBe(true);
+            expect(existsSync(join(project!.loopxDir, name, ".gitignore"))).toBe(
+              false,
+            );
+          }
+          expectNoAutoInstallFailureReport(result.stderr);
+        });
+      });
+
+      it("T-INST-111e: --no-install and -w commits only the selected workflow without auto-install", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            [
+              "install",
+              "--no-install",
+              "-w",
+              "beta",
+              `${gitServer!.url}/multi.git`,
+            ],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(readNpmInvocations(logFile)).toHaveLength(0);
+          expect(existsSync(join(project!.loopxDir, "beta", "index.sh"))).toBe(
+            true,
+          );
+          expect(
+            existsSync(join(project!.loopxDir, "beta", "package.json")),
+          ).toBe(true);
+          expect(existsSync(join(project!.loopxDir, "beta", ".gitignore"))).toBe(
+            false,
+          );
+          expect(existsSync(join(project!.loopxDir, "alpha"))).toBe(false);
+          expect(existsSync(join(project!.loopxDir, "gamma"))).toBe(false);
+          expectNoAutoInstallFailureReport(result.stderr);
+        });
+      });
+
+      it("T-INST-112: missing .gitignore is synthesized before npm install starts", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "synthesize-ignore",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "synthesize-ignore",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm(
+          { exitCode: 0, recordGitignoreAtStart: true },
+          async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/synthesize-ignore.git`],
+              { cwd: project!.dir, runtime, env },
+            );
+
+            expect(result.exitCode).toBe(0);
+            const installed = join(project!.loopxDir, "synthesize-ignore");
+            expect(readFileSync(join(installed, ".gitignore"), "utf-8")).toMatch(
+              /^node_modules\s*$/,
+            );
+            const invocations = readNpmInvocations(logFile);
+            expect(invocations).toHaveLength(1);
+            expect(invocations[0].cwd).toBe(installed);
+            expect(invocations[0].argv).toEqual(["install"]);
+            expect(invocations[0].gitignoreAtStart).toEqual({
+              existed: true,
+              content: "node_modules",
+            });
+          },
+        );
+      });
+
+      it("T-INST-112a: existing regular .gitignore is left unchanged and npm still runs", async () => {
+        project = await createTempProject();
+        const gitignore = "dist/\n# my custom comment\n";
+        gitServer = await startLocalGitServer([
+          {
+            name: "existing-ignore",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "existing-ignore",
+                version: "1.0.0",
+              }),
+              ".gitignore": gitignore,
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/existing-ignore.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          const installed = join(project!.loopxDir, "existing-ignore");
+          expect(readFileSync(join(installed, ".gitignore"), "utf-8")).toBe(
+            gitignore,
+          );
+          expect(result.stderr).not.toMatch(/node_modules.*gitignore/i);
+          const invocations = readNpmInvocations(logFile);
+          expect(invocations).toHaveLength(1);
+          expect(invocations[0].cwd).toBe(installed);
+          expect(invocations[0].argv).toEqual(["install"]);
+        });
+      });
+
+      it("T-INST-112a2: source .gitignore symlink to regular file materializes as regular file", async () => {
+        project = await createTempProject();
+        const gitignore = "dist/\n# project-custom\n";
+        const source = await createManualGitSource(
+          project.dir,
+          "symlink-gitignore-workflow",
+          async (workDir) => {
+            await writeFile(join(workDir, "index.sh"), BASH_STOP, "utf-8");
+            await chmod(join(workDir, "index.sh"), 0o755);
+            await writeFile(
+              join(workDir, "package.json"),
+              JSON.stringify({
+                name: "symlink-gitignore-workflow",
+                version: "1.0.0",
+              }),
+              "utf-8",
+            );
+            await writeFile(join(workDir, "gitignore-template"), gitignore, "utf-8");
+            symlinkSync("gitignore-template", join(workDir, ".gitignore"));
+          },
+        );
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(["install", source], {
+            cwd: project!.dir,
+            runtime,
+            env,
+          });
+
+          expect(result.exitCode).toBe(0);
+          const installed = join(project!.loopxDir, "symlink-gitignore-workflow");
+          expect(lstatSync(join(installed, ".gitignore")).isFile()).toBe(true);
+          expect(
+            lstatSync(join(installed, ".gitignore")).isSymbolicLink(),
+          ).toBe(false);
+          expect(readFileSync(join(installed, ".gitignore"), "utf-8")).toBe(
+            gitignore,
+          );
+          expect(readFileSync(join(installed, "gitignore-template"), "utf-8")).toBe(
+            gitignore,
+          );
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            installed,
+          ]);
+          expectNoAutoInstallFailureReport(result.stderr);
+        });
+      });
+
+      it("T-INST-112a3: source .gitignore symlink to directory materializes and fails safeguard", async () => {
+        project = await createTempProject();
+        const source = await createManualGitSource(
+          project.dir,
+          "multi",
+          async (workDir) => {
+            await mkdir(join(workDir, "alpha", "gitignore-dir"), {
+              recursive: true,
+            });
+            await mkdir(join(workDir, "beta"), { recursive: true });
+            await writeFile(join(workDir, "alpha", "index.sh"), BASH_STOP, "utf-8");
+            await chmod(join(workDir, "alpha", "index.sh"), 0o755);
+            await writeFile(
+              join(workDir, "alpha", "package.json"),
+              JSON.stringify({ name: "alpha", version: "1.0.0" }),
+              "utf-8",
+            );
+            await writeFile(
+              join(workDir, "alpha", "gitignore-dir", "README"),
+              "kept",
+              "utf-8",
+            );
+            symlinkSync("gitignore-dir", join(workDir, "alpha", ".gitignore"));
+            await writeFile(join(workDir, "beta", "index.sh"), BASH_STOP, "utf-8");
+            await chmod(join(workDir, "beta", "index.sh"), 0o755);
+            await writeFile(
+              join(workDir, "beta", "package.json"),
+              JSON.stringify({ name: "beta", version: "1.0.0" }),
+              "utf-8",
+            );
+          },
+        );
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(["install", source], {
+            cwd: project!.dir,
+            runtime,
+            env,
+          });
+
+          expect(result.exitCode).toBe(1);
+          expect(
+            lstatSync(join(project!.loopxDir, "alpha", ".gitignore")).isDirectory(),
+          ).toBe(true);
+          expect(
+            readFileSync(
+              join(project!.loopxDir, "alpha", ".gitignore", "README"),
+              "utf-8",
+            ),
+          ).toBe("kept");
+          expect(
+            readFileSync(
+              join(project!.loopxDir, "alpha", "gitignore-dir", "README"),
+              "utf-8",
+            ),
+          ).toBe("kept");
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "beta"),
+          ]);
+          expect(result.stderr).toMatch(/alpha/i);
+          expect(result.stderr).toMatch(/gitignore/i);
+          expect(readFileSync(join(project!.loopxDir, "beta", ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+        });
+      });
+
+      it("T-INST-112a4: cross-boundary .gitignore symlink to regular file materializes", async () => {
+        project = await createTempProject();
+        const gitignore = "dist/\n# project-custom\n";
+        const source = await createManualGitSource(
+          project.dir,
+          "cross-file",
+          async (workDir) => {
+            await mkdir(join(workDir, "ralph"), { recursive: true });
+            await mkdir(join(workDir, "shared"), { recursive: true });
+            await writeFile(join(workDir, "ralph", "index.sh"), BASH_STOP, "utf-8");
+            await chmod(join(workDir, "ralph", "index.sh"), 0o755);
+            await writeFile(
+              join(workDir, "ralph", "package.json"),
+              JSON.stringify({ name: "ralph", version: "1.0.0" }),
+              "utf-8",
+            );
+            await writeFile(
+              join(workDir, "shared", "gitignore-template"),
+              gitignore,
+              "utf-8",
+            );
+            symlinkSync(
+              "../shared/gitignore-template",
+              join(workDir, "ralph", ".gitignore"),
+            );
+          },
+        );
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(["install", source], {
+            cwd: project!.dir,
+            runtime,
+            env,
+          });
+
+          expect(result.exitCode).toBe(0);
+          const installed = join(project!.loopxDir, "ralph");
+          expect(lstatSync(join(installed, ".gitignore")).isFile()).toBe(true);
+          expect(readFileSync(join(installed, ".gitignore"), "utf-8")).toBe(
+            gitignore,
+          );
+          expect(existsSync(join(project!.loopxDir, "shared"))).toBe(false);
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            installed,
+          ]);
+          expectNoAutoInstallFailureReport(result.stderr);
+        });
+      });
+
+      it("T-INST-112a5: cross-boundary .gitignore symlink to directory materializes and fails", async () => {
+        project = await createTempProject();
+        const source = await createManualGitSource(
+          project.dir,
+          "cross-dir",
+          async (workDir) => {
+            await mkdir(join(workDir, "alpha"), { recursive: true });
+            await mkdir(join(workDir, "beta"), { recursive: true });
+            await mkdir(join(workDir, "shared", "gitignore-dir"), {
+              recursive: true,
+            });
+            await writeFile(join(workDir, "alpha", "index.sh"), BASH_STOP, "utf-8");
+            await chmod(join(workDir, "alpha", "index.sh"), 0o755);
+            await writeFile(
+              join(workDir, "alpha", "package.json"),
+              JSON.stringify({ name: "alpha", version: "1.0.0" }),
+              "utf-8",
+            );
+            await writeFile(
+              join(workDir, "shared", "gitignore-dir", "README"),
+              "kept",
+              "utf-8",
+            );
+            symlinkSync(
+              "../shared/gitignore-dir",
+              join(workDir, "alpha", ".gitignore"),
+            );
+            await writeFile(join(workDir, "beta", "index.sh"), BASH_STOP, "utf-8");
+            await chmod(join(workDir, "beta", "index.sh"), 0o755);
+            await writeFile(
+              join(workDir, "beta", "package.json"),
+              JSON.stringify({ name: "beta", version: "1.0.0" }),
+              "utf-8",
+            );
+          },
+        );
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(["install", source], {
+            cwd: project!.dir,
+            runtime,
+            env,
+          });
+
+          expect(result.exitCode).toBe(1);
+          expect(
+            lstatSync(join(project!.loopxDir, "alpha", ".gitignore")).isDirectory(),
+          ).toBe(true);
+          expect(
+            readFileSync(
+              join(project!.loopxDir, "alpha", ".gitignore", "README"),
+              "utf-8",
+            ),
+          ).toBe("kept");
+          expect(existsSync(join(project!.loopxDir, "shared"))).toBe(false);
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "beta"),
+          ]);
+          expect(result.stderr).toMatch(/alpha/i);
+          expect(result.stderr).toMatch(/gitignore/i);
+        });
+      });
+
+      it("T-INST-112b: .gitignore synthesis is skipped without top-level package.json", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "no-package",
+            files: {
+              "index.sh": BASH_STOP,
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/no-package.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(readNpmInvocations(logFile)).toHaveLength(0);
+          expect(
+            existsSync(join(project!.loopxDir, "no-package", ".gitignore")),
+          ).toBe(false);
+          expect(
+            existsSync(join(project!.loopxDir, "no-package", "index.sh")),
+          ).toBe(true);
+        });
+      });
+
+      it("T-INST-112e: directory .gitignore is a safeguard failure and does not stop other workflows", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "alpha/.gitignore/README": "kept",
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(1);
+          expect(lstatSync(join(project!.loopxDir, "alpha", ".gitignore")).isDirectory()).toBe(
+            true,
+          );
+          expect(
+            readFileSync(
+              join(project!.loopxDir, "alpha", ".gitignore", "README"),
+              "utf-8",
+            ),
+          ).toBe("kept");
+          const invocations = readNpmInvocations(logFile);
+          expect(invocations).toHaveLength(1);
+          expect(invocations[0].cwd).toBe(join(project!.loopxDir, "beta"));
+          expect(invocations[0].argv).toEqual(["install"]);
+          expect(result.stderr).toMatch(/alpha/i);
+          expect(result.stderr).toMatch(/gitignore/i);
+          expect(readFileSync(join(project!.loopxDir, "beta", ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+        });
+      });
+
+      it("T-INST-112f: --no-install skips safeguard lstat even for directory .gitignore", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "directory-ignore",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "directory-ignore",
+                version: "1.0.0",
+              }),
+              ".gitignore/README": "kept",
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            [
+              "install",
+              "--no-install",
+              `${gitServer!.url}/directory-ignore.git`,
+            ],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(readNpmInvocations(logFile)).toHaveLength(0);
+          expect(
+            lstatSync(
+              join(project!.loopxDir, "directory-ignore", ".gitignore"),
+            ).isDirectory(),
+          ).toBe(true);
+          expectNoAutoInstallFailureReport(result.stderr);
+        });
+      });
+
+      it.each([
+        ["regular-file-target", ".gitignore-target", true],
+        ["broken", "does-not-exist", false],
+        ["cycle", ".gitignore-loop", true],
+      ] as const)(
+        "T-INST-112g: symlink .gitignore safeguard failure (%s)",
+        async (kind, expectedTarget, targetExists) => {
+          project = await createTempProject();
+          gitServer = await startLocalGitServer([
+            {
+              name: "multi",
+              files: {
+                "alpha/index.sh": BASH_STOP,
+                "alpha/package.json": JSON.stringify({
+                  name: "alpha",
+                  version: "1.0.0",
+                }),
+                "beta/index.sh": BASH_STOP,
+                "beta/package.json": JSON.stringify({
+                  name: "beta",
+                  version: "1.0.0",
+                }),
+              },
+            },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: {
+                  ...env,
+                  NODE_ENV: "test",
+                  LOOPX_TEST_AUTOINSTALL_FAULT: `gitignore-replace-with-symlink:alpha=${kind}`,
+                },
+              },
+            );
+
+            expect(result.exitCode).toBe(1);
+            expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+              join(project!.loopxDir, "beta"),
+            ]);
+            expect(result.stderr).toMatch(/alpha/i);
+            expect(result.stderr).toMatch(/gitignore/i);
+            const linkPath = join(project!.loopxDir, "alpha", ".gitignore");
+            expect(lstatSync(linkPath).isSymbolicLink()).toBe(true);
+            expect(readlinkSync(linkPath)).toBe(expectedTarget);
+            expect(
+              existsSync(join(project!.loopxDir, "alpha", expectedTarget)),
+            ).toBe(targetExists);
+            if (kind === "cycle") {
+              expect(
+                lstatSync(
+                  join(project!.loopxDir, "alpha", ".gitignore-loop"),
+                ).isSymbolicLink(),
+              ).toBe(true);
+            }
+            expect(readFileSync(join(project!.loopxDir, "beta", ".gitignore"), "utf-8")).toMatch(
+              /^node_modules\s*$/,
+            );
+          });
+        },
+      );
+
+      it("T-INST-112l: no-package workflow skips safeguard before lstat on directory .gitignore", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/.gitignore/README": "kept",
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          const invocations = readNpmInvocations(logFile);
+          expect(invocations).toHaveLength(1);
+          expect(invocations[0].cwd).toBe(join(project!.loopxDir, "beta"));
+          expectNoAutoInstallFailureReport(result.stderr);
+          expect(
+            lstatSync(join(project!.loopxDir, "alpha", ".gitignore")).isDirectory(),
+          ).toBe(true);
+          expect(
+            existsSync(join(project!.loopxDir, "alpha", "index.sh")),
+          ).toBe(true);
+          expect(readFileSync(join(project!.loopxDir, "beta", ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+        });
+      });
+
+      it("T-INST-112m: malformed package.json skips safeguard before lstat on directory .gitignore", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": "{broken",
+              "alpha/.gitignore/README": "kept",
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          const invocations = readNpmInvocations(logFile);
+          expect(invocations).toHaveLength(1);
+          expect(invocations[0].cwd).toBe(join(project!.loopxDir, "beta"));
+          expect(countInvalidJsonWarnings(result.stderr, "alpha")).toBe(1);
+          expectNoAutoInstallFailureReport(result.stderr);
+          expect(
+            lstatSync(join(project!.loopxDir, "alpha", ".gitignore")).isDirectory(),
+          ).toBe(true);
+          expect(
+            readFileSync(join(project!.loopxDir, "alpha", "package.json"), "utf-8"),
+          ).toBe("{broken");
+          expect(readFileSync(join(project!.loopxDir, "beta", ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+        });
+      });
+
+      it("T-INST-112c / T-INST-112d: .gitignore write failure skips npm, continues, and does not roll back", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              env: {
+                ...env,
+                NODE_ENV: "test",
+                LOOPX_TEST_AUTOINSTALL_FAULT:
+                  "gitignore-write-fail:beta,gamma",
+              },
+            },
+          );
+
+          expect(result.exitCode).toBe(1);
+          const invocations = readNpmInvocations(logFile);
+          expect(invocations.map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "alpha"),
+          ]);
+          expect(result.stderr).toMatch(/beta/i);
+          expect(result.stderr).toMatch(/gamma/i);
+          expect(result.stderr).toMatch(/gitignore/i);
+          expect(result.stderr).not.toMatch(/alpha.*gitignore/i);
+          expect(readFileSync(join(project!.loopxDir, "alpha", ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+          for (const name of ["beta", "gamma"]) {
+            expect(existsSync(join(project!.loopxDir, name, "index.sh"))).toBe(
+              true,
+            );
+            expect(
+              existsSync(join(project!.loopxDir, name, "package.json")),
+            ).toBe(true);
+            expect(existsSync(join(project!.loopxDir, name, ".gitignore"))).toBe(
+              false,
+            );
+          }
+        });
+      });
+
+      it("T-INST-112h: .gitignore lstat failure skips npm and leaves no synthesized file", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              env: {
+                ...env,
+                NODE_ENV: "test",
+                LOOPX_TEST_AUTOINSTALL_FAULT: "gitignore-lstat-fail:beta,gamma",
+              },
+            },
+          );
+
+          expect(result.exitCode).toBe(1);
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "alpha"),
+          ]);
+          expect(result.stderr).toMatch(/beta/i);
+          expect(result.stderr).toMatch(/gamma/i);
+          expect(result.stderr).toMatch(/gitignore/i);
+          expect(readFileSync(join(project!.loopxDir, "alpha", ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+          expect(existsSync(join(project!.loopxDir, "beta", ".gitignore"))).toBe(
+            false,
+          );
+          expect(
+            existsSync(join(project!.loopxDir, "gamma", ".gitignore")),
+          ).toBe(false);
+        });
+      });
+
+      it.each([
+        ["T-INST-112i", "gitignore-replace-with-fifo:alpha", "isFIFO"],
+        ["T-INST-112j", "gitignore-replace-with-socket:alpha", "isSocket"],
+      ] as const)(
+        "%s: non-regular %s .gitignore is a safeguard failure",
+        async (_id, fault, statMethod) => {
+          project = await createTempProject();
+          gitServer = await startLocalGitServer([
+            {
+              name: "multi",
+              files: {
+                "alpha/index.sh": BASH_STOP,
+                "alpha/package.json": JSON.stringify({
+                  name: "alpha",
+                  version: "1.0.0",
+                }),
+                "beta/index.sh": BASH_STOP,
+                "beta/package.json": JSON.stringify({
+                  name: "beta",
+                  version: "1.0.0",
+                }),
+              },
+            },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: {
+                  ...env,
+                  NODE_ENV: "test",
+                  LOOPX_TEST_AUTOINSTALL_FAULT: fault,
+                },
+              },
+            );
+
+            expect(result.exitCode).toBe(1);
+            expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+              join(project!.loopxDir, "beta"),
+            ]);
+            expect(result.stderr).toMatch(/alpha/i);
+            expect(result.stderr).toMatch(/gitignore/i);
+            expect(lstatSync(join(project!.loopxDir, "alpha", ".gitignore"))[statMethod]()).toBe(
+              true,
+            );
+            expect(readFileSync(join(project!.loopxDir, "beta", ".gitignore"), "utf-8")).toMatch(
+              /^node_modules\s*$/,
+            );
+          });
+        },
+      );
+
+      it("T-INST-112k: unreadable regular .gitignore is not inspected or chmodded", async () => {
+        if (IS_ROOT) {
+          expect(IS_ROOT).toBe(true);
+          return;
+        }
+        project = await createTempProject();
+        const gitignore = "dist/\n# my-content\n";
+        gitServer = await startLocalGitServer([
+          {
+            name: "unreadable-ignore",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "unreadable-ignore",
+                version: "1.0.0",
+              }),
+              ".gitignore": gitignore,
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/unreadable-ignore.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              env: {
+                ...env,
+                NODE_ENV: "test",
+                LOOPX_TEST_AUTOINSTALL_FAULT:
+                  "gitignore-make-unreadable:unreadable-ignore",
+              },
+            },
+          );
+
+          expect(result.exitCode).toBe(0);
+          const installed = join(project!.loopxDir, "unreadable-ignore");
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            installed,
+          ]);
+          expectNoAutoInstallFailureReport(result.stderr);
+          const gitignorePath = join(installed, ".gitignore");
+          expect(lstatSync(gitignorePath).isFile()).toBe(true);
+          expect(lstatSync(gitignorePath).mode & 0o777).toBe(0);
+          await chmod(gitignorePath, 0o644);
+          expect(readFileSync(gitignorePath, "utf-8")).toBe(gitignore);
+        });
+      });
+
+      it("T-INST-112n: lstat failure on an existing regular .gitignore makes no further changes", async () => {
+        if (IS_ROOT) {
+          expect(IS_ROOT).toBe(true);
+          return;
+        }
+        project = await createTempProject();
+        const alphaGitignore = "dist/\n# my-pre-existing-content\n";
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "alpha/.gitignore": alphaGitignore,
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              env: {
+                ...env,
+                NODE_ENV: "test",
+                LOOPX_TEST_AUTOINSTALL_FAULT:
+                  "gitignore-make-unreadable:alpha;gitignore-lstat-fail:alpha",
+              },
+            },
+          );
+
+          expect(result.exitCode).toBe(1);
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "beta"),
+          ]);
+          expect(result.stderr).toMatch(/alpha/i);
+          expect(result.stderr).toMatch(/gitignore/i);
+          const alphaGitignorePath = join(project!.loopxDir, "alpha", ".gitignore");
+          expect(lstatSync(alphaGitignorePath).mode & 0o777).toBe(0);
+          await chmod(alphaGitignorePath, 0o644);
+          expect(readFileSync(alphaGitignorePath, "utf-8")).toBe(alphaGitignore);
+          expect(readFileSync(join(project!.loopxDir, "beta", ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+        });
+      });
+
+      it("T-INST-112o: partial .gitignore write failure preserves partial bytes and mode", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              env: {
+                ...env,
+                NODE_ENV: "test",
+                LOOPX_TEST_AUTOINSTALL_FAULT:
+                  "gitignore-partial-write-fail:beta,gamma",
+              },
+            },
+          );
+
+          expect(result.exitCode).toBe(1);
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "alpha"),
+          ]);
+          expect(result.stderr).toMatch(/beta/i);
+          expect(result.stderr).toMatch(/gamma/i);
+          expect(readFileSync(join(project!.loopxDir, "alpha", ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+          for (const name of ["beta", "gamma"]) {
+            const partialPath = join(project!.loopxDir, name, ".gitignore");
+            const modePath = join(
+              project!.loopxDir,
+              name,
+              ".gitignore.seam-observed-mode",
+            );
+            expect(lstatSync(partialPath).isFile()).toBe(true);
+            expect(readFileSync(partialPath, "utf-8")).toBe("node");
+            expect(lstatSync(partialPath).mode & 0o777).toBe(
+              Number(readFileSync(modePath, "utf-8")),
+            );
+          }
+        });
+      });
+
+      it.each([
+        ["T-INST-113", "invalid-json", "{broken", "invalid-json"],
+        [
+          "T-INST-113b",
+          "invalid-semver",
+          JSON.stringify({ dependencies: { loopx: "not-a-range!!!" } }),
+          "invalid-semver",
+        ],
+        [
+          "T-INST-113g",
+          "non-string-loopx-range",
+          JSON.stringify({ dependencies: { loopx: 42 } }),
+          "invalid-semver",
+        ],
+      ] as const)(
+        "%s: malformed package.json skips auto-install silently (%s)",
+        async (_id, name, packageJson, warningKind) => {
+          project = await createTempProject();
+          gitServer = await startLocalGitServer([
+            {
+              name,
+              files: {
+                "index.sh": BASH_STOP,
+                "package.json": packageJson,
+              },
+            },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/${name}.git`],
+              { cwd: project!.dir, runtime, env },
+            );
+
+            expect(result.exitCode).toBe(0);
+            expect(readNpmInvocations(logFile)).toHaveLength(0);
+            if (warningKind === "invalid-json") {
+              expect(countInvalidJsonWarnings(result.stderr, name)).toBe(1);
+            } else {
+              expect(countInvalidSemverWarnings(result.stderr, name)).toBe(1);
+            }
+            expect(existsSync(join(project!.loopxDir, name, ".gitignore"))).toBe(
+              false,
+            );
+            expectNoAutoInstallFailureReport(result.stderr);
+            expect(readFileSync(join(project!.loopxDir, name, "package.json"), "utf-8")).toBe(
+              packageJson,
+            );
+          });
+        },
+      );
+
+      it("T-INST-113a: unreadable committed package.json skips auto-install with one warning", async () => {
+        if (IS_ROOT) {
+          expect(IS_ROOT).toBe(true);
+          return;
+        }
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({ name: "ralph", version: "1.0.0" }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/ralph.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              env: {
+                ...env,
+                NODE_ENV: "test",
+                LOOPX_TEST_AUTOINSTALL_FAULT:
+                  "package-json-make-unreadable:ralph",
+              },
+            },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(readNpmInvocations(logFile)).toHaveLength(0);
+          expect(countUnreadableWarnings(result.stderr, "ralph")).toBe(1);
+          expect(existsSync(join(project!.loopxDir, "ralph", ".gitignore"))).toBe(
+            false,
+          );
+          const packagePath = join(project!.loopxDir, "ralph", "package.json");
+          expect(lstatSync(packagePath).mode & 0o777).toBe(0);
+          await chmod(packagePath, 0o644);
+          expectNoAutoInstallFailureReport(result.stderr);
+        });
+      });
+
+      it.each([
+        [
+          "T-INST-113d",
+          "ignored-optional",
+          { optionalDependencies: { loopx: "not-a-range!!!" } },
+        ],
+        [
+          "T-INST-113d2",
+          "ignored-peer",
+          { peerDependencies: { loopx: "not-a-range!!!" } },
+        ],
+        [
+          "T-INST-113e",
+          "dependency-precedence",
+          {
+            dependencies: { loopx: "*" },
+            devDependencies: { loopx: "not-a-range!!!" },
+          },
+        ],
+        [
+          "T-INST-113f",
+          "unrelated-invalid-range",
+          { dependencies: { "not-loopx": "not-a-range!!!" } },
+        ],
+      ] as const)(
+        "%s: ignored invalid package ranges do not skip auto-install",
+        async (_id, name, packageJson) => {
+          project = await createTempProject();
+          gitServer = await startLocalGitServer([
+            {
+              name,
+              files: {
+                "index.sh": BASH_STOP,
+                "package.json": JSON.stringify(packageJson),
+              },
+            },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/${name}.git`],
+              { cwd: project!.dir, runtime, env },
+            );
+
+            expect(result.exitCode).toBe(0);
+            expect(hasAnyPackageJsonWarning(result.stderr, name)).toBe(false);
+            expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+              join(project!.loopxDir, name),
+            ]);
+            expect(readFileSync(join(project!.loopxDir, name, ".gitignore"), "utf-8")).toMatch(
+              /^node_modules\s*$/,
+            );
+          });
+        },
+      );
+
+      it("T-INST-113c: multi-workflow install continues past invalid JSON package.json", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": "{broken",
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "beta"),
+          ]);
+          expect(countInvalidJsonWarnings(result.stderr, "alpha")).toBe(1);
+          expect(existsSync(join(project!.loopxDir, "alpha", ".gitignore"))).toBe(
+            false,
+          );
+          expect(readFileSync(join(project!.loopxDir, "beta", ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+          expectNoAutoInstallFailureReport(result.stderr);
+          expect(existsSync(join(project!.loopxDir, "alpha"))).toBe(true);
+          expect(existsSync(join(project!.loopxDir, "beta"))).toBe(true);
+        });
+      });
+
+      it.each([
+        [
+          "T-INST-113c2",
+          "invalid-semver",
+          JSON.stringify({ dependencies: { loopx: "not-a-range!!!" } }),
+          "invalid-semver",
+          undefined,
+        ],
+        [
+          "T-INST-113c2",
+          "non-string-range",
+          JSON.stringify({ dependencies: { loopx: 42 } }),
+          "invalid-semver",
+          undefined,
+        ],
+        [
+          "T-INST-113c2",
+          "unreadable",
+          JSON.stringify({ name: "alpha", version: "1.0.0" }),
+          "unreadable",
+          "package-json-make-unreadable:alpha",
+        ],
+      ] as const)(
+        "%s: multi-workflow continuation for malformed package cause %s",
+        async (_id, variant, alphaPackageJson, warningKind, fault) => {
+          if (variant === "unreadable" && IS_ROOT) {
+            expect(IS_ROOT).toBe(true);
+            return;
+          }
+          project = await createTempProject();
+          gitServer = await startLocalGitServer([
+            {
+              name: "multi",
+              files: {
+                "alpha/index.sh": BASH_STOP,
+                "alpha/package.json": alphaPackageJson,
+                "beta/index.sh": BASH_STOP,
+                "beta/package.json": JSON.stringify({
+                  name: "beta",
+                  version: "1.0.0",
+                }),
+              },
+            },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: fault
+                  ? {
+                      ...env,
+                      NODE_ENV: "test",
+                      LOOPX_TEST_AUTOINSTALL_FAULT: fault,
+                    }
+                  : env,
+              },
+            );
+
+            expect(result.exitCode).toBe(0);
+            expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+              join(project!.loopxDir, "beta"),
+            ]);
+            if (warningKind === "unreadable") {
+              expect(countUnreadableWarnings(result.stderr, "alpha")).toBe(1);
+              await chmod(join(project!.loopxDir, "alpha", "package.json"), 0o644);
+            } else {
+              expect(countInvalidSemverWarnings(result.stderr, "alpha")).toBe(1);
+            }
+            expect(existsSync(join(project!.loopxDir, "alpha", ".gitignore"))).toBe(
+              false,
+            );
+            expect(readFileSync(join(project!.loopxDir, "beta", ".gitignore"), "utf-8")).toMatch(
+              /^node_modules\s*$/,
+            );
+            expectNoAutoInstallFailureReport(result.stderr);
+          });
+        },
+      );
+
+      it("T-INST-113h: directory package.json skips only that workflow", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json/README": "not a regular file",
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "beta"),
+          ]);
+          expect(lstatSync(join(project!.loopxDir, "alpha", "package.json")).isDirectory()).toBe(
+            true,
+          );
+          expect(result.stderr).toMatch(/alpha/i);
+          expect(result.stderr).toMatch(/package\.json/i);
+          expect(existsSync(join(project!.loopxDir, "alpha", ".gitignore"))).toBe(
+            false,
+          );
+          expect(readFileSync(join(project!.loopxDir, "beta", ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+          expectNoAutoInstallFailureReport(result.stderr);
+        });
+      });
+
+      it.each([
+        [
+          "T-INST-113i",
+          "package-json-replace-with-symlink:alpha=regular-file-target",
+          "isSymbolicLink",
+        ],
+        [
+          "T-INST-113i",
+          "package-json-replace-with-symlink:alpha=broken",
+          "isSymbolicLink",
+        ],
+        [
+          "T-INST-113i",
+          "package-json-replace-with-symlink:alpha=cycle",
+          "isSymbolicLink",
+        ],
+        ["T-INST-113j", "package-json-replace-with-fifo:alpha", "isFIFO"],
+        ["T-INST-113k", "package-json-replace-with-socket:alpha", "isSocket"],
+      ] as const)(
+        "%s: non-regular committed package.json skips auto-install (%s)",
+        async (_id, fault, statMethod) => {
+          project = await createTempProject();
+          gitServer = await startLocalGitServer([
+            {
+              name: "multi",
+              files: {
+                "alpha/index.sh": BASH_STOP,
+                "alpha/package.json": JSON.stringify({
+                  name: "alpha",
+                  version: "1.0.0",
+                }),
+                "beta/index.sh": BASH_STOP,
+                "beta/package.json": JSON.stringify({
+                  name: "beta",
+                  version: "1.0.0",
+                }),
+              },
+            },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: {
+                  ...env,
+                  NODE_ENV: "test",
+                  LOOPX_TEST_AUTOINSTALL_FAULT: fault,
+                },
+              },
+            );
+
+            expect(result.exitCode).toBe(0);
+            expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+              join(project!.loopxDir, "beta"),
+            ]);
+            expect(lstatSync(join(project!.loopxDir, "alpha", "package.json"))[statMethod]()).toBe(
+              true,
+            );
+            expect(result.stderr).toMatch(/alpha/i);
+            expect(result.stderr).toMatch(/package\.json/i);
+            expect(existsSync(join(project!.loopxDir, "alpha", ".gitignore"))).toBe(
+              false,
+            );
+            expect(readFileSync(join(project!.loopxDir, "beta", ".gitignore"), "utf-8")).toMatch(
+              /^node_modules\s*$/,
+            );
+            expectNoAutoInstallFailureReport(result.stderr);
+          });
+        },
+      );
+
+      it.each([
+        [
+          "invalid-json",
+          { "alpha/package.json": "{broken" },
+          "invalid-json",
+          undefined,
+        ],
+        [
+          "unreadable",
+          {
+            "alpha/package.json": JSON.stringify({
+              name: "alpha",
+              version: "1.0.0",
+            }),
+          },
+          "unreadable",
+          "package-json-make-unreadable:alpha",
+        ],
+        [
+          "invalid-semver",
+          {
+            "alpha/package.json": JSON.stringify({
+              dependencies: { loopx: "not-a-range!!!" },
+            }),
+          },
+          "invalid-semver",
+          undefined,
+        ],
+        [
+          "non-string-range",
+          {
+            "alpha/package.json": JSON.stringify({
+              dependencies: { loopx: 42 },
+            }),
+          },
+          "invalid-semver",
+          undefined,
+        ],
+        [
+          "non-regular-directory",
+          { "alpha/package.json/README": "not a regular file" },
+          "package-json",
+          undefined,
+        ],
+      ] as const)(
+        "T-INST-113l: -w selected malformed package.json skips auto-install (%s)",
+        async (variant, alphaFiles, warningKind, fault) => {
+          if (variant === "unreadable" && IS_ROOT) {
+            expect(IS_ROOT).toBe(true);
+            return;
+          }
+          project = await createTempProject();
+          gitServer = await startLocalGitServer([
+            {
+              name: "multi",
+              files: {
+                "alpha/index.sh": BASH_STOP,
+                ...alphaFiles,
+                "beta/index.sh": BASH_STOP,
+                "beta/package.json": JSON.stringify({
+                  name: "beta",
+                  version: "1.0.0",
+                }),
+              },
+            },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const result = await runCLI(
+              ["install", "-w", "alpha", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: fault
+                  ? {
+                      ...env,
+                      NODE_ENV: "test",
+                      LOOPX_TEST_AUTOINSTALL_FAULT: fault,
+                    }
+                  : env,
+              },
+            );
+
+            expect(result.exitCode).toBe(0);
+            expect(readNpmInvocations(logFile)).toHaveLength(0);
+            if (warningKind === "invalid-json") {
+              expect(countInvalidJsonWarnings(result.stderr, "alpha")).toBe(1);
+            } else if (warningKind === "invalid-semver") {
+              expect(countInvalidSemverWarnings(result.stderr, "alpha")).toBe(1);
+            } else if (warningKind === "unreadable") {
+              expect(countUnreadableWarnings(result.stderr, "alpha")).toBe(1);
+              await chmod(join(project!.loopxDir, "alpha", "package.json"), 0o644);
+            } else {
+              expect(result.stderr).toMatch(/alpha/i);
+              expect(result.stderr).toMatch(/package\.json/i);
+            }
+            expect(existsSync(join(project!.loopxDir, "alpha", "index.sh"))).toBe(
+              true,
+            );
+            if (variant === "non-regular-directory") {
+              expect(
+                lstatSync(
+                  join(project!.loopxDir, "alpha", "package.json"),
+                ).isDirectory(),
+              ).toBe(true);
+            } else {
+              expect(
+                existsSync(join(project!.loopxDir, "alpha", "package.json")),
+              ).toBe(true);
+            }
+            expect(existsSync(join(project!.loopxDir, "beta"))).toBe(false);
+            expect(existsSync(join(project!.loopxDir, "alpha", ".gitignore"))).toBe(
+              false,
+            );
+            expectNoAutoInstallFailureReport(result.stderr);
+          });
+        },
+      );
+
+      it.each([
+        [
+          "T-INST-113m",
+          "package-json-remove:alpha",
+          "{ \"name\": \"alpha\", \"version\": \"1.0.0\" }",
+          false,
+        ],
+        [
+          "T-INST-113n",
+          "package-json-replace-with-valid:alpha",
+          "{broken",
+          true,
+        ],
+      ] as const)(
+        "%s: auto-install re-evaluates committed package.json state",
+        async (_id, fault, alphaPackageJson, alphaShouldRun) => {
+          project = await createTempProject();
+          gitServer = await startLocalGitServer([
+            {
+              name: "multi",
+              files: {
+                "alpha/index.sh": BASH_STOP,
+                "alpha/package.json": alphaPackageJson,
+                "beta/index.sh": BASH_STOP,
+                "beta/package.json": JSON.stringify({
+                  name: "beta",
+                  version: "1.0.0",
+                }),
+              },
+            },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: {
+                  ...env,
+                  NODE_ENV: "test",
+                  LOOPX_TEST_AUTOINSTALL_FAULT: fault,
+                },
+              },
+            );
+
+            expect(result.exitCode).toBe(0);
+            const cwds = readNpmInvocations(logFile)
+              .map((i) => i.cwd)
+              .sort();
+            expect(cwds).toEqual(
+              alphaShouldRun
+                ? [
+                    join(project!.loopxDir, "alpha"),
+                    join(project!.loopxDir, "beta"),
+                  ].sort()
+                : [join(project!.loopxDir, "beta")],
+            );
+            if (alphaShouldRun) {
+              expect(countInvalidJsonWarnings(result.stderr, "alpha")).toBe(1);
+              expect(
+                readFileSync(
+                  join(project!.loopxDir, "alpha", "package.json"),
+                  "utf-8",
+                ),
+              ).toMatch(/"dependencies"\s*:\s*\{\s*"loopx"\s*:\s*"\*"/);
+              expect(readFileSync(join(project!.loopxDir, "alpha", ".gitignore"), "utf-8")).toMatch(
+                /^node_modules\s*$/,
+              );
+            } else {
+              expect(result.stderr).not.toMatch(/alpha.*package\.json/i);
+              expect(
+                existsSync(join(project!.loopxDir, "alpha", "package.json")),
+              ).toBe(false);
+              expect(
+                existsSync(join(project!.loopxDir, "alpha", ".gitignore")),
+              ).toBe(false);
+            }
+            expect(readFileSync(join(project!.loopxDir, "beta", ".gitignore"), "utf-8")).toMatch(
+              /^node_modules\s*$/,
+            );
+            expectNoAutoInstallFailureReport(result.stderr);
+          });
+        },
+      );
+
+      it("T-INST-114: npm install non-zero exits aggregate, continue, and leave commits", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm(
+          { exitCode: 0, exitCodeByWorkflow: { beta: 1, gamma: 1 } },
+          async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/multi.git`],
+              { cwd: project!.dir, runtime, env },
+            );
+
+            expect(result.exitCode).toBe(1);
+            expect(readNpmInvocations(logFile).map((i) => i.cwd).sort()).toEqual(
+              [
+                join(project!.loopxDir, "alpha"),
+                join(project!.loopxDir, "beta"),
+                join(project!.loopxDir, "gamma"),
+              ].sort(),
+            );
+            expect(result.stderr).toMatch(/beta/i);
+            expect(result.stderr).toMatch(/gamma/i);
+            expect(result.stderr).toMatch(/npm|install|exit|failed/i);
+            expect(result.stderr).not.toMatch(/alpha.*failed/i);
+            for (const name of ["alpha", "beta", "gamma"]) {
+              expect(existsSync(join(project!.loopxDir, name, "index.sh"))).toBe(
+                true,
+              );
+              expect(
+                existsSync(join(project!.loopxDir, name, "package.json")),
+              ).toBe(true);
+            }
+          },
+        );
+      });
+
+      it("T-INST-114a / T-INST-114c: npm spawn failures aggregate after safeguards synthesize .gitignore", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              env: {
+                ...env,
+                NODE_ENV: "test",
+                LOOPX_TEST_AUTOINSTALL_FAULT:
+                  "npm-spawn-fail:alpha,beta,gamma",
+              },
+            },
+          );
+
+          expect(result.exitCode).toBe(1);
+          expect(readNpmInvocations(logFile)).toHaveLength(0);
+          for (const name of ["alpha", "beta", "gamma"]) {
+            expect(result.stderr).toMatch(new RegExp(name, "i"));
+            expect(existsSync(join(project!.loopxDir, name, "index.sh"))).toBe(
+              true,
+            );
+            expect(readFileSync(join(project!.loopxDir, name, ".gitignore"), "utf-8")).toMatch(
+              /^node_modules\s*$/,
+            );
+          }
+          expect(result.stderr).toMatch(/spawn|ENOENT|npm/i);
+        });
+      });
+
+      it("T-INST-114b: per-workflow npm spawn failure continues to later workflows", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/multi.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              env: {
+                ...env,
+                NODE_ENV: "test",
+                LOOPX_TEST_AUTOINSTALL_FAULT: "npm-spawn-fail:beta,gamma",
+              },
+            },
+          );
+
+          expect(result.exitCode).toBe(1);
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "alpha"),
+          ]);
+          expect(result.stderr).toMatch(/beta/i);
+          expect(result.stderr).toMatch(/gamma/i);
+          expect(result.stderr).toMatch(/spawn|ENOENT|npm/i);
+          expect(result.stderr).not.toMatch(/alpha.*spawn|alpha.*ENOENT/i);
+        });
+      });
+
+      it("T-INST-114d: mixed safeguard, npm non-zero, and spawn failures preserve categories", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+              "delta/index.sh": BASH_STOP,
+              "delta/package.json": JSON.stringify({
+                name: "delta",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm(
+          { exitCode: 0, exitCodeByWorkflow: { beta: 1 } },
+          async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: {
+                  ...env,
+                  NODE_ENV: "test",
+                  LOOPX_TEST_AUTOINSTALL_FAULT:
+                    "gitignore-write-fail:alpha;npm-spawn-fail:gamma",
+                },
+              },
+            );
+
+            expect(result.exitCode).toBe(1);
+            expect(readNpmInvocations(logFile).map((i) => i.cwd).sort()).toEqual(
+              [
+                join(project!.loopxDir, "beta"),
+                join(project!.loopxDir, "delta"),
+              ].sort(),
+            );
+            expect(result.stderr).toMatch(/alpha/i);
+            expect(result.stderr).toMatch(/gitignore/i);
+            expect(result.stderr).toMatch(/beta/i);
+            expect(result.stderr).toMatch(/exit|non.?zero|failed/i);
+            expect(result.stderr).toMatch(/gamma/i);
+            expect(result.stderr).toMatch(/spawn|ENOENT|npm/i);
+            expect(result.stderr).not.toMatch(/delta.*failed/i);
+            expect(existsSync(join(project!.loopxDir, "alpha", ".gitignore"))).toBe(
+              false,
+            );
+            for (const name of ["beta", "gamma", "delta"]) {
+              expect(readFileSync(join(project!.loopxDir, name, ".gitignore"), "utf-8")).toMatch(
+                /^node_modules\s*$/,
+              );
+            }
+          },
+        );
+      });
+
+      it("T-INST-115: npm install inherits loopx process.env unchanged without env-file or protocol injection", async () => {
+        project = await createTempProject();
+        const configHome = join(project.dir, "xdg");
+        await mkdir(join(configHome, "loopx"), { recursive: true });
+        await writeFile(
+          join(configHome, "loopx", "env"),
+          "INJECTED_GLOBAL=yes\nPATH=/fake/env-file-path\n",
+          "utf-8",
+        );
+        gitServer = await startLocalGitServer([
+          {
+            name: "env-probe",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "env-probe",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withScrubbedLoopxProcessEnv(async () => {
+          await withEnvRecordingFakeNpm(
+            [
+              "MYVAR",
+              "INJECTED_GLOBAL",
+              "PATH",
+              "TMPDIR",
+              "PWD",
+              "LOOPX_BIN",
+              "LOOPX_PROJECT_ROOT",
+              "LOOPX_WORKFLOW",
+              "LOOPX_WORKFLOW_DIR",
+              "LOOPX_TMPDIR",
+            ],
+            async (env, logFile) => {
+              const result = await runCLI(
+                ["install", `${gitServer!.url}/env-probe.git`],
+                {
+                  cwd: project!.dir,
+                  runtime,
+                  env: {
+                    ...env,
+                    MYVAR: "inherited",
+                    PWD: project!.dir,
+                    TMPDIR: tmpdir(),
+                    XDG_CONFIG_HOME: configHome,
+                  },
+                },
+              );
+
+              expect(result.exitCode).toBe(0);
+              const [invocation] = readEnvRecordingInvocations(logFile);
+              expect(invocation.cwd).toBe(join(project!.loopxDir, "env-probe"));
+              expect(invocation.argv).toEqual(["install"]);
+              expect(invocation.env.MYVAR).toBe("inherited");
+              expect(invocation.env.INJECTED_GLOBAL).toBeUndefined();
+              expect(invocation.env.PATH).toBe(env.PATH);
+              expect(invocation.env.TMPDIR).toBe(tmpdir());
+              expect(invocation.env.PWD).toBe(project!.dir);
+              for (const key of [
+                "LOOPX_BIN",
+                "LOOPX_PROJECT_ROOT",
+                "LOOPX_WORKFLOW",
+                "LOOPX_WORKFLOW_DIR",
+                "LOOPX_TMPDIR",
+              ]) {
+                expect(invocation.env[key]).toBeUndefined();
+              }
+            },
+          );
+        });
+      });
+
+      it("T-INST-115a: inherited LOOPX protocol variables pass through to npm unchanged", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "protocol-pass",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "protocol-pass",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        const inherited = {
+          LOOPX_BIN: "/inherited-bin/loopx",
+          LOOPX_TMPDIR: "/inherited-tmp",
+          LOOPX_WORKFLOW: "/inherited-workflow",
+          LOOPX_PROJECT_ROOT: "/inherited-project-root",
+          LOOPX_WORKFLOW_DIR: "/inherited-workflow-dir",
+        };
+
+        await withEnvRecordingFakeNpm(
+          Object.keys(inherited),
+          async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/protocol-pass.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: { ...env, ...inherited },
+              },
+            );
+
+            expect(result.exitCode).toBe(0);
+            const [invocation] = readEnvRecordingInvocations(logFile);
+            for (const [key, value] of Object.entries(inherited)) {
+              expect(invocation.env[key]).toBe(value);
+            }
+          },
+        );
+      });
+
+      it("T-INST-115b: inherited LOOPX_DELEGATED passes through to npm unchanged", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "delegated-pass",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "delegated-pass",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withEnvRecordingFakeNpm(
+          ["LOOPX_DELEGATED"],
+          async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/delegated-pass.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: { ...env, LOOPX_DELEGATED: "1" },
+              },
+            );
+
+            expect(result.exitCode).toBe(0);
+            const [invocation] = readEnvRecordingInvocations(logFile);
+            expect(invocation.env.LOOPX_DELEGATED).toBe("1");
+            expect(result.stderr).not.toMatch(/delegat|recurs/i);
+          },
+        );
+      });
+
+      it("T-INST-115c: unreadable global env file does not affect loopx install", async () => {
+        if (IS_ROOT) {
+          expect(IS_ROOT).toBe(true);
+          return;
+        }
+        project = await createTempProject();
+        const configHome = join(project.dir, "xdg");
+        const envFile = join(configHome, "loopx", "env");
+        await mkdir(dirname(envFile), { recursive: true });
+        await writeFile(envFile, "READABLE_TEST_KEY=value\n", "utf-8");
+        await chmod(envFile, 0);
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({ name: "ralph", version: "1.0.0" }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/ralph.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              env: { ...env, XDG_CONFIG_HOME: configHome },
+            },
+          );
+
+          await chmod(envFile, 0o644);
+          expect(result.exitCode).toBe(0);
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "ralph"),
+          ]);
+          expect(result.stderr).not.toMatch(/env|EACCES|permission|unreadable/i);
+          expect(existsSync(join(project!.loopxDir, "ralph", "index.sh"))).toBe(
+            true,
+          );
+        });
+      });
+
+      it("T-INST-115d: malformed global env file emits no parser warning during install", async () => {
+        project = await createTempProject();
+        const configHome = join(project.dir, "xdg");
+        const envFile = join(configHome, "loopx", "env");
+        await mkdir(dirname(envFile), { recursive: true });
+        await writeFile(envFile, "1BAD=val\nKEY WITH SPACES=val\n", "utf-8");
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({ name: "ralph", version: "1.0.0" }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/ralph.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              env: { ...env, XDG_CONFIG_HOME: configHome },
+            },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "ralph"),
+          ]);
+          expect(result.stderr).not.toMatch(/invalid.*env|invalid.*key|ignored/i);
+          expect(existsSync(join(project!.loopxDir, "ralph", "index.sh"))).toBe(
+            true,
+          );
+        });
+      });
+
+      it.each([
+        ["T-INST-116", "SIGINT", 130],
+        ["T-INST-116a", "SIGTERM", 143],
+      ] as const)(
+        "%s: signal during npm install terminates npm child",
+        async (_id, signal, expectedExit) => {
+          project = await createTempProject();
+          const pidFile = join(project.dir, `${signal}-npm.pid`);
+          gitServer = await startLocalGitServer([
+            {
+              name: "ralph",
+              files: {
+                "index.sh": BASH_STOP,
+                "package.json": JSON.stringify({
+                  name: "ralph",
+                  version: "1.0.0",
+                }),
+              },
+            },
+          ]);
+
+          await withFakeNpm(
+            {
+              sleepSeconds: 30,
+              pidFile,
+              stderr: "ready",
+            },
+            async (env) => {
+              const handle = runCLIWithSignal(
+                ["install", `${gitServer!.url}/ralph.git`],
+                { cwd: project!.dir, runtime, env, timeout: 15_000 },
+              );
+              await handle.waitForStderr("ready", { timeoutMs: 5_000 });
+              const npmPid = Number(readFileSync(pidFile, "utf-8"));
+              handle.sendSignal(signal);
+              const result = await handle.result;
+              expect(result.exitCode).toBe(expectedExit);
+              expect(isProcessAlive(npmPid)).toBe(false);
+            },
+          );
+        },
+      );
+
+      it.each([
+        ["T-INST-116b", "SIGINT", 130],
+        ["T-INST-116b2", "SIGTERM", 143],
+      ] as const)(
+        "%s: signal during first npm install leaves remaining workflows unprocessed",
+        async (_id, signal, expectedExit) => {
+          project = await createTempProject();
+          gitServer = await startLocalGitServer([
+            {
+              name: "multi",
+              files: {
+                "alpha/index.sh": BASH_STOP,
+                "alpha/package.json": JSON.stringify({
+                  name: "alpha",
+                  version: "1.0.0",
+                }),
+                "beta/index.sh": BASH_STOP,
+                "beta/package.json": JSON.stringify({
+                  name: "beta",
+                  version: "1.0.0",
+                }),
+                "gamma/index.sh": BASH_STOP,
+                "gamma/package.json": JSON.stringify({
+                  name: "gamma",
+                  version: "1.0.0",
+                }),
+              },
+            },
+          ]);
+
+          await withFakeNpm(
+            { sleepSeconds: 30, stderr: "ready" },
+            async (env, logFile) => {
+              const handle = runCLIWithSignal(
+                ["install", `${gitServer!.url}/multi.git`],
+                { cwd: project!.dir, runtime, env, timeout: 15_000 },
+              );
+              await handle.waitForStderr("ready", { timeoutMs: 5_000 });
+              handle.sendSignal(signal);
+              const result = await handle.result;
+              expect(result.exitCode).toBe(expectedExit);
+              const invocations = readNpmInvocations(logFile);
+              expect(invocations).toHaveLength(1);
+              const first = invocations[0].cwd.split("/").at(-1)!;
+              for (const name of ["alpha", "beta", "gamma"]) {
+                expect(existsSync(join(project!.loopxDir, name, "index.sh"))).toBe(
+                  true,
+                );
+                expect(
+                  existsSync(join(project!.loopxDir, name, "package.json")),
+                ).toBe(true);
+                expect(existsSync(join(project!.loopxDir, name, ".gitignore"))).toBe(
+                  name === first,
+                );
+              }
+            },
+          );
+        },
+      );
+
+      it.each([
+        ["T-INST-116d", "SIGINT", 130],
+        ["T-INST-116d2", "SIGTERM", 143],
+      ] as const)(
+        "%s: signal does not clean partial node_modules state",
+        async (_id, signal, expectedExit) => {
+          project = await createTempProject();
+          gitServer = await startLocalGitServer([
+            {
+              name: "ralph",
+              files: {
+                "index.sh": BASH_STOP,
+                "package.json": JSON.stringify({
+                  name: "ralph",
+                  version: "1.0.0",
+                }),
+              },
+            },
+          ]);
+
+          await withFakeNpm(
+            {
+              sleepSeconds: 30,
+              stderr: "ready",
+              createFiles: ["node_modules/partial-file"],
+            },
+            async (env) => {
+              const handle = runCLIWithSignal(
+                ["install", `${gitServer!.url}/ralph.git`],
+                { cwd: project!.dir, runtime, env, timeout: 15_000 },
+              );
+              await handle.waitForStderr("ready", { timeoutMs: 5_000 });
+              handle.sendSignal(signal);
+              const result = await handle.result;
+              expect(result.exitCode).toBe(expectedExit);
+              expect(
+                existsSync(
+                  join(project!.loopxDir, "ralph", "node_modules", "partial-file"),
+                ),
+              ).toBe(true);
+            },
+          );
+        },
+      );
+
+      it.each([
+        ["T-INST-116c", "SIGTERM", 143, ["TERM", "INT"] as const],
+        ["T-INST-116f", "SIGINT", 130, ["INT", "TERM"] as const],
+      ] as const)(
+        "%s: signal grace period escalates when npm child ignores %s",
+        async (_id, signal, expectedExit, trapSignals) => {
+          project = await createTempProject();
+          const pidFile = join(project.dir, `${signal}-trapped-npm.pid`);
+          gitServer = await startLocalGitServer([
+            {
+              name: "ralph",
+              files: {
+                "index.sh": BASH_STOP,
+                "package.json": JSON.stringify({
+                  name: "ralph",
+                  version: "1.0.0",
+                }),
+              },
+            },
+          ]);
+
+          await withFakeNpm(
+            {
+              sleepSeconds: 30,
+              stderr: "ready",
+              pidFile,
+              trapSignals: [...trapSignals],
+            },
+            async (env) => {
+              const handle = runCLIWithSignal(
+                ["install", `${gitServer!.url}/ralph.git`],
+                { cwd: project!.dir, runtime, env, timeout: 15_000 },
+              );
+              await handle.waitForStderr("ready", { timeoutMs: 5_000 });
+              const npmPid = Number(readFileSync(pidFile, "utf-8"));
+              const started = Date.now();
+              handle.sendSignal(signal);
+              const result = await handle.result;
+              const elapsedMs = Date.now() - started;
+              expect(result.exitCode).toBe(expectedExit);
+              expect(elapsedMs).toBeGreaterThanOrEqual(4_000);
+              expect(elapsedMs).toBeLessThan(8_000);
+              expect(isProcessAlive(npmPid)).toBe(false);
+              expectNoAutoInstallFailureReport(result.stderr);
+            },
+          );
+        },
+      );
+
+      it.each([
+        ["T-INST-116e", "SIGTERM", 143],
+        ["T-INST-116g", "SIGINT", 130],
+      ] as const)(
+        "%s: signal during npm install reaches npm child process group",
+        async (_id, signal, expectedExit) => {
+          project = await createTempProject();
+          const pidFile = join(project.dir, `${signal}-npm.pid`);
+          const grandchildPidFile = join(project.dir, `${signal}-grandchild.pid`);
+          gitServer = await startLocalGitServer([
+            {
+              name: "ralph",
+              files: {
+                "index.sh": BASH_STOP,
+                "package.json": JSON.stringify({
+                  name: "ralph",
+                  version: "1.0.0",
+                }),
+              },
+            },
+          ]);
+
+          await withFakeNpm(
+            {
+              sleepSeconds: 30,
+              stderr: "ready",
+              pidFile,
+              spawnGrandchild: true,
+              grandchildPidFile,
+            },
+            async (env) => {
+              const handle = runCLIWithSignal(
+                ["install", `${gitServer!.url}/ralph.git`],
+                { cwd: project!.dir, runtime, env, timeout: 15_000 },
+              );
+              await handle.waitForStderr("ready", { timeoutMs: 5_000 });
+              const npmPid = Number(readFileSync(pidFile, "utf-8"));
+              const grandchildPid = Number(
+                readFileSync(grandchildPidFile, "utf-8"),
+              );
+              handle.sendSignal(signal);
+              const result = await handle.result;
+              expect(result.exitCode).toBe(expectedExit);
+              expect(isProcessAlive(npmPid)).toBe(false);
+              expect(isProcessAlive(grandchildPid)).toBe(false);
+            },
+          );
+        },
+      );
+
+      it.each([
+        ["T-INST-116n", "SIGINT", 130],
+        ["T-INST-116n2", "SIGTERM", 143],
+      ] as const)(
+        "%s: signal before first auto-install workflow prevents all safeguards and spawns",
+        async (_id, signal, expectedExit) => {
+          const names = ["alpha", "beta", "gamma"];
+          project = await createTempProject();
+          const markerPath = join(project.dir, `${signal}-before-first.json`);
+          gitServer = await startLocalGitServer([
+            { name: "multi", files: packageJsonWorkflowFiles(names) },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const handle = runCLIWithSignal(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: {
+                  ...env,
+                  NODE_ENV: "test",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE: "before-first-workflow",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+                },
+                timeout: 15_000,
+              },
+            );
+            const marker = await waitForAutoInstallPauseMarker(markerPath);
+            expect(marker.window).toBe("before-first-workflow");
+            expect(marker.processed).toEqual([]);
+            expect(marker.current).not.toBeNull();
+            expectWorkflowNamesCoverMarker(marker, names);
+            handle.sendSignal(signal);
+
+            const result = await handle.result;
+            expect(result.exitCode).toBe(expectedExit);
+            expect(readNpmInvocations(logFile)).toHaveLength(0);
+            expectCommittedWorkflows(project!.loopxDir, names);
+            for (const name of names) {
+              expect(existsSync(join(project!.loopxDir, name, ".gitignore"))).toBe(
+                false,
+              );
+            }
+            expectNoAutoInstallFailureReport(result.stderr);
+          });
+        },
+      );
+
+      it.each([
+        ["T-INST-116h", "SIGINT", 130],
+        ["T-INST-116h2", "SIGTERM", 143],
+      ] as const)(
+        "%s: signal between auto-install workflows stops remaining safeguards and spawns",
+        async (_id, signal, expectedExit) => {
+          const names = ["alpha", "beta", "gamma"];
+          project = await createTempProject();
+          const markerPath = join(project.dir, `${signal}-between.json`);
+          gitServer = await startLocalGitServer([
+            { name: "multi", files: packageJsonWorkflowFiles(names) },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const handle = runCLIWithSignal(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: {
+                  ...env,
+                  NODE_ENV: "test",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE: "between-workflows-after-first",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+                },
+                timeout: 15_000,
+              },
+            );
+            const marker = await waitForAutoInstallPauseMarker(markerPath);
+            expect(marker.window).toBe("between-workflows-after-first");
+            expect(marker.processed).toHaveLength(1);
+            expect(marker.current).not.toBeNull();
+            expectWorkflowNamesCoverMarker(marker, names);
+            handle.sendSignal(signal);
+
+            const result = await handle.result;
+            expect(result.exitCode).toBe(expectedExit);
+            expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+              join(project!.loopxDir, marker.processed[0]),
+            ]);
+            expectCommittedWorkflows(project!.loopxDir, names);
+            for (const name of names) {
+              expect(existsSync(join(project!.loopxDir, name, ".gitignore"))).toBe(
+                name === marker.processed[0],
+              );
+            }
+            expectNoAutoInstallFailureReport(result.stderr);
+          });
+        },
+      );
+
+      it.each([
+        ["T-INST-116i", "SIGINT", 130],
+        ["T-INST-116i2", "SIGTERM", 143],
+      ] as const)(
+        "%s: signal in pre-spawn safeguard window preserves marker-captured .gitignore state",
+        async (_id, signal, expectedExit) => {
+          const names = ["alpha", "beta", "gamma"];
+          project = await createTempProject();
+          const markerPath = join(project.dir, `${signal}-pre-spawn.json`);
+          gitServer = await startLocalGitServer([
+            { name: "multi", files: packageJsonWorkflowFiles(names) },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const handle = runCLIWithSignal(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: {
+                  ...env,
+                  NODE_ENV: "test",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE: "pre-spawn-first",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+                },
+                timeout: 15_000,
+              },
+            );
+            const marker = await waitForAutoInstallPauseMarker(markerPath);
+            expect(marker.window).toBe("pre-spawn-first");
+            expect(marker.processed).toEqual([]);
+            expect(marker.current).not.toBeNull();
+            expect(marker.gitignoreStateAtPause).toBeDefined();
+            expectWorkflowNamesCoverMarker(marker, names);
+            handle.sendSignal(signal);
+
+            const result = await handle.result;
+            expect(result.exitCode).toBe(expectedExit);
+            expect(readNpmInvocations(logFile)).toHaveLength(0);
+            expectCommittedWorkflows(project!.loopxDir, names);
+            expectGitignoreMatchesPauseState(
+              project!.loopxDir,
+              marker.current!,
+              marker.gitignoreStateAtPause!,
+            );
+            for (const name of names.filter((name) => name !== marker.current)) {
+              expect(existsSync(join(project!.loopxDir, name, ".gitignore"))).toBe(
+                false,
+              );
+            }
+            expectNoAutoInstallFailureReport(result.stderr);
+          });
+        },
+      );
+
+      it.each([
+        ["T-INST-116j", "SIGTERM", 143, 0],
+        ["T-INST-116j2", "SIGINT", 130, 1],
+        ["T-INST-116j3", "SIGTERM", 143, 1],
+      ] as const)(
+        "%s: signal after first npm child exit stops before the next workflow",
+        async (_id, signal, expectedExit, npmExitCode) => {
+          const names = ["alpha", "beta", "gamma"];
+          project = await createTempProject();
+          const markerPath = join(project.dir, `${signal}-post-exit.json`);
+          gitServer = await startLocalGitServer([
+            { name: "multi", files: packageJsonWorkflowFiles(names) },
+          ]);
+
+          await withFakeNpm({ exitCode: npmExitCode }, async (env, logFile) => {
+            const handle = runCLIWithSignal(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: {
+                  ...env,
+                  NODE_ENV: "test",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE: "post-exit-first",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+                },
+                timeout: 15_000,
+              },
+            );
+            const marker = await waitForAutoInstallPauseMarker(markerPath);
+            expect(marker.window).toBe("post-exit-first");
+            expect(marker.processed).toEqual([]);
+            expect(marker.current).not.toBeNull();
+            expectWorkflowNamesCoverMarker(marker, names);
+            handle.sendSignal(signal);
+
+            const result = await handle.result;
+            expect(result.exitCode).toBe(expectedExit);
+            expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+              join(project!.loopxDir, marker.current!),
+            ]);
+            expectCommittedWorkflows(project!.loopxDir, names);
+            expect(readFileSync(join(project!.loopxDir, marker.current!, ".gitignore"), "utf-8")).toMatch(
+              /^node_modules\s*$/,
+            );
+            for (const name of [...marker.remaining, ...marker.processed]) {
+              expect(existsSync(join(project!.loopxDir, name, ".gitignore"))).toBe(
+                false,
+              );
+            }
+            expectNoAutoInstallFailureReport(result.stderr);
+          });
+        },
+      );
+
+      it.each([
+        ["T-INST-116k", "SIGINT", 130],
+        ["T-INST-116k2", "SIGTERM", 143],
+      ] as const)(
+        "%s: signal after safeguard failure suppresses the not-yet-emitted aggregate report",
+        async (_id, signal, expectedExit) => {
+          const names = ["alpha", "beta", "gamma"];
+          project = await createTempProject();
+          const markerPath = join(project.dir, `${signal}-post-safeguard.json`);
+          gitServer = await startLocalGitServer([
+            { name: "multi", files: packageJsonWorkflowFiles(names) },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const handle = runCLIWithSignal(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: {
+                  ...env,
+                  NODE_ENV: "test",
+                  LOOPX_TEST_AUTOINSTALL_FAULT:
+                    "gitignore-replace-with-fifo:alpha,beta,gamma",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE: "post-safeguard-failure-first",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+                },
+                timeout: 15_000,
+              },
+            );
+            const marker = await waitForAutoInstallPauseMarker(markerPath);
+            expect(marker.window).toBe("post-safeguard-failure-first");
+            expect(marker.current).not.toBeNull();
+            expectWorkflowNamesCoverMarker(marker, names);
+            handle.sendSignal(signal);
+
+            const result = await handle.result;
+            expect(result.exitCode).toBe(expectedExit);
+            expect(readNpmInvocations(logFile)).toHaveLength(0);
+            expectCommittedWorkflows(project!.loopxDir, names);
+            expect(
+              lstatSync(join(project!.loopxDir, marker.current!, ".gitignore")).isFIFO(),
+            ).toBe(true);
+            for (const name of marker.remaining) {
+              expect(existsSync(join(project!.loopxDir, name, ".gitignore"))).toBe(
+                false,
+              );
+            }
+            expectNoAutoInstallFailureReport(result.stderr);
+          });
+        },
+      );
+
+      it.each([
+        ["T-INST-116m", "SIGINT", 130],
+        ["T-INST-116m2", "SIGTERM", 143],
+      ] as const)(
+        "%s: signal after npm spawn failure suppresses the not-yet-emitted aggregate report",
+        async (_id, signal, expectedExit) => {
+          const names = ["alpha", "beta", "gamma"];
+          project = await createTempProject();
+          const markerPath = join(project.dir, `${signal}-post-spawn-failure.json`);
+          gitServer = await startLocalGitServer([
+            { name: "multi", files: packageJsonWorkflowFiles(names) },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const handle = runCLIWithSignal(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: {
+                  ...env,
+                  NODE_ENV: "test",
+                  LOOPX_TEST_AUTOINSTALL_FAULT:
+                    "npm-spawn-fail:alpha,beta,gamma",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE: "post-spawn-failure-first",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+                },
+                timeout: 15_000,
+              },
+            );
+            const marker = await waitForAutoInstallPauseMarker(markerPath);
+            expect(marker.window).toBe("post-spawn-failure-first");
+            expect(marker.current).not.toBeNull();
+            expectWorkflowNamesCoverMarker(marker, names);
+            handle.sendSignal(signal);
+
+            const result = await handle.result;
+            expect(result.exitCode).toBe(expectedExit);
+            expect(readNpmInvocations(logFile)).toHaveLength(0);
+            expectCommittedWorkflows(project!.loopxDir, names);
+            expect(readFileSync(join(project!.loopxDir, marker.current!, ".gitignore"), "utf-8")).toMatch(
+              /^node_modules\s*$/,
+            );
+            for (const name of marker.remaining) {
+              expect(existsSync(join(project!.loopxDir, name, ".gitignore"))).toBe(
+                false,
+              );
+            }
+            expectNoAutoInstallFailureReport(result.stderr);
+          });
+        },
+      );
+
+      it.each([
+        ["T-INST-116l", "SIGINT", 130],
+        ["T-INST-116l2", "SIGTERM", 143],
+      ] as const)(
+        "%s: signal after aggregate report preserves the already-emitted report",
+        async (_id, signal, expectedExit) => {
+          const names = ["alpha", "beta", "gamma"];
+          project = await createTempProject();
+          const markerPath = join(project.dir, `${signal}-post-aggregate.json`);
+          gitServer = await startLocalGitServer([
+            { name: "multi", files: packageJsonWorkflowFiles(names) },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const handle = runCLIWithSignal(
+              ["install", `${gitServer!.url}/multi.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: {
+                  ...env,
+                  NODE_ENV: "test",
+                  LOOPX_TEST_AUTOINSTALL_FAULT:
+                    "gitignore-write-fail:alpha,beta,gamma",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE: "post-aggregate-report",
+                  LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+                },
+                timeout: 15_000,
+              },
+            );
+            const marker = await waitForAutoInstallPauseMarker(markerPath);
+            expect(marker.window).toBe("post-aggregate-report");
+            expect(marker.current).toBeNull();
+            expect(marker.remaining).toEqual([]);
+            expect(marker.processed.sort()).toEqual([...names].sort());
+            handle.sendSignal(signal);
+
+            const result = await handle.result;
+            expect(result.exitCode).toBe(expectedExit);
+            expect(readNpmInvocations(logFile)).toHaveLength(0);
+            expectCommittedWorkflows(project!.loopxDir, names);
+            for (const name of names) {
+              expect(result.stderr).toMatch(new RegExp(name, "i"));
+              expect(result.stderr).toMatch(/gitignore/i);
+            }
+          });
+        },
+      );
+
+      it.each([
+        ["T-INST-116o", "SIGINT", 130],
+        ["T-INST-116o2", "SIGTERM", 143],
+      ] as const)(
+        "%s: signal during active npm child after a prior failure suppresses aggregate report",
+        async (_id, signal, expectedExit) => {
+          const names = ["alpha", "beta", "gamma"];
+          project = await createTempProject();
+          const markerPath = join(project.dir, `${signal}-active-after-failure.json`);
+          gitServer = await startLocalGitServer([
+            { name: "multi", files: packageJsonWorkflowFiles(names) },
+          ]);
+
+          await withFakeNpm(
+            { exitCode: 1, sleepByInvocation: { 2: 30, 3: 30 } },
+            async (env) => {
+              const handle = runCLIWithSignal(
+                ["install", `${gitServer!.url}/multi.git`],
+                {
+                  cwd: project!.dir,
+                  runtime,
+                  env: {
+                    ...env,
+                    NODE_ENV: "test",
+                    LOOPX_TEST_AUTOINSTALL_PAUSE: "child-active-after-failure",
+                    LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER: markerPath,
+                  },
+                  timeout: 15_000,
+                },
+              );
+              const marker = await waitForAutoInstallPauseMarker(markerPath);
+              expect(marker.window).toBe("child-active-after-failure");
+              expect(marker.current).not.toBeNull();
+              expect(marker.processed.length).toBeGreaterThanOrEqual(1);
+              expect(marker.activeChildPid).toEqual(expect.any(Number));
+              expectWorkflowNamesCoverMarker(marker, names);
+              handle.sendSignal(signal);
+
+              const result = await handle.result;
+              expect(result.exitCode).toBe(expectedExit);
+              expect(isProcessAlive(marker.activeChildPid!)).toBe(false);
+              expectCommittedWorkflows(project!.loopxDir, names);
+              expectNoAutoInstallFailureReport(result.stderr);
+            },
+          );
+        },
+      );
+
+      it("T-INST-117: auto-install failures do not remove committed workflow files", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "multi",
+            files: {
+              "alpha/index.sh": BASH_STOP,
+              "alpha/package.json": JSON.stringify({
+                name: "alpha",
+                version: "1.0.0",
+              }),
+              "beta/index.sh": BASH_STOP,
+              "beta/package.json": JSON.stringify({
+                name: "beta",
+                version: "1.0.0",
+              }),
+              "gamma/index.sh": BASH_STOP,
+              "gamma/package.json": JSON.stringify({
+                name: "gamma",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm(
+          { exitCode: 0, exitCodeByWorkflow: { beta: 1 } },
+          async (env) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/multi.git`],
+              { cwd: project!.dir, runtime, env },
+            );
+
+            expect(result.exitCode).toBe(1);
+            for (const name of ["alpha", "beta", "gamma"]) {
+              expect(existsSync(join(project!.loopxDir, name, "index.sh"))).toBe(
+                true,
+              );
+              expect(
+                existsSync(join(project!.loopxDir, name, "package.json")),
+              ).toBe(true);
+              expect(readFileSync(join(project!.loopxDir, name, ".gitignore"), "utf-8")).toMatch(
+                /^node_modules\s*$/,
+              );
+            }
+          },
+        );
+      });
+
+      it("T-INST-117a: partial node_modules from failed npm install is not cleaned up", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({ name: "ralph", version: "1.0.0" }),
+            },
+          },
+        ]);
+
+        await withFakeNpm(
+          { exitCode: 1, createFiles: ["node_modules/partial-file"] },
+          async (env) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/ralph.git`],
+              { cwd: project!.dir, runtime, env },
+            );
+
+            expect(result.exitCode).toBe(1);
+            expect(
+              existsSync(
+                join(project!.loopxDir, "ralph", "node_modules", "partial-file"),
+              ),
+            ).toBe(true);
+          },
+        );
+      });
+
+      it("T-INST-117b: install -y after auto-install failure reinstalls from scratch and reruns npm", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({ name: "ralph", version: "1.0.0" }),
+            },
+          },
+        ]);
+
+        await withFakeNpm(
+          { exitCode: 1, createFiles: ["node_modules/partial-file"] },
+          async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/ralph.git`],
+              { cwd: project!.dir, runtime, env },
+            );
+            expect(result.exitCode).toBe(1);
+            expect(readNpmInvocations(logFile)).toHaveLength(1);
+            expect(
+              existsSync(
+                join(project!.loopxDir, "ralph", "node_modules", "partial-file"),
+              ),
+            ).toBe(true);
+          },
+        );
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", "-y", `${gitServer!.url}/ralph.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(
+            existsSync(
+              join(project!.loopxDir, "ralph", "node_modules", "partial-file"),
+            ),
+          ).toBe(false);
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "ralph"),
+          ]);
+          expect(readFileSync(join(project!.loopxDir, "ralph", ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+        });
+      });
+
+      it.each([
+        [
+          "T-INST-118",
+          "pnpm-signals",
+          {
+            "package.json": JSON.stringify({
+              packageManager: "pnpm@8.6.0",
+              dependencies: {},
+            }),
+            "pnpm-lock.yaml": "lock",
+          },
+        ],
+        [
+          "T-INST-118a",
+          "bun-lock",
+          {
+            "package.json": JSON.stringify({ name: "bun-lock", version: "1.0.0" }),
+            "bun.lockb": "",
+          },
+        ],
+        [
+          "T-INST-118b",
+          "yarn-lock",
+          {
+            "package.json": JSON.stringify({ name: "yarn-lock", version: "1.0.0" }),
+            "yarn.lock": "",
+          },
+        ],
+        [
+          "T-INST-118c",
+          "all-manager-signals",
+          {
+            "package.json": JSON.stringify({ packageManager: "yarn@3.6.1" }),
+            "bun.lockb": "",
+            "pnpm-lock.yaml": "lock",
+            "yarn.lock": "",
+          },
+        ],
+      ] as const)("%s: package-manager signals still run npm install", async (_id, name, extraFiles) => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name,
+            files: {
+              "index.sh": BASH_STOP,
+              ...extraFiles,
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", `${gitServer!.url}/${name}.git`],
+            {
+              cwd: project!.dir,
+              runtime,
+              env: {
+                ...env,
+                PATH: env.PATH.split(":")
+                  .filter((segment) => !/pnpm|yarn|bun/.test(segment))
+                  .join(":"),
+              },
+            },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, name),
+          ]);
+          expect(readNpmInvocations(logFile)[0].argv).toEqual(["install"]);
+        });
+      });
+
+      it("T-INST-119: npm stdout/stderr stream through unchanged and no progress indicator is added", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "stream-markers",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "stream-markers",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm(
+          {
+            exitCode: 0,
+            stdout: "npm-stdout-MARKER\n",
+            stderr: "npm-stderr-MARKER\n",
+          },
+          async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/stream-markers.git`],
+              { cwd: project!.dir, runtime, env },
+            );
+
+            expect(result.exitCode).toBe(0);
+            expect(result.stdout).toMatch(/(^|\n)npm-stdout-MARKER\n/);
+            expect(result.stderr).toMatch(/(^|\n)npm-stderr-MARKER\n/);
+            expect(`${result.stdout}\n${result.stderr}`).not.toMatch(
+              /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]|\[[#=\-\s]{4,}\]|\b\d{1,3}%\b/,
+            );
+            expect(readNpmInvocations(logFile)).toHaveLength(1);
+          },
+        );
+      });
+
+      it.each([
+        ["T-INST-119a", "stdout", "npm-streaming-MARKER\n", 0],
+        ["T-INST-119a-stderr", "stderr", "npm-streaming-stderr-MARKER\n", 0],
+        ["T-INST-119c", "stdout", "npm-failure-stdout-MARKER\n", 1],
+        ["T-INST-119c", "stderr", "npm-failure-stderr-MARKER\n", 1],
+      ] as const)(
+        "%s: npm %s streams in real time before child exit",
+        async (_id, stream, marker, exitCode) => {
+          project = await createTempProject();
+          const pidFile = join(project.dir, `${stream}-npm.pid`);
+          gitServer = await startLocalGitServer([
+            {
+              name: "streaming",
+              files: {
+                "index.sh": BASH_STOP,
+                "package.json": JSON.stringify({
+                  name: "streaming",
+                  version: "1.0.0",
+                }),
+              },
+            },
+          ]);
+
+          await withFakeNpm(
+            {
+              exitCode,
+              sleepSeconds: 5,
+              pidFile,
+              stdout: stream === "stdout" ? marker : undefined,
+              stderr: stream === "stderr" ? marker : undefined,
+            },
+            async (env) => {
+              const handle = runCLIWithSignal(
+                ["install", `${gitServer!.url}/streaming.git`],
+                { cwd: project!.dir, runtime, env, timeout: 10_000 },
+              );
+              const pattern = new RegExp(
+                `(^|\\n)${marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+              );
+              if (stream === "stdout") {
+                await handle.waitForStdout(pattern, { timeoutMs: 2_000 });
+              } else {
+                await handle.waitForStderr(pattern, { timeoutMs: 2_000 });
+              }
+              const npmPid = Number(readFileSync(pidFile, "utf-8"));
+              expect(isProcessAlive(npmPid)).toBe(true);
+              const result = await handle.result;
+              expect(result.exitCode).toBe(exitCode);
+            },
+          );
+        },
+      );
+
+      it("T-INST-119b: npm failure stdout/stderr marker bytes appear in final output", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "failure-output",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "failure-output",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm(
+          {
+            exitCode: 1,
+            stdout: "npm-failure-stdout-MARKER\n",
+            stderr: "npm-failure-stderr-MARKER\n",
+          },
+          async (env, logFile) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/failure-output.git`],
+              { cwd: project!.dir, runtime, env },
+            );
+
+            expect(result.exitCode).toBe(1);
+            expect(result.stdout).toMatch(/(^|\n)npm-failure-stdout-MARKER\n/);
+            expect(result.stderr).toMatch(/(^|\n)npm-failure-stderr-MARKER\n/);
+            expect(readNpmInvocations(logFile)).toHaveLength(1);
+          },
+        );
+      });
+
+      it("T-INST-119d: npm byte-shape passthrough preserves intra-line marker payload", async () => {
+        project = await createTempProject();
+        const payload = "prefix\tmiddle  spaced unicode-check ascii-tail";
+        gitServer = await startLocalGitServer([
+          {
+            name: "byte-shape",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "byte-shape",
+                version: "1.0.0",
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm(
+          {
+            exitCode: 0,
+            stdout: `${payload}\n`,
+            stderr: `${payload}\n`,
+          },
+          async (env) => {
+            const result = await runCLI(
+              ["install", `${gitServer!.url}/byte-shape.git`],
+              { cwd: project!.dir, runtime, env },
+            );
+
+            expect(result.exitCode).toBe(0);
+            expect(result.stdout).toContain(`${payload}\n`);
+            expect(result.stderr).toContain(`${payload}\n`);
+            expect(result.stdout).not.toContain(payload.replace(/\t/g, " "));
+          },
+        );
+      });
+
+      it.each([
+        ["T-INST-120", true, false, false],
+        ["T-INST-120a", true, true, false],
+        ["T-INST-120c", false, false, false],
+        ["T-INST-120d", true, false, true],
+      ] as const)(
+        "%s: -y replacement runs fresh against replacement package/gitignore state",
+        async (_id, replacementHasPackage, replacementHasGitignore, noInstall) => {
+          project = await createTempProject();
+          await createBashWorkflowScript(project, "ralph", "index", "exit 0");
+          await createWorkflowPackageJson(project, "ralph", {
+            name: "old-ralph",
+            version: "1.0.0",
+          });
+          await mkdir(join(project.loopxDir, "ralph", "node_modules"), {
+            recursive: true,
+          });
+          await writeFile(
+            join(project.loopxDir, "ralph", "node_modules", "old-marker"),
+            "old",
+            "utf-8",
+          );
+          await writeFile(
+            join(project.loopxDir, "ralph", ".gitignore"),
+            "node_modules\n",
+            "utf-8",
+          );
+
+          const files: Record<string, string> = {
+            "index.sh": BASH_STOP,
+          };
+          if (replacementHasPackage) {
+            files["package.json"] = JSON.stringify({
+              name: "ralph",
+              version: "1.0.0",
+            });
+          }
+          if (replacementHasGitignore) {
+            files[".gitignore"] = "dist/\n# custom\n";
+          }
+          gitServer = await startLocalGitServer([{ name: "ralph", files }]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const args = ["install", "-y"];
+            if (noInstall) args.push("--no-install");
+            args.push(`${gitServer!.url}/ralph.git`);
+            const result = await runCLI(args, {
+              cwd: project!.dir,
+              runtime,
+              env,
+            });
+
+            expect(result.exitCode).toBe(0);
+            expect(
+              existsSync(
+                join(project!.loopxDir, "ralph", "node_modules", "old-marker"),
+              ),
+            ).toBe(false);
+            expect(existsSync(join(project!.loopxDir, "ralph", "index.sh"))).toBe(
+              true,
+            );
+            expect(readNpmInvocations(logFile)).toHaveLength(
+              replacementHasPackage && !noInstall ? 1 : 0,
+            );
+            if (replacementHasPackage) {
+              expect(
+                existsSync(join(project!.loopxDir, "ralph", "package.json")),
+              ).toBe(true);
+            } else {
+              expect(
+                existsSync(join(project!.loopxDir, "ralph", "package.json")),
+              ).toBe(false);
+            }
+            const gitignorePath = join(project!.loopxDir, "ralph", ".gitignore");
+            if (replacementHasGitignore) {
+              expect(readFileSync(gitignorePath, "utf-8")).toBe(
+                "dist/\n# custom\n",
+              );
+            } else if (replacementHasPackage && !noInstall) {
+              expect(readFileSync(gitignorePath, "utf-8")).toMatch(
+                /^node_modules\s*$/,
+              );
+            } else {
+              expect(existsSync(gitignorePath)).toBe(false);
+            }
+          });
+        },
+      );
+
+      it("T-INST-120b: -y override of version mismatch still runs auto-install", async () => {
+        project = await createTempProject();
+        gitServer = await startLocalGitServer([
+          {
+            name: "ralph",
+            files: {
+              "index.sh": BASH_STOP,
+              "package.json": JSON.stringify({
+                name: "ralph",
+                version: "1.0.0",
+                dependencies: { loopx: unsatisfiedRange() },
+              }),
+            },
+          },
+        ]);
+
+        await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+          const result = await runCLI(
+            ["install", "-y", `${gitServer!.url}/ralph.git`],
+            { cwd: project!.dir, runtime, env },
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(readFileSync(join(project!.loopxDir, "ralph", "package.json"), "utf-8")).toContain(
+            unsatisfiedRange(),
+          );
+          expect(readNpmInvocations(logFile).map((i) => i.cwd)).toEqual([
+            join(project!.loopxDir, "ralph"),
+          ]);
+          expect(readFileSync(join(project!.loopxDir, "ralph", ".gitignore"), "utf-8")).toMatch(
+            /^node_modules\s*$/,
+          );
+        });
+      });
+
+      it.each([
+        ["invalid-json", { "package.json": "{broken" }, "invalid-json", undefined],
+        [
+          "invalid-semver",
+          {
+            "package.json": JSON.stringify({
+              dependencies: { loopx: "not-a-range!!!" },
+            }),
+          },
+          "invalid-semver",
+          undefined,
+        ],
+        [
+          "non-string-range",
+          {
+            "package.json": JSON.stringify({
+              dependencies: { loopx: 42 },
+            }),
+          },
+          "invalid-semver",
+          undefined,
+        ],
+        [
+          "non-regular-directory",
+          { "package.json/README": "not regular" },
+          "package-json",
+          undefined,
+        ],
+        [
+          "unreadable",
+          {
+            "package.json": JSON.stringify({
+              name: "ralph",
+              version: "1.0.0",
+            }),
+          },
+          "unreadable",
+          "package-json-make-unreadable:ralph",
+        ],
+      ] as const)(
+        "T-INST-120e: -y replacement with malformed package skips fresh auto-install (%s)",
+        async (variant, replacementFiles, warningKind, fault) => {
+          if (variant === "unreadable" && IS_ROOT) {
+            expect(IS_ROOT).toBe(true);
+            return;
+          }
+          project = await createTempProject();
+          await createBashWorkflowScript(project, "ralph", "index", "exit 0");
+          await createWorkflowPackageJson(project, "ralph", {
+            name: "old-ralph",
+            version: "1.0.0",
+          });
+          await mkdir(join(project.loopxDir, "ralph", "node_modules"), {
+            recursive: true,
+          });
+          await writeFile(
+            join(project.loopxDir, "ralph", "node_modules", "old-marker"),
+            "old",
+            "utf-8",
+          );
+          await writeFile(
+            join(project.loopxDir, "ralph", ".gitignore"),
+            "node_modules\n",
+            "utf-8",
+          );
+          gitServer = await startLocalGitServer([
+            {
+              name: "ralph",
+              files: {
+                "index.sh": BASH_STOP,
+                ...replacementFiles,
+              },
+            },
+          ]);
+
+          await withFakeNpm({ exitCode: 0 }, async (env, logFile) => {
+            const result = await runCLI(
+              ["install", "-y", `${gitServer!.url}/ralph.git`],
+              {
+                cwd: project!.dir,
+                runtime,
+                env: fault
+                  ? {
+                      ...env,
+                      NODE_ENV: "test",
+                      LOOPX_TEST_AUTOINSTALL_FAULT: fault,
+                    }
+                  : env,
+              },
+            );
+
+            expect(result.exitCode).toBe(0);
+            expect(
+              existsSync(
+                join(project!.loopxDir, "ralph", "node_modules", "old-marker"),
+              ),
+            ).toBe(false);
+            expect(readNpmInvocations(logFile)).toHaveLength(0);
+            if (warningKind === "invalid-json") {
+              expect(countInvalidJsonWarnings(result.stderr, "ralph")).toBe(1);
+            } else if (warningKind === "invalid-semver") {
+              expect(countInvalidSemverWarnings(result.stderr, "ralph")).toBe(1);
+            } else if (warningKind === "unreadable") {
+              expect(countUnreadableWarnings(result.stderr, "ralph")).toBe(1);
+              await chmod(join(project!.loopxDir, "ralph", "package.json"), 0o644);
+            } else {
+              expect(result.stderr).toMatch(/ralph/i);
+              expect(result.stderr).toMatch(/package\.json/i);
+            }
+            expect(existsSync(join(project!.loopxDir, "ralph", ".gitignore"))).toBe(
+              false,
+            );
+            expectNoAutoInstallFailureReport(result.stderr);
+          });
+        },
+      );
     });
   });
 

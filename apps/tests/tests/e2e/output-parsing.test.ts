@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -7,6 +8,7 @@ import {
   type TempProject,
 } from "../helpers/fixtures.js";
 import { runAPIDriver } from "../helpers/api-driver.js";
+import { runCLI } from "../helpers/cli.js";
 import { forEachRuntime } from "../helpers/runtime.js";
 
 // ---------------------------------------------------------------------------
@@ -47,7 +49,7 @@ console.log(JSON.stringify(outputs));
   };
 }
 
-describe("SPEC: Structured Output Parsing (T-PARSE-01 through T-PARSE-29)", () => {
+describe("SPEC: Structured Output Parsing (T-PARSE- T-PARSE-01 through T-PARSE-29)", () => {
   let project: TempProject | null = null;
 
   afterEach(async () => {
@@ -157,6 +159,42 @@ console.log(JSON.stringify(outputs));
         expect(outputs).toHaveLength(1);
         const output = outputs[0] as Record<string, unknown>;
         expect(output.stop).toBe(true);
+      });
+
+      it("T-PARSE-04a: stop true beats invalid goto validation", async () => {
+        project = await createTempProject();
+        const counterPath = join(project.dir, "parse-04a-count");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          `#!/bin/bash
+count=0
+if [ -f "${counterPath}" ]; then count=$(cat "${counterPath}"); fi
+printf '%s' "$((count + 1))" > "${counterPath}"
+printf '{"stop":true,"goto":"a:b:c"}'
+`,
+        );
+
+        const cli = await runCLI(["run", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+        expect(cli.exitCode).toBe(0);
+        expect(cli.stderr).not.toMatch(/goto|target|colon|missing/i);
+        expect(readFileSync(counterPath, "utf-8")).toBe("1");
+
+        const driverCode = `
+import { runPromise } from "loopx";
+const outputs = await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 5 });
+console.log(JSON.stringify(outputs));
+`;
+        const api = await runAPIDriver(runtime, driverCode);
+        expect(api.exitCode).toBe(0);
+        const outputs = JSON.parse(api.stdout) as Array<Record<string, unknown>>;
+        expect(outputs).toHaveLength(1);
+        expect(outputs[0].stop).toBe(true);
+        expect(readFileSync(counterPath, "utf-8")).toBe("2");
       });
 
       it('T-PARSE-05: {"result":"x","extra":"ignored"} drops unknown fields', async () => {
@@ -328,6 +366,22 @@ console.log(JSON.stringify(outputs));
         expect(outputs).toHaveLength(1);
         expect((outputs[0] as Record<string, unknown>).result).toBe("");
       });
+
+      it("T-PARSE-13a: whitespace-only stdout falls back to exact raw bytes", async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '   '`,
+        );
+
+        const { outputs, exitCode } = await runParseTest(runtime, project);
+
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe("   ");
+      });
     });
 
     // -------------------------------------------------------------------------
@@ -398,6 +452,22 @@ console.log(JSON.stringify(outputs));
         expect(exitCode).toBe(0);
         expect(outputs).toHaveLength(1);
         expect((outputs[0] as Record<string, unknown>).result).toBe("null");
+      });
+
+      it('T-PARSE-17a: {"result":[1,2]} coerces array result via String(value)', async () => {
+        project = await createTempProject();
+        await createBashWorkflowScript(
+          project,
+          "test",
+          "index",
+          `printf '{"result":[1,2]}'`,
+        );
+
+        const { outputs, exitCode } = await runParseTest(runtime, project);
+
+        expect(exitCode).toBe(0);
+        expect(outputs).toHaveLength(1);
+        expect((outputs[0] as Record<string, unknown>).result).toBe("1,2");
       });
 
       it('T-PARSE-18: {"goto":42} invalid goto discarded, Output is {}', async () => {

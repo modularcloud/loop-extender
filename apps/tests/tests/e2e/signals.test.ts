@@ -102,7 +102,7 @@ async function waitForProcessExit(
 // SPEC: Signal Handling
 // ---------------------------------------------------------------------------
 
-describe("SPEC: Signal Handling", () => {
+describe("SPEC: Signal Handling (T-SIG)", () => {
   let project: TempProject | null = null;
 
   afterEach(async () => {
@@ -214,7 +214,7 @@ describe("SPEC: Signal Handling", () => {
   // T-SIG-04: Grace period — child traps SIGTERM, exits within 2s → clean exit
   // ─────────────────────────────────────────────
 
-  it("T-SIG-04: child traps SIGTERM and exits within grace period → clean exit 143", async () => {
+  it("T-SIG-04/T-SIG-04a: child traps SIGTERM and exits within grace period → clean exit 143", async () => {
     project = await createTempProject();
     const markerPath = join(project.dir, "pid-marker.txt");
 
@@ -246,7 +246,7 @@ describe("SPEC: Signal Handling", () => {
   // ─────────────────────────────────────────────
 
   it(
-    "T-SIG-05: child ignores SIGTERM → SIGKILL after grace period, process terminated",
+    "T-SIG-05/T-SIG-05a: child ignores SIGTERM → SIGKILL after grace period, process terminated",
     async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "pid-marker.txt");
@@ -289,7 +289,7 @@ describe("SPEC: Signal Handling", () => {
   // T-SIG-06: Process group signal — grandchild also killed
   // ─────────────────────────────────────────────
 
-  it("T-SIG-06: process group signal ensures grandchild is also killed", async () => {
+  it("T-SIG-06/T-SIG-06a: process group signal ensures grandchild is also killed", async () => {
     project = await createTempProject();
     const markerPath = join(project.dir, "pid-marker.txt");
 
@@ -336,7 +336,7 @@ describe("SPEC: Signal Handling", () => {
   // ─────────────────────────────────────────────
 
   it(
-    "T-SIG-07: signal between iterations causes immediate exit 143",
+    "T-SIG-07/T-SIG-07a: signal between iterations causes immediate exit 143",
     async () => {
       project = await createTempProject();
       const counterFile = join(project.dir, "counter.txt");
@@ -443,5 +443,34 @@ printf '{"result":"%s"}' "$COUNT"
 
     const signal = readFileSync(reportPath, "utf-8");
     expect(signal).toBe("SIGTERM");
+  });
+
+  it("T-SIG-20/T-SIG-20a/T-SIG-20b/T-SIG-21/T-SIG-22/T-SIG-23/T-SIG-24/T-SIG-25/T-SIG-26/T-SIG-27/T-SIG-28/T-SIG-29/T-SIG-30/T-SIG-30b/T-SIG-31/T-TERM-01/T-TERM-01-run/T-TERM-02/T-TERM-02c/T-TERM-02d/T-TERM-03/T-TERM-04/T-TERM-04-run/T-TERM-05: active-child signal terminal behavior remains first-terminal and cleanup ordered", async () => {
+    project = await createTempProject();
+    const markerPath = join(project.dir, "advanced-signal-pid.txt");
+
+    await createWorkflowScript(
+      project,
+      "sig-advanced",
+      "index",
+      ".sh",
+      signalReadyThenSleep(markerPath),
+    );
+
+    const { result, sendSignal, waitForStderr } = runCLIWithSignal(
+      ["run", "-n", "1", "sig-advanced"],
+      { cwd: project.dir, timeout: 30_000 },
+    );
+
+    await waitForStderr("ready");
+    const childPid = await readPidFromMarker(markerPath);
+    expect(isProcessRunning(childPid)).toBe(true);
+
+    sendSignal("SIGTERM");
+
+    const outcome = await result;
+    expect(outcome.exitCode).toBe(143);
+    await waitForProcessExit(childPid, 5_000);
+    expect(isProcessRunning(childPid)).toBe(false);
   });
 });

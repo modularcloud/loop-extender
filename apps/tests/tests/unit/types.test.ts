@@ -1,6 +1,6 @@
 import { describe, it, expectTypeOf } from "vitest";
 import type { Output, RunOptions } from "loopx";
-import type { run, runPromise } from "loopx";
+import type { input, output, run, runPromise } from "loopx";
 
 /**
  * TEST-SPEC §6.4 — Compile-time type surface verification.
@@ -126,5 +126,22 @@ describe("SPEC: Type Surface Verification", () => {
     // Calling with zero arguments should NOT be valid (scriptName is required)
     expectTypeOf<[]>().not.toMatchTypeOf<RunParams>();
     expectTypeOf<[]>().not.toMatchTypeOf<RunPromiseParams>();
+  });
+
+  it("T-TYPE-08: script-side input() and output() helper signatures are exported", () => {
+    expectTypeOf<typeof input>().not.toBeAny();
+    expectTypeOf<typeof output>().not.toBeAny();
+
+    expectTypeOf<ReturnType<typeof input>>().toEqualTypeOf<Promise<string>>();
+    expectTypeOf<typeof output>().parameter(0).toMatchTypeOf<
+      Output | string | number | boolean | null | undefined
+    >();
+
+    type OutputParams = Parameters<typeof output>;
+    expectTypeOf<[{ result: "ok" }]>().toMatchTypeOf<OutputParams>();
+    expectTypeOf<[{ goto: "ralph:check" }]>().toMatchTypeOf<OutputParams>();
+    expectTypeOf<[{ stop: true }]>().toMatchTypeOf<OutputParams>();
+    expectTypeOf<[42]>().toMatchTypeOf<OutputParams>();
+    expectTypeOf<["hello"]>().toMatchTypeOf<OutputParams>();
   });
 });
