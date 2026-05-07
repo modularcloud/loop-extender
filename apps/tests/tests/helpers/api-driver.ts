@@ -16,7 +16,7 @@ export interface APIDriverResult {
 
 export interface APIDriverOptions {
   cwd?: string;
-  env?: Record<string, string>;
+  env?: Record<string, string | undefined>;
   timeout?: number;
 }
 
@@ -87,7 +87,25 @@ export async function runAPIDriver(
 ): Promise<APIDriverResult> {
   const { cwd, env: extraEnv = {}, timeout = 30_000 } = options;
 
-  const { consumerDir, driverPath } = await createConsumerDriver(code);
+  const runtimeEnvAssignments: string[] = [];
+  let childOnlyEnv = { ...extraEnv };
+  if (runtime === "node" && Object.prototype.hasOwnProperty.call(childOnlyEnv, "TMPDIR")) {
+    if (childOnlyEnv.TMPDIR === undefined) {
+      runtimeEnvAssignments.push("delete process.env.TMPDIR;");
+    } else {
+      runtimeEnvAssignments.push(
+        `process.env.TMPDIR = ${JSON.stringify(childOnlyEnv.TMPDIR)};`
+      );
+    }
+    delete childOnlyEnv.TMPDIR;
+  }
+
+  const effectiveCode =
+    runtimeEnvAssignments.length > 0
+      ? `${runtimeEnvAssignments.join("\n")}\n${code}`
+      : code;
+
+  const { consumerDir, driverPath } = await createConsumerDriver(effectiveCode);
 
   try {
     // Spawn the driver. Under Node, invoke the repo's own `tsx` binary by
@@ -102,10 +120,14 @@ export async function runAPIDriver(
       : resolve(REPO_ROOT, "node_modules", ".bin", "tsx");
     const args = [driverPath];
 
-    const mergedEnv = {
-      ...process.env,
-      ...extraEnv,
-    };
+    const mergedEnv = { ...process.env };
+    for (const [key, value] of Object.entries(childOnlyEnv)) {
+      if (value === undefined) {
+        delete mergedEnv[key];
+      } else {
+        mergedEnv[key] = value;
+      }
+    }
 
     return await new Promise<APIDriverResult>((resolve, reject) => {
       const child = spawn(command, args, {
@@ -161,10 +183,14 @@ export async function runAPIDriverLive(
   const command = runtime === "bun"
     ? "bun"
     : resolve(REPO_ROOT, "node_modules", ".bin", "tsx");
-  const mergedEnv = {
-    ...process.env,
-    ...extraEnv,
-  };
+  const mergedEnv = { ...process.env };
+  for (const [key, value] of Object.entries(extraEnv)) {
+    if (value === undefined) {
+      delete mergedEnv[key];
+    } else {
+      mergedEnv[key] = value;
+    }
+  }
   const child = spawn(command, [driverPath], {
     cwd: cwd ?? consumerDir,
     env: mergedEnv,
@@ -240,6 +266,7 @@ export async function runAPIDriverLive(
     child,
     writeStdin(data: string) {
       child.stdin.write(data);
+      child.stdin.end();
     },
     waitForStderr(pattern: string | RegExp, waitTimeout = timeout) {
       if (matches(pattern, stderr)) return Promise.resolve();

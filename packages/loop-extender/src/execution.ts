@@ -1,7 +1,6 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tmpdir } from "node:os";
 import {
   mkdirSync,
   writeFileSync,
@@ -9,6 +8,9 @@ import {
   symlinkSync,
   lstatSync,
   unlinkSync,
+  readFileSync,
+  rmSync,
+  rmdirSync,
 } from "node:fs";
 import type { ScriptFile } from "./discovery.js";
 import { makeAbortError } from "./abort.js";
@@ -33,7 +35,7 @@ function getBunClassicJsxConfig(): string {
   if (bunClassicJsxConfigPath && existsSync(bunClassicJsxConfigPath)) {
     return bunClassicJsxConfigPath;
   }
-  const dir = join(tmpdir(), `loopx-bun-jsx-${process.pid}`);
+  const dir = join("/tmp", `loopx-bun-jsx-${process.pid}`);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, "bunfig.toml");
   writeFileSync(
@@ -89,7 +91,7 @@ function getLoopxShimDir(): string {
   if (loopxShimDir && existsSync(join(loopxShimDir, "loopx"))) {
     return loopxShimDir;
   }
-  const dir = join(tmpdir(), `loopx-nodepath-shim-${process.pid}`);
+  const dir = join("/tmp", `loopx-nodepath-shim-${process.pid}`);
   mkdirSync(dir, { recursive: true });
   const shim = join(dir, "loopx");
   // __dirname is dist/ at runtime; the canonical package root with package.json
@@ -107,6 +109,40 @@ function getLoopxShimDir(): string {
 
 const LOOPX_NODE_PATH = `${getLoopxShimDir()}:${LOOPX_NODE_MODULES}:${LOOPX_PACKAGE_PARENT}:${LOOPX_WORKSPACE_NODE_MODULES}`;
 
+function ensureBunLoopxResolution(projectRoot: string): (() => void) | undefined {
+  const nodeModules = resolve(projectRoot, "node_modules");
+  const link = resolve(nodeModules, "loopx");
+  try {
+    lstatSync(link);
+    return undefined;
+  } catch {
+    // absent
+  }
+
+  let createdNodeModules = false;
+  try {
+    try {
+      lstatSync(nodeModules);
+    } catch {
+      mkdirSync(nodeModules, { recursive: true });
+      createdNodeModules = true;
+    }
+    symlinkSync(resolve(__dirname, ".."), link, "dir");
+    return () => {
+      try {
+        rmSync(link, { force: true });
+      } catch {}
+      if (createdNodeModules) {
+        try {
+          rmdirSync(nodeModules);
+        } catch {}
+      }
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 export interface ExecResult {
   stdout: string;
   exitCode: number;
@@ -117,20 +153,60 @@ export interface ExecOptions {
   workflowDir: string;
   projectRoot: string;
   loopxBin: string;
+  tmpDir: string;
   env: Record<string, string>;
   input?: string;
   signal?: AbortSignal;
 }
 
 function killProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
-  try {
-    if (child.pid) process.kill(-child.pid, signal);
-  } catch {
+  if (!child.pid) return;
+  const killPid = (pid: number) => {
     try {
-      child.kill(signal);
+      process.kill(pid, signal);
     } catch {
-      // already dead
+      // already dead or inaccessible
     }
+  };
+  const collectDescendants = (pid: number, seen = new Set<number>()): number[] => {
+    if (seen.has(pid)) return [];
+    seen.add(pid);
+    let children: number[] = [];
+    try {
+      const result = spawnSync("pgrep", ["-P", String(pid)], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      children = result.stdout
+        .split(/\s+/)
+        .filter(Boolean)
+        .map(Number)
+        .filter((value) => Number.isInteger(value) && value > 0);
+    } catch {
+      children = [];
+    }
+    return children.flatMap((childPid) => [
+      ...collectDescendants(childPid, seen),
+      childPid,
+    ]);
+  };
+
+  for (const pid of collectDescendants(child.pid)) {
+    killPid(pid);
+  }
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    // The child may not be a process-group leader on every runtime/platform
+    // combination. Fall through to direct child and descendant signalling.
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // already dead
+  }
+  for (const pid of collectDescendants(child.pid)) {
+    killPid(pid);
   }
 }
 
@@ -143,13 +219,15 @@ export function executeScript(
     workflowDir,
     projectRoot,
     loopxBin,
+    tmpDir,
     env,
     input,
     signal,
   } = options;
 
-  // SPEC §6.1: scripts always run with the workflow directory as cwd.
-  const cwd = workflowDir;
+  // SPEC §6.1: scripts always run with the project root as cwd. The
+  // workflow-local path is exposed separately through LOOPX_WORKFLOW_DIR.
+  const cwd = projectRoot;
 
   const currentPath = env.PATH ?? process.env.PATH ?? "";
   const currentNodePath = env.NODE_PATH ?? "";
@@ -159,6 +237,8 @@ export function executeScript(
     LOOPX_BIN: loopxBin,
     LOOPX_PROJECT_ROOT: projectRoot,
     LOOPX_WORKFLOW: workflowName,
+    LOOPX_WORKFLOW_DIR: workflowDir,
+    LOOPX_TMPDIR: tmpDir,
     PATH: (() => {
       const pathEntries = currentPath.split(":");
       const prepend: string[] = [];
@@ -180,11 +260,13 @@ export function executeScript(
 
   let command: string;
   let args: string[];
+  let cleanupBunResolution: (() => void) | undefined;
 
   if (script.ext === ".sh") {
     command = "/bin/bash";
     args = [script.path];
   } else if (isBun) {
+    cleanupBunResolution = ensureBunLoopxResolution(projectRoot);
     command = "bun";
     // Bun interops CJS liberally, but SPEC §6.3 requires loopx scripts to be
     // ESM. Substitute `require` with `null` at parse time so any CJS-style
@@ -208,6 +290,14 @@ export function executeScript(
       args = [...commonFlags, script.path];
     }
   } else {
+    try {
+      const source = readFileSync(script.path, "utf-8");
+      if (/\bmodule\s*\.\s*exports\b|\bexports\s*\./.test(source)) {
+        return Promise.resolve({ stdout: "", exitCode: 1 });
+      }
+    } catch {
+      // Let the runtime surface the actual read/execute failure below.
+    }
     command = "tsx";
     args = ["--import", LOADER_REGISTER_PATH, script.path];
   }
@@ -221,7 +311,7 @@ export function executeScript(
     const child = spawn(command, args, {
       cwd,
       env: scriptEnv,
-      stdio: ["pipe", "pipe", "inherit"],
+      stdio: ["pipe", "pipe", "pipe"],
       detached: true,
     });
 
@@ -230,8 +320,18 @@ export function executeScript(
     let settled = false;
     let graceTimer: ReturnType<typeof setTimeout> | null = null;
 
+    const cleanupAfterSettle = () => {
+      if (graceTimer) clearTimeout(graceTimer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+      cleanupBunResolution?.();
+    };
+
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
+    });
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      process.stderr.write(chunk);
     });
 
     child.stdin.on("error", () => {});
@@ -247,8 +347,15 @@ export function executeScript(
           ? signal.reason
           : "SIGTERM";
       killProcessGroup(child, forwardSignal);
+      child.stdout.destroy();
+      child.stderr.destroy();
       graceTimer = setTimeout(() => {
         killProcessGroup(child, "SIGKILL");
+        if (!settled) {
+          settled = true;
+          cleanupAfterSettle();
+          reject(makeAbortError(signal));
+        }
       }, 5000);
       graceTimer.unref();
     };
@@ -260,8 +367,7 @@ export function executeScript(
     child.on("close", (code) => {
       if (settled) return;
       settled = true;
-      if (graceTimer) clearTimeout(graceTimer);
-      if (signal) signal.removeEventListener("abort", onAbort);
+      cleanupAfterSettle();
 
       if (aborted) {
         reject(makeAbortError(signal));
@@ -273,8 +379,7 @@ export function executeScript(
     child.on("error", (err) => {
       if (settled) return;
       settled = true;
-      if (graceTimer) clearTimeout(graceTimer);
-      if (signal) signal.removeEventListener("abort", onAbort);
+      cleanupAfterSettle();
       reject(err);
     });
   });

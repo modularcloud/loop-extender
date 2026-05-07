@@ -665,6 +665,15 @@ forEachRuntime((runtime) => {
   // ---------------------------------------------------------------------------
 
   describe("SPEC: loopx env list subcommand (§4.3)", () => {
+    let project: TempProject | null = null;
+
+    afterEach(async () => {
+      if (project) {
+        await project.cleanup();
+        project = null;
+      }
+    });
+
     // T-SUB-17
     it("T-SUB-17: env list with no vars → empty stdout, exit 0", async () => {
       await withIsolatedHome(async () => {

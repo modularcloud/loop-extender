@@ -1589,7 +1589,7 @@ for (const name of names) {
         expect(entry.value.startsWith(tmpParent)).toBe(true);
         expect(entry.tmpdirIsDirectory).toBe(true);
       } else if (entry.name === "LOOPX_BIN") {
-        expect(entry.value).toMatch(/\b(loopx|tsx|bun|node)/i);
+        expect(entry.value).toMatch(/^\/.*\/bin\.js$/);
       }
     }
   });

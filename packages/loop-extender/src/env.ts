@@ -10,18 +10,22 @@ import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { parseEnvFile, KEY_PATTERN } from "./parsers/parse-env.js";
 
-export function getGlobalEnvPath(): string {
+export function getGlobalEnvPath(
+  baseEnv: Record<string, string | undefined> = process.env
+): string {
   const xdg =
-    process.env.XDG_CONFIG_HOME ||
-    join(process.env.HOME || homedir(), ".config");
+    baseEnv.XDG_CONFIG_HOME ||
+    join(baseEnv.HOME || homedir(), ".config");
   return join(xdg, "loopx", "env");
 }
 
-export function loadGlobalEnv(): {
+export function loadGlobalEnv(
+  baseEnv: Record<string, string | undefined> = process.env
+): {
   vars: Record<string, string>;
   warnings: string[];
 } {
-  const envPath = getGlobalEnvPath();
+  const envPath = getGlobalEnvPath(baseEnv);
 
   if (!existsSync(envPath)) {
     return { vars: {}, warnings: [] };
@@ -57,7 +61,8 @@ export function loadLocalEnv(path: string): {
 
 export function mergeEnv(
   globalEnv: Record<string, string>,
-  localEnv: Record<string, string>
+  localEnv: Record<string, string>,
+  baseEnv: Record<string, string | undefined> = process.env
 ): Record<string, string> {
   // Per SPEC §8.3 precedence (highest wins):
   //   loopx-injected (LOOPX_BIN / LOOPX_PROJECT_ROOT / LOOPX_WORKFLOW)
@@ -71,7 +76,7 @@ export function mergeEnv(
   // loopx invocation, it passes through unchanged (SPEC §4.7 / TEST-SPEC
   // T-ENV-24a).
   return {
-    ...(process.env as Record<string, string>),
+    ...(baseEnv as Record<string, string>),
     ...globalEnv,
     ...localEnv,
   };
@@ -163,7 +168,10 @@ export function envList(): void {
   }
 
   const content = readFileSync(envPath, "utf-8");
-  const { vars } = parseEnvFile(content);
+  const { vars, warnings } = parseEnvFile(content);
+  for (const warning of warnings) {
+    process.stderr.write(`Warning: ${warning}\n`);
+  }
 
   const sorted = Object.entries(vars).sort(([a], [b]) =>
     a.localeCompare(b)

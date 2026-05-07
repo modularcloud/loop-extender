@@ -834,8 +834,8 @@ console.log(JSON.stringify({ promiseOutputs, promiseMarker, runOutputs, runMarke
     const parsed = JSON.parse(result.stdout);
     expect(parsed.promiseMarker.marker).toBe("absolute-path-win");
     expect(parsed.runMarker.marker).toBe("absolute-path-win");
-    expect(parsed.promiseOutputs[0].marker).toBe("absolute-path-win");
-    expect(parsed.runOutputs[0].marker).toBe("absolute-path-win");
+    expect(parsed.promiseOutputs[0]).toEqual({ stop: true });
+    expect(parsed.runOutputs[0]).toEqual({ stop: true });
   });
 
   it("T-API-21f/T-API-21g/T-API-21h/T-API-21i/T-API-21j/T-API-21k: relative cwd and envFile are resolved at call time", async () => {

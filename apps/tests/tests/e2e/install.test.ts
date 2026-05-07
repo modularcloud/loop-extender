@@ -2579,6 +2579,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
               await mkdir(join(workDir, "ralph", "dir-target"), {
                 recursive: true,
               });
+              await writeFile(join(workDir, "ralph", "dir-target", ".keep"), "");
               await writeFile(join(workDir, "ralph", "check.sh"), BASH_STOP);
               await chmod(join(workDir, "ralph", "check.sh"), 0o755);
               symlinkSync("dir-target", join(workDir, "ralph", "index.sh"));
@@ -3406,6 +3407,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
             "-w",
             "ralph",
             "-y",
+            "--no-install",
             `${gitServer.url}/multi.git`,
           ],
           { cwd: project.dir, runtime },
@@ -4213,7 +4215,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           { name: "repo", files: { "index.sh": BASH_STOP } },
         ]);
         const result = await runCLI(
-          ["install", `${gitServer.url}/repo.git`],
+          ["install", "--no-install", `${gitServer.url}/repo.git`],
           { cwd: project.dir, runtime },
         );
         expect(result.exitCode).toBe(0);
@@ -4227,7 +4229,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           { name: "repo", files: { "index.sh": BASH_STOP } },
         ]);
         const result = await runCLI(
-          ["install", `${gitServer.url}/repo.git`],
+          ["install", "--no-install", `${gitServer.url}/repo.git`],
           { cwd: project.dir, runtime },
         );
         expect(result.exitCode).toBe(1);
@@ -4611,7 +4613,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           },
         ]);
         const result = await runCLI(
-          ["install", "-y", `${gitServer.url}/wf.git`],
+          ["install", "-y", "--no-install", `${gitServer.url}/wf.git`],
           { cwd: project.dir, runtime },
         );
         expect(result.exitCode).toBe(0);
@@ -4657,7 +4659,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           },
         ]);
         const result = await runCLI(
-          ["install", "-y", `${gitServer.url}/wf.git`],
+          ["install", "-y", "--no-install", `${gitServer.url}/wf.git`],
           { cwd: project.dir, runtime },
         );
         expect(result.exitCode).toBe(0);
@@ -4944,7 +4946,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           },
         ]);
         const result = await runCLI(
-          ["install", "-y", `${gitServer.url}/multi.git`],
+          ["install", "-y", "--no-install", `${gitServer.url}/multi.git`],
           { cwd: project.dir, runtime },
         );
         expect(result.exitCode).toBe(0);
@@ -5547,7 +5549,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           { name: "repo", files: { "index.sh": BASH_STOP } },
         ]);
         const result = await runCLI(
-          ["install", `${gitServer.url}/repo.git`],
+          ["install", "--no-install", `${gitServer.url}/repo.git`],
           { cwd: project.dir, runtime },
         );
         expect(result.exitCode).toBe(0);
@@ -5606,7 +5608,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           { name: "repo", files: { "index.sh": BASH_STOP } },
         ]);
         const result = await runCLI(
-          ["install", `${gitServer.url}/repo.git`],
+          ["install", "--no-install", `${gitServer.url}/repo.git`],
           { cwd: project.dir, runtime },
         );
         expect(result.exitCode).toBe(0);
@@ -5628,7 +5630,7 @@ describe("SPEC: Install Command (T-INST-* / ADR-0003 workflow model)", () => {
           },
         ]);
         const result = await runCLI(
-          ["install", `${gitServer.url}/repo.git`],
+          ["install", "--no-install", `${gitServer.url}/repo.git`],
           { cwd: project.dir, runtime },
         );
         expect(result.exitCode).toBe(0);

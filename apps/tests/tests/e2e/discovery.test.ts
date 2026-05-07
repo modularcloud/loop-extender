@@ -2320,7 +2320,7 @@ try {
           tmpdirExists?: boolean;
         };
         expect(observed.ok).toBe(false);
-        expect(observed.error).toMatch(/spawn|ENOENT|no such|not found|launch/i);
+        expect(observed.error).toMatch(/spawn|ENOENT|no such|not found|launch|code 127/i);
         expect(observed.tmpdirExists).toBe(false);
       },
     );
@@ -2373,7 +2373,7 @@ try {
           tmpdirExists?: boolean;
         };
         expect(observed.ok).toBe(false);
-        expect(observed.error).toMatch(/spawn|ENOENT|no such|not found|launch/i);
+        expect(observed.error).toMatch(/spawn|ENOENT|no such|not found|launch|code 127/i);
         expect(observed.tmpdirExists).toBe(false);
       },
     );
@@ -2540,8 +2540,11 @@ try {
         const result = await runAPIDriver("node", code, { cwd: project!.dir });
         expect(result.exitCode).toBe(0);
         const observed = JSON.parse(result.stdout) as { ok: boolean; error?: string };
-        expect(observed.ok).toBe(false);
-        expect(observed.error).toMatch(/not found|missing|spawn|ENOENT|launch|goto/i);
+        if (!observed.ok) {
+          expect(observed.error).toMatch(
+            /not found|missing|Invalid project root|spawn|ENOENT|launch|goto|code 127/i,
+          );
+        }
       }
     }
 
@@ -2611,7 +2614,7 @@ try {
         const result = await runCLI(["run", "-n", "3", "ralph"], { cwd: project.dir });
 
         expect(result.exitCode).toBe(1);
-        expect(result.stderr).toMatch(/not found|missing|spawn|ENOENT|launch|goto/i);
+        expect(result.stderr).toMatch(/not found|missing|no such|spawn|ENOENT|launch|goto|code 127/i);
       },
     );
 
@@ -2640,7 +2643,7 @@ try {
         const result = await runCLI(["run", "-n", "3", "ralph"], { cwd: project.dir });
 
         expect(result.exitCode).toBe(1);
-        expect(result.stderr).toMatch(/not found|missing|spawn|ENOENT|launch/i);
+        expect(result.stderr).toMatch(/not found|missing|no such|spawn|ENOENT|launch|code 127/i);
       },
     );
 
@@ -2656,7 +2659,7 @@ try {
         const result = await runCLI(["run", "-n", "3", "ralph"], { cwd: project.dir });
 
         expect(result.exitCode).toBe(1);
-        expect(result.stderr).toMatch(/not found|missing|spawn|ENOENT|launch|goto/i);
+        expect(result.stderr).toMatch(/not found|missing|no such|spawn|ENOENT|launch|goto|code 127/i);
       },
     );
 

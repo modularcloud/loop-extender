@@ -2,6 +2,7 @@ import { join, resolve } from "node:path";
 import { readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
 import type { Output, RunOptions } from "./types.js";
 import { discoverScripts } from "./discovery.js";
 import { runLoop, type LoopStartingTarget } from "./loop.js";
@@ -28,9 +29,7 @@ function getRunningVersion(): string {
  *
  * Per SPEC §9.1/9.5:
  *   - RunOptions.cwd is snapshotted at call time; it specifies the project
- *     root (for `.loopx/` resolution and LOOPX_PROJECT_ROOT), NOT the script
- *     execution cwd. Scripts always execute with their workflow directory
- *     as cwd (§6.1).
+ *     root, LOOPX_PROJECT_ROOT, and the script execution cwd (§6.1).
  *   - target is a required string of shape `workflow[:script]`.
  *   - Errors are surfaced lazily on first iteration.
  */
@@ -38,30 +37,43 @@ export function run(
   target: string,
   options?: RunOptions
 ): AsyncGenerator<Output> {
-  const cwd = options?.cwd ?? process.cwd();
-  const maxIterations = options?.maxIterations;
-  const envFile = options?.envFile;
-  const externalSignal = options?.signal;
+  return createRunGenerator(target, options, undefined, undefined);
+}
+
+function createRunGenerator(
+  target: string,
+  options: RunOptions | undefined,
+  tmpParent: string | undefined,
+  processEnv: Record<string, string | undefined> | undefined
+): AsyncGenerator<Output> {
+  const snapshot = snapshotRunOptions(options);
+  snapshot.processEnv = processEnv;
   const loopxBin = getLoopxBin();
 
   const internalAc = new AbortController();
-  const effectiveSignal: AbortSignal = externalSignal
-    ? AbortSignal.any([externalSignal, internalAc.signal])
-    : internalAc.signal;
+  const combinedAc = new AbortController();
+  const forwardAbort = () => combinedAc.abort(makeAbortError(snapshot.signal as AbortSignal));
+  internalAc.signal.addEventListener("abort", forwardAbort, { once: true });
+  if (!snapshot.error && snapshot.signal) {
+    try {
+      snapshot.signal.addEventListener(
+        "abort",
+        () => combinedAc.abort(makeAbortError(snapshot.signal as AbortSignal)),
+        { once: true }
+      );
+    } catch (err) {
+      snapshot.error = err;
+    }
+  }
 
-  const gen = runInternal(
-    target,
-    cwd,
-    maxIterations,
-    envFile,
-    effectiveSignal,
-    loopxBin
-  );
+  const gen = runInternal(target, snapshot, combinedAc.signal, loopxBin, tmpParent);
 
   let returnCalled = false;
+  let started = false;
 
   const wrapper: AsyncGenerator<Output> = {
     next: async () => {
+      started = true;
       try {
         return await gen.next();
       } catch (err) {
@@ -72,15 +84,44 @@ export function run(
       }
     },
     return: async (value?: Output) => {
+      const wasExternallyAborted = combinedAc.signal.aborted;
       returnCalled = true;
+      if (!started) {
+        return { done: true, value } as IteratorResult<Output>;
+      }
       internalAc.abort();
       try {
-        return await gen.return(value as Output);
+        const result = await gen.return(value as Output);
+        if (wasExternallyAborted) {
+          throw makeAbortError(combinedAc.signal);
+        }
+        return result;
       } catch {
+        if (wasExternallyAborted) {
+          throw makeAbortError(combinedAc.signal);
+        }
         return { done: true, value: undefined } as IteratorResult<Output>;
       }
     },
-    throw: (err: unknown) => gen.throw(err),
+    throw: async (err: unknown) => {
+      const wasExternallyAborted = combinedAc.signal.aborted;
+      if (!started) {
+        return await gen.throw(err);
+      }
+      returnCalled = true;
+      if (wasExternallyAborted) {
+        throw makeAbortError(combinedAc.signal);
+      }
+      internalAc.abort();
+      try {
+        return await gen.return(undefined as unknown as Output);
+      } catch {
+        if (wasExternallyAborted) {
+          throw makeAbortError(combinedAc.signal);
+        }
+        return { done: true, value: undefined } as IteratorResult<Output>;
+      }
+    },
     [Symbol.asyncIterator]() {
       return this;
     },
@@ -97,14 +138,123 @@ export function run(
   return wrapper;
 }
 
+interface RunOptionsSnapshot {
+  cwd: string;
+  maxIterations?: number;
+  envFile?: string;
+  env: Record<string, string>;
+  signal?: AbortSignalLike;
+  processEnv?: Record<string, string | undefined>;
+  error?: unknown;
+}
+
+interface AbortSignalLike {
+  aborted: boolean;
+  reason?: unknown;
+  addEventListener(
+    type: "abort",
+    listener: () => void,
+    options?: { once?: boolean }
+  ): void;
+  removeEventListener?(
+    type: "abort",
+    listener: () => void,
+    options?: unknown
+  ): void;
+}
+
+function snapshotRunOptions(options: RunOptions | undefined): RunOptionsSnapshot {
+  const snapshot: RunOptionsSnapshot = {
+    cwd: process.cwd(),
+    env: {},
+  };
+  try {
+    if (
+      options !== undefined &&
+      (typeof options !== "object" || options === null || Array.isArray(options))
+    ) {
+      throw new Error("Invalid options: RunOptions must be an object");
+    }
+    const opts = options as RunOptions | undefined;
+    const signal = opts?.signal as unknown;
+    if (signal !== undefined) {
+      snapshot.signal = validateSignal(signal);
+      if (snapshot.signal.aborted) {
+        return snapshot;
+      }
+    }
+    const env = opts?.env;
+    const cwd = opts?.cwd;
+    const envFile = opts?.envFile;
+    const maxIterations = opts?.maxIterations;
+
+    if (cwd !== undefined) {
+      if (typeof cwd !== "string") {
+        throw new Error("Invalid cwd: must be a string");
+      }
+      snapshot.cwd = cwd.startsWith("/") ? cwd : resolve(process.cwd(), cwd);
+    }
+    if (envFile !== undefined) {
+      if (typeof envFile !== "string") {
+        throw new Error("Invalid envFile: must be a string");
+      }
+      snapshot.envFile = envFile;
+    }
+    if (maxIterations !== undefined) {
+      snapshot.maxIterations = maxIterations;
+    }
+    if (env !== undefined) {
+      if (typeof env !== "object" || env === null || Array.isArray(env)) {
+        throw new Error("Invalid env: must be an object");
+      }
+      const captured: Record<string, string> = {};
+      for (const key of Object.keys(env)) {
+        const value = (env as Record<string, unknown>)[key];
+        if (typeof value !== "string") {
+          throw new Error(`Invalid env value for ${key}: must be a string`);
+        }
+        captured[key] = value;
+      }
+      snapshot.env = captured;
+    }
+  } catch (err) {
+    snapshot.error = err;
+  }
+  return snapshot;
+}
+
+function validateSignal(signal: unknown): AbortSignalLike {
+  if (typeof signal !== "object" || signal === null) {
+    throw new Error("Invalid signal: must be AbortSignal-compatible");
+  }
+  const candidate = signal as Partial<AbortSignalLike>;
+  const aborted = candidate.aborted;
+  if (typeof aborted !== "boolean") {
+    throw new Error("Invalid signal: aborted must be boolean");
+  }
+  if (typeof candidate.addEventListener !== "function") {
+    throw new Error("Invalid signal: addEventListener must be a function");
+  }
+  return candidate as AbortSignalLike;
+}
+
 async function* runInternal(
   target: string | undefined,
-  cwd: string,
-  maxIterations: number | undefined,
-  envFile: string | undefined,
+  snapshot: RunOptionsSnapshot,
   signal: AbortSignal,
-  loopxBin: string
+  loopxBin: string,
+  tmpParent: string | undefined
 ): AsyncGenerator<Output> {
+  if (snapshot.error) {
+    throw snapshot.error;
+  }
+
+  const { cwd, maxIterations, envFile } = snapshot;
+
+  if (snapshot.signal?.aborted || signal.aborted) {
+    throw makeAbortError((snapshot.signal ?? signal) as AbortSignal);
+  }
+
   if (maxIterations !== undefined) {
     if (
       typeof maxIterations !== "number" ||
@@ -116,10 +266,6 @@ async function* runInternal(
         `Invalid maxIterations: must be a non-negative integer, got ${maxIterations}`
       );
     }
-  }
-
-  if (signal.aborted) {
-    throw makeAbortError(signal);
   }
 
   const loopxDir = join(cwd, ".loopx");
@@ -134,7 +280,8 @@ async function* runInternal(
   }
 
   // Load env (SPEC §8)
-  const globalResult = loadGlobalEnv();
+  const baseEnv = snapshot.processEnv ?? process.env;
+  const globalResult = loadGlobalEnv(baseEnv);
   const globalEnv = globalResult.vars;
   for (const w of globalResult.warnings) {
     process.stderr.write(`Warning: ${w}\n`);
@@ -150,7 +297,8 @@ async function* runInternal(
     }
   }
 
-  const mergedEnv = mergeEnv(globalEnv, localEnv);
+  const mergedEnv = mergeEnv(globalEnv, localEnv, baseEnv);
+  Object.assign(mergedEnv, snapshot.env);
 
   ensureLoopxPackageJson(loopxDir);
 
@@ -209,6 +357,7 @@ async function* runInternal(
     loopxBin,
     runningVersion: getRunningVersion(),
     signal,
+    tmpParent,
   });
 }
 
@@ -220,41 +369,16 @@ export async function runPromise(
   target: string,
   options?: RunOptions
 ): Promise<Output[]> {
-  const signal = options?.signal;
-  if (signal?.aborted) {
-    throw makeAbortError(signal);
-  }
-
-  const gen = run(target, options);
+  const processEnv = { ...process.env };
+  const gen = createRunGenerator(
+    target,
+    options,
+    processEnv.TMPDIR ?? tmpdir(),
+    processEnv
+  );
   const outputs: Output[] = [];
 
-  if (signal) {
-    const abortPromise = new Promise<IteratorResult<Output>>((_, reject) => {
-      if (signal.aborted) {
-        reject(makeAbortError(signal));
-        return;
-      }
-      signal.addEventListener(
-        "abort",
-        () => reject(makeAbortError(signal)),
-        { once: true }
-      );
-    });
-    abortPromise.catch(() => {});
-
-    try {
-      while (true) {
-        const iterResult = await Promise.race([gen.next(), abortPromise]);
-        if (iterResult.done) break;
-        outputs.push(iterResult.value);
-      }
-      return outputs;
-    } catch (err) {
-      await gen.return(undefined as unknown as Output).catch(() => {});
-      throw err;
-    }
-  }
-
+  await Promise.resolve();
   for await (const output of gen) {
     outputs.push(output);
   }

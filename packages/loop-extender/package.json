@@ -1,10 +1,10 @@
 {
-  "name": "loop-extender",
+  "name": "loopx",
   "version": "0.2.0",
   "description": "A CLI tool that automates repeated execution (loops) of scripts, primarily designed to wrap agent CLIs.",
   "type": "module",
   "bin": {
-    "loopx": "./dist/bin.js"
+    "loopx": "./bin.js"
   },
   "exports": {
     ".": {
@@ -17,6 +17,7 @@
     }
   },
   "files": [
+    "bin.js",
     "dist",
     "README.md"
   ],

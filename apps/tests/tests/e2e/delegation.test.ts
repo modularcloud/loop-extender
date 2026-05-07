@@ -1271,7 +1271,7 @@ echo "99.0.0-local"
 
       const result = await spawnBinary(
         globalBinPath,
-        ["install", `${gitServer.url}/ralph.git`],
+        ["install", "--no-install", `${gitServer.url}/ralph.git`],
         { cwd: projectDir },
       );
 

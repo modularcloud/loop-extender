@@ -60,12 +60,13 @@ export function classifySource(source: string): ClassifyResult {
     const cleanPath = pathname.replace(/\/$/, "");
     const segments = cleanPath.split("/").filter(Boolean);
     if (segments.length === 2) {
-      return { type: "git", url: source };
+      url.hash = "";
+      return { type: "git", url: url.toString() };
     }
   }
 
   // Rule 3: URL ending in .git
-  if (pathname.endsWith(".git") || pathname.endsWith(".git/")) {
+  if (pathname.endsWith(".git")) {
     return { type: "git", url: source };
   }
 

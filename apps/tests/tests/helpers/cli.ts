@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -15,6 +15,17 @@ export interface CLIOptions {
   runtime?: "node" | "bun";
   timeout?: number;
   input?: string;
+}
+
+function resolveRuntimeCommand(runtime: "node" | "bun"): string {
+  if (runtime === "node") return "node";
+  try {
+    return execSync("command -v bun", {
+      encoding: "utf-8",
+    }).trim();
+  } catch {
+    return "bun";
+  }
 }
 
 /**
@@ -53,8 +64,8 @@ export async function runCLI(
 
   const binPath = getLoopxBinPath();
 
-  const command = runtime === "bun" ? "bun" : "node";
-  const spawnArgs = [binPath, ...args];
+  const command = resolveRuntimeCommand(runtime);
+  const spawnArgs = runtime === "bun" ? [binPath, "--", ...args] : [binPath, ...args];
 
   const mergedEnv = {
     ...process.env,
@@ -132,8 +143,8 @@ export function runCLIWithSignal(
   } = options;
 
   const binPath = getLoopxBinPath();
-  const command = runtime === "bun" ? "bun" : "node";
-  const spawnArgs = [binPath, ...args];
+  const command = resolveRuntimeCommand(runtime);
+  const spawnArgs = runtime === "bun" ? [binPath, "--", ...args] : [binPath, ...args];
 
   const mergedEnv = {
     ...process.env,

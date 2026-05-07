@@ -1672,7 +1672,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", `${gitServer.url}/ralph.git`],
+            ["install", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1703,7 +1703,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", `${gitServer.url}/ralph.git`],
+            ["install", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1727,7 +1727,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -1752,7 +1752,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -1776,7 +1776,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -1799,7 +1799,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -1824,7 +1824,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -1883,7 +1883,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", "-y", `${gitServer.url}/ralph.git`],
+            ["install", "-y", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1906,7 +1906,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -1933,7 +1933,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", `${gitServer.url}/ralph.git`],
+            ["install", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1964,7 +1964,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", "-y", `${gitServer.url}/ralph.git`],
+            ["install", "-y", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1985,7 +1985,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -2007,7 +2007,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -2041,7 +2041,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });

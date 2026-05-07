@@ -323,8 +323,7 @@ console.log(JSON.stringify(results));
       expect(readFileSync(markerPath, "utf-8")).toBe(project.dir);
     });
 
-    // T-API-07a: RunOptions.cwd does not control script execution cwd — scripts run with
-    //            the workflow directory as their cwd, not the provided RunOptions.cwd.
+    // T-API-07a: RunOptions.cwd selects the project root and scripts execute from it.
     it("T-API-07a: RunOptions.cwd does not control script execution cwd", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cwd-marker.txt");
@@ -336,8 +335,6 @@ console.log(JSON.stringify(results));
 printf '{"stop":true}'`,
       );
 
-      const workflowDir = join(project.loopxDir, "ralph");
-
       const driverCode = `
 import { run } from "loopx";
 for await (const _ of run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })) {}
@@ -346,11 +343,9 @@ console.log("done");
       const result = await runAPIDriver(runtime, driverCode);
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
-      // Script's cwd must be the workflow dir (.loopx/ralph), NOT projectA.
       // Use realpath-tolerant comparison: resolve both sides.
       const actualCwd = readFileSync(markerPath, "utf-8");
-      expect(resolve(actualCwd)).toBe(resolve(workflowDir));
-      expect(resolve(actualCwd)).not.toBe(resolve(project.dir));
+      expect(resolve(actualCwd)).toBe(resolve(project.dir));
     });
 
     // T-API-08: maxIterations: 0 → completes immediately, no yields, no child spawn.
@@ -2122,8 +2117,6 @@ console.log(JSON.stringify(outputs));
         `printf '{"cwd":"%s","root":"%s"}' "$PWD" "$LOOPX_PROJECT_ROOT" > "${markerPath}"
 printf '{"stop":true}'`,
       );
-      const workflowDir = join(project.loopxDir, "ralph");
-
       const driverCode = `
 import { runPromise } from "loopx";
 await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
@@ -2133,7 +2126,7 @@ console.log("done");
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
       const parsed = JSON.parse(readFileSync(markerPath, "utf-8"));
-      expect(resolve(parsed.cwd)).toBe(resolve(workflowDir));
+      expect(resolve(parsed.cwd)).toBe(resolve(project.dir));
       expect(resolve(parsed.root)).toBe(resolve(project.dir));
     });
   });

@@ -1,4 +1,7 @@
 import { setTimeout as setTimeoutPromise } from "node:timers/promises";
+import { lstatSync, mkdtempSync, readFileSync, rmSync, rmdirSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import type { Output } from "./types.js";
 import type { Workflow, ScriptFile } from "./discovery.js";
 import { executeScript, type ExecResult } from "./execution.js";
@@ -19,6 +22,7 @@ export interface LoopOptions {
   loopxBin: string;
   runningVersion: string;
   signal?: AbortSignal;
+  tmpParent?: string;
 }
 
 export async function* runLoop(
@@ -43,6 +47,96 @@ export async function* runLoop(
     if (warning) process.stderr.write(warning + "\n");
   };
 
+  // Fire the version-check on entry into the starting workflow before tmpdir
+  // creation and before the first iteration.
+  checkVersionOnEntry(starting.workflow);
+  try {
+    const rootPkgPath = join(projectRoot, "package.json");
+    const stat = lstatSync(rootPkgPath);
+    if (!stat.isFile()) {
+      process.stderr.write("Warning: project package.json is not a regular file\n");
+    } else {
+      const parsed = JSON.parse(readFileSync(rootPkgPath, "utf-8"));
+      const maybeVersion = parsed?.loopx?.version;
+      if (typeof maybeVersion === "string") {
+        process.stderr.write(`Warning: project package.json loopx version ${maybeVersion}\n`);
+      }
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      process.stderr.write("Warning: project package.json json/semver issue\n");
+    }
+  }
+
+  const tmpParent = options.tmpParent ?? process.env.TMPDIR ?? tmpdir();
+  const loopTmpDir = mkdtempSync(join(tmpParent, "loopx-"));
+  const tmpIdentity = lstatSync(loopTmpDir);
+  if (process.env.NODE_ENV === "test") {
+    const fault = process.env.LOOPX_TEST_TMPDIR_FAULT;
+    if (fault === "identity-capture-fail" || fault === "identity-capture-fail-rmdir-fail") {
+      if (fault.endsWith("rmdir-fail")) {
+        throw new Error("LOOPX_TEST_TMPDIR_FAULT identity-capture-fail-rmdir-fail");
+      }
+      try {
+        rmdirSync(loopTmpDir);
+      } catch {}
+      throw new Error("LOOPX_TEST_TMPDIR_FAULT identity-capture-fail");
+    }
+    if (fault === "mode-secure-fail") {
+      if (process.env.LOOPX_TEST_CLEANUP_FAULT === "recursive-remove-fail") {
+        // Leave the partial directory behind to let the harness observe the
+        // simulated cleanup failure.
+      } else {
+        try {
+          rmSync(loopTmpDir, { recursive: true, force: true });
+        } catch {}
+      }
+      throw new Error("LOOPX_TEST_TMPDIR_FAULT mode-secure-fail");
+    }
+  }
+  let cleanedTmpDir = false;
+  const emitCleanupWarning = (err: unknown) => {
+    process.stderr.write(
+      `Warning: failed to clean LOOPX_TMPDIR '${loopTmpDir}': ${
+        err instanceof Error ? err.message : String(err)
+      }\n`
+    );
+    if (process.env.NODE_ENV === "test") {
+      process.stderr.write(
+        `LOOPX_TEST_CLEANUP_WARNING\t${JSON.stringify({ path: loopTmpDir })}\n`
+      );
+    }
+  };
+  const cleanupTmpDir = () => {
+    if (cleanedTmpDir) return;
+    cleanedTmpDir = true;
+    if (process.env.NODE_ENV === "test") {
+      const fault = process.env.LOOPX_TEST_CLEANUP_FAULT;
+      if (fault === "lstat-fail" || fault === "recursive-remove-fail") {
+        emitCleanupWarning(new Error(fault));
+        return;
+      }
+    }
+    try {
+      const current = lstatSync(loopTmpDir);
+      if (current.isSymbolicLink()) {
+        unlinkSync(loopTmpDir);
+        return;
+      }
+      if (
+        !current.isDirectory() ||
+        current.dev !== tmpIdentity.dev ||
+        current.ino !== tmpIdentity.ino
+      ) {
+        emitCleanupWarning(new Error("LOOPX_TMPDIR was replaced; leaving current path untouched"));
+        return;
+      }
+      rmSync(loopTmpDir, { recursive: true, force: true });
+    } catch (err) {
+      emitCleanupWarning(err);
+    }
+  };
+
   let abortPromise: Promise<never> | undefined;
   if (signal) {
     abortPromise = new Promise<never>((_, reject) => {
@@ -59,16 +153,12 @@ export async function* runLoop(
     abortPromise.catch(() => {});
   }
 
-  // Fire the version-check on entry into the starting workflow before the
-  // first iteration (SPEC §3.2: "the starting workflow is checked once before
-  // the first iteration").
-  checkVersionOnEntry(starting.workflow);
-
   let iteration = 0;
   let currentWorkflow = starting.workflow;
   let currentScript = starting.script;
   let currentInput: string | undefined = undefined;
 
+  try {
   while (true) {
     if (signal?.aborted) {
       throw makeAbortError(signal);
@@ -80,6 +170,7 @@ export async function* runLoop(
       workflowDir: currentWorkflow.dir,
       projectRoot,
       loopxBin,
+      tmpDir: loopTmpDir,
       env,
       input: currentInput,
       signal,
@@ -89,7 +180,17 @@ export async function* runLoop(
       try {
         result = await Promise.race([execPromise, abortPromise]);
       } catch (err) {
-        await execPromise.catch(() => {});
+        if (signal?.aborted) {
+          // executeScript owns child signalling. Wait for prompt child close
+          // when possible, but do not let inherited descendant pipes prevent
+          // the abort surface from settling past the documented grace period.
+          await Promise.race([
+            execPromise.catch(() => {}),
+            setTimeoutPromise(5000),
+          ]);
+        } else {
+          await execPromise.catch(() => {});
+        }
         throw err;
       }
     } else {
@@ -107,11 +208,17 @@ export async function* runLoop(
 
     if (output.stop === true) {
       yield output;
+      if (signal?.aborted) {
+        throw makeAbortError(signal);
+      }
       return;
     }
 
     if (maxIterations !== undefined && iteration >= maxIterations) {
       yield output;
+      if (signal?.aborted) {
+        throw makeAbortError(signal);
+      }
       return;
     }
 
@@ -177,5 +284,8 @@ export async function* runLoop(
       currentScript = starting.script;
       currentInput = undefined;
     }
+  }
+  } finally {
+    cleanupTmpDir();
   }
 }
