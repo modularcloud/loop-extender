@@ -23,6 +23,7 @@ jobs:
           cache: npm
       - uses: oven-sh/setup-bun@v2
       - run: npm ci
+      - run: npm run build
       - run: npm run test:unit
 
   harness:
@@ -38,6 +39,7 @@ jobs:
           cache: npm
       - uses: oven-sh/setup-bun@v2
       - run: npm ci
+      - run: npm run build
       - run: npm run test:harness
 
   e2e:
@@ -53,6 +55,7 @@ jobs:
           cache: npm
       - uses: oven-sh/setup-bun@v2
       - run: npm ci
+      - run: npm run build
       - run: npm run test:e2e
 
   fuzz:
@@ -68,6 +71,7 @@ jobs:
           cache: npm
       - uses: oven-sh/setup-bun@v2
       - run: npm ci
+      - run: npm run build
       - run: npm run test:fuzz
 
   typecheck:
@@ -83,4 +87,5 @@ jobs:
           cache: npm
       - uses: oven-sh/setup-bun@v2
       - run: npm ci
+      - run: npm run build
       - run: npm run test:typecheck
