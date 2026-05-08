@@ -1175,7 +1175,7 @@ process.stdout.write(JSON.stringify({ before, zeroDone: zero.done, between, afte
       const api = await runAPIDriver(runtime, driverCode, { cwd: project.dir });
       const observed = JSON.parse(api.stdout);
 
-      expect(api.exitCode).toBe(0);
+      expect(api.exitCode, `stdout:\n${api.stdout}\nstderr:\n${api.stderr}`).toBe(0);
       expect(observed.zeroDone).toBe(true);
       expect(observed.markerExists).toBe(false);
       expect(readdirSync(parent).filter((entry) => entry.startsWith("loopx-"))).toEqual(before);
@@ -1564,7 +1564,7 @@ process.stdout.write(JSON.stringify({
         cwd: project.dir,
         env: { TMPDIR: parent },
       });
-      expect(api.exitCode).toBe(0);
+      expect(api.exitCode, `stdout:\n${api.stdout}\nstderr:\n${api.stderr}`).toBe(0);
       const observed = JSON.parse(api.stdout);
       expect(observed.exists).toEqual({
         stopPromise: false,
@@ -2235,7 +2235,7 @@ process.stdout.write(JSON.stringify({
         symlink: `rm -rf "$LOOPX_TMPDIR"\nln -s "${externalTarget}" "$LOOPX_TMPDIR"\nprintf '{"stop":true}'`,
         regular: `rm -rf "$LOOPX_TMPDIR"\nprintf 'regular-file-replacement' > "$LOOPX_TMPDIR"\nprintf '{"stop":true}'`,
         fifo: `rm -rf "$LOOPX_TMPDIR"\nmkfifo "$LOOPX_TMPDIR"\nprintf '{"stop":true}'`,
-        mismatch: `ORIGINAL="$LOOPX_TMPDIR"\nORIGINAL_ID="$(stat -Lc '%d:%i' "$ORIGINAL")"\nrm -rf "$ORIGINAL"\nmkdir -p "${externalTarget}/mismatch-replacements"\nfor attempt in $(seq 1 20); do\n  CANDIDATE="$(mktemp -d "${externalTarget}/mismatch-replacements/candidate.XXXXXX")"\n  CANDIDATE_ID="$(stat -Lc '%d:%i' "$CANDIDATE")"\n  if [ "$CANDIDATE_ID" != "$ORIGINAL_ID" ]; then\n    mv "$CANDIDATE" "$ORIGINAL"\n    break\n  fi\n  rm -rf "$CANDIDATE"\ndone\nif [ ! -d "$ORIGINAL" ]; then\n  printf 'failed to create distinct replacement for LOOPX_TMPDIR\\n' >&2\n  exit 64\nfi\nprintf 'mismatch-marker' > "$ORIGINAL/marker.txt"\nprintf '{"stop":true}'`,
+        mismatch: `ORIGINAL="$LOOPX_TMPDIR"\nORIGINAL_PARENT="$(dirname "$ORIGINAL")"\nORIGINAL_ID="$(stat -Lc '%d:%i' "$ORIGINAL")"\nCANDIDATE="$(mktemp -d "$ORIGINAL_PARENT/loopx-replacement.XXXXXX")"\nCANDIDATE_ID="$(stat -Lc '%d:%i' "$CANDIDATE")"\nif [ "$CANDIDATE_ID" = "$ORIGINAL_ID" ]; then\n  printf 'replacement unexpectedly matched original LOOPX_TMPDIR identity\\n' >&2\n  exit 64\nfi\nrm -rf "$ORIGINAL"\nmv "$CANDIDATE" "$ORIGINAL"\nprintf 'mismatch-marker' > "$ORIGINAL/marker.txt"\nprintf '{"stop":true}'`,
       };
       for (const [workflow, body] of Object.entries(scripts)) {
         await createWorkflowScript(
@@ -2306,7 +2306,7 @@ process.stdout.write(JSON.stringify(results));
         cwd: project.dir,
         env: { TMPDIR: parent },
       });
-      expect(api.exitCode).toBe(0);
+      expect(api.exitCode, `stdout:\n${api.stdout}\nstderr:\n${api.stderr}`).toBe(0);
       for (const result of JSON.parse(api.stdout)) {
         if (result.workflow === "symlink") {
           expect(result.exists, `${result.surface}:symlink`).toBe(false);
