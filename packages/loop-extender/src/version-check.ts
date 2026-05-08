@@ -71,6 +71,9 @@ export function checkWorkflowVersion(
   if (range === null) {
     return { kind: "no-loopx-declared" };
   }
+  if (typeof range !== "string") {
+    return { kind: "invalid-semver", range: String(range) };
+  }
 
   if (!isValidRange(range)) {
     return { kind: "invalid-semver", range };
@@ -87,16 +90,18 @@ export function checkWorkflowVersion(
  * both) then devDependencies. Per SPEC §3.2, optionalDependencies is NOT
  * checked at the workflow level.
  */
-function extractLoopxRange(pkg: Record<string, unknown>): string | null {
+function extractLoopxRange(pkg: Record<string, unknown>): unknown | null {
   const deps = pkg.dependencies;
   if (typeof deps === "object" && deps !== null && !Array.isArray(deps)) {
-    const v = (deps as Record<string, unknown>).loopx;
-    if (typeof v === "string") return v;
+    if (Object.hasOwn(deps as Record<string, unknown>, "loopx")) {
+      return (deps as Record<string, unknown>).loopx;
+    }
   }
   const devDeps = pkg.devDependencies;
   if (typeof devDeps === "object" && devDeps !== null && !Array.isArray(devDeps)) {
-    const v = (devDeps as Record<string, unknown>).loopx;
-    if (typeof v === "string") return v;
+    if (Object.hasOwn(devDeps as Record<string, unknown>, "loopx")) {
+      return (devDeps as Record<string, unknown>).loopx;
+    }
   }
   return null;
 }

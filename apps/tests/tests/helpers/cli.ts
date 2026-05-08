@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -15,6 +15,17 @@ export interface CLIOptions {
   runtime?: "node" | "bun";
   timeout?: number;
   input?: string;
+}
+
+function resolveRuntimeCommand(runtime: "node" | "bun"): string {
+  if (runtime === "node") return "node";
+  try {
+    return execSync("command -v bun", {
+      encoding: "utf-8",
+    }).trim();
+  } catch {
+    return "bun";
+  }
 }
 
 /**
@@ -53,8 +64,8 @@ export async function runCLI(
 
   const binPath = getLoopxBinPath();
 
-  const command = runtime === "bun" ? "bun" : "node";
-  const spawnArgs = [binPath, ...args];
+  const command = resolveRuntimeCommand(runtime);
+  const spawnArgs = runtime === "bun" ? [binPath, "--", ...args] : [binPath, ...args];
 
   const mergedEnv = {
     ...process.env,
@@ -111,7 +122,18 @@ export async function runCLI(
 export function runCLIWithSignal(
   args: string[],
   options: CLIOptions = {}
-): { result: Promise<CLIResult>; sendSignal: (signal: NodeJS.Signals) => void; waitForStderr: (pattern: string | RegExp) => Promise<void> } {
+): {
+  result: Promise<CLIResult>;
+  sendSignal: (signal: NodeJS.Signals) => void;
+  waitForStderr: (
+    pattern: string | RegExp,
+    options?: { timeoutMs?: number },
+  ) => Promise<void>;
+  waitForStdout: (
+    pattern: string | RegExp,
+    options?: { timeoutMs?: number },
+  ) => Promise<void>;
+} {
   const {
     cwd = process.cwd(),
     env: extraEnv = {},
@@ -121,8 +143,8 @@ export function runCLIWithSignal(
   } = options;
 
   const binPath = getLoopxBinPath();
-  const command = runtime === "bun" ? "bun" : "node";
-  const spawnArgs = [binPath, ...args];
+  const command = resolveRuntimeCommand(runtime);
+  const spawnArgs = runtime === "bun" ? [binPath, "--", ...args] : [binPath, ...args];
 
   const mergedEnv = {
     ...process.env,
@@ -138,10 +160,35 @@ export function runCLIWithSignal(
   let stdout = "";
   let stderr = "";
   let childExited = false;
-  const stderrListeners: Array<{ pattern: string | RegExp; resolve: () => void; reject: (err: Error) => void }> = [];
+  const stdoutListeners: Array<{
+    pattern: string | RegExp;
+    resolve: () => void;
+    reject: (err: Error) => void;
+    timer?: NodeJS.Timeout;
+  }> = [];
+  const stderrListeners: Array<{
+    pattern: string | RegExp;
+    resolve: () => void;
+    reject: (err: Error) => void;
+    timer?: NodeJS.Timeout;
+  }> = [];
+
+  function matchesPattern(buffer: string, pattern: string | RegExp): boolean {
+    return typeof pattern === "string"
+      ? buffer.includes(pattern)
+      : pattern.test(buffer);
+  }
 
   child.stdout.on("data", (chunk: Buffer) => {
     stdout += chunk.toString();
+    for (let i = stdoutListeners.length - 1; i >= 0; i--) {
+      const listener = stdoutListeners[i];
+      if (matchesPattern(stdout, listener.pattern)) {
+        stdoutListeners.splice(i, 1);
+        if (listener.timer) clearTimeout(listener.timer);
+        listener.resolve();
+      }
+    }
   });
 
   child.stderr.on("data", (chunk: Buffer) => {
@@ -149,12 +196,9 @@ export function runCLIWithSignal(
     // Check if any waiting pattern has been matched
     for (let i = stderrListeners.length - 1; i >= 0; i--) {
       const listener = stderrListeners[i];
-      const matches =
-        typeof listener.pattern === "string"
-          ? stderr.includes(listener.pattern)
-          : listener.pattern.test(stderr);
-      if (matches) {
+      if (matchesPattern(stderr, listener.pattern)) {
         stderrListeners.splice(i, 1);
+        if (listener.timer) clearTimeout(listener.timer);
         listener.resolve();
       }
     }
@@ -175,8 +219,18 @@ export function runCLIWithSignal(
     child.on("close", (code, signal) => {
       clearTimeout(timer);
       childExited = true;
+      for (const listener of stdoutListeners) {
+        if (listener.timer) clearTimeout(listener.timer);
+        listener.reject(
+          new Error(
+            `Child exited (code=${code}, signal=${signal}) before stdout matched pattern: ${listener.pattern}`
+          )
+        );
+      }
+      stdoutListeners.length = 0;
       // Reject any pending stderr listeners — the pattern will never match
       for (const listener of stderrListeners) {
+        if (listener.timer) clearTimeout(listener.timer);
         listener.reject(
           new Error(
             `Child exited (code=${code}, signal=${signal}) before stderr matched pattern: ${listener.pattern}`
@@ -202,28 +256,56 @@ export function runCLIWithSignal(
     child.kill(signal);
   }
 
-  function waitForStderr(pattern: string | RegExp): Promise<void> {
+  function waitForOutput(
+    streamName: "stdout" | "stderr",
+    buffer: () => string,
+    listeners: typeof stdoutListeners,
+    pattern: string | RegExp,
+    waitOptions: { timeoutMs?: number } = {},
+  ): Promise<void> {
     // Check if already matched
-    const matches =
-      typeof pattern === "string"
-        ? stderr.includes(pattern)
-        : pattern.test(stderr);
-    if (matches) {
+    if (matchesPattern(buffer(), pattern)) {
       return Promise.resolve();
     }
 
     if (childExited) {
       return Promise.reject(
         new Error(
-          `Child already exited before stderr matched pattern: ${pattern}`
+          `Child already exited before ${streamName} matched pattern: ${pattern}`
         )
       );
     }
 
     return new Promise<void>((resolve, reject) => {
-      stderrListeners.push({ pattern, resolve, reject });
+      const listener: (typeof listeners)[number] = { pattern, resolve, reject };
+      if (waitOptions.timeoutMs !== undefined) {
+        listener.timer = setTimeout(() => {
+          const index = listeners.indexOf(listener);
+          if (index !== -1) listeners.splice(index, 1);
+          reject(
+            new Error(
+              `Timed out after ${waitOptions.timeoutMs}ms waiting for ${streamName} pattern: ${pattern}`
+            )
+          );
+        }, waitOptions.timeoutMs);
+      }
+      listeners.push(listener);
     });
   }
 
-  return { result, sendSignal, waitForStderr };
+  function waitForStderr(
+    pattern: string | RegExp,
+    waitOptions?: { timeoutMs?: number },
+  ): Promise<void> {
+    return waitForOutput("stderr", () => stderr, stderrListeners, pattern, waitOptions);
+  }
+
+  function waitForStdout(
+    pattern: string | RegExp,
+    waitOptions?: { timeoutMs?: number },
+  ): Promise<void> {
+    return waitForOutput("stdout", () => stdout, stdoutListeners, pattern, waitOptions);
+  }
+
+  return { result, sendSignal, waitForStderr, waitForStdout };
 }

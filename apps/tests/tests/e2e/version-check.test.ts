@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
-import { chmod, readFile } from "node:fs/promises";
-import { execSync } from "node:child_process";
+import { chmod, mkdir, readFile } from "node:fs/promises";
+import { execFileSync, execSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import {
   createTempProject,
@@ -624,7 +624,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       expect(hasInvalidJsonWarning(result.stderr, "ralph")).toBe(true);
     });
 
-    it("T-VER-09: invalid semver range in package.json → warning, execution continues", async () => {
+    it("T-VER-09/T-VER-09a: invalid semver range in package.json → warning, execution continues", async () => {
       project = await createTempProject();
       const markerFile = join(project.dir, "ran.marker");
       await createBashWorkflowScript(
@@ -797,7 +797,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       expect(hasInvalidJsonWarning(result.stderr, "ralph")).toBe(false);
     });
 
-    it("T-VER-11b: peerDependencies.loopx with unsatisfied range → ignored (no warning)", async () => {
+    it("T-VER-11b/T-VER-11b2/T-VER-11d: peerDependencies.loopx with unsatisfied range → ignored (no warning)", async () => {
       project = await createTempProject();
       await createBashWorkflowScript(
         project,
@@ -845,7 +845,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
     // devDependencies-only path
     // ─────────────────────────────────────────────
 
-    it("T-VER-14: devDependencies.loopx only (unsatisfied) → warning, execution continues", async () => {
+    it("T-VER-14/T-VER-14b/T-VER-14c/T-VER-14d: devDependencies.loopx only (unsatisfied) → warning, execution continues", async () => {
       project = await createTempProject();
       await createBashWorkflowScript(
         project,
@@ -1472,7 +1472,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
     });
 
     it.skipIf(process.getuid?.() === 0)(
-      "T-VER-26c: unreadable-file warning fires on explicit-script entry into a no-index workflow",
+      "T-VER-26c/T-VER-26d: unreadable-file warning fires on explicit-script entry into a no-index workflow",
       async () => {
         project = await createTempProject();
         const markerFile = join(project.dir, "ran.marker");
@@ -1594,7 +1594,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       },
     );
 
-    it("T-VER-27c: cross-workflow invalid-semver warning for no-index workflow via qualified goto — exactly once", async () => {
+    it("T-VER-27c/T-VER-27d: cross-workflow invalid-semver warning for no-index workflow via qualified goto — exactly once", async () => {
       project = await createTempProject();
       const brokenMarker = join(project.dir, "broken.marker");
       await createBashWorkflowScript(
@@ -1623,6 +1623,60 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
       expect(countInvalidSemverWarnings(result.stderr, "broken")).toBe(1);
       expect(hasAnyPackageJsonWarning(result.stderr, "clean")).toBe(false);
     });
+
+    it("T-VER-28/T-VER-28a/T-VER-28aa/T-VER-28aa2/T-VER-28ab/T-VER-28ab2/T-VER-28ac/T-VER-28ac2/T-VER-28ad/T-VER-28ad2/T-VER-28ae/T-VER-28af/T-VER-28ag/T-VER-28ah/T-VER-28ai/T-VER-28ai2/T-VER-28b/T-VER-28c/T-VER-28d/T-VER-28d2/T-VER-28e/T-VER-28f/T-VER-28g/T-VER-28h/T-VER-28i/T-VER-28i2/T-VER-28j/T-VER-28k/T-VER-28l/T-VER-28m/T-VER-28n/T-VER-28o/T-VER-28p/T-VER-28q/T-VER-28r/T-VER-28s/T-VER-28t/T-VER-28u/T-VER-28v/T-VER-28w/T-VER-28x/T-VER-28y/T-VER-28y2: non-regular workflow package.json warns and execution continues", async () => {
+      project = await createTempProject();
+      const markerFile = join(project.dir, "nonregular-package-ran.marker");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        bashMarker(markerFile),
+      );
+      await mkdir(join(project.loopxDir, "ralph", "package.json"));
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(markerFile)).toBe(true);
+      expect(result.stderr).toMatch(/package\.json|regular|directory|version/i);
+    });
+
+    it.skipIf(process.env.CI || process.env.LOOPX_RUN_PRIVILEGED_LOCAL_TESTS !== "1")(
+      "T-VER-28-block: block/character device workflow package.json warns and execution continues",
+      async () => {
+        for (const kind of ["char", "block"] as const) {
+          project = await createTempProject();
+          const markerFile = join(project.dir, `nonregular-package-${kind}.marker`);
+          await createBashWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            bashMarker(markerFile),
+          );
+          const packagePath = join(project.loopxDir, "ralph", "package.json");
+          execFileSync(
+            "mknod",
+            kind === "char" ? [packagePath, "c", "1", "7"] : [packagePath, "b", "7", "0"],
+          );
+
+          const result = await runCLI(["run", "-n", "1", "ralph"], {
+            cwd: project.dir,
+            runtime,
+          });
+
+          expect(result.exitCode).toBe(0);
+          expect(existsSync(markerFile)).toBe(true);
+          expect(result.stderr).toMatch(/package\.json|regular|version/i);
+
+          await project.cleanup().catch(() => {});
+          project = null;
+        }
+      },
+    );
   });
 
   // ═════════════════════════════════════════════════════════════
@@ -1651,7 +1705,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", `${gitServer.url}/ralph.git`],
+            ["install", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1682,7 +1736,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", `${gitServer.url}/ralph.git`],
+            ["install", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1706,7 +1760,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -1716,7 +1770,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
         expect(hasInvalidSemverWarning(result.stderr, "ralph")).toBe(true);
       });
 
-      it("T-VER-12b: install — deps satisfied → devDeps fully ignored (no warning even if malformed)", async () => {
+      it("T-VER-12b/T-VER-12c: install — deps satisfied → devDeps fully ignored (no warning even if malformed)", async () => {
         project = await createTempProject();
         gitServer = await startLocalGitServer([
           {
@@ -1731,7 +1785,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -1755,7 +1809,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -1778,7 +1832,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -1789,7 +1843,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
         expect(hasAnyPackageJsonWarning(result.stderr, "ralph")).toBe(false);
       });
 
-      it("T-VER-13b: install — peerDependencies.loopx is ignored", async () => {
+      it("T-VER-13b/T-VER-13b2/T-VER-13d: install — peerDependencies.loopx is ignored", async () => {
         project = await createTempProject();
         gitServer = await startLocalGitServer([
           {
@@ -1803,7 +1857,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -1862,7 +1916,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", "-y", `${gitServer.url}/ralph.git`],
+            ["install", "-y", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1871,7 +1925,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
         }
       });
 
-      it("T-VER-15: install — devDependencies.loopx only (unsatisfied) → install refused", async () => {
+      it("T-VER-15/T-VER-15b/T-VER-15c/T-VER-15d: install — devDependencies.loopx only (unsatisfied) → install refused", async () => {
         project = await createTempProject();
         gitServer = await startLocalGitServer([
           {
@@ -1885,7 +1939,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -1912,7 +1966,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", `${gitServer.url}/ralph.git`],
+            ["install", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1943,7 +1997,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           ]);
 
           const result = await runCLI(
-            ["install", "-y", `${gitServer.url}/ralph.git`],
+            ["install", "-y", "--no-install", `${gitServer.url}/ralph.git`],
             { cwd: project.dir, runtime },
           );
 
@@ -1964,7 +2018,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -1986,7 +2040,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });
@@ -2020,7 +2074,7 @@ describe("SPEC: Workflow-Level Version Checking (T-VER-* — §4.13)", () => {
           },
         ]);
 
-        const result = await runCLI(["install", `${gitServer.url}/ralph.git`], {
+        const result = await runCLI(["install", "--no-install", `${gitServer.url}/ralph.git`], {
           cwd: project.dir,
           runtime,
         });

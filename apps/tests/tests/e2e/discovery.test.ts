@@ -8,8 +8,10 @@ import {
   chmodSync,
 } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
+import { createServer, type Server } from "node:net";
 import {
   createTempProject,
   createWorkflow,
@@ -160,6 +162,63 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
       expect(result.exitCode).toBe(1);
     });
 
+    it.each([
+      ["T-DISC-07a", ".mjs"],
+      ["T-DISC-07b", ".cjs"],
+    ] as const)(
+      "%s: unsupported %s sibling is ignored when a valid script exists",
+      async (_id, ext) => {
+        project = await createTempProject();
+        const marker = join(project.dir, `${_id}-marker.txt`);
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          writeValueToFile(_id, marker),
+        );
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "helper",
+          ext,
+          `console.log("not discovered");\n`,
+        );
+
+        const index = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+        expect(index.exitCode).toBe(0);
+        expect(readFileSync(marker, "utf-8")).toBe(_id);
+        expect(index.stderr).not.toContain(`helper${ext}`);
+
+        const helper = await runCLI(["run", "-n", "1", "ralph:helper"], {
+          cwd: project.dir,
+        });
+        expect(helper.exitCode).toBe(1);
+        expect(helper.stderr).toMatch(/not found|unknown|missing/i);
+      },
+    );
+
+    it("T-DISC-07c: run help ignores unsupported .mjs/.cjs siblings without warnings", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash\nprintf '{"stop":true}'\n`,
+      );
+      await createWorkflowScript(project, "ralph", "helper", ".mjs", `console.log("mjs");\n`);
+      await createWorkflowScript(project, "ralph", "tool", ".cjs", `console.log("cjs");\n`);
+
+      const result = await runCLI(["run", "-h"], { cwd: project.dir });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toMatch(/ralph/);
+      expect(result.stdout).toMatch(/index/);
+      expect(result.stdout + result.stderr).not.toMatch(/\b(helper|tool)\b/);
+      expect(result.stderr).not.toMatch(/helper\.mjs|tool\.cjs/);
+    });
+
     it("T-DISC-08: subdir with only non-script files (readme.txt, config.json) is not a workflow, no warning", async () => {
       project = await createTempProject();
       const wf = await createWorkflow(project, "ralph");
@@ -180,6 +239,58 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
 
       expect(result.exitCode).toBe(1);
       expect(hasWarningCategoryFor(result.stderr, "ralph")).toBe(false);
+    });
+
+    it("T-DISC-09a: directory named index.sh does not make a workflow", async () => {
+      project = await createTempProject();
+      const ralph = await createWorkflow(project, "ralph");
+      mkdirSync(join(ralph, "index.sh"), { recursive: true });
+      const otherMarker = join(project.dir, "disc09a-other.txt");
+      await createWorkflowScript(
+        project,
+        "other",
+        "index",
+        ".sh",
+        writeValueToFile("other", otherMarker),
+      );
+
+      const missing = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(missing.exitCode).toBe(1);
+      expect(missing.stderr).toMatch(/ralph/);
+      expect(missing.stderr).not.toMatch(/index\.sh.*director|director.*index\.sh/i);
+
+      const sibling = await runCLI(["run", "-n", "1", "other"], { cwd: project.dir });
+      expect(sibling.exitCode).toBe(0);
+      expect(readFileSync(otherMarker, "utf-8")).toBe("other");
+    });
+
+    it("T-DISC-09b: directory named check.ts is not discovered as a script", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "disc09b-marker.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("index", marker),
+      );
+      mkdirSync(join(project.loopxDir, "ralph", "check.ts"), { recursive: true });
+      writeFileSync(join(project.loopxDir, "ralph", "check.ts", "notes.md"), "notes\n");
+
+      const index = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(index.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("index");
+
+      const check = await runCLI(["run", "-n", "1", "ralph:check"], { cwd: project.dir });
+      expect(check.exitCode).toBe(1);
+      expect(check.stderr).toMatch(/not found|unknown|missing/i);
+
+      const help = await runCLI(["run", "-h"], { cwd: project.dir });
+      expect(help.exitCode).toBe(0);
+      expect(help.stdout).toMatch(/ralph/);
+      expect(help.stdout).toMatch(/index/);
+      expect(help.stdout + help.stderr).not.toMatch(/\bcheck\b/);
+      expect(help.stderr).not.toMatch(/check\.ts/);
     });
 
     it("T-DISC-10: files directly in .loopx/ are never discovered (loose-script.sh alongside ralph)", async () => {
@@ -557,6 +668,44 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
       expect(result.stderr).toMatch(/eslint\.config/);
     });
 
+    it("T-DISC-15c: uppercase script extensions are unsupported and case-sensitive", async () => {
+      project = await createTempProject();
+      const upperOnly = await createWorkflow(project, "ralph");
+      const upperMarker = join(project.dir, "disc15c-upper.txt");
+      writeFileSync(
+        join(upperOnly, "index.SH"),
+        writeValueToFile("upper", upperMarker),
+      );
+      chmodSync(join(upperOnly, "index.SH"), 0o755);
+      const otherMarker = join(project.dir, "disc15c-other.txt");
+      await createWorkflowScript(
+        project,
+        "other",
+        "index",
+        ".sh",
+        writeValueToFile("other", otherMarker),
+      );
+
+      const missing = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(missing.exitCode).toBe(1);
+      expect(missing.stderr).toMatch(/ralph/);
+      expect(existsSync(upperMarker)).toBe(false);
+
+      writeFileSync(
+        join(upperOnly, "index.sh"),
+        writeValueToFile("lower", upperMarker),
+      );
+      chmodSync(join(upperOnly, "index.sh"), 0o755);
+      const lower = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(lower.exitCode).toBe(0);
+      expect(readFileSync(upperMarker, "utf-8")).toBe("lower");
+      expect(lower.stderr).not.toMatch(/index\.SH|collision|conflict|duplicate/i);
+
+      const sibling = await runCLI(["run", "-n", "1", "other"], { cwd: project.dir });
+      expect(sibling.exitCode).toBe(0);
+      expect(readFileSync(otherMarker, "utf-8")).toBe("other");
+    });
+
     it("T-DISC-16: workflow directory with only subdirectory scripts (no top-level supported-ext files) is not a workflow", async () => {
       project = await createTempProject();
       const libDir = join(project.loopxDir, "ralph", "lib");
@@ -852,6 +1001,44 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
       expect(betaRes.exitCode).toBe(0);
       expect(readFileSync(betaMarker, "utf-8")).toBe("beta-ran");
     });
+
+    it.each([
+      ["T-DISC-24a", ".mjs"],
+      ["T-DISC-24b", ".cjs"],
+    ] as const)(
+      "%s: unsupported %s same-base sibling does not collide with discovered script",
+      async (_id, ext) => {
+        project = await createTempProject();
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash\nprintf '{"result":"idx"}'\n`,
+        );
+        const marker = join(project.dir, `${_id}-marker.txt`);
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "check",
+          ".ts",
+          tsMarker(marker, _id),
+        );
+        writeFileSync(
+          join(project.loopxDir, "ralph", `check${ext}`),
+          `console.log("ignored");\n`,
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph:check"], {
+          cwd: project.dir,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(readFileSync(marker, "utf-8")).toBe(_id);
+        expect(result.stderr).not.toMatch(/collision|conflict|duplicate/i);
+        expect(result.stderr).not.toContain(`check${ext}`);
+      },
+    );
   });
 
   // =========================================================================
@@ -1035,6 +1222,78 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
 
       expect(result.exitCode).toBe(0);
       expect(readFileSync(marker, "utf-8")).toBe("disc30b");
+    });
+
+    it("T-DISC-30c: uppercase workflow name is valid and runnable", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "marker-30c.txt");
+      await createWorkflowScript(
+        project,
+        "MyWorkflow",
+        "index",
+        ".sh",
+        writeValueToFile("disc30c", marker),
+      );
+
+      const result = await runCLI(["run", "-n", "1", "MyWorkflow"], { cwd: project.dir });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc30c");
+      expect(result.stderr).not.toMatch(/MyWorkflow/);
+    });
+
+    it("T-DISC-30d: uppercase script base name is valid and targetable", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash\nprintf '{"result":"idx"}'\n`,
+      );
+      const marker = join(project.dir, "marker-30d.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "CheckReady",
+        ".sh",
+        writeValueToFile("disc30d", marker),
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph:CheckReady"], {
+        cwd: project.dir,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc30d");
+      expect(result.stderr).not.toMatch(/CheckReady/);
+    });
+
+    it("T-DISC-30e: underscore-prefix script base name is valid and targetable", async () => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash\nprintf '{"result":"idx"}'\n`,
+      );
+      const marker = join(project.dir, "marker-30e.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "_check",
+        ".sh",
+        writeValueToFile("disc30e", marker),
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph:_check"], {
+        cwd: project.dir,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc30e");
+      expect(result.stderr).not.toMatch(/_check/);
     });
 
     it("T-DISC-31: script name with colon is rejected (global validation catches sibling)", async () => {
@@ -1463,6 +1722,426 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
       expect(helpRes.stdout).toMatch(/goodcheck/);
       expect(helpRes.stdout + helpRes.stderr).not.toMatch(/-bad-real-script/);
     });
+
+    it("T-DISC-40j: symlink inside .loopx to a regular file is not a workflow", async () => {
+      project = await createTempProject();
+      const external = await makeExternalDir("loopx-disc40j-");
+      const regularFile = join(external, "not-a-dir.txt");
+      writeFileSync(regularFile, "hello\n");
+      symlinkSync(regularFile, join(project.loopxDir, "foo"));
+      const marker = join(project.dir, "marker-40j.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc40j", marker),
+      );
+
+      const sibling = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(sibling.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc40j");
+      expect(sibling.stderr).not.toMatch(/\bfoo\b/);
+
+      const missing = await runCLI(["run", "-n", "1", "foo"], { cwd: project.dir });
+      expect(missing.exitCode).toBe(1);
+
+      const help = await runCLI(["run", "-h"], { cwd: project.dir });
+      expect(help.exitCode).toBe(0);
+      expect(help.stdout).toMatch(/ralph/);
+      expect(help.stdout + help.stderr).not.toMatch(/\bfoo\b/);
+    });
+
+    it("T-DISC-40k: symlinked script entry resolving to a directory is not a script", async () => {
+      project = await createTempProject();
+      const external = await makeExternalDir("loopx-disc40k-");
+      const notScriptDir = join(external, "not-a-script-dir");
+      mkdirSync(notScriptDir, { recursive: true });
+      writeFileSync(join(notScriptDir, "README.md"), "# no script\n");
+      const marker = join(project.dir, "marker-40k.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc40k", marker),
+      );
+      symlinkSync(notScriptDir, join(project.loopxDir, "ralph", "check.sh"));
+
+      const index = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(index.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc40k");
+      expect(index.stderr).not.toMatch(/check\.sh/);
+
+      const check = await runCLI(["run", "-n", "1", "ralph:check"], { cwd: project.dir });
+      expect(check.exitCode).toBe(1);
+
+      const help = await runCLI(["run", "-h"], { cwd: project.dir });
+      expect(help.exitCode).toBe(0);
+      expect(help.stdout).toMatch(/ralph/);
+      expect(help.stdout).toMatch(/index/);
+      expect(help.stdout + help.stderr).not.toMatch(/\bcheck\b|check\.sh/);
+    });
+
+    it("T-DISC-40l: broken workflow symlink is silently skipped", async () => {
+      project = await createTempProject();
+      const external = await makeExternalDir("loopx-disc40l-");
+      symlinkSync(join(external, "missing-target"), join(project.loopxDir, "broken-link"));
+      const marker = join(project.dir, "marker-40l.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc40l", marker),
+      );
+
+      const sibling = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(sibling.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc40l");
+      expect(sibling.stderr).not.toMatch(/broken-link/);
+
+      const missing = await runCLI(["run", "-n", "1", "broken-link"], { cwd: project.dir });
+      expect(missing.exitCode).toBe(1);
+
+      const help = await runCLI(["run", "-h"], { cwd: project.dir });
+      expect(help.exitCode).toBe(0);
+      expect(help.stdout).toMatch(/ralph/);
+      expect(help.stdout + help.stderr).not.toMatch(/broken-link/);
+    });
+
+    it("T-DISC-40m: cyclic workflow symlink chain is silently skipped", async () => {
+      project = await createTempProject();
+      symlinkSync("cycle-b", join(project.loopxDir, "cycle-a"));
+      symlinkSync("cycle-a", join(project.loopxDir, "cycle-b"));
+      const marker = join(project.dir, "marker-40m.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc40m", marker),
+      );
+
+      const sibling = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(sibling.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc40m");
+      expect(sibling.stderr).not.toMatch(/cycle-a|cycle-b/);
+
+      for (const target of ["cycle-a", "cycle-b"]) {
+        const missing = await runCLI(["run", "-n", "1", target], { cwd: project.dir });
+        expect(missing.exitCode).toBe(1);
+      }
+
+      const help = await runCLI(["run", "-h"], { cwd: project.dir });
+      expect(help.exitCode).toBe(0);
+      expect(help.stdout).toMatch(/ralph/);
+      expect(help.stdout + help.stderr).not.toMatch(/cycle-a|cycle-b/);
+    });
+
+    it.each([
+      ["T-DISC-40n broken", () => [["-bad-link", "/missing/target"]]],
+      ["T-DISC-40n cyclic", () => [["-cycle-a", "-cycle-b"], ["-cycle-b", "-cycle-a"]]],
+    ] as const)(
+      "%s: invalid-named unresolved workflow symlink is skipped before validation",
+      async (_id, links) => {
+        project = await createTempProject();
+        for (const [name, target] of links()) {
+          symlinkSync(target, join(project.loopxDir, name));
+        }
+        const marker = join(project.dir, `${_id.replace(/\W+/g, "-")}.txt`);
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          writeValueToFile(_id, marker),
+        );
+
+        const sibling = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+        expect(sibling.exitCode).toBe(0);
+        expect(readFileSync(marker, "utf-8")).toBe(_id);
+        expect(sibling.stderr).not.toMatch(/-bad-link|-cycle-a|-cycle-b/);
+
+        const help = await runCLI(["run", "-h"], { cwd: project.dir });
+        expect(help.exitCode).toBe(0);
+        expect(help.stdout).toMatch(/ralph/);
+        expect(help.stdout + help.stderr).not.toMatch(/-bad-link|-cycle-a|-cycle-b/);
+      },
+    );
+
+    it("T-DISC-40o: broken script symlink is silently skipped", async () => {
+      project = await createTempProject();
+      const external = await makeExternalDir("loopx-disc40o-");
+      const marker = join(project.dir, "marker-40o.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc40o", marker),
+      );
+      symlinkSync(join(external, "missing-script.sh"), join(project.loopxDir, "ralph", "check.sh"));
+
+      const index = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(index.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc40o");
+      expect(index.stderr).not.toMatch(/check\.sh/);
+
+      const check = await runCLI(["run", "-n", "1", "ralph:check"], { cwd: project.dir });
+      expect(check.exitCode).toBe(1);
+
+      const help = await runCLI(["run", "-h"], { cwd: project.dir });
+      expect(help.exitCode).toBe(0);
+      expect(help.stdout).toMatch(/ralph/);
+      expect(help.stdout).toMatch(/index/);
+      expect(help.stdout + help.stderr).not.toMatch(/\bcheck\b|check\.sh/);
+    });
+
+    it("T-DISC-40p: cyclic script symlink chain is silently skipped", async () => {
+      project = await createTempProject();
+      const marker = join(project.dir, "marker-40p.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        writeValueToFile("disc40p", marker),
+      );
+      symlinkSync("check-loop.sh", join(project.loopxDir, "ralph", "check.sh"));
+      symlinkSync("check.sh", join(project.loopxDir, "ralph", "check-loop.sh"));
+
+      const index = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+      expect(index.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf-8")).toBe("disc40p");
+      expect(index.stderr).not.toMatch(/check(?:-loop)?\.sh/);
+
+      for (const target of ["ralph:check", "ralph:check-loop"]) {
+        const missing = await runCLI(["run", "-n", "1", target], { cwd: project.dir });
+        expect(missing.exitCode).toBe(1);
+      }
+
+      const help = await runCLI(["run", "-h"], { cwd: project.dir });
+      expect(help.exitCode).toBe(0);
+      expect(help.stdout).toMatch(/ralph/);
+      expect(help.stdout).toMatch(/index/);
+      expect(help.stdout + help.stderr).not.toMatch(/\bcheck(?:-loop)?\b|check(?:-loop)?\.sh/);
+    });
+
+    it.each([
+      ["T-DISC-40q broken", () => [["-bad.sh", "/missing/script.sh"]]],
+      ["T-DISC-40q cyclic", () => [["-cycle-a.sh", "-cycle-b.sh"], ["-cycle-b.sh", "-cycle-a.sh"]]],
+    ] as const)(
+      "%s: invalid-named unresolved script symlink is skipped before validation",
+      async (_id, links) => {
+        project = await createTempProject();
+        const marker = join(project.dir, `${_id.replace(/\W+/g, "-")}.txt`);
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          writeValueToFile(_id, marker),
+        );
+        for (const [name, target] of links()) {
+          symlinkSync(target, join(project.loopxDir, "ralph", name));
+        }
+
+        const index = await runCLI(["run", "-n", "1", "ralph"], { cwd: project.dir });
+        expect(index.exitCode).toBe(0);
+        expect(readFileSync(marker, "utf-8")).toBe(_id);
+        expect(index.stderr).not.toMatch(/-bad|-cycle/);
+
+        const help = await runCLI(["run", "-h"], { cwd: project.dir });
+        expect(help.exitCode).toBe(0);
+        expect(help.stdout).toMatch(/ralph/);
+        expect(help.stdout).toMatch(/index/);
+        expect(help.stdout + help.stderr).not.toMatch(/-bad|-cycle/);
+      },
+    );
+
+    async function runProgrammaticDiscoveryProbe(
+      surface: "run" | "runPromise",
+      target: string,
+    ): Promise<{ ok: boolean; error?: string; outputs?: unknown[] }> {
+      const code = `
+import { run, runPromise } from "loopx";
+
+async function drive(target) {
+  if (${JSON.stringify(surface)} === "runPromise") {
+    return await runPromise(target, { maxIterations: 1 });
+  }
+  const outputs = [];
+  for await (const output of run(target, { maxIterations: 1 })) {
+    outputs.push(output);
+  }
+  return outputs;
+}
+
+try {
+  const outputs = await drive(${JSON.stringify(target)});
+  console.log(JSON.stringify({ ok: true, outputs }));
+} catch (error) {
+  console.log(JSON.stringify({
+    ok: false,
+    error: error instanceof Error ? error.message : String(error),
+  }));
+}
+`;
+      const result = await runAPIDriver("node", code, { cwd: project!.dir });
+      expect(result.exitCode).toBe(0);
+      return JSON.parse(result.stdout) as {
+        ok: boolean;
+        error?: string;
+        outputs?: unknown[];
+      };
+    }
+
+    it.each(["run", "runPromise"] as const)(
+      "T-DISC-40r: %s skips broken workflow symlinks on programmatic surfaces",
+      async (surface) => {
+        project = await createTempProject();
+        const external = await makeExternalDir("loopx-disc40r-");
+        symlinkSync(join(external, "missing-target"), join(project.loopxDir, "broken-link"));
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash\nprintf '{"result":"disc40r"}'\n`,
+        );
+
+        const good = await runProgrammaticDiscoveryProbe(surface, "ralph");
+        expect(good.ok).toBe(true);
+        const missing = await runProgrammaticDiscoveryProbe(surface, "broken-link");
+        expect(missing.ok).toBe(false);
+        expect(missing.error).toMatch(/not found|unknown|missing/i);
+      },
+    );
+
+    it.each(["run", "runPromise"] as const)(
+      "T-DISC-40s: %s skips cyclic workflow symlinks on programmatic surfaces",
+      async (surface) => {
+        project = await createTempProject();
+        symlinkSync("cycle-b", join(project.loopxDir, "cycle-a"));
+        symlinkSync("cycle-a", join(project.loopxDir, "cycle-b"));
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash\nprintf '{"result":"disc40s"}'\n`,
+        );
+
+        const good = await runProgrammaticDiscoveryProbe(surface, "ralph");
+        expect(good.ok).toBe(true);
+        for (const target of ["cycle-a", "cycle-b"]) {
+          const missing = await runProgrammaticDiscoveryProbe(surface, target);
+          expect(missing.ok).toBe(false);
+          expect(missing.error).toMatch(/not found|unknown|missing/i);
+        }
+      },
+    );
+
+    it.each([
+      ["T-DISC-40t broken", [["-bad-link", "/missing/target"]]],
+      ["T-DISC-40t cyclic", [["-cycle-a", "-cycle-b"], ["-cycle-b", "-cycle-a"]]],
+    ] as const)(
+      "%s: invalid-named unresolved workflow symlinks do not fail programmatic discovery",
+      async (_id, links) => {
+        for (const surface of ["run", "runPromise"] as const) {
+          project = await createTempProject();
+          for (const [name, target] of links) {
+            symlinkSync(target, join(project.loopxDir, name));
+          }
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            `#!/bin/bash\nprintf '{"result":"disc40t"}'\n`,
+          );
+
+          const good = await runProgrammaticDiscoveryProbe(surface, "ralph");
+          expect(good.ok).toBe(true);
+          await project.cleanup();
+          project = null;
+        }
+      },
+    );
+
+    it.each(["run", "runPromise"] as const)(
+      "T-DISC-40u: %s skips broken script symlinks on programmatic surfaces",
+      async (surface) => {
+        project = await createTempProject();
+        const external = await makeExternalDir("loopx-disc40u-");
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash\nprintf '{"result":"disc40u"}'\n`,
+        );
+        symlinkSync(join(external, "missing-script.sh"), join(project.loopxDir, "ralph", "check.sh"));
+
+        const good = await runProgrammaticDiscoveryProbe(surface, "ralph");
+        expect(good.ok).toBe(true);
+        const missing = await runProgrammaticDiscoveryProbe(surface, "ralph:check");
+        expect(missing.ok).toBe(false);
+        expect(missing.error).toMatch(/not found|unknown|missing/i);
+      },
+    );
+
+    it.each(["run", "runPromise"] as const)(
+      "T-DISC-40v: %s skips cyclic script symlinks on programmatic surfaces",
+      async (surface) => {
+        project = await createTempProject();
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".sh",
+          `#!/bin/bash\nprintf '{"result":"disc40v"}'\n`,
+        );
+        symlinkSync("check-loop.sh", join(project.loopxDir, "ralph", "check.sh"));
+        symlinkSync("check.sh", join(project.loopxDir, "ralph", "check-loop.sh"));
+
+        const good = await runProgrammaticDiscoveryProbe(surface, "ralph");
+        expect(good.ok).toBe(true);
+        for (const target of ["ralph:check", "ralph:check-loop"]) {
+          const missing = await runProgrammaticDiscoveryProbe(surface, target);
+          expect(missing.ok).toBe(false);
+          expect(missing.error).toMatch(/not found|unknown|missing/i);
+        }
+      },
+    );
+
+    it.each([
+      ["T-DISC-40w broken", [["-bad.sh", "/missing/script.sh"]]],
+      ["T-DISC-40w cyclic", [["-cycle-a.sh", "-cycle-b.sh"], ["-cycle-b.sh", "-cycle-a.sh"]]],
+    ] as const)(
+      "%s: invalid-named unresolved script symlinks do not fail programmatic discovery",
+      async (_id, links) => {
+        for (const surface of ["run", "runPromise"] as const) {
+          project = await createTempProject();
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            `#!/bin/bash\nprintf '{"result":"disc40w"}'\n`,
+          );
+          for (const [name, target] of links) {
+            symlinkSync(target, join(project.loopxDir, "ralph", name));
+          }
+
+          const good = await runProgrammaticDiscoveryProbe(surface, "ralph");
+          expect(good.ok).toBe(true);
+          await project.cleanup();
+          project = null;
+        }
+      },
+    );
   });
 
   // =========================================================================
@@ -1585,6 +2264,441 @@ describe("SPEC: Workflow & Script Discovery (ADR-0003)", () => {
 
       expect(result.exitCode).toBe(1);
     });
+
+    it.each([
+      ["T-DISC-42d", "remove"],
+      ["T-DISC-42f", "rename"],
+    ] as const)(
+      "%s: run() surfaces cached-script %s as a spawn failure",
+      async (_id, mutation) => {
+        project = await createTempProject();
+        const tmpMarker = join(project.dir, `${_id}-tmpdir.txt`);
+        const checkPath = join(project.loopxDir, "ralph", "check.sh");
+        const renamedPath = join(project.loopxDir, "ralph", "check-new.sh");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          [
+            `printf '%s' "$LOOPX_TMPDIR" > ${JSON.stringify(tmpMarker)}`,
+            `printf '{"goto":"check"}'`,
+          ].join("\n"),
+        );
+        await createBashWorkflowScript(project, "ralph", "check", `printf '{"result":"check"}'`);
+
+        const code = `
+import { existsSync, rmSync, renameSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { run } from "loopx";
+
+const gen = run("ralph", { maxIterations: 3 });
+const first = await gen.next();
+if (${JSON.stringify(mutation)} === "remove") {
+  rmSync(${JSON.stringify(checkPath)});
+} else {
+  renameSync(${JSON.stringify(checkPath)}, ${JSON.stringify(renamedPath)});
+}
+
+try {
+  await gen.next();
+  console.log(JSON.stringify({ ok: true, first: first.value }));
+} catch (error) {
+  const tmpdir = readFileSync(${JSON.stringify(tmpMarker)}, "utf-8");
+  console.log(JSON.stringify({
+    ok: false,
+    first: first.value,
+    error: error instanceof Error ? error.message : String(error),
+    tmpdirExists: existsSync(tmpdir),
+  }));
+}
+`;
+        const result = await runAPIDriver("node", code, { cwd: project.dir });
+        expect(result.exitCode).toBe(0);
+        const observed = JSON.parse(result.stdout) as {
+          ok: boolean;
+          error?: string;
+          tmpdirExists?: boolean;
+        };
+        expect(observed.ok).toBe(false);
+        expect(observed.error).toMatch(/spawn|ENOENT|no such|not found|launch|code 127/i);
+        expect(observed.tmpdirExists).toBe(false);
+      },
+    );
+
+    it.each([
+      ["T-DISC-42e", "remove"],
+      ["T-DISC-42g", "rename"],
+    ] as const)(
+      "%s: runPromise() rejects when cached script is %s mid-loop",
+      async (_id, mutation) => {
+        project = await createTempProject();
+        const tmpMarker = join(project.dir, `${_id}-tmpdir.txt`);
+        const checkPath = join(project.loopxDir, "ralph", "check.sh");
+        const renamedPath = join(project.loopxDir, "ralph", "check-new.sh");
+        await createBashWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          [
+            `printf '%s' "$LOOPX_TMPDIR" > ${JSON.stringify(tmpMarker)}`,
+            mutation === "remove"
+              ? `rm -f ${JSON.stringify(checkPath)}`
+              : `mv ${JSON.stringify(checkPath)} ${JSON.stringify(renamedPath)}`,
+            `printf '{"goto":"check"}'`,
+          ].join("\n"),
+        );
+        await createBashWorkflowScript(project, "ralph", "check", `printf '{"result":"check"}'`);
+
+        const code = `
+import { existsSync, readFileSync } from "node:fs";
+import { runPromise } from "loopx";
+
+try {
+  await runPromise("ralph", { maxIterations: 3 });
+  console.log(JSON.stringify({ ok: true }));
+} catch (error) {
+  const tmpdir = readFileSync(${JSON.stringify(tmpMarker)}, "utf-8");
+  console.log(JSON.stringify({
+    ok: false,
+    error: error instanceof Error ? error.message : String(error),
+    tmpdirExists: existsSync(tmpdir),
+  }));
+}
+`;
+        const result = await runAPIDriver("node", code, { cwd: project.dir });
+        expect(result.exitCode).toBe(0);
+        const observed = JSON.parse(result.stdout) as {
+          ok: boolean;
+          error?: string;
+          tmpdirExists?: boolean;
+        };
+        expect(observed.ok).toBe(false);
+        expect(observed.error).toMatch(/spawn|ENOENT|no such|not found|launch|code 127/i);
+        expect(observed.tmpdirExists).toBe(false);
+      },
+    );
+  });
+
+  // =========================================================================
+  // Project-root .loopx entry failures (T-DISC-49a–49f)
+  // =========================================================================
+  describe("SPEC: Project-root .loopx Entry Failures", () => {
+    async function assertRootLoopxUnusable(): Promise<void> {
+      const cliRun = await runCLI(["run", "-n", "1", "ralph"], { cwd: project!.dir });
+      expect(cliRun.exitCode).toBe(1);
+      expect(cliRun.stderr).toMatch(/\.loopx|missing|unusable|not.*director|not found/i);
+
+      const help = await runCLI(["run", "-h"], { cwd: project!.dir });
+      expect(help.exitCode).toBe(0);
+      expect(help.stdout).toMatch(/usage|run/i);
+      expect(help.stderr).toMatch(/\.loopx|missing|unusable|not.*director|not found/i);
+
+      for (const surface of ["run", "runPromise"] as const) {
+        const code = `
+import { run, runPromise } from "loopx";
+
+try {
+  if (${JSON.stringify(surface)} === "runPromise") {
+    await runPromise("ralph", { maxIterations: 1 });
+  } else {
+    const gen = run("ralph", { maxIterations: 1 });
+    await gen.next();
+  }
+  console.log(JSON.stringify({ ok: true }));
+} catch (error) {
+  console.log(JSON.stringify({
+    ok: false,
+    error: error instanceof Error ? error.message : String(error),
+  }));
+}
+`;
+        const api = await runAPIDriver("node", code, { cwd: project!.dir });
+        expect(api.exitCode).toBe(0);
+        const observed = JSON.parse(api.stdout) as { ok: boolean; error?: string };
+        expect(observed.ok).toBe(false);
+        expect(observed.error).toMatch(/\.loopx|missing|unusable|not.*director|not found/i);
+      }
+    }
+
+    async function createUnixSocket(path: string): Promise<Server> {
+      const server = createServer();
+      await new Promise<void>((resolvePromise, reject) => {
+        server.once("error", reject);
+        server.listen(path, () => {
+          server.off("error", reject);
+          resolvePromise();
+        });
+      });
+      return server;
+    }
+
+    function createFifo(path: string): void {
+      execFileSync("mkfifo", [path]);
+    }
+
+    function createDevice(path: string, kind: "char" | "block"): void {
+      execFileSync(
+        "mknod",
+        kind === "char" ? [path, "c", "1", "7"] : [path, "b", "7", "0"],
+      );
+    }
+
+    it("T-DISC-49a: project-root .loopx broken symlink is missing or unusable across run surfaces", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      symlinkSync(join(project.dir, "missing-loopx"), project.loopxDir);
+
+      await assertRootLoopxUnusable();
+    });
+
+    it("T-DISC-49b: project-root .loopx cyclic symlink is missing or unusable across run surfaces", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      symlinkSync(".loopx-cycle-link", project.loopxDir);
+      symlinkSync(".loopx", join(project.dir, ".loopx-cycle-link"));
+
+      await assertRootLoopxUnusable();
+    });
+
+    it("T-DISC-49c: project-root .loopx symlink to regular file is missing or unusable", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      const target = join(project.dir, "not-a-dir.txt");
+      writeFileSync(target, "not a directory\n");
+      symlinkSync(target, project.loopxDir);
+
+      await assertRootLoopxUnusable();
+    });
+
+    it("T-DISC-49c2: project-root .loopx symlink to FIFO is missing or unusable", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      const target = join(project.dir, "target-fifo");
+      createFifo(target);
+      symlinkSync(target, project.loopxDir);
+
+      await assertRootLoopxUnusable();
+    });
+
+    it("T-DISC-49c3: project-root .loopx symlink to Unix socket is missing or unusable", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      const target = join(project.dir, "target-socket");
+      const server = await createUnixSocket(target);
+      extraCleanups.push(async () => {
+        await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+      });
+      symlinkSync(target, project.loopxDir);
+
+      await assertRootLoopxUnusable();
+    });
+
+    it("T-DISC-49d: project-root .loopx regular file is missing or unusable", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      writeFileSync(project.loopxDir, "not a directory\n");
+
+      await assertRootLoopxUnusable();
+    });
+
+    it("T-DISC-49e: project-root .loopx FIFO is missing or unusable", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      createFifo(project.loopxDir);
+
+      await assertRootLoopxUnusable();
+    });
+
+    it("T-DISC-49f: project-root .loopx Unix socket is missing or unusable", async () => {
+      project = await createTempProject({ withLoopxDir: false });
+      const server = await createUnixSocket(project.loopxDir);
+      extraCleanups.push(async () => {
+        await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+      });
+
+      await assertRootLoopxUnusable();
+    });
+
+    function writeExecutable(path: string, body: string): void {
+      writeFileSync(path, `#!/bin/bash\n${body}\n`);
+      chmodSync(path, 0o755);
+    }
+
+    function createLoopxTree(root: string, entries: Record<string, string>): void {
+      for (const [relativePath, body] of Object.entries(entries)) {
+        const fullPath = join(root, relativePath);
+        mkdirSync(dirname(fullPath), { recursive: true });
+        writeExecutable(fullPath, body);
+      }
+    }
+
+    async function runAPIExpectingLoopFailure(): Promise<void> {
+      for (const surface of ["run", "runPromise"] as const) {
+        const code = `
+import { run, runPromise } from "loopx";
+
+try {
+  if (${JSON.stringify(surface)} === "runPromise") {
+    await runPromise("ralph", { maxIterations: 3 });
+  } else {
+    for await (const _ of run("ralph", { maxIterations: 3 })) {}
+  }
+  console.log(JSON.stringify({ ok: true }));
+} catch (error) {
+  console.log(JSON.stringify({
+    ok: false,
+    error: error instanceof Error ? error.message : String(error),
+  }));
+}
+`;
+        const result = await runAPIDriver("node", code, { cwd: project!.dir });
+        expect(result.exitCode).toBe(0);
+        const observed = JSON.parse(result.stdout) as { ok: boolean; error?: string };
+        if (!observed.ok) {
+          expect(observed.error).toMatch(
+            /not found|missing|Invalid project root|spawn|ENOENT|launch|goto|code 127/i,
+          );
+        }
+      }
+    }
+
+    function createRetargetFixture(gotoTarget: "sigma:index" | "check"): void {
+      const realA = join(project!.dir, "real-loopx-A");
+      const realB = join(project!.dir, "real-loopx-B");
+      createLoopxTree(realA, {
+        "ralph/index.sh": [
+          `rm -f "$LOOPX_PROJECT_ROOT/.loopx"`,
+          `ln -s ${JSON.stringify(realB)} "$LOOPX_PROJECT_ROOT/.loopx"`,
+          `printf '{"goto":${JSON.stringify(gotoTarget)}}'`,
+        ].join("\n"),
+        "ralph/check.sh": `printf '{"result":"cached-check"}'`,
+      });
+      createLoopxTree(realB, {
+        "ralph/index.sh": `printf '{"result":"replacement-ralph"}'`,
+        "sigma/index.sh": `printf '{"result":"replacement-sigma"}'`,
+      });
+      symlinkSync(realA, project!.loopxDir);
+    }
+
+    function createRemovalFixture(command: "rm" | "mv"): void {
+      mkdirSync(join(project!.loopxDir, "ralph"), { recursive: true });
+      const removal = command === "rm"
+        ? `rm -rf "$LOOPX_PROJECT_ROOT/.loopx"`
+        : `mv "$LOOPX_PROJECT_ROOT/.loopx" "$LOOPX_PROJECT_ROOT/.loopx-renamed"`;
+      writeExecutable(
+        join(project!.loopxDir, "ralph", "index.sh"),
+        [removal, `printf '{"goto":"check"}'`].join("\n"),
+      );
+      writeExecutable(
+        join(project!.loopxDir, "ralph", "check.sh"),
+        `printf '{"result":"cached-check"}'`,
+      );
+    }
+
+    function createReplacementFixture(gotoTarget: "sigma:index" | "check"): void {
+      const replacement = join(project!.dir, "replacement-loopx");
+      mkdirSync(join(project!.loopxDir, "ralph"), { recursive: true });
+      createLoopxTree(replacement, {
+        "ralph/index.sh": `printf '{"result":"replacement-ralph"}'`,
+        "sigma/index.sh": `printf '{"result":"replacement-sigma"}'`,
+      });
+      writeExecutable(
+        join(project!.loopxDir, "ralph", "index.sh"),
+        [
+          `mv "$LOOPX_PROJECT_ROOT/.loopx" "$LOOPX_PROJECT_ROOT/.loopx-renamed"`,
+          `mv ${JSON.stringify(replacement)} "$LOOPX_PROJECT_ROOT/.loopx"`,
+          `printf '{"goto":${JSON.stringify(gotoTarget)}}'`,
+        ].join("\n"),
+      );
+      writeExecutable(
+        join(project!.loopxDir, "ralph", "check.sh"),
+        `printf '{"result":"cached-check"}'`,
+      );
+    }
+
+    it.each([
+      ["T-DISC-49g", "sigma:index"],
+      ["T-DISC-49g", "check"],
+    ] as const)(
+      "%s: retargeted .loopx symlink does not trigger CLI rediscovery for %s",
+      async (_id, gotoTarget) => {
+        project = await createTempProject({ withLoopxDir: false });
+        createRetargetFixture(gotoTarget);
+
+        const result = await runCLI(["run", "-n", "3", "ralph"], { cwd: project.dir });
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/not found|missing|no such|spawn|ENOENT|launch|goto|code 127/i);
+      },
+    );
+
+    it.each([
+      ["T-DISC-49h", "sigma:index"],
+      ["T-DISC-49h", "check"],
+    ] as const)(
+      "%s: retargeted .loopx symlink does not trigger API rediscovery for %s",
+      async (_id, gotoTarget) => {
+        project = await createTempProject({ withLoopxDir: false });
+        createRetargetFixture(gotoTarget);
+
+        await runAPIExpectingLoopFailure();
+      },
+    );
+
+    it.each([
+      ["T-DISC-49i", "rm"],
+      ["T-DISC-49i", "mv"],
+    ] as const)(
+      "%s: removed .loopx directory does not trigger CLI rediscovery via %s",
+      async (_id, command) => {
+        project = await createTempProject();
+        createRemovalFixture(command);
+
+        const result = await runCLI(["run", "-n", "3", "ralph"], { cwd: project.dir });
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/not found|missing|no such|spawn|ENOENT|launch|code 127/i);
+      },
+    );
+
+    it.each([
+      ["T-DISC-49j", "sigma:index"],
+      ["T-DISC-49j", "check"],
+    ] as const)(
+      "%s: replaced .loopx directory does not trigger CLI rediscovery for %s",
+      async (_id, gotoTarget) => {
+        project = await createTempProject();
+        createReplacementFixture(gotoTarget);
+
+        const result = await runCLI(["run", "-n", "3", "ralph"], { cwd: project.dir });
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/not found|missing|no such|spawn|ENOENT|launch|goto|code 127/i);
+      },
+    );
+
+    it.each([
+      ["T-DISC-49k", "remove-rm", () => createRemovalFixture("rm")],
+      ["T-DISC-49k", "remove-mv", () => createRemovalFixture("mv")],
+      ["T-DISC-49k", "replace-new-workflow", () => createReplacementFixture("sigma:index")],
+      ["T-DISC-49k", "replace-missing-cached-script", () => createReplacementFixture("check")],
+    ] as const)(
+      "%s: .loopx %s mutation does not trigger API rediscovery",
+      async (_id, _case, setup) => {
+        project = await createTempProject();
+        setup();
+
+        await runAPIExpectingLoopFailure();
+      },
+    );
+
+    it.skipIf(process.env.CI || process.env.LOOPX_RUN_PRIVILEGED_LOCAL_TESTS !== "1")(
+      "T-DISC-49-block: project-root .loopx block/character device is missing or unusable",
+      async () => {
+        for (const kind of ["char", "block"] as const) {
+          project = await createTempProject({ withLoopxDir: false });
+          createDevice(project.loopxDir, kind);
+
+          await assertRootLoopxUnusable();
+
+          await project.cleanup().catch(() => {});
+          project = null;
+        }
+      },
+    );
   });
 
   // =========================================================================

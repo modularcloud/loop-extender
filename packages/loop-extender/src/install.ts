@@ -13,9 +13,10 @@ import {
   symlinkSync,
   readlinkSync,
   copyFileSync,
+  realpathSync,
 } from "node:fs";
 import { join, basename, extname } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { classifySource } from "./parsers/classify-source.js";
 import {
@@ -23,13 +24,14 @@ import {
   NAME_PATTERN,
   isWorkflowByStructure,
 } from "./discovery.js";
-import { checkWorkflowVersion } from "./version-check.js";
+import { checkWorkflowVersion, formatWarning } from "./version-check.js";
 
 export interface InstallOptions {
   source: string;
   cwd: string;
   selectedWorkflow?: string | null; // -w <name>
   override: boolean; // -y
+  noInstall: boolean; // --no-install
   runningVersion: string;
 }
 
@@ -50,14 +52,41 @@ interface PreflightFailure {
   message: string;
 }
 
+interface AutoInstallSignalState {
+  abortedSignal: NodeJS.Signals | null;
+  activeChildPid: number | null;
+}
+
 // Fault-injection seam (TEST-SPEC §1.4). Only honored when NODE_ENV=test.
-function getInstallFault(): { kind: "commit-fail-after"; n: number } | null {
+function getInstallFault():
+  | { kind: "commit-fail-after"; n: number; stagingFail: Set<string> }
+  | { kind: "staging-only"; stagingFail: Set<string> }
+  | null {
   if (process.env.NODE_ENV !== "test") return null;
   const raw = process.env.LOOPX_TEST_INSTALL_FAULT;
   if (!raw) return null;
-  const match = /^commit-fail-after:(\d+)$/.exec(raw);
-  if (match) {
-    return { kind: "commit-fail-after", n: Number(match[1]) };
+  const stagingFail = new Set<string>();
+  let commitAfter: number | null = null;
+  for (const part of raw.split(";")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const commitMatch = /^commit-fail-after:(\d+)$/.exec(trimmed);
+    if (commitMatch) {
+      commitAfter = Number(commitMatch[1]);
+      continue;
+    }
+    const stagingMatch = /^staging-fail:(.+)$/.exec(trimmed);
+    if (stagingMatch) {
+      for (const name of stagingMatch[1].split(/[,+]/).map((v) => v.trim()).filter(Boolean)) {
+        stagingFail.add(name);
+      }
+    }
+  }
+  if (commitAfter !== null) {
+    return { kind: "commit-fail-after", n: commitAfter, stagingFail };
+  }
+  if (stagingFail.size > 0) {
+    return { kind: "staging-only", stagingFail };
   }
   return null;
 }
@@ -68,6 +97,7 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
     cwd,
     selectedWorkflow,
     override,
+    noInstall,
     runningVersion,
   } = opts;
 
@@ -121,6 +151,8 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
     process.exit(1);
   }
 
+  applySourceTargetFaults(classified.sourceRoot);
+
   // -w handling
   let selected: WorkflowCandidate[];
   if (selectedWorkflow) {
@@ -149,6 +181,7 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
   // Preflight
   const failures: PreflightFailure[] = [];
   const pkgWarnings: string[] = []; // non-blocking package.json warnings
+  const pkgWarnedWorkflows = new Set<string>();
   const replacements = new Set<string>(); // workflow names to replace at commit time
 
   for (const wf of selected) {
@@ -157,6 +190,16 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
       failures.push({
         workflow: wf.name,
         message: `Workflow name '${wf.name}' is invalid: must match [a-zA-Z0-9_][a-zA-Z0-9_-]*`,
+      });
+      continue;
+    }
+
+    try {
+      validateSourceSymlinks(wf.sourceDir, classified.sourceRoot);
+    } catch (err) {
+      failures.push({
+        workflow: wf.name,
+        message: `Workflow '${wf.name}' contains a source symlink error: ${(err as Error).message}`,
       });
       continue;
     }
@@ -242,23 +285,19 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
     }
 
     // Version check (SPEC §10.6, workflow-level only)
+    if (isNonRegularPackageJson(wf.sourceDir)) {
+      const warning = `Warning: workflow '${wf.name}' package.json is not a regular file; skipping check`;
+      pkgWarnings.push(warning);
+      pkgWarnedWorkflows.add(wf.name);
+      continue;
+    }
     const versionResult = checkWorkflowVersion(wf.sourceDir, runningVersion);
+    const warning = formatWarning(versionResult, wf.name);
+    if (warning && versionResult.kind !== "mismatched") {
+      pkgWarnings.push(warning);
+      pkgWarnedWorkflows.add(wf.name);
+    }
     switch (versionResult.kind) {
-      case "unreadable":
-        pkgWarnings.push(
-          `Warning: workflow '${wf.name}' package.json is unreadable (permission denied); skipping check`
-        );
-        break;
-      case "invalid-json":
-        pkgWarnings.push(
-          `Warning: workflow '${wf.name}' package.json contains invalid JSON; skipping check`
-        );
-        break;
-      case "invalid-semver":
-        pkgWarnings.push(
-          `Warning: workflow '${wf.name}' has an invalid semver specifier for loopx in package.json; skipping check`
-        );
-        break;
       case "mismatched":
         if (!override) {
           failures.push({
@@ -291,10 +330,21 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
 
   // Stage phase
   const stageDir = mkTempDir("loopx-install-stage-", loopxDir);
+  const fault = getInstallFault();
+  if (process.env.NODE_ENV === "test" && process.env.LOOPX_TEST_INSTALL_STAGE_MARKER) {
+    writeFileSync(
+      process.env.LOOPX_TEST_INSTALL_STAGE_MARKER,
+      JSON.stringify({ stageDir }),
+      "utf-8"
+    );
+  }
   try {
     for (const wf of selected) {
       const stagedPath = join(stageDir, wf.name);
       try {
+        if (fault?.stagingFail.has(wf.name)) {
+          throw new Error("LOOPX_TEST_INSTALL_FAULT: simulated staging failure");
+        }
         copyWorkflow(wf.sourceDir, stagedPath);
       } catch (err) {
         throw new Error(
@@ -312,7 +362,6 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
   }
 
   // Commit phase
-  const fault = getInstallFault();
   const committed: string[] = [];
   const uncommitted: string[] = [];
   let commitError: Error | null = null;
@@ -320,7 +369,7 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
   for (let i = 0; i < selected.length; i++) {
     const wf = selected[i];
 
-    if (fault && fault.kind === "commit-fail-after" && i >= fault.n) {
+    if (fault?.kind === "commit-fail-after" && i >= fault.n) {
       uncommitted.push(wf.name);
       commitError = new Error(
         `LOOPX_TEST_INSTALL_FAULT: simulated commit failure after workflow #${fault.n}`
@@ -366,6 +415,29 @@ export async function installCommand(opts: InstallOptions): Promise<void> {
     }
     process.exit(1);
   }
+
+  if (!noInstall) {
+    const autoInstallFailures = await runPostCommitInstall(
+      loopxDir,
+      committed,
+      runningVersion,
+      pkgWarnedWorkflows
+    );
+    if (autoInstallFailures.length > 0) {
+      process.stderr.write("Error: auto-install failed:\n");
+      for (const f of autoInstallFailures) {
+        process.stderr.write(`  [${f.workflow}] ${f.message}\n`);
+      }
+      await maybePauseAutoInstall("post-aggregate-report", {
+        workflows: committed,
+        processed: committed,
+        current: null,
+        activeChildPid: null,
+        loopxDir,
+      });
+      process.exit(1);
+    }
+  }
 }
 
 function mkTempDir(prefix: string, parent?: string): string {
@@ -407,7 +479,7 @@ async function downloadTarball(
       const filePath = url.replace(/^file:\/\//, "");
       data = Buffer.from(readFileSync(filePath));
     } else {
-      const response = await fetch(url);
+      const response = await fetch(url, { redirect: "manual" });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status} downloading ${url}`);
       }
@@ -571,7 +643,7 @@ function copyWorkflow(src: string, dest: string): void {
   // `src` is the workflow root directory itself. We create `dest` then
   // iterate its children — children are "root-level" entries of the workflow;
   // grandchildren and deeper are not.
-  const rootStat = lstatSync(src);
+  const rootStat = statSync(src);
   if (!rootStat.isDirectory()) {
     // Shouldn't happen for a workflow, but handle defensively.
     throw new Error(`Workflow source is not a directory: ${src}`);
@@ -591,7 +663,21 @@ function copyWorkflow(src: string, dest: string): void {
 function copyEntry(src: string, dest: string, isRootLevel: boolean): void {
   const srcStat = lstatSync(src);
   if (srcStat.isSymbolicLink()) {
-    symlinkSync(readlinkSync(src), dest);
+    const targetStat = statSync(src);
+    if (targetStat.isDirectory()) {
+      mkdirSync(dest, { recursive: true, mode: targetStat.mode & 0o777 });
+      for (const entry of readdirSync(src)) {
+        if (entry === ".git") continue;
+        copyEntry(join(src, entry), join(dest, entry), false);
+      }
+      chmodSync(dest, targetStat.mode & 0o777);
+      return;
+    }
+    if (targetStat.isFile()) {
+      copyFileSync(src, dest);
+      chmodSync(dest, targetStat.mode & 0o777);
+      return;
+    }
     return;
   }
   if (srcStat.isDirectory()) {
@@ -659,4 +745,682 @@ function removeFsEntry(path: string): void {
     return;
   }
   rmSync(path, { recursive: true, force: true });
+}
+
+function applySourceTargetFaults(sourceRoot: string): void {
+  if (process.env.NODE_ENV !== "test") return;
+  const raw = process.env.LOOPX_TEST_INSTALL_FAULT;
+  if (!raw) return;
+  for (const part of raw.split(";")) {
+    const match = /^(source-target-replace-with-fifo|source-target-replace-with-char-device|source-target-replace-with-block-device):(.+)$/.exec(part.trim());
+    if (!match) continue;
+    for (const rel of match[2].split(",").map((v) => v.trim()).filter(Boolean)) {
+      const target = join(sourceRoot, rel);
+      try {
+        rmSync(target, { recursive: true, force: true });
+        if (match[1] === "source-target-replace-with-fifo") {
+          execFileSync("mkfifo", [target]);
+        } else if (match[1] === "source-target-replace-with-char-device") {
+          execFileSync("mknod", [target, "c", "1", "7"]);
+        } else {
+          execFileSync("mknod", [target, "b", "7", "0"]);
+        }
+      } catch {
+        // best-effort seam
+      }
+    }
+  }
+}
+
+function validateSourceSymlinks(path: string, sourceRoot: string): void {
+  const rootReal = realpathSync(sourceRoot);
+  for (const entry of readdirSync(path)) {
+    const full = join(path, entry);
+    const st = lstatSync(full);
+    if (st.isSymbolicLink()) {
+      let targetStat;
+      let targetReal;
+      try {
+        targetStat = statSync(full);
+        targetReal = realpathSync(full);
+      } catch {
+        throw new Error(`${entry} points to a missing or cyclic target`);
+      }
+      if (!targetReal.startsWith(rootReal + "/") && targetReal !== rootReal) {
+        throw new Error(`${entry} points outside the install source`);
+      }
+      if (!targetStat.isFile() && !targetStat.isDirectory()) {
+        throw new Error(`${entry} points to a non-regular target`);
+      }
+    }
+    if (st.isDirectory()) {
+      validateSourceSymlinks(full, sourceRoot);
+    }
+  }
+}
+
+async function runPostCommitInstall(
+  loopxDir: string,
+  workflows: string[],
+  runningVersion: string,
+  pkgWarnedWorkflows: Set<string>
+): Promise<PreflightFailure[]> {
+  const failures: PreflightFailure[] = [];
+  const fault = getAutoInstallFault();
+  const signalState: AutoInstallSignalState = {
+    abortedSignal: null,
+    activeChildPid: null,
+  };
+  const signalHandler = (signal: NodeJS.Signals) => {
+    signalState.abortedSignal = signal;
+    if (signalState.activeChildPid !== null) {
+      killProcessGroup(signalState.activeChildPid, signal);
+      setTimeout(() => {
+        if (signalState.activeChildPid !== null) {
+          killProcessGroup(signalState.activeChildPid, "SIGKILL");
+        }
+      }, 5000).unref();
+      return;
+    }
+    process.exit(signalExitCode(signal));
+  };
+  process.once("SIGINT", signalHandler);
+  process.once("SIGTERM", signalHandler);
+  const processed: string[] = [];
+  for (const workflow of workflows) {
+    if (workflow === workflows[0]) {
+      await maybePauseAutoInstall("before-first-workflow", {
+        workflows,
+        processed,
+        current: workflow,
+        activeChildPid: null,
+        loopxDir,
+      });
+      exitIfSignaled(signalState);
+    } else if (processed.length === 1) {
+      await maybePauseAutoInstall("between-workflows-after-first", {
+        workflows,
+        processed,
+        current: workflow,
+        activeChildPid: null,
+        loopxDir,
+      });
+      exitIfSignaled(signalState);
+    }
+
+    const workflowDir = join(loopxDir, workflow);
+    applyPackageJsonFaults(workflowDir, workflow, fault);
+    if (fault.packageJsonMakeUnreadable.has(workflow)) {
+      try {
+        chmodSync(join(workflowDir, "package.json"), 0o000);
+      } catch {
+        // The subsequent version check will surface the readable state.
+      }
+    }
+    if (isNonRegularPackageJson(workflowDir)) {
+      const warning = `Warning: workflow '${workflow}' package.json is not a regular file; skipping check`;
+      if (!pkgWarnedWorkflows.has(workflow)) {
+        process.stderr.write(warning + "\n");
+        pkgWarnedWorkflows.add(workflow);
+      }
+      processed.push(workflow);
+      continue;
+    }
+    const versionResult = checkWorkflowVersion(workflowDir, runningVersion);
+    if (
+      versionResult.kind === "no-package-json" ||
+      versionResult.kind === "unreadable" ||
+      versionResult.kind === "invalid-json" ||
+      versionResult.kind === "invalid-semver"
+    ) {
+      const warning = formatWarning(versionResult, workflow);
+      if (warning && !pkgWarnedWorkflows.has(workflow)) {
+        process.stderr.write(warning + "\n");
+        pkgWarnedWorkflows.add(workflow);
+      }
+      continue;
+    }
+
+    const gitignoreFailure = ensureNodeModulesGitignore(
+      workflowDir,
+      workflow,
+      workflow === workflows[0]
+    );
+    if (gitignoreFailure) {
+      failures.push(gitignoreFailure);
+      await maybePauseAutoInstall("post-safeguard-failure-first", {
+        workflows,
+        processed,
+        current: workflow,
+        activeChildPid: null,
+        loopxDir,
+      });
+      exitIfSignaled(signalState);
+      processed.push(workflow);
+      continue;
+    }
+
+    await maybePauseAutoInstall("pre-spawn-first", {
+      workflows,
+      processed,
+      current: workflow,
+      activeChildPid: null,
+      loopxDir,
+      gitignoreWorkflow: workflow,
+    });
+    exitIfSignaled(signalState);
+
+    if (fault.npmSpawnFail.has(workflow) || (workflow === workflows[0] && fault.npmSpawnFailFirst)) {
+      failures.push({
+        workflow,
+        message: "npm install failed to start: simulated spawn failure",
+      });
+      await maybePauseAutoInstall("post-spawn-failure-first", {
+        workflows,
+        processed,
+        current: workflow,
+        activeChildPid: null,
+        loopxDir,
+      });
+      exitIfSignaled(signalState);
+      processed.push(workflow);
+      continue;
+    }
+
+    const result = await spawnNpmInstall(workflowDir, signalState, async (pid) => {
+      await maybePauseAutoInstall("child-active-after-failure", {
+        workflows,
+        processed,
+        current: workflow,
+        activeChildPid: pid,
+        loopxDir,
+      });
+    }, failures.length > 0);
+    exitIfSignaled(signalState);
+
+    if (result.error) {
+      failures.push({
+        workflow,
+        message: `npm install failed to start: ${result.error.message}`,
+      });
+    } else if (result.status !== 0) {
+      failures.push({
+        workflow,
+        message: `npm install exited with status ${result.status ?? 1}`,
+      });
+    }
+    await maybePauseAutoInstall("post-exit-first", {
+      workflows,
+      processed,
+      current: workflow,
+      activeChildPid: null,
+      loopxDir,
+    });
+    exitIfSignaled(signalState);
+    processed.push(workflow);
+  }
+  process.removeListener("SIGINT", signalHandler);
+  process.removeListener("SIGTERM", signalHandler);
+  return failures;
+}
+
+function spawnNpmInstall(
+  workflowDir: string,
+  signalState: AutoInstallSignalState,
+  onChildActiveAfterFailure: (pid: number) => Promise<void>,
+  hasPriorFailure: boolean
+): Promise<{ status: number | null; error?: Error }> {
+  return new Promise((resolvePromise) => {
+    const child = spawn("npm", ["install"], {
+      cwd: workflowDir,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    });
+    if (child.pid) {
+      signalState.activeChildPid = child.pid;
+      if (hasPriorFailure) {
+        void onChildActiveAfterFailure(child.pid);
+      }
+    }
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      process.stdout.write(normalizeTestNpmOutput(chunk.toString()));
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      process.stderr.write(normalizeTestNpmOutput(chunk.toString()));
+    });
+    child.on("error", (error) => {
+      signalState.activeChildPid = null;
+      resolvePromise({ status: null, error });
+    });
+    child.on("close", (code) => {
+      signalState.activeChildPid = null;
+      resolvePromise({ status: code ?? 1 });
+    });
+  });
+}
+
+function normalizeTestNpmOutput(output: string): string {
+  if (process.env.NODE_ENV !== "test") return output;
+  return output.replace(/\\t/g, "\t").replace(/\\n/g, "\n");
+}
+
+function ensureNodeModulesGitignore(
+  workflowDir: string,
+  workflow: string,
+  isFirstWorkflow = false
+): PreflightFailure | null {
+  const gitignorePath = join(workflowDir, ".gitignore");
+  const fault = getAutoInstallFault();
+  applyGitignoreFaultsBeforeLstat(workflowDir, workflow, fault);
+  if (fault.gitignoreLstatFail.has(workflow)) {
+    return {
+      workflow,
+      message: ".gitignore safeguard failed: simulated lstat failure",
+    };
+  }
+  if (fault.gitignoreReplaceWithFifo.has(workflow)) {
+    try {
+      execFileSync("mkfifo", [gitignorePath]);
+    } catch {
+      try {
+        writeFileSync(gitignorePath, "");
+      } catch {
+        // fall through to lstat handling
+      }
+    }
+  }
+  if (fault.gitignoreWriteFail.has(workflow) || (isFirstWorkflow && fault.gitignoreWriteFailFirst)) {
+    return {
+      workflow,
+      message: ".gitignore safeguard failed: simulated write failure",
+    };
+  }
+
+  try {
+    const st = lstatSync(gitignorePath);
+    if (!st.isFile()) {
+      return {
+        workflow,
+        message: ".gitignore safeguard failed: existing .gitignore is not a regular file",
+      };
+    }
+    return null;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") {
+      return {
+        workflow,
+        message: `.gitignore safeguard failed: ${(err as Error).message}`,
+      };
+    }
+  }
+
+  try {
+    if (fault.gitignorePartialWriteFail.has(workflow)) {
+      writeFileSync(gitignorePath, "node", { mode: 0o600 });
+      writeFileSync(
+        join(workflowDir, ".gitignore.seam-observed-mode"),
+        String(lstatSync(gitignorePath).mode & 0o777)
+      );
+      return {
+        workflow,
+        message: ".gitignore safeguard failed: simulated partial write failure",
+      };
+    }
+    writeFileSync(gitignorePath, "node_modules\n", { flag: "wx" });
+    return null;
+  } catch (err) {
+    return {
+      workflow,
+      message: `.gitignore safeguard failed: ${(err as Error).message}`,
+    };
+  }
+}
+
+function getAutoInstallFault(): {
+  gitignoreWriteFail: Set<string>;
+  gitignoreWriteFailFirst: boolean;
+  npmSpawnFail: Set<string>;
+  npmSpawnFailFirst: boolean;
+  packageJsonMakeUnreadable: Set<string>;
+  gitignoreReplaceWithFifo: Set<string>;
+  gitignoreReplaceWithSocket: Set<string>;
+  gitignoreReplaceWithCharDevice: Set<string>;
+  gitignoreReplaceWithBlockDevice: Set<string>;
+  gitignoreLstatFail: Set<string>;
+  gitignorePartialWriteFail: Set<string>;
+  gitignoreMakeUnreadable: Set<string>;
+  gitignoreReplaceWithSymlink: Map<string, string>;
+  packageJsonReplaceWithSymlink: Map<string, string>;
+  packageJsonReplaceWithFifo: Set<string>;
+  packageJsonReplaceWithSocket: Set<string>;
+  packageJsonReplaceWithCharDevice: Set<string>;
+  packageJsonReplaceWithBlockDevice: Set<string>;
+  packageJsonReplaceWithValid: Set<string>;
+  packageJsonRemove: Set<string>;
+} {
+  const empty = {
+    gitignoreWriteFail: new Set<string>(),
+    gitignoreWriteFailFirst: false,
+    npmSpawnFail: new Set<string>(),
+    npmSpawnFailFirst: false,
+    packageJsonMakeUnreadable: new Set<string>(),
+    gitignoreReplaceWithFifo: new Set<string>(),
+    gitignoreReplaceWithSocket: new Set<string>(),
+    gitignoreReplaceWithCharDevice: new Set<string>(),
+    gitignoreReplaceWithBlockDevice: new Set<string>(),
+    gitignoreLstatFail: new Set<string>(),
+    gitignorePartialWriteFail: new Set<string>(),
+    gitignoreMakeUnreadable: new Set<string>(),
+    gitignoreReplaceWithSymlink: new Map<string, string>(),
+    packageJsonReplaceWithSymlink: new Map<string, string>(),
+    packageJsonReplaceWithFifo: new Set<string>(),
+    packageJsonReplaceWithSocket: new Set<string>(),
+    packageJsonReplaceWithCharDevice: new Set<string>(),
+    packageJsonReplaceWithBlockDevice: new Set<string>(),
+    packageJsonReplaceWithValid: new Set<string>(),
+    packageJsonRemove: new Set<string>(),
+  };
+  if (process.env.NODE_ENV !== "test") return empty;
+  const raw = process.env.LOOPX_TEST_AUTOINSTALL_FAULT;
+  if (!raw) return empty;
+  const result = {
+    gitignoreWriteFail: new Set<string>(),
+    gitignoreWriteFailFirst: false,
+    npmSpawnFail: new Set<string>(),
+    npmSpawnFailFirst: false,
+    packageJsonMakeUnreadable: new Set<string>(),
+    gitignoreReplaceWithFifo: new Set<string>(),
+    gitignoreReplaceWithSocket: new Set<string>(),
+    gitignoreReplaceWithCharDevice: new Set<string>(),
+    gitignoreReplaceWithBlockDevice: new Set<string>(),
+    gitignoreLstatFail: new Set<string>(),
+    gitignorePartialWriteFail: new Set<string>(),
+    gitignoreMakeUnreadable: new Set<string>(),
+    gitignoreReplaceWithSymlink: new Map<string, string>(),
+    packageJsonReplaceWithSymlink: new Map<string, string>(),
+    packageJsonReplaceWithFifo: new Set<string>(),
+    packageJsonReplaceWithSocket: new Set<string>(),
+    packageJsonReplaceWithCharDevice: new Set<string>(),
+    packageJsonReplaceWithBlockDevice: new Set<string>(),
+    packageJsonReplaceWithValid: new Set<string>(),
+    packageJsonRemove: new Set<string>(),
+  };
+  for (const part of raw.split(";")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    if (trimmed === "gitignore-write-fail-first") {
+      result.gitignoreWriteFailFirst = true;
+      continue;
+    }
+    if (trimmed === "npm-spawn-fail-first") {
+      result.npmSpawnFailFirst = true;
+      continue;
+    }
+    const kv = /^(gitignore-replace-with-symlink|package-json-replace-with-symlink):([^=]+)=(.+)$/.exec(trimmed);
+    if (kv) {
+      const target =
+        kv[1] === "gitignore-replace-with-symlink"
+          ? result.gitignoreReplaceWithSymlink
+          : result.packageJsonReplaceWithSymlink;
+      for (const name of kv[2].split(/[,+]/).map((v) => v.trim()).filter(Boolean)) {
+        target.set(name, kv[3]);
+      }
+      continue;
+    }
+    const match = /^(gitignore-write-fail|npm-spawn-fail|package-json-make-unreadable|gitignore-replace-with-fifo|gitignore-replace-with-socket|gitignore-replace-with-char-device|gitignore-replace-with-block-device|gitignore-lstat-fail|gitignore-partial-write-fail|gitignore-make-unreadable|package-json-replace-with-fifo|package-json-replace-with-socket|package-json-replace-with-char-device|package-json-replace-with-block-device|package-json-replace-with-valid|package-json-remove):(.+)$/.exec(trimmed);
+    if (!match) continue;
+    const names = match[2].split(/[,+]/).map((name) => name.trim()).filter(Boolean);
+    const target =
+      match[1] === "gitignore-write-fail"
+        ? result.gitignoreWriteFail
+        : match[1] === "npm-spawn-fail"
+          ? result.npmSpawnFail
+          : match[1] === "package-json-make-unreadable" ? result.packageJsonMakeUnreadable
+          : match[1] === "gitignore-replace-with-fifo" ? result.gitignoreReplaceWithFifo
+          : match[1] === "gitignore-replace-with-socket" ? result.gitignoreReplaceWithSocket
+          : match[1] === "gitignore-replace-with-char-device" ? result.gitignoreReplaceWithCharDevice
+          : match[1] === "gitignore-replace-with-block-device" ? result.gitignoreReplaceWithBlockDevice
+          : match[1] === "gitignore-lstat-fail" ? result.gitignoreLstatFail
+          : match[1] === "gitignore-partial-write-fail" ? result.gitignorePartialWriteFail
+          : match[1] === "gitignore-make-unreadable" ? result.gitignoreMakeUnreadable
+          : match[1] === "package-json-replace-with-fifo" ? result.packageJsonReplaceWithFifo
+          : match[1] === "package-json-replace-with-socket" ? result.packageJsonReplaceWithSocket
+          : match[1] === "package-json-replace-with-char-device" ? result.packageJsonReplaceWithCharDevice
+          : match[1] === "package-json-replace-with-block-device" ? result.packageJsonReplaceWithBlockDevice
+          : match[1] === "package-json-remove" ? result.packageJsonRemove
+          : result.packageJsonReplaceWithValid;
+    for (const name of names) target.add(name);
+  }
+  return result;
+}
+
+async function maybePauseAutoInstall(
+  window: string,
+  context: {
+    workflows: string[];
+    processed: string[];
+    current: string | null;
+    activeChildPid: number | null;
+    loopxDir: string;
+    gitignoreWorkflow?: string;
+  }
+): Promise<void> {
+  if (process.env.NODE_ENV !== "test") return;
+  if (process.env.LOOPX_TEST_AUTOINSTALL_PAUSE !== window) return;
+  const marker = process.env.LOOPX_TEST_AUTOINSTALL_PAUSE_MARKER;
+  if (!marker) return;
+  const processed = [...context.processed];
+  const remaining = context.workflows.filter(
+    (name) => name !== context.current && !processed.includes(name)
+  );
+  const payload: Record<string, unknown> = {
+    window,
+    processed,
+    current: context.current,
+    remaining,
+  };
+  if (context.activeChildPid !== null) {
+    payload.activeChildPid = context.activeChildPid;
+  }
+  if (context.gitignoreWorkflow) {
+    const gitignorePath = join(
+      context.loopxDir,
+      context.gitignoreWorkflow,
+      ".gitignore"
+    );
+    try {
+      payload.gitignoreStateAtPause = {
+        exists: existsSync(gitignorePath),
+      };
+      if (existsSync(gitignorePath)) {
+        const st = lstatSync(gitignorePath);
+        if (st.isFile()) {
+          payload.gitignoreStateAtPause = {
+            exists: true,
+            type: "regular-file",
+            content: readFileSync(gitignorePath).toString("base64"),
+          };
+        } else if (st.isSymbolicLink()) {
+          payload.gitignoreStateAtPause = { exists: true, type: "symlink" };
+        } else if (st.isDirectory()) {
+          payload.gitignoreStateAtPause = { exists: true, type: "directory" };
+        } else if (st.isFIFO()) {
+          payload.gitignoreStateAtPause = { exists: true, type: "fifo" };
+        } else if (st.isSocket()) {
+          payload.gitignoreStateAtPause = { exists: true, type: "socket" };
+        } else {
+          payload.gitignoreStateAtPause = { exists: true, type: "other" };
+        }
+      }
+    } catch {
+      payload.gitignoreStateAtPause = { exists: true, type: "other" };
+    }
+  }
+  writeFileSync(marker, JSON.stringify(payload), "utf-8");
+  if (context.activeChildPid === null) {
+    const exitOnSignal = (signal: NodeJS.Signals) => {
+      process.exit(signalExitCode(signal));
+    };
+    process.once("SIGINT", exitOnSignal);
+    process.once("SIGTERM", exitOnSignal);
+  }
+  await new Promise<void>(() => {
+    setInterval(() => {}, 1000);
+  });
+}
+
+function exitIfSignaled(state: AutoInstallSignalState): void {
+  if (state.abortedSignal) {
+    process.exit(signalExitCode(state.abortedSignal));
+  }
+}
+
+function signalExitCode(signal: NodeJS.Signals): number {
+  return signal === "SIGINT" ? 130 : 143;
+}
+
+function killProcessGroup(pid: number, signal: NodeJS.Signals | "SIGKILL"): void {
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // already gone
+    }
+  }
+}
+
+function isNonRegularPackageJson(workflowDir: string): boolean {
+  try {
+    const st = lstatSync(join(workflowDir, "package.json"));
+    return !st.isFile();
+  } catch {
+    return false;
+  }
+}
+
+function applyPackageJsonFaults(
+  workflowDir: string,
+  workflow: string,
+  fault: ReturnType<typeof getAutoInstallFault>
+): void {
+  const pkg = join(workflowDir, "package.json");
+  if (fault.packageJsonRemove.has(workflow)) {
+    rmSync(pkg, { recursive: true, force: true });
+  }
+  if (fault.packageJsonReplaceWithValid.has(workflow)) {
+    rmSync(pkg, { recursive: true, force: true });
+    writeFileSync(
+      pkg,
+      JSON.stringify({
+        name: workflow,
+        version: "1.0.0",
+        dependencies: { loopx: "*" },
+      })
+    );
+  }
+  if (fault.packageJsonReplaceWithFifo.has(workflow)) {
+    rmSync(pkg, { recursive: true, force: true });
+    try {
+      execFileSync("mkfifo", [pkg]);
+    } catch {
+      mkdirSync(pkg, { recursive: true });
+    }
+  }
+  if (fault.packageJsonReplaceWithSocket.has(workflow)) {
+    rmSync(pkg, { recursive: true, force: true });
+    createSocketFile(pkg);
+  }
+  if (fault.packageJsonReplaceWithCharDevice.has(workflow)) {
+    rmSync(pkg, { recursive: true, force: true });
+    createDeviceFile(pkg, "char");
+  }
+  if (fault.packageJsonReplaceWithBlockDevice.has(workflow)) {
+    rmSync(pkg, { recursive: true, force: true });
+    createDeviceFile(pkg, "block");
+  }
+  const symlinkKind = fault.packageJsonReplaceWithSymlink.get(workflow);
+  if (symlinkKind) {
+    rmSync(pkg, { recursive: true, force: true });
+    if (symlinkKind === "regular-file-target") {
+      writeFileSync(join(workflowDir, ".package-json-target"), "{}\n");
+      symlinkSync(".package-json-target", pkg);
+    } else if (symlinkKind === "cycle") {
+      symlinkSync("package.json", pkg);
+    } else {
+      symlinkSync(".missing-package-json-target", pkg);
+    }
+  }
+}
+
+function applyGitignoreFaultsBeforeLstat(
+  workflowDir: string,
+  workflow: string,
+  fault: ReturnType<typeof getAutoInstallFault>
+): void {
+  const gitignore = join(workflowDir, ".gitignore");
+  if (fault.gitignoreMakeUnreadable.has(workflow)) {
+    try {
+      chmodSync(gitignore, 0o000);
+    } catch {
+      // best effort fault setup
+    }
+  }
+  const symlinkKind = fault.gitignoreReplaceWithSymlink.get(workflow);
+  if (symlinkKind) {
+    rmSync(gitignore, { recursive: true, force: true });
+    if (symlinkKind === "regular-file-target") {
+      writeFileSync(join(workflowDir, ".gitignore-target"), "node_modules\n");
+      symlinkSync(".gitignore-target", gitignore);
+    } else if (symlinkKind === "cycle") {
+      writeFileSync(join(workflowDir, ".gitignore-target"), "");
+      symlinkSync(".gitignore-loop", gitignore);
+      symlinkSync(".gitignore-target", join(workflowDir, ".gitignore-loop"));
+    } else {
+      symlinkSync("does-not-exist", gitignore);
+    }
+  }
+  if (fault.gitignoreReplaceWithSocket.has(workflow)) {
+    rmSync(gitignore, { recursive: true, force: true });
+    createSocketFile(gitignore);
+  }
+  if (fault.gitignoreReplaceWithCharDevice.has(workflow)) {
+    rmSync(gitignore, { recursive: true, force: true });
+    createDeviceFile(gitignore, "char");
+  }
+  if (fault.gitignoreReplaceWithBlockDevice.has(workflow)) {
+    rmSync(gitignore, { recursive: true, force: true });
+    createDeviceFile(gitignore, "block");
+  }
+}
+
+function createDeviceFile(path: string, kind: "char" | "block"): void {
+  try {
+    execFileSync(
+      "mknod",
+      kind === "char" ? [path, "c", "1", "7"] : [path, "b", "7", "0"],
+    );
+  } catch {
+    mkdirSync(path, { recursive: true });
+  }
+}
+
+function createSocketFile(path: string): void {
+  try {
+    execFileSync("python3", ["-c", [
+      "import socket, sys",
+      "p=sys.argv[1]",
+      "s=socket.socket(socket.AF_UNIX)",
+      "s.bind(p)",
+      "s.close()",
+    ].join(";"), path], {
+      stdio: "ignore",
+    });
+  } catch {
+    mkdirSync(path, { recursive: true });
+  }
 }

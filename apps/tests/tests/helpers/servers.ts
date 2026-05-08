@@ -7,12 +7,15 @@ import { tmpdir } from "node:os";
 export interface HTTPRoute {
   path: string;
   status?: number;
+  headers?: Record<string, string>;
   contentType?: string;
   body: string | Buffer;
+  handler?: (req: IncomingMessage, res: ServerResponse) => void;
 }
 
 export interface HTTPServer {
   url: string;
+  requests: string[];
   close(): Promise<void>;
 }
 
@@ -30,6 +33,7 @@ export async function startLocalHTTPServer(
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const urlObj = new URL(req.url ?? "/", `http://${req.headers.host}`);
     const pathname = urlObj.pathname;
+    requests.push(req.url ?? pathname);
 
     // Try exact path match first, then path with query string
     const route = routeMap.get(pathname) ?? routeMap.get(req.url ?? "/");
@@ -40,11 +44,21 @@ export async function startLocalHTTPServer(
       return;
     }
 
+    if (route.handler) {
+      route.handler(req, res);
+      return;
+    }
+
     const status = route.status ?? 200;
-    const contentType = route.contentType ?? "application/octet-stream";
-    res.writeHead(status, { "Content-Type": contentType });
+    const headers = {
+      "Content-Type": route.contentType ?? "application/octet-stream",
+      ...route.headers,
+    };
+    res.writeHead(status, headers);
     res.end(route.body);
   });
+
+  const requests: string[] = [];
 
   return new Promise<HTTPServer>((resolve, reject) => {
     server.listen(0, "127.0.0.1", () => {
@@ -56,6 +70,7 @@ export async function startLocalHTTPServer(
       const url = `http://127.0.0.1:${addr.port}`;
       resolve({
         url,
+        requests,
         async close() {
           return new Promise<void>((res, rej) => {
             server.close((err) => (err ? rej(err) : res()));

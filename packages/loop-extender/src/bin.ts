@@ -213,6 +213,7 @@ Sources:
 
 Options:
   -w <name>, --workflow <name>   Install only the named workflow (multi-workflow source)
+  --no-install                   Skip post-install npm install for installed workflows
   -y                             Override version mismatch and workflow collision checks
   -h, --help                     Print this help message`);
 }
@@ -269,18 +270,22 @@ function handleEnvSubcommand(subArgs: string[]): void {
   const action = subArgs[0];
 
   if (action === "set") {
-    if (subArgs.length < 3) {
-      process.stderr.write("Error: loopx env set requires <name> <value>\n");
+    if (subArgs.length !== 3) {
+      process.stderr.write("Error: loopx env set usage: requires exactly <name> <value> arguments\n");
       process.exit(1);
     }
     envSet(subArgs[1], subArgs[2]);
   } else if (action === "remove") {
-    if (subArgs.length < 2) {
-      process.stderr.write("Error: loopx env remove requires <name>\n");
+    if (subArgs.length !== 2) {
+      process.stderr.write("Error: loopx env remove usage: requires exactly <name> argument\n");
       process.exit(1);
     }
     envRemove(subArgs[1]);
   } else if (action === "list") {
+    if (subArgs.length !== 1) {
+      process.stderr.write("Error: loopx env list does not accept arguments\n");
+      process.exit(1);
+    }
     envList();
   } else {
     process.stderr.write(
@@ -295,18 +300,20 @@ interface InstallArgs {
   help: boolean;
   selectedWorkflow?: string | null;
   override: boolean;
+  noInstall: boolean;
   source?: string;
 }
 
 function parseInstallArgs(argv: string[]): InstallArgs {
   // Short-circuit: `-h` / `--help` anywhere ignores all validation.
   if (argv.includes("-h") || argv.includes("--help")) {
-    return { help: true, override: false };
+    return { help: true, override: false, noInstall: false };
   }
 
-  const result: InstallArgs = { help: false, override: false };
+  const result: InstallArgs = { help: false, override: false, noInstall: false };
   let sawW = false;
   let sawY = false;
+  let sawNoInstall = false;
   let i = 0;
 
   while (i < argv.length) {
@@ -330,6 +337,13 @@ function parseInstallArgs(argv: string[]): InstallArgs {
       }
       sawY = true;
       result.override = true;
+    } else if (arg === "--no-install") {
+      if (sawNoInstall) {
+        process.stderr.write("Error: duplicate --no-install flag\n");
+        process.exit(1);
+      }
+      sawNoInstall = true;
+      result.noInstall = true;
     } else if (arg.startsWith("-")) {
       process.stderr.write(`Error: unknown install flag '${arg}'\n`);
       process.exit(1);
@@ -369,7 +383,10 @@ function parseRunArgs(argv: string[]): RunArgs {
   while (i < argv.length) {
     const arg = argv[i];
 
-    if (arg === "-n") {
+    if (arg === "--") {
+      process.stderr.write("Error: unexpected '--' in loopx run arguments\n");
+      process.exit(1);
+    } else if (arg === "-n") {
       if (sawN) {
         process.stderr.write("Error: duplicate -n flag\n");
         process.exit(1);
@@ -381,6 +398,10 @@ function parseRunArgs(argv: string[]): RunArgs {
         process.exit(1);
       }
       const val = argv[i];
+      if (val === "--") {
+        process.stderr.write("Error: unexpected '--' as -n value\n");
+        process.exit(1);
+      }
       const num = Number(val);
       if (!Number.isInteger(num) || num < 0 || val.trim() === "") {
         process.stderr.write(
@@ -400,22 +421,11 @@ function parseRunArgs(argv: string[]): RunArgs {
         process.stderr.write("Error: -e requires a value\n");
         process.exit(1);
       }
-      result.envFile = argv[i];
-    } else if (arg === "--") {
-      i++;
-      if (i < argv.length) {
-        if (result.target) {
-          process.stderr.write(`Error: unexpected argument '${argv[i]}'\n`);
-          process.exit(1);
-        }
-        result.target = argv[i];
-        i++;
-      }
-      if (i < argv.length) {
-        process.stderr.write(`Error: unexpected argument '${argv[i]}'\n`);
+      if (argv[i] === "--") {
+        process.stderr.write("Error: unexpected '--' as -e value\n");
         process.exit(1);
       }
-      break;
+      result.envFile = argv[i];
     } else if (arg.startsWith("-")) {
       process.stderr.write(`Error: unknown flag '${arg}'\n`);
       process.exit(1);
@@ -476,6 +486,11 @@ async function main(): Promise<void> {
 
   const firstArg = argv[0];
 
+  if (firstArg === "--") {
+    process.stderr.write("Error: unexpected argument '--'. Run 'loopx -h' for usage.\n");
+    process.exit(1);
+  }
+
   if (firstArg === "-h" || firstArg === "--help") {
     printTopLevelHelp();
     process.exit(0);
@@ -490,6 +505,10 @@ async function main(): Promise<void> {
   }
 
   if (firstArg === "version") {
+    if (argv.length !== 1) {
+      process.stderr.write("Error: loopx version does not accept arguments. Run 'loopx -h' for usage.\n");
+      process.exit(1);
+    }
     console.log(getVersion());
     process.exit(0);
   }
@@ -521,6 +540,7 @@ async function main(): Promise<void> {
       cwd,
       selectedWorkflow: installArgs.selectedWorkflow ?? null,
       override: installArgs.override,
+      noInstall: installArgs.noInstall,
       runningVersion: getVersion(),
     });
     process.exit(0);

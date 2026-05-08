@@ -1,4 +1,5 @@
 import { writeSync } from "node:fs";
+import type { Output } from "./types.js";
 
 /**
  * Write structured JSON to stdout and terminate the process.
@@ -16,7 +17,9 @@ import { writeSync } from "node:fs";
  * - Arrays with no known fields: throw.
  * - undefined properties omitted from JSON serialization.
  */
-export function output(value: unknown): never {
+export function output(
+  value: Output | string | number | boolean | null | undefined
+): never {
   if (value === null || value === undefined) {
     throw new Error(
       "output() requires a non-null, non-undefined argument"

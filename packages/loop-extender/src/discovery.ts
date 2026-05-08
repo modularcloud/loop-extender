@@ -61,7 +61,7 @@ export function discoverScripts(
     if (code === "ENOENT") {
       if (mode === "run") {
         errors.push(
-          "No .loopx/ directory found. Create a .loopx/ directory with workflows."
+          "No .loopx/ directory found. Invalid project root: create a .loopx/ directory with workflows."
         );
       } else {
         warnings.push("Warning: .loopx/ directory not found");

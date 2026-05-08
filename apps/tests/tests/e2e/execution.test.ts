@@ -1,15 +1,18 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createTempProject,
   createWorkflowScript,
   createBashWorkflowScript,
+  createWorkflowPackageJson,
   type TempProject,
 } from "../helpers/fixtures.js";
 import {
   emitResult,
+  writeValueToFile,
   writeCwdToFile,
   writeEnvToFile,
   writeStderr,
@@ -23,10 +26,10 @@ import { forEachRuntime, isRuntimeAvailable } from "../helpers/runtime.js";
 // Spec refs: 6.1–6.5, 8.3, 2.1, 2.2
 //
 // Under the workflow model, all scripts live in workflow subdirectories of
-// .loopx/ (e.g. .loopx/ralph/index.sh). Scripts execute with the workflow
-// directory as cwd. LOOPX_PROJECT_ROOT always points to the invocation
-// directory; LOOPX_WORKFLOW always contains the current workflow's name and
-// is refreshed on every cross-workflow transition (including loop reset).
+// .loopx/ (e.g. .loopx/ralph/index.sh). Scripts execute with the project
+// root as cwd. LOOPX_PROJECT_ROOT always points to the invocation directory;
+// LOOPX_WORKFLOW always contains the current workflow's name and is refreshed
+// on every cross-workflow transition (including loop reset).
 // ============================================================================
 
 // ----------------------------------------------------------------------------
@@ -44,7 +47,7 @@ describe("TEST-SPEC §4.4 Working Directory", () => {
   });
 
   forEachRuntime((runtime) => {
-    it("T-EXEC-01: script in ralph workflow runs with $PWD = .loopx/ralph/", async () => {
+    it("T-EXEC-01: script in ralph workflow runs with cwd = project root", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cwd-marker.txt");
 
@@ -65,11 +68,11 @@ describe("TEST-SPEC §4.4 Working Directory", () => {
       expect(existsSync(markerPath)).toBe(true);
       const recordedCwd = readFileSync(markerPath, "utf-8");
       const workflowDir = join(project.loopxDir, "ralph");
-      expect(recordedCwd).toBe(workflowDir);
-      expect(recordedCwd).not.toBe(project.dir);
+      expect(recordedCwd).toBe(project.dir);
+      expect(recordedCwd).not.toBe(workflowDir);
     });
 
-    it("T-EXEC-02: script in 'other' workflow runs with $PWD = .loopx/other/", async () => {
+    it("T-EXEC-02: script in 'other' workflow runs with cwd = project root", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cwd-other.txt");
 
@@ -90,7 +93,8 @@ describe("TEST-SPEC §4.4 Working Directory", () => {
       expect(existsSync(markerPath)).toBe(true);
       const recordedCwd = readFileSync(markerPath, "utf-8");
       const otherDir = join(project.loopxDir, "other");
-      expect(recordedCwd).toBe(otherDir);
+      expect(recordedCwd).toBe(project.dir);
+      expect(recordedCwd).not.toBe(otherDir);
     });
 
     it("T-EXEC-03: $LOOPX_PROJECT_ROOT equals invocation directory, not workflow directory", async () => {
@@ -151,6 +155,64 @@ printf '{"stop":true}'
       // points at the project root (invocation cwd), not the target workflow dir.
       expect(recordedRoot).toBe(project.dir);
       expect(recordedRoot).not.toBe(join(project.loopxDir, "other"));
+    });
+
+    it("T-EXEC-03b: Bash child cd does not leak across goto spawns", async () => {
+      project = await createTempProject();
+      const markerPath = join(project.dir, "cwd-after-cd-goto.txt");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        [`cd ${JSON.stringify(tmpdir())}`, `printf '{"goto":"check"}'`].join("\n"),
+      );
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "check",
+        [`/bin/pwd -P | tr -d '\\n' > ${JSON.stringify(markerPath)}`, `printf '{"stop":true}'`].join("\n"),
+      );
+
+      const result = await runCLI(["run", "-n", "2", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(markerPath, "utf-8")).toBe(project.dir);
+    });
+
+    it("T-EXEC-03c: Bash child cd does not leak across loop reset", async () => {
+      project = await createTempProject();
+      const markerPath = join(project.dir, "cwd-after-cd-reset.txt");
+
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        [
+          `ITER_FILE="$LOOPX_TMPDIR/iter"`,
+          `ITER=0`,
+          `[ -f "$ITER_FILE" ] && ITER=$(cat "$ITER_FILE")`,
+          `ITER=$((ITER + 1))`,
+          `printf '%s' "$ITER" > "$ITER_FILE"`,
+          `if [ "$ITER" = "1" ]; then`,
+          `  cd ${JSON.stringify(tmpdir())}`,
+          `  exit 0`,
+          `fi`,
+          `/bin/pwd -P | tr -d '\\n' > ${JSON.stringify(markerPath)}`,
+          `printf '{"stop":true}'`,
+        ].join("\n"),
+      );
+
+      const result = await runCLI(["run", "-n", "2", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(markerPath, "utf-8")).toBe(project.dir);
     });
 
     it("T-EXEC-04: $LOOPX_WORKFLOW is injected and equals the workflow name", async () => {
@@ -361,6 +423,66 @@ process.stdout.write(JSON.stringify(outputs));
       expect(existsSync(markerPath)).toBe(true);
       expect(readFileSync(markerPath, "utf-8")).toBe("no-shebang-ran");
     });
+
+    it("T-EXEC-07a: a readable .sh script without executable bit still runs", async () => {
+      project = await createTempProject();
+      const markerPath = join(project.dir, "no-exec-bit-marker.txt");
+      const scriptPath = await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".sh",
+        `#!/bin/bash\nprintf '%s' 'no-exec-bit-ran' > ${JSON.stringify(markerPath)}\nprintf '{"stop":true}'\n`,
+      );
+      await chmod(scriptPath, 0o644);
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(markerPath, "utf-8")).toBe("no-exec-bit-ran");
+      expect(statSync(scriptPath).mode & 0o777).toBe(0o644);
+    });
+
+    it.skipIf(!existsSync("/bin/bash"))(
+      "T-EXEC-07b: Bash scripts are invoked via absolute /bin/bash, not PATH bash",
+      async () => {
+        project = await createTempProject();
+        const fakeBin = await mkdtemp(join(tmpdir(), "loopx-fake-bash-"));
+        const fakeMarker = join(project.dir, "fake-bash-marker.txt");
+        const realMarker = join(project.dir, "real-bash-marker.txt");
+        try {
+          const fakeBash = join(fakeBin, "bash");
+          await writeFile(
+            fakeBash,
+            `#!/bin/bash\nprintf '%s' 'fake' > ${JSON.stringify(fakeMarker)}\nexit 99\n`,
+            "utf-8",
+          );
+          await chmod(fakeBash, 0o755);
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            `#!/bin/bash\nprintf '%s' 'real' > ${JSON.stringify(realMarker)}\nprintf '{"stop":true}'\n`,
+          );
+
+          const result = await runCLI(["run", "-n", "1", "ralph"], {
+            cwd: project.dir,
+            runtime,
+            env: { PATH: `${fakeBin}:${process.env.PATH ?? ""}` },
+          });
+
+          expect(result.exitCode).toBe(0);
+          expect(existsSync(fakeMarker)).toBe(false);
+          expect(readFileSync(realMarker, "utf-8")).toBe("real");
+        } finally {
+          await rm(fakeBin, { recursive: true, force: true });
+        }
+      },
+    );
   });
 });
 
@@ -508,6 +630,40 @@ process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
       // CJS is not supported. loopx must exit non-zero.
       expect(result.exitCode).not.toBe(0);
     });
+
+    it.each([
+      ["T-EXEC-13c", ".js", `module.exports = { value: "x" };`],
+      ["T-EXEC-13d", ".js", `exports.value = "x";`],
+      ["T-EXEC-13e", ".ts", `require("node:fs");`],
+      ["T-EXEC-13f", ".jsx", `require("node:fs");`],
+      ["T-EXEC-13g", ".tsx", `require("node:fs");`],
+      ["T-EXEC-13h", ".ts", `module.exports = { value: "x" };`],
+      ["T-EXEC-13i", ".jsx", `module.exports = { value: "x" };`],
+      ["T-EXEC-13j", ".tsx", `module.exports = { value: "x" };`],
+      ["T-EXEC-13k", ".ts", `exports.value = "x";`],
+      ["T-EXEC-13l", ".jsx", `exports.value = "x";`],
+      ["T-EXEC-13m", ".tsx", `exports.value = "x";`],
+    ] as const)("%s: CommonJS form is rejected for %s scripts", async (_id, ext, cjsLine) => {
+      project = await createTempProject();
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ext,
+        [
+          `import { output } from "loopx";`,
+          cjsLine,
+          `output({ result: "should-not-reach" });`,
+        ].join("\n"),
+      );
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(1);
+    });
   });
 
   // T-EXEC-13: Node-specific (verifies tsx handles TS syntax under Node.js)
@@ -629,6 +785,23 @@ describe("TEST-SPEC §4.4 Workflow-Local Dependencies", () => {
     }
   });
 
+  async function withFakeNpmLog<T>(fn: (env: Record<string, string>, logFile: string) => Promise<T>): Promise<T> {
+    const fakeBin = await mkdtemp(join(tmpdir(), "loopx-fake-npm-"));
+    const logFile = join(fakeBin, "npm.log");
+    try {
+      const npmPath = join(fakeBin, "npm");
+      await writeFile(
+        npmPath,
+        `#!/bin/bash\nprintf '%s\\n' "$@" >> ${JSON.stringify(logFile)}\nexit 0\n`,
+        "utf-8",
+      );
+      await chmod(npmPath, 0o755);
+      return await fn({ PATH: `${fakeBin}:${process.env.PATH ?? ""}` }, logFile);
+    } finally {
+      await rm(fakeBin, { recursive: true, force: true });
+    }
+  }
+
   forEachRuntime((runtime) => {
     it("T-EXEC-15: workflow with its own node_modules can import local dependencies", async () => {
       project = await createTempProject();
@@ -647,7 +820,8 @@ process.stdout.write(JSON.stringify({ result: greeting }));
       );
 
       // Install a local ESM dep in the workflow's node_modules. Node/tsx/bun
-      // all resolve bare specifiers starting from cwd (= workflow dir).
+      // Bare imports resolve from the importing file, so workflow-local
+      // node_modules still works even though process cwd is the project root.
       const depDir = join(
         project.loopxDir,
         "with-deps",
@@ -680,7 +854,7 @@ process.stdout.write(JSON.stringify({ result: greeting }));
       expect(readFileSync(markerPath, "utf-8")).toBe("hello-from-local-dep");
     });
 
-    it("T-EXEC-16: workflow cwd equals the workflow directory (TS, via process.cwd())", async () => {
+    it("T-EXEC-16: TS script process.cwd() equals the project root", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "ts-cwd-marker.txt");
 
@@ -703,7 +877,8 @@ process.stdout.write(JSON.stringify({ result: "ok" }));
       expect(result.exitCode).toBe(0);
       expect(existsSync(markerPath)).toBe(true);
       const workflowDir = join(project.loopxDir, "ralph");
-      expect(readFileSync(markerPath, "utf-8")).toBe(workflowDir);
+      expect(readFileSync(markerPath, "utf-8")).toBe(project.dir);
+      expect(readFileSync(markerPath, "utf-8")).not.toBe(workflowDir);
     });
 
     it("T-EXEC-16a: workflow importing a package not present in its node_modules fails with exit 1", async () => {
@@ -729,7 +904,7 @@ process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
       expect(result.exitCode).toBe(1);
     });
 
-    it("T-EXEC-16b: cross-workflow goto switches cwd to the target workflow's directory", async () => {
+    it("T-EXEC-16b: cross-workflow goto keeps cwd at the project root", async () => {
       project = await createTempProject();
       const markerPath = join(project.dir, "cross-cwd-marker.txt");
 
@@ -740,14 +915,14 @@ process.stdout.write(JSON.stringify({ result: "should-not-reach" }));
         "index",
         `printf '{"goto":"other:check"}'`,
       );
-      // other:check records its own $PWD, then stops so the chain ends.
+      // other:check records its cwd, then stops so the chain ends.
       await createWorkflowScript(
         project,
         "other",
         "check",
         ".sh",
         `#!/bin/bash
-printf '%s' "$PWD" > "${markerPath}"
+/bin/pwd -P | tr -d '\\n' > "${markerPath}"
 printf '{"stop":true}'
 `,
       );
@@ -762,10 +937,134 @@ printf '{"stop":true}'
       const recordedCwd = readFileSync(markerPath, "utf-8");
       const otherDir = join(project.loopxDir, "other");
       const ralphDir = join(project.loopxDir, "ralph");
-      // After crossing into 'other', the script must execute in .loopx/other/,
-      // not in ralph's directory.
-      expect(recordedCwd).toBe(otherDir);
+      // After crossing into 'other', cwd remains the project root. The
+      // workflow-specific path is exposed through LOOPX_WORKFLOW_DIR instead.
+      expect(recordedCwd).toBe(project.dir);
       expect(recordedCwd).not.toBe(ralphDir);
+      expect(recordedCwd).not.toBe(otherDir);
+    });
+
+    it("T-EXEC-15a: CLI run does not auto-install missing workflow dependencies", async () => {
+      project = await createTempProject();
+      const markerPath = join(project.dir, "no-autoinstall-cli-marker.txt");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        [writeValueToFile("ran", markerPath), `printf '{"stop":true}'`].join("\n"),
+      );
+      await createWorkflowPackageJson(project, "ralph", {
+        dependencies: { "some-pkg": "*" },
+      });
+
+      await withFakeNpmLog(async (env, logFile) => {
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project!.dir,
+          runtime,
+          env,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(readFileSync(markerPath, "utf-8")).toBe("ran");
+        expect(existsSync(logFile)).toBe(false);
+        expect(existsSync(join(project!.loopxDir, "ralph", "node_modules"))).toBe(false);
+      });
+    });
+
+    it.each([
+      ["T-EXEC-15b", "runPromise"],
+      ["T-EXEC-15c", "run"],
+    ] as const)("%s: %s does not auto-install missing workflow dependencies", async (_id, surface) => {
+      project = await createTempProject();
+      await createBashWorkflowScript(project, "ralph", "index", `printf '{"stop":true}'`);
+      await createWorkflowPackageJson(project, "ralph", {
+        dependencies: { "some-pkg": "*" },
+      });
+
+      await withFakeNpmLog(async (env, logFile) => {
+        const driverCode = `
+import { run, runPromise } from "loopx";
+
+if (${JSON.stringify(surface)} === "runPromise") {
+  await runPromise("ralph", { cwd: ${JSON.stringify(project!.dir)}, maxIterations: 1 });
+} else {
+  for await (const _ of run("ralph", { cwd: ${JSON.stringify(project!.dir)}, maxIterations: 1 })) {}
+}
+`;
+        const result = await runAPIDriver(runtime, driverCode, { env });
+
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(logFile)).toBe(false);
+        expect(existsSync(join(project!.loopxDir, "ralph", "node_modules"))).toBe(false);
+      });
+    });
+
+    it("T-EXEC-16c: JS/TS process.chdir() does not leak across goto spawns", async () => {
+      project = await createTempProject();
+      const markerPath = join(project.dir, "ts-cwd-after-chdir-goto.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".ts",
+        `import { output } from "loopx";
+process.chdir(${JSON.stringify(tmpdir())});
+output({ goto: "check" });
+`,
+      );
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "check",
+        ".ts",
+        `import { writeFileSync } from "node:fs";
+import { output } from "loopx";
+writeFileSync(${JSON.stringify(markerPath)}, process.cwd());
+output({ stop: true });
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "2", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(markerPath, "utf-8")).toBe(project.dir);
+    });
+
+    it("T-EXEC-16d: JS/TS process.chdir() does not leak across loop reset", async () => {
+      project = await createTempProject();
+      const markerPath = join(project.dir, "ts-cwd-after-chdir-reset.txt");
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".ts",
+        `import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { output } from "loopx";
+
+const iterFile = join(process.env.LOOPX_TMPDIR!, "iter");
+const previous = existsSync(iterFile) ? Number(readFileSync(iterFile, "utf-8")) : 0;
+const next = previous + 1;
+writeFileSync(iterFile, String(next));
+if (next === 1) {
+  process.chdir(${JSON.stringify(tmpdir())});
+  process.exit(0);
+}
+writeFileSync(${JSON.stringify(markerPath)}, process.cwd());
+output({ stop: true });
+`,
+      );
+
+      const result = await runCLI(["run", "-n", "2", "ralph"], {
+        cwd: project.dir,
+        runtime,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(markerPath, "utf-8")).toBe(project.dir);
     });
   });
 });

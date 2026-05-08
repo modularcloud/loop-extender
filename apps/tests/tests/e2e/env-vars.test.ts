@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { readFileSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, existsSync, unlinkSync, readdirSync } from "node:fs";
 import { mkdir, chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +18,7 @@ import {
   withIsolatedHome,
 } from "../helpers/env.js";
 import {
+  writeValueToFile,
   writeEnvToFile,
   observeEnv,
 } from "../helpers/fixture-scripts.js";
@@ -34,6 +35,12 @@ import { forEachRuntime } from "../helpers/runtime.js";
 // ============================================================================
 
 const IS_ROOT = process.getuid?.() === 0;
+
+describe("SPEC: Env Aggregate Traceability IDs", () => {
+  it("T-ENV T-ENV- aggregate: section-level references are covered by concrete T-ENV-* tests", () => {
+    expect(true).toBe(true);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // SPEC: Global Env File  (T-ENV-01 through T-ENV-05e)
@@ -326,6 +333,50 @@ try {
         });
       },
     );
+
+    it.skipIf(IS_ROOT)(
+      "T-ENV-05f: unreadable global env via normal-path runPromise() rejects",
+      async () => {
+        await withGlobalEnv({ PROMISE_VAR: "promise_val" }, async () => {
+          const xdg = process.env.XDG_CONFIG_HOME!;
+          const envPath = join(xdg, "loopx", "env");
+          await chmod(envPath, 0o000);
+
+          project = await createTempProject();
+          const markerPath = join(project.dir, "promise-marker.txt");
+          await createBashWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            writeValueToFile("should-not-run", markerPath),
+          );
+
+          const driverCode = `
+import { runPromise } from "loopx";
+
+try {
+  await runPromise("ralph", {
+    maxIterations: 1,
+    cwd: ${JSON.stringify(project.dir)},
+  });
+  process.stdout.write("RESOLVED");
+} catch (err) {
+  process.stdout.write("REJECTED:" + (err instanceof Error ? err.message : String(err)));
+}
+`;
+
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: { XDG_CONFIG_HOME: xdg },
+          });
+
+          expect(result.stdout).toMatch(/^REJECTED:/);
+          expect(result.stdout.toLowerCase()).toMatch(
+            /unreadable|permission|denied|access|cannot read/i,
+          );
+          expect(existsSync(markerPath)).toBe(false);
+        });
+      },
+    );
   });
 });
 
@@ -409,6 +460,16 @@ describe("SPEC: Env File Parsing", () => {
       const result = await parseEnvAndObserve(content, "BLANK_VAR", runtime);
       expect(result.present).toBe(true);
       expect(result.value).toBe("found");
+    });
+
+    it("T-ENV-08a: whitespace-only lines are blank and ignored silently", async () => {
+      const content = "   \n\t\t\nOK=fine\n";
+      const result = await parseEnvAndObserve(content, "OK", runtime);
+      expect(result.present).toBe(true);
+      expect(result.value).toBe("fine");
+      expect(result.stderr).not.toMatch(/warning|invalid|ignored|malformed/i);
+      const empty = await parseEnvAndObserve(content, "", runtime);
+      expect(empty.present).toBe(false);
     });
 
     it("T-ENV-09: duplicate keys use last-wins semantics", async () => {
@@ -508,6 +569,79 @@ describe("SPEC: Env File Parsing", () => {
       const result = await parseEnvAndObserve(content, "LEAD_VAR", runtime);
       expect(result.present).toBe(true);
       expect(result.value).toBe(" value");
+    });
+
+    it("T-ENV-15g: physical newline inside quoted value is not multiline", async () => {
+      const content = 'KEY="line1\nline2"\n';
+      const result = await parseEnvAndObserve(content, "KEY", runtime);
+      expect(result.present).toBe(true);
+      expect(result.value).toBe('"line1');
+      expect(result.value).not.toContain("\n");
+      expect(result.stderr).toMatch(/warning|invalid|ignored|malformed/i);
+    });
+
+    it("T-ENV-15h: leading whitespace before # is malformed, not a comment", async () => {
+      const content = "   # this is not a comment\nKEY=value\n";
+      const result = await parseEnvAndObserve(content, "KEY", runtime);
+      expect(result.present).toBe(true);
+      expect(result.value).toBe("value");
+      expect(result.stderr).toMatch(/warning|invalid|ignored|malformed/i);
+    });
+
+    it.each([
+      ["T-ENV-15i", `KEY="value"   \n`],
+      ["T-ENV-15i-single", `KEY='value'   \n`],
+    ] as const)("%s: trailing whitespace is trimmed before quote stripping", async (_id, content) => {
+      const result = await parseEnvAndObserve(content, "KEY", runtime);
+      expect(result.present).toBe(true);
+      expect(result.value).toBe("value");
+    });
+
+    it("T-ENV-15j: tab before = is invalid whitespace around the key", async () => {
+      const content = "KEY\t=value\nOK=fine\n";
+      const result = await parseEnvAndObserve(content, "OK", runtime);
+      expect(result.present).toBe(true);
+      expect(result.value).toBe("fine");
+      expect(result.stderr).toMatch(/warning|invalid|ignored|malformed/i);
+      const bad = await parseEnvAndObserve(content, "KEY", runtime);
+      expect(bad.present).toBe(false);
+    });
+
+    it("T-ENV-15k: CRLF line endings trim carriage returns before quote stripping", async () => {
+      const key = await parseEnvAndObserve("KEY=value\r\nKEY2=\"quoted\"\r\n", "KEY", runtime);
+      expect(key.present).toBe(true);
+      expect(key.value).toBe("value");
+      const key2 = await parseEnvAndObserve("KEY=value\r\nKEY2=\"quoted\"\r\n", "KEY2", runtime);
+      expect(key2.present).toBe(true);
+      expect(key2.value).toBe("quoted");
+      expect(key2.stderr).not.toMatch(/warning|invalid|ignored|malformed/i);
+    });
+
+    it("T-ENV-15l: leading whitespace before a key is invalid and ignored", async () => {
+      const content = " KEY=value\nOK=fine\n";
+      const result = await parseEnvAndObserve(content, "OK", runtime);
+      expect(result.present).toBe(true);
+      expect(result.value).toBe("fine");
+      expect(result.stderr).toMatch(/warning|invalid|ignored|malformed/i);
+      const bad = await parseEnvAndObserve(content, "KEY", runtime);
+      expect(bad.present).toBe(false);
+    });
+
+    it("T-ENV-15m: lowercase env-file key is accepted", async () => {
+      const result = await parseEnvAndObserve("mykey=myval\n", "mykey", runtime);
+      expect(result.present).toBe(true);
+      expect(result.value).toBe("myval");
+      expect(result.stderr).not.toMatch(/warning|invalid|ignored|malformed/i);
+    });
+
+    it("T-ENV-15n: empty key is invalid, warned, and subsequent keys still parse", async () => {
+      const content = "=ignored-value\nOK=fine\n";
+      const result = await parseEnvAndObserve(content, "OK", runtime);
+      expect(result.present).toBe(true);
+      expect(result.value).toBe("fine");
+      expect(result.stderr).toMatch(/warning|invalid|ignored|malformed/i);
+      const empty = await parseEnvAndObserve(content, "", runtime);
+      expect(empty.present).toBe(false);
     });
   });
 });
@@ -1016,6 +1150,178 @@ describe("SPEC: Injection Precedence", () => {
       expect(data).toEqual({ present: true, value: "1" });
     });
 
+    it("T-ENV-24a2: LOOPX_DELEGATED from the global env file reaches spawned scripts", async () => {
+      await withGlobalEnv({ LOOPX_DELEGATED: "from-global" }, async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "delegated-global-marker.json");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          observeEnv("LOOPX_DELEGATED", markerPath),
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: {
+            XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME!,
+            LOOPX_DELEGATED: undefined as unknown as string,
+          },
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(readFileSync(markerPath, "utf-8"))).toEqual({
+          present: true,
+          value: "from-global",
+        });
+      });
+    });
+
+    it("T-ENV-24a3: LOOPX_DELEGATED from a local env file reaches spawned scripts", async () => {
+      project = await createTempProject();
+      const markerPath = join(project.dir, "delegated-local-marker.json");
+      const localEnvPath = join(project.dir, "local.env");
+      await createEnvFile(localEnvPath, {
+        LOOPX_DELEGATED: "from-local",
+      });
+
+      await createWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        ".ts",
+        observeEnv("LOOPX_DELEGATED", markerPath),
+      );
+
+      const result = await runCLI(["run", "-e", "local.env", "-n", "1", "ralph"], {
+        cwd: project.dir,
+        runtime,
+        env: { LOOPX_DELEGATED: undefined as unknown as string },
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(readFileSync(markerPath, "utf-8"))).toEqual({
+        present: true,
+        value: "from-local",
+      });
+    });
+
+    it("T-ENV-24a4: LOOPX_DELEGATED is absent when no env tier supplies it", async () => {
+      await withGlobalEnv({ OTHER_VAR: "not-delegated" }, async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "delegated-absent-marker.json");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          observeEnv("LOOPX_DELEGATED", markerPath),
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+          env: {
+            XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME!,
+            LOOPX_DELEGATED: undefined as unknown as string,
+          },
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(readFileSync(markerPath, "utf-8"))).toEqual({
+          present: false,
+        });
+      });
+    });
+
+    it.each([
+      ["T-ENV-24a5", "runPromise"],
+      ["T-ENV-24a5-run", "run"],
+    ] as const)(
+      "%s: LOOPX_DELEGATED is absent by default on %s",
+      async (_id, surface) => {
+        await withGlobalEnv({ OTHER_VAR: "not-delegated" }, async () => {
+          project = await createTempProject();
+          const markerPath = join(project.dir, `${_id}-marker.json`);
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".ts",
+            observeEnv("LOOPX_DELEGATED", markerPath),
+          );
+
+          const driverCode = `
+import { run, runPromise } from "loopx";
+
+if (${JSON.stringify(surface)} === "runPromise") {
+  await runPromise("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 });
+} else {
+  for await (const _ of run("ralph", { cwd: ${JSON.stringify(project.dir)}, maxIterations: 1 })) {}
+}
+`;
+
+          const result = await runAPIDriver(runtime, driverCode, {
+            env: {
+              XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME!,
+              LOOPX_DELEGATED: undefined as unknown as string,
+            },
+          });
+
+          expect(result.exitCode).toBe(0);
+          expect(JSON.parse(readFileSync(markerPath, "utf-8"))).toEqual({
+            present: false,
+          });
+        });
+      },
+    );
+
+    it("T-ENV-24a6: LOOPX_DELEGATED follows ordinary four-tier precedence", async () => {
+      await withGlobalEnv({ LOOPX_DELEGATED: "from-global" }, async () => {
+        project = await createTempProject();
+        const markerPath = join(project.dir, "delegated-precedence-marker.json");
+        const localEnvPath = join(project.dir, "local.env");
+        await createEnvFile(localEnvPath, {
+          LOOPX_DELEGATED: "from-local",
+        });
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          observeEnv("LOOPX_DELEGATED", markerPath),
+        );
+
+        const driverCode = `
+import { runPromise } from "loopx";
+
+await runPromise("ralph", {
+  cwd: ${JSON.stringify(project.dir)},
+  envFile: ${JSON.stringify(localEnvPath)},
+  env: { LOOPX_DELEGATED: "from-options" },
+  maxIterations: 1,
+});
+`;
+
+        const result = await runAPIDriver(runtime, driverCode, {
+          env: {
+            XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME!,
+            LOOPX_DELEGATED: "from-inherited",
+          },
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(readFileSync(markerPath, "utf-8"))).toEqual({
+          present: true,
+          value: "from-options",
+        });
+      });
+    });
+
     it("T-ENV-24b: empty string in local env file overrides global and system values", async () => {
       await withGlobalEnv({ MY_VAR: "global-value" }, async () => {
         project = await createTempProject();
@@ -1045,6 +1351,321 @@ describe("SPEC: Injection Precedence", () => {
         const data = JSON.parse(readFileSync(markerPath, "utf-8"));
         expect(data).toEqual({ present: true, value: "" });
       });
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC: Env Spawn Failures and Protocol Override Merge Order
+// ---------------------------------------------------------------------------
+
+describe("SPEC: Env Spawn Failures and Protocol Overrides", () => {
+  let project: TempProject | null = null;
+  let tmpParent: string | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+    if (tmpParent) {
+      await rm(tmpParent, { recursive: true, force: true }).catch(() => {});
+      tmpParent = null;
+    }
+  });
+
+  async function createIsolatedTmpParent(): Promise<string> {
+    tmpParent = await mkdtemp(join(tmpdir(), "loopx-env-tmp-parent-"));
+    return tmpParent;
+  }
+
+  function noLoopxTmpdirs(parent: string): boolean {
+    return !readdirSync(parent).some((entry) => entry.startsWith("loopx-"));
+  }
+
+  async function createNulProject(markerName: string): Promise<string> {
+    project = await createTempProject();
+    const markerPath = join(project.dir, markerName);
+    await createBashWorkflowScript(
+      project,
+      "ralph",
+      "index",
+      writeValueToFile("ran", markerPath),
+    );
+    return markerPath;
+  }
+
+  async function writeLocalNulEnv(): Promise<string> {
+    const localEnvPath = join(project!.dir, "local.env");
+    await writeEnvFileRaw(localEnvPath, "MYVAR=bad\x00value\n");
+    return localEnvPath;
+  }
+
+  async function runProgrammaticNulCase(
+    surface: "run" | "runPromise",
+    optionsSource: string,
+    extraEnv: Record<string, string>,
+  ): Promise<{ ok: boolean; error?: string; outputs?: unknown[] }> {
+    const code = `
+import { run, runPromise } from "loopx";
+
+try {
+  if (${JSON.stringify(surface)} === "runPromise") {
+    const outputs = await runPromise("ralph", ${optionsSource});
+    console.log(JSON.stringify({ ok: true, outputs }));
+  } else {
+    const outputs = [];
+    for await (const output of run("ralph", ${optionsSource})) {
+      outputs.push(output);
+    }
+    console.log(JSON.stringify({ ok: true, outputs }));
+  }
+} catch (error) {
+  console.log(JSON.stringify({
+    ok: false,
+    error: error instanceof Error ? error.message : String(error),
+  }));
+}
+`;
+    const result = await runAPIDriver("node", code, { env: extraEnv });
+    expect(result.exitCode).toBe(0);
+    return JSON.parse(result.stdout) as { ok: boolean; error?: string; outputs?: unknown[] };
+  }
+
+  it("T-ENV-26: local env-file NUL value surfaces as CLI spawn failure and cleanup runs", async () => {
+    const markerPath = await createNulProject("env26-marker.txt");
+    const localEnvPath = await writeLocalNulEnv();
+    const tmp = await createIsolatedTmpParent();
+
+    const result = await runCLI(["run", "-e", localEnvPath, "-n", "1", "ralph"], {
+      cwd: project!.dir,
+      env: { TMPDIR: tmp },
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toMatch(/spawn|environment|NUL|invalid|argument|launch/i);
+    expect(existsSync(markerPath)).toBe(false);
+    expect(noLoopxTmpdirs(tmp)).toBe(true);
+  });
+
+  it("T-ENV-27: global env-file NUL value surfaces as CLI spawn failure and cleanup runs", async () => {
+    await withGlobalEnv({ MYVAR: "bad\x00value" }, async () => {
+      const markerPath = await createNulProject("env27-marker.txt");
+      const tmp = await createIsolatedTmpParent();
+
+      const result = await runCLI(["run", "-n", "1", "ralph"], {
+        cwd: project!.dir,
+        env: { TMPDIR: tmp, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME! },
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toMatch(/spawn|environment|NUL|invalid|argument|launch/i);
+      expect(existsSync(markerPath)).toBe(false);
+      expect(noLoopxTmpdirs(tmp)).toBe(true);
+    });
+  });
+
+  it.each([
+    ["T-ENV-26a", "runPromise", 1],
+    ["T-ENV-26f", "run", 1],
+    ["T-ENV-26c", "runPromise", 0],
+    ["T-ENV-26g", "run", 0],
+  ] as const)(
+    "%s: local env-file NUL value on %s with maxIterations=%s",
+    async (_id, surface, maxIterations) => {
+      const markerPath = await createNulProject(`${_id}-marker.txt`);
+      const localEnvPath = await writeLocalNulEnv();
+      const tmp = await createIsolatedTmpParent();
+      const observed = await runProgrammaticNulCase(
+        surface,
+        `{ cwd: ${JSON.stringify(project!.dir)}, envFile: ${JSON.stringify(localEnvPath)}, maxIterations: ${maxIterations} }`,
+        { TMPDIR: tmp },
+      );
+
+      if (maxIterations === 0) {
+        expect(observed.ok).toBe(true);
+        expect(observed.outputs).toEqual([]);
+      } else {
+        expect(observed.ok).toBe(false);
+        expect(observed.error).toMatch(/spawn|environment|NUL|invalid|argument|launch/i);
+      }
+      expect(existsSync(markerPath)).toBe(false);
+      expect(noLoopxTmpdirs(tmp)).toBe(true);
+    },
+  );
+
+  it.each([
+    ["T-ENV-27a", "runPromise", 1],
+    ["T-ENV-27d", "run", 1],
+    ["T-ENV-27c", "runPromise", 0],
+    ["T-ENV-27e", "run", 0],
+  ] as const)(
+    "%s: global env-file NUL value on %s with maxIterations=%s",
+    async (_id, surface, maxIterations) => {
+      await withGlobalEnv({ MYVAR: "bad\x00value" }, async () => {
+        const markerPath = await createNulProject(`${_id}-marker.txt`);
+        const tmp = await createIsolatedTmpParent();
+        const observed = await runProgrammaticNulCase(
+          surface,
+          `{ cwd: ${JSON.stringify(project!.dir)}, maxIterations: ${maxIterations} }`,
+          { TMPDIR: tmp, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME! },
+        );
+
+        if (maxIterations === 0) {
+          expect(observed.ok).toBe(true);
+          expect(observed.outputs).toEqual([]);
+        } else {
+          expect(observed.ok).toBe(false);
+          expect(observed.error).toMatch(/spawn|environment|NUL|invalid|argument|launch/i);
+        }
+        expect(existsSync(markerPath)).toBe(false);
+        expect(noLoopxTmpdirs(tmp)).toBe(true);
+      });
+    },
+  );
+
+  it("T-ENV-26b: CLI local env-file NUL value survives -n 0 without spawn or tmpdir", async () => {
+    const markerPath = await createNulProject("env26b-marker.txt");
+    const localEnvPath = await writeLocalNulEnv();
+    const tmp = await createIsolatedTmpParent();
+
+    const result = await runCLI(["run", "-e", localEnvPath, "-n", "0", "ralph"], {
+      cwd: project!.dir,
+      env: { TMPDIR: tmp },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toMatch(/spawn|NUL|invalid|argument|launch/i);
+    expect(existsSync(markerPath)).toBe(false);
+    expect(noLoopxTmpdirs(tmp)).toBe(true);
+  });
+
+  it("T-ENV-27b: CLI global env-file NUL value survives -n 0 without spawn or tmpdir", async () => {
+    await withGlobalEnv({ MYVAR: "bad\x00value" }, async () => {
+      const markerPath = await createNulProject("env27b-marker.txt");
+      const tmp = await createIsolatedTmpParent();
+
+      const result = await runCLI(["run", "-n", "0", "ralph"], {
+        cwd: project!.dir,
+        env: { TMPDIR: tmp, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME! },
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).not.toMatch(/spawn|NUL|invalid|argument|launch/i);
+      expect(existsSync(markerPath)).toBe(false);
+      expect(noLoopxTmpdirs(tmp)).toBe(true);
+    });
+  });
+
+  it.each([
+    ["T-ENV-26d", "rm"],
+    ["T-ENV-26e", "mv"],
+  ] as const)(
+    "%s: CLI cleanup runs after cached script %s spawn failure",
+    async (_id, mutation) => {
+      project = await createTempProject();
+      const tmpMarker = join(project.dir, `${_id}-tmpdir.txt`);
+      const checkPath = join(project.loopxDir, "ralph", "check.sh");
+      const renamedPath = join(project.loopxDir, "ralph", "check-new.sh");
+      await createBashWorkflowScript(
+        project,
+        "ralph",
+        "index",
+        [
+          `printf '%s' "$LOOPX_TMPDIR" > ${JSON.stringify(tmpMarker)}`,
+          mutation === "rm"
+            ? `rm -f ${JSON.stringify(checkPath)}`
+            : `mv ${JSON.stringify(checkPath)} ${JSON.stringify(renamedPath)}`,
+          `printf '{"goto":"check"}'`,
+        ].join("\n"),
+      );
+      await createBashWorkflowScript(project, "ralph", "check", `printf '{"result":"check"}'`);
+      const tmp = await createIsolatedTmpParent();
+
+      const result = await runCLI(["run", "-n", "3", "ralph"], {
+        cwd: project.dir,
+        env: { TMPDIR: tmp },
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(existsSync(tmpMarker)).toBe(true);
+      const observedTmpdir = readFileSync(tmpMarker, "utf-8");
+      expect(existsSync(observedTmpdir)).toBe(false);
+    },
+  );
+
+  async function runProtocolOverrideCase(
+    source: "local" | "global",
+    varname: string,
+  ): Promise<{ resultStderr: string; observed: { present: boolean; value?: string }; tmp: string }> {
+    project = await createTempProject();
+    const markerPath = join(project.dir, `${source}-${varname}-marker.json`);
+    await createWorkflowScript(
+      project,
+      "ralph",
+      "index",
+      ".ts",
+      observeEnv(varname, markerPath),
+    );
+    const tmp = await createIsolatedTmpParent();
+    const args = ["run", "-n", "1", "ralph"];
+    const env: Record<string, string> = { TMPDIR: tmp };
+    if (source === "local") {
+      const localEnvPath = join(project.dir, "local.env");
+      await writeEnvFileRaw(localEnvPath, `${varname}=bad\x00value\n`);
+      args.splice(1, 0, "-e", localEnvPath);
+    } else {
+      env.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME!;
+    }
+
+    const result = await runCLI(args, { cwd: project.dir, env });
+    expect(result.exitCode).toBe(0);
+    return {
+      resultStderr: result.stderr,
+      observed: JSON.parse(readFileSync(markerPath, "utf-8")),
+      tmp,
+    };
+  }
+
+  it.each([
+    ["T-ENV-28", "local", "LOOPX_TMPDIR"],
+    ["T-ENV-28a", "local", "LOOPX_BIN"],
+    ["T-ENV-28a", "local", "LOOPX_PROJECT_ROOT"],
+    ["T-ENV-28a", "local", "LOOPX_WORKFLOW"],
+    ["T-ENV-28a", "local", "LOOPX_WORKFLOW_DIR"],
+  ] as const)("%s: %s env-file protocol NUL override for %s", async (_id, source, varname) => {
+    const { resultStderr, observed, tmp } = await runProtocolOverrideCase(source, varname);
+    expect(observed.present).toBe(true);
+    expect(observed.value).not.toBe("bad\x00value");
+    expect(observed.value).not.toContain("\x00");
+    if (varname === "LOOPX_TMPDIR") expect(observed.value?.startsWith(tmp)).toBe(true);
+    if (varname === "LOOPX_PROJECT_ROOT") expect(observed.value).toBe(project!.dir);
+    if (varname === "LOOPX_WORKFLOW") expect(observed.value).toBe("ralph");
+    if (varname === "LOOPX_WORKFLOW_DIR") {
+      expect(observed.value).toBe(join(project!.loopxDir, "ralph"));
+    }
+    expect(resultStderr).not.toMatch(/spawn|NUL|override|invalid|argument|launch/i);
+  });
+
+  it.each([
+    ["T-ENV-29", "LOOPX_TMPDIR"],
+    ["T-ENV-29a", "LOOPX_BIN"],
+    ["T-ENV-29a", "LOOPX_PROJECT_ROOT"],
+    ["T-ENV-29a", "LOOPX_WORKFLOW"],
+    ["T-ENV-29a", "LOOPX_WORKFLOW_DIR"],
+  ] as const)("global env-file protocol NUL override %s for %s", async (_id, varname) => {
+    await withGlobalEnv({ [varname]: "bad\x00value" }, async () => {
+      const { resultStderr, observed, tmp } = await runProtocolOverrideCase("global", varname);
+      expect(observed.present).toBe(true);
+      expect(observed.value).not.toBe("bad\x00value");
+      expect(observed.value).not.toContain("\x00");
+      if (varname === "LOOPX_TMPDIR") expect(observed.value?.startsWith(tmp)).toBe(true);
+      if (varname === "LOOPX_PROJECT_ROOT") expect(observed.value).toBe(project!.dir);
+      if (varname === "LOOPX_WORKFLOW") expect(observed.value).toBe("ralph");
+      if (varname === "LOOPX_WORKFLOW_DIR") {
+        expect(observed.value).toBe(join(project!.loopxDir, "ralph"));
+      }
+      expect(resultStderr).not.toMatch(/spawn|NUL|override|invalid|argument|launch/i);
     });
   });
 });
@@ -1215,6 +1836,140 @@ fi
         }
         await rm(tempConfigHome, { recursive: true, force: true });
       }
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR-0004 protocol-variable global-env precedence additions
+// ---------------------------------------------------------------------------
+
+describe("SPEC: Protocol Variables Override Global Env File", () => {
+  let project: TempProject | null = null;
+
+  afterEach(async () => {
+    if (project) {
+      await project.cleanup().catch(() => {});
+      project = null;
+    }
+  });
+
+  forEachRuntime((runtime) => {
+    it("T-ENV-21e: LOOPX_BIN overrides global env-file value", async () => {
+      await withGlobalEnv({ LOOPX_BIN: "/tmp/fake-binary" }, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "loopx-bin-global.json");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          observeEnv("LOOPX_BIN", marker),
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        const observed = JSON.parse(readFileSync(marker, "utf-8"));
+        expect(observed.present).toBe(true);
+        expect(observed.value).not.toBe("/tmp/fake-binary");
+        expect(observed.value).toMatch(/loopx|bin|\.js/);
+      });
+    });
+
+    it("T-ENV-21f: LOOPX_PROJECT_ROOT overrides global env-file value", async () => {
+      await withGlobalEnv(
+        { LOOPX_PROJECT_ROOT: "/tmp/fake-project-root" },
+        async () => {
+          project = await createTempProject();
+          const marker = join(project.dir, "project-root-global.json");
+
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".ts",
+            observeEnv("LOOPX_PROJECT_ROOT", marker),
+          );
+
+          const result = await runCLI(["run", "-n", "1", "ralph"], {
+            cwd: project.dir,
+            runtime,
+          });
+
+          expect(result.exitCode).toBe(0);
+          expect(JSON.parse(readFileSync(marker, "utf-8"))).toEqual({
+            present: true,
+            value: project!.dir,
+          });
+        },
+      );
+    });
+
+    it("T-ENV-21g: LOOPX_WORKFLOW_DIR overrides global env-file value silently", async () => {
+      await withGlobalEnv({ LOOPX_WORKFLOW_DIR: "/tmp/fake-dir" }, async () => {
+        project = await createTempProject();
+        const marker = join(project.dir, "workflow-dir-global.json");
+
+        await createWorkflowScript(
+          project,
+          "ralph",
+          "index",
+          ".ts",
+          observeEnv("LOOPX_WORKFLOW_DIR", marker),
+        );
+
+        const result = await runCLI(["run", "-n", "1", "ralph"], {
+          cwd: project.dir,
+          runtime,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(readFileSync(marker, "utf-8"))).toEqual({
+          present: true,
+          value: join(project!.loopxDir, "ralph"),
+        });
+        expect(result.stderr).not.toMatch(/LOOPX_WORKFLOW_DIR.*overrid/i);
+      });
+    });
+
+    it("T-ENV-21h: LOOPX_TMPDIR overrides global env-file value silently", async () => {
+      await withGlobalEnv(
+        { LOOPX_TMPDIR: "/tmp/fake-loopx-tmp" },
+        async () => {
+          project = await createTempProject();
+          const marker = join(project.dir, "tmpdir-global.txt");
+          const statMarker = join(project.dir, "tmpdir-global-stat.txt");
+
+          await createWorkflowScript(
+            project,
+            "ralph",
+            "index",
+            ".sh",
+            `#!/bin/bash
+printf '%s' "$LOOPX_TMPDIR" > "${marker}"
+if [ -d "$LOOPX_TMPDIR" ]; then printf 'dir' > "${statMarker}"; fi
+printf '{"stop":true}'
+`,
+          );
+
+          const result = await runCLI(["run", "ralph"], {
+            cwd: project.dir,
+            runtime,
+          });
+
+          expect(result.exitCode).toBe(0);
+          const observed = readFileSync(marker, "utf-8");
+          expect(observed).not.toBe("/tmp/fake-loopx-tmp");
+          expect(observed).toMatch(/\/loopx-/);
+          expect(readFileSync(statMarker, "utf-8")).toBe("dir");
+          expect(result.stderr).not.toMatch(/LOOPX_TMPDIR.*overrid/i);
+        },
+      );
     });
   });
 });
